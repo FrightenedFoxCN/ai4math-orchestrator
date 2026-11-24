@@ -6,11 +6,11 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use std::{collections::HashSet, fmt, marker::PhantomData};
 
 const BUILD_SCHEMA: &str = "ai4math.t2.clean-build.v1";
-const MAX_SAMPLES: usize = 9;
-const MAX_MODULES: usize = 128;
+pub(super) const MAX_SAMPLES: usize = 9;
+pub(super) const MAX_MODULES: usize = 128;
 const MAX_MODULE_COMPILE_MS: u64 = 30_000;
 const MAX_TOTAL_COMPILE_MS: u64 = 120_000;
-const MAX_INCREASE_PERCENT: u64 = 1_000;
+pub(super) const MAX_INCREASE_PERCENT: u64 = 1_000;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct T2Comparison {
@@ -105,15 +105,15 @@ struct BuildSample {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ModuleSample {
-    path: String,
-    source_sha256: String,
+pub(super) struct ModuleSample {
+    pub(super) path: String,
+    pub(super) source_sha256: String,
     compile_ms: u64,
 }
 
 // A derived struct can accept positional sequences as well as objects. Only
 // admit object rows, keeping derive's missing, unknown and duplicate key checks.
-struct Object<T>(T);
+pub(super) struct Object<T>(pub(super) T);
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -135,7 +135,7 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Object<T> {
 
 // Bound the number of retained objects during deserialization, not after
 // allocating an arbitrary number of reports or modules.
-struct ObjectArray<T, const MAX: usize>(Vec<T>);
+pub(super) struct ObjectArray<T, const MAX: usize>(pub(super) Vec<T>);
 
 impl<'de, T: Deserialize<'de>, const MAX: usize> Deserialize<'de> for ObjectArray<T, MAX> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -190,6 +190,69 @@ fn root_lean_path(path: &str) -> bool {
         })
 }
 
+pub(super) fn validate_reviewed_metadata(
+    reviewed_commit: &str,
+    ledger_event_seq: i64,
+) -> Result<()> {
+    ensure!(
+        canonical_commit(reviewed_commit),
+        "invalid reviewed_commit Git object ID"
+    );
+    ensure!(
+        ledger_event_seq >= 0,
+        "ledger_event_seq must be nonnegative"
+    );
+    Ok(())
+}
+
+pub(super) fn validate_build_metadata(
+    source_set_sha256: &str,
+    compiler_sha256: &str,
+    compile_ms: u64,
+    modules: &[ModuleSample],
+) -> Result<()> {
+    ensure!(
+        canonical_sha256(source_set_sha256),
+        "invalid source_set_sha256"
+    );
+    ensure!(canonical_sha256(compiler_sha256), "invalid compiler_sha256");
+    ensure!(
+        compile_ms <= MAX_TOTAL_COMPILE_MS,
+        "total compile_ms exceeds {MAX_TOTAL_COMPILE_MS}"
+    );
+    ensure!(!modules.is_empty(), "empty module list");
+
+    let mut paths = HashSet::new();
+    let mut sum = 0;
+    for (index, module) in modules.iter().enumerate() {
+        ensure!(
+            root_lean_path(&module.path),
+            "invalid root Lean module path at index {index}"
+        );
+        ensure!(
+            paths.insert(module.path.to_ascii_lowercase()),
+            "case-folded module path collision: {:?}",
+            module.path
+        );
+        ensure!(
+            canonical_sha256(&module.source_sha256),
+            "invalid source_sha256 for {:?}",
+            module.path
+        );
+        ensure!(
+            module.compile_ms <= MAX_MODULE_COMPILE_MS,
+            "module compile_ms exceeds {MAX_MODULE_COMPILE_MS} for {:?}",
+            module.path
+        );
+        sum += module.compile_ms;
+    }
+    ensure!(
+        sum <= compile_ms,
+        "sum of module compile_ms exceeds total compile_ms"
+    );
+    Ok(())
+}
+
 impl BuildSample {
     fn ordered_paths(&self) -> impl Iterator<Item = &str> {
         self.modules.0.iter().map(|m| m.path.as_str())
@@ -206,57 +269,13 @@ impl BuildSample {
             "engine must be lean4"
         );
         ensure!(self.advisory_only, "advisory_only must be true");
-        ensure!(
-            canonical_commit(&self.reviewed_commit),
-            "invalid reviewed_commit Git object ID"
-        );
-        ensure!(
-            self.ledger_event_seq >= 0,
-            "ledger_event_seq must be nonnegative"
-        );
-        ensure!(
-            canonical_sha256(&self.source_set_sha256),
-            "invalid source_set_sha256"
-        );
-        ensure!(
-            canonical_sha256(&self.compiler_sha256),
-            "invalid compiler_sha256"
-        );
-        ensure!(
-            self.compile_ms <= MAX_TOTAL_COMPILE_MS,
-            "total compile_ms exceeds {MAX_TOTAL_COMPILE_MS}"
-        );
-        ensure!(!self.modules.0.is_empty(), "empty module list");
-
-        let mut paths = HashSet::new();
-        let mut sum = 0;
-        for (index, module) in self.modules.0.iter().enumerate() {
-            ensure!(
-                root_lean_path(&module.path),
-                "invalid root Lean module path at index {index}"
-            );
-            ensure!(
-                paths.insert(module.path.to_ascii_lowercase()),
-                "case-folded module path collision: {:?}",
-                module.path
-            );
-            ensure!(
-                canonical_sha256(&module.source_sha256),
-                "invalid source_sha256 for {:?}",
-                module.path
-            );
-            ensure!(
-                module.compile_ms <= MAX_MODULE_COMPILE_MS,
-                "module compile_ms exceeds {MAX_MODULE_COMPILE_MS} for {:?}",
-                module.path
-            );
-            sum += module.compile_ms;
-        }
-        ensure!(
-            sum <= self.compile_ms,
-            "sum of module compile_ms exceeds total compile_ms"
-        );
-        Ok(())
+        validate_reviewed_metadata(&self.reviewed_commit, self.ledger_event_seq)?;
+        validate_build_metadata(
+            &self.source_set_sha256,
+            &self.compiler_sha256,
+            self.compile_ms,
+            &self.modules.0,
+        )
     }
 }
 
@@ -299,7 +318,7 @@ fn parse_group(bytes: &[u8], group: &str) -> Result<Vec<BuildSample>> {
     Ok(samples)
 }
 
-fn median(values: impl Iterator<Item = u64>) -> u64 {
+pub(super) fn median(values: impl Iterator<Item = u64>) -> u64 {
     let mut values: Vec<_> = values.collect();
     values.sort_unstable();
     values[values.len() / 2]

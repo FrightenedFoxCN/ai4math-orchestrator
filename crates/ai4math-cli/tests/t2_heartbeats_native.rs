@@ -18,6 +18,7 @@ const LATER: &str = "BHeartbeatAfter.lean";
 const MANIFEST: &str = "ai4math-modules.txt";
 const CLAIM: &str = "native-t2-heartbeats-fixture";
 const DECLARATION: &str = "heartbeatFixtureProof";
+const SAMPLE_COUNT: usize = 3;
 const MODULES: [(&str, &str); 3] = [
     (BASIS, "def heartbeatFixtureBasis : Nat := 2\n"),
     (
@@ -136,6 +137,17 @@ fn rejects(output: Output, case: &str, diagnostic: &str) {
         stderr.contains(diagnostic),
         "{case}: expected {diagnostic:?}, got {stderr:?}"
     );
+}
+
+struct HeartbeatSample {
+    report: Value,
+    max_raw: u64,
+    total_raw: u64,
+}
+
+fn median(mut values: [u64; SAMPLE_COUNT]) -> u64 {
+    values.sort_unstable();
+    values[SAMPLE_COUNT / 2]
 }
 
 fn assert_build(build: &Value, pin: &str, sources: &[(&str, &str)]) -> Result<()> {
@@ -265,43 +277,67 @@ fn native_t2_heartbeats_profiles_a_reviewed_snapshot_without_authority() -> Resu
             .output()
     };
 
-    let read_sample = |commit: &str, modules: &[(&str, &str)], count: u64| -> Result<(u64, u64)> {
-        let report: Value = serde_json::from_slice(&checked(profile(commit, &pin)?, "profile")?)?;
-        assert_eq!(report["schema"], "ai4math.t2.lean-heartbeats.v1");
-        assert_eq!(report["advisory_only"], true);
-        assert_eq!(report["reviewed_commit"], commit);
-        assert_eq!(report["ledger_event_seq"], seq);
-        assert_build(&report["build"], &pin, modules)?;
-        let profile = &report["profile"];
-        assert_eq!(profile["target_module"], TARGET);
-        assert_eq!(profile["command_count"], count);
-        let max = profile["max_command_heartbeats_raw"]
-            .as_u64()
-            .context("raw maximum heartbeat count")?;
-        let total = profile["total_command_heartbeats_raw"]
-            .as_u64()
-            .context("raw total heartbeat count")?;
-        // These fixtures consume thousands of raw allocation heartbeats,
-        // not normalized heartbeats. Do not pin exact absolute values.
-        assert!(
-            (1_000..10_000_000).contains(&max),
-            "unexpected maximum: {max}"
-        );
-        assert!(
-            (max + 1..=count * max).contains(&total),
-            "unexpected total: {total}"
-        );
-        Ok((max, total))
+    let read_sample =
+        |commit: &str, modules: &[(&str, &str)], count: u64| -> Result<HeartbeatSample> {
+            let report: Value =
+                serde_json::from_slice(&checked(profile(commit, &pin)?, "profile")?)?;
+            assert_eq!(report["schema"], "ai4math.t2.lean-heartbeats.v1");
+            assert_eq!(report["advisory_only"], true);
+            assert_eq!(report["reviewed_commit"], commit);
+            assert_eq!(report["ledger_event_seq"], seq);
+            assert_build(&report["build"], &pin, modules)?;
+            let profile = &report["profile"];
+            assert_eq!(profile["target_module"], TARGET);
+            assert_eq!(profile["command_count"], count);
+            let max = profile["max_command_heartbeats_raw"]
+                .as_u64()
+                .context("raw maximum heartbeat count")?;
+            let total = profile["total_command_heartbeats_raw"]
+                .as_u64()
+                .context("raw total heartbeat count")?;
+            // These fixtures consume thousands of raw allocation heartbeats,
+            // not normalized heartbeats. Do not pin exact absolute values.
+            assert!(
+                (1_000..10_000_000).contains(&max),
+                "unexpected maximum: {max}"
+            );
+            assert!(
+                (max + 1..=count * max).contains(&total),
+                "unexpected total: {total}"
+            );
+            Ok(HeartbeatSample {
+                report,
+                max_raw: max,
+                total_raw: total,
+            })
+        };
+    let collect_samples = |commit: &str,
+                           modules: &[(&str, &str)],
+                           count: u64|
+     -> Result<[HeartbeatSample; SAMPLE_COUNT]> {
+        let before = snapshot(&fixture)?;
+        let sample = || -> Result<HeartbeatSample> {
+            let observation = read_sample(commit, modules, count)?;
+            assert_unchanged(&before, "successful profile")?;
+            Ok(observation)
+        };
+        // Launch a separate native CLI process for every observation.
+        Ok([sample()?, sample()?, sample()?])
     };
 
-    let before = snapshot(&fixture)?;
     // Count the target's two definitions and theorem, not its header or EOF.
-    let baseline = read_sample(&head, &MODULES, 3)?;
-    assert!(baseline.0 < 1_000_000, "unexpected baseline: {baseline:?}");
-    assert_unchanged(&before, "successful profile")?;
+    let baseline = collect_samples(&head, &MODULES, 3)?;
+    let baseline_max = median(baseline.each_ref().map(|sample| sample.max_raw));
+    let baseline_total = median(baseline.each_ref().map(|sample| sample.total_raw));
+    assert!(
+        baseline_max < 1_000_000,
+        "unexpected baseline max: {baseline_max}"
+    );
     // Compare raw counts for ordinary synchronous elaboration, not wall time.
-    assert_eq!(read_sample(&head, &MODULES, 3)?, baseline);
-    assert_unchanged(&before, "repeat profile")?;
+    assert_eq!(baseline[0].max_raw, baseline[1].max_raw);
+    assert_eq!(baseline[0].total_raw, baseline[1].total_raw);
+
+    let before = snapshot(&fixture)?;
     rejects(
         profile(&head, &wrong_pin)?,
         "wrong compiler pin",
@@ -315,13 +351,80 @@ fn native_t2_heartbeats_profiles_a_reviewed_snapshot_without_authority() -> Resu
     heavier_modules[1].1 = &heavier_source;
     let heavier_head = advance_main(&source, &repo, TARGET, &heavier_source, "add heavier proof")?;
     assert_ne!(heavier_head, head);
-    let before = snapshot(&fixture)?;
-    let heavier = read_sample(&heavier_head, &heavier_modules, 4)?;
+    let candidate = collect_samples(&heavier_head, &heavier_modules, 4)?;
+    let candidate_max = median(candidate.each_ref().map(|sample| sample.max_raw));
+    let candidate_total = median(candidate.each_ref().map(|sample| sample.total_raw));
     assert!(
-        heavier.0 > 10 * baseline.0 && heavier.1 > 10 * baseline.1,
-        "expected larger raw counters: baseline={baseline:?}, heavier={heavier:?}"
+        candidate_max > 10 * baseline_max && candidate_total > 10 * baseline_total,
+        "expected larger raw medians: max {baseline_max} -> {candidate_max}, \
+         total {baseline_total} -> {candidate_total}"
     );
-    assert_unchanged(&before, "heavier profile")?;
+
+    let baseline_json = fixture.join("baseline-heartbeats.json");
+    let candidate_json = fixture.join("candidate-heartbeats.json");
+    for (path, samples) in [(&baseline_json, &baseline), (&candidate_json, &candidate)] {
+        serde_json::to_writer(
+            fs::File::create(path)?,
+            &samples.each_ref().map(|sample| &sample.report),
+        )?;
+    }
+    // Baseline after writing the inputs, so both comparison invocations must
+    // leave the JSON arrays, repository and ledger untouched.
+    let before = snapshot(&fixture)?;
+    for (min_delta, regressed) in [(1_000, true), (9_000_000_000_000_000u64, false)] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ai4math"))
+            .current_dir(&root)
+            .arg("t2-compare-heartbeats")
+            .arg(&baseline_json)
+            .arg(&candidate_json)
+            .arg(min_delta.to_string())
+            .arg("100")
+            .output()?;
+        assert_eq!(
+            output.status.success(),
+            !regressed,
+            "comparison at raw delta {min_delta} exited {}:\nstdout: {}\nstderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+            format!(
+                "comparison at raw delta {min_delta} did not emit JSON:\nstdout: {}\nstderr: {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            )
+        })?;
+        assert_eq!(report["schema"], "ai4math.t2.heartbeat-comparison.v1");
+        assert_eq!(report["advisory_only"], true);
+        assert_eq!(report["regressed"], regressed);
+        assert_eq!(report["target_module"], TARGET);
+        assert_eq!(report["thresholds"]["min_delta_heartbeats_raw"], min_delta);
+        assert_eq!(report["thresholds"]["min_increase_percent"], 100);
+        assert_eq!(report["baseline"]["reviewed_commit"], head);
+        assert_eq!(report["candidate"]["reviewed_commit"], heavier_head);
+        assert_eq!(report["baseline"]["command_count"], 3);
+        assert_eq!(report["candidate"]["command_count"], 4);
+        assert_eq!(report["baseline"]["sample_count"], SAMPLE_COUNT);
+        assert_eq!(report["candidate"]["sample_count"], SAMPLE_COUNT);
+        assert_eq!(report["target_source_changed"], true);
+        assert_eq!(report["target_prefix_changed"], true);
+        for (metric, baseline_median, candidate_median) in [
+            ("max_command", baseline_max, candidate_max),
+            ("total_commands", baseline_total, candidate_total),
+        ] {
+            assert_eq!(
+                report[metric]["baseline_median_heartbeats_raw"],
+                baseline_median
+            );
+            assert_eq!(
+                report[metric]["candidate_median_heartbeats_raw"],
+                candidate_median
+            );
+            assert_eq!(report[metric]["regressed"], regressed);
+        }
+        assert_unchanged(&before, &format!("comparison at raw delta {min_delta}"))?;
+    }
 
     // Break only the later module. The unchanged target must not yield a
     // partial report even though its predecessors and its own proof are valid.

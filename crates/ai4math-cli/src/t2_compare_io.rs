@@ -1,5 +1,5 @@
 //! Offline operator input for T2 telemetry comparisons. No project or ledger is opened.
-use crate::{print_json, t2_compare};
+use crate::{print_json, t2_compare, t2_heartbeat_compare};
 use anyhow::{Context, Result, ensure};
 use std::{fs, io::Read, path::Path};
 
@@ -7,8 +7,9 @@ use std::{fs, io::Read, path::Path};
 const INPUT_CAP: u64 = 1024 * 1024;
 
 fn read_samples(path: &Path) -> Result<Vec<u8>> {
+    let before = fs::symlink_metadata(path)?;
     ensure!(
-        fs::symlink_metadata(path)?.is_file(),
+        before.is_file(),
         "T2 sample input must be a regular file, not a link"
     );
     let mut options = fs::OpenOptions::new();
@@ -24,6 +25,14 @@ fn read_samples(path: &Path) -> Result<Vec<u8>> {
         metadata.is_file() && metadata.len() <= INPUT_CAP,
         "T2 sample input exceeds the 1 MiB limit or is not a regular file"
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            (before.dev(), before.ino()) == (metadata.dev(), metadata.ino()),
+            "T2 sample input changed during open"
+        );
+    }
     let mut data = Vec::new();
     file.take(INPUT_CAP + 1).read_to_end(&mut data)?;
     ensure!(
@@ -41,6 +50,26 @@ fn threshold(value: &str) -> Result<u64> {
     value
         .parse()
         .context("T2 comparison threshold must be a canonical positive integer")
+}
+
+pub(crate) fn run_heartbeats(
+    baseline: &Path,
+    candidate: &Path,
+    delta: &str,
+    percent: &str,
+) -> Result<()> {
+    let absolute = threshold(delta)?;
+    let relative = threshold(percent)?;
+    let baseline = read_samples(baseline).context("read T2 heartbeat baseline samples")?;
+    let candidate = read_samples(candidate).context("read T2 heartbeat candidate samples")?;
+    let report = t2_heartbeat_compare::compare(&baseline, &candidate, absolute, relative)?;
+    let regressed = report.regressed;
+    print_json(report)?;
+    ensure!(
+        !regressed,
+        "measured T2 heartbeat increase meets both comparison thresholds"
+    );
+    Ok(())
 }
 
 pub(crate) fn run(baseline: &Path, candidate: &Path, delta: &str, percent: &str) -> Result<()> {
