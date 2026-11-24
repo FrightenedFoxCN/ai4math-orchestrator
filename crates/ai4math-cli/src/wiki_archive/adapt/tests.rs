@@ -3,7 +3,7 @@
 use super::{apply, prepare};
 use crate::{
     breaker_probes, declare_claim, init, managed_tests::git, promote_managed,
-    promotion::PromotionRepo, reviewed_spec, wiki_archive, worker_dispatch,
+    promotion::PromotionRepo, reviewed_spec, t3, wiki_archive, worker_dispatch,
 };
 use ai4math_core::{Engine, FrozenTarget, ProofBodySubmission, render_proof_body};
 use ai4math_store::{
@@ -730,6 +730,141 @@ fn native_sediment_adaptation_approves_only_a_fresh_target_without_granting_auth
     );
     assert_hidden(&wiki, stale)?;
     assert_eq!(state.status()?.last_event_seq, stale.event_seq);
+
+    // Change the candidate's ordered prefix without changing the approved spec or
+    // the proposition it proves. Only a fresh, comparator-backed T3 can republish it.
+    git(&review, &["checkout", "--detach", &adapted]);
+    fs::write(review.join("Defs.lean"), "def x : Nat := 1 + 2\n")?;
+    git(
+        &review,
+        &["commit", "-am", "review equivalent dependency change"],
+    );
+    git(&review, &["push", "origin", "HEAD:refs/heads/main"]);
+    let rechecked_head = git(&repo, &["rev-parse", MAIN]);
+    let t3_plan = {
+        let locked = PromotionRepo::try_lock(&repo)?;
+        let mut preview = StateStore::open_readonly(root.join(DB))?;
+        t3::plan(
+            &mut preview,
+            &locked,
+            NEW_MODULE,
+            &adapted,
+            &rechecked_head,
+            Engine::Lean4,
+        )?
+    };
+    let t3_hash = &t3_plan.plan_sha256;
+    assert_eq!(t3_plan.changed_modules, ["Defs.lean"]);
+    assert_eq!(t3_plan.ledger_event_seq, stale.event_seq);
+    let planned_target = t3_plan
+        .claims
+        .iter()
+        .find(|claim| claim.claim_id == TARGET)
+        .context("target missing from T3 preview")?;
+    assert!(matches!(
+        &planned_target.old_proof,
+        t3::ProofDisposition::Ready { promoted_commit, .. } if promoted_commit == &adapted
+    ));
+    assert!(state.applied_t3_plan(t3_hash)?.is_none());
+    t3::apply(root, &repo, NEW_MODULE, &adapted, &rechecked_head, t3_hash)?;
+    let applied = state
+        .applied_t3_plan(t3_hash)?
+        .context("missing T3 approval")?;
+    assert_eq!(applied.reviewed_commit, rechecked_head);
+    let tainted = state
+        .claim(TARGET)?
+        .context("missing tainted destination Claim")?;
+    assert!(tainted.stale);
+    assert_eq!(tainted.prior_trust, Some(Trust::L5));
+    assert_eq!(
+        tainted.taint_root_commit.as_deref(),
+        Some(rechecked_head.as_str())
+    );
+    let taint_events = state.events_after(t3_plan.ledger_event_seq, 16)?;
+    assert!(taint_events.iter().any(|event| {
+        event.event_type == "CLAIM_TAINTED"
+            && event.entity_id == TARGET
+            && event.git_commit.as_deref() == Some(rechecked_head.as_str())
+    }));
+    assert!(state.lean_spec_recheck(TARGET, t3_hash)?.is_none());
+    assert_eq!(
+        wiki_archive::core_projection::rebuild(root, &repo, &rechecked_head)?,
+        1
+    );
+    wiki_archive::core_projection::checked_read(root, &repo, &rechecked_head, &assert_hidden)?;
+
+    t3::recheck_one(root, &repo, t3_hash, TARGET, &lean, None)?;
+    let restored = state
+        .claim(TARGET)?
+        .context("missing restored destination Claim")?;
+    assert!(!restored.stale);
+    assert_eq!(restored.effective_trust, Trust::L5);
+    assert!(restored.taint_root_commit.is_none());
+    assert!(state.claim(ORIGIN)?.context("missing source Claim")?.stale);
+    let recheck = state
+        .lean_spec_recheck(TARGET, t3_hash)?
+        .context("missing comparator-backed T3 recheck")?;
+    assert_eq!(recheck.reviewed_commit, rechecked_head);
+    assert_eq!(recheck.promoted_commit, adapted);
+    assert_eq!(recheck.spec_prefix_sha256, comparison.spec_prefix_sha256);
+    assert_ne!(recheck.comparison_receipt_sha256, comparison.receipt_sha256);
+    let restored_seq = state.status()?.last_event_seq;
+    wiki_archive::core_projection::checked_read(root, &repo, &rechecked_head, &assert_hidden)?;
+    assert_eq!(
+        wiki_archive::core_projection::rebuild(root, &repo, &rechecked_head)?,
+        2
+    );
+    let ((), indexed_seq) = wiki_archive::core_projection::checked_read(
+        root,
+        &repo,
+        &rechecked_head,
+        |index, generation| {
+            assert_cold_source(index, generation)?;
+            let hits = index.search_at(core_query, generation)?.hits;
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].summary.id, core[0].summary.id);
+            assert_eq!(
+                hits[0].summary.verified_at_commit.as_deref(),
+                Some(rechecked_head.as_str())
+            );
+            assert_eq!(hits[0].trust_level, Trust::L5);
+            let restored_edges = index.provenance_at(&archive.id, 1, 16, generation)?;
+            assert_eq!(
+                serde_json::to_value(restored_edges)?,
+                serde_json::to_value(&provenance)?
+            );
+            Ok(())
+        },
+    )?;
+    assert_eq!(indexed_seq, restored_seq);
+
+    // The retained T3 comparison does not authorize a further changed prefix.
+    fs::write(review.join("Defs.lean"), "def x : Nat := 4\n")?;
+    git(
+        &review,
+        &["commit", "-am", "drift beyond rechecked dependencies"],
+    );
+    git(&review, &["push", "origin", "HEAD:refs/heads/main"]);
+    let drift_after_t3 = git(&repo, &["rev-parse", MAIN]);
+    let err = wiki_archive::core_projection::checked_read(
+        root,
+        &repo,
+        &rechecked_head,
+        |_, _| -> Result<()> { panic!("query with an outdated T3 review head must be refused") },
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("not current main"), "{err:#}");
+    wiki_archive::core_projection::checked_read(root, &repo, &drift_after_t3, &assert_hidden)?;
+    assert_eq!(
+        wiki_archive::core_projection::rebuild(root, &repo, &drift_after_t3)?,
+        1
+    );
+    wiki_archive::core_projection::checked_read(root, &repo, &drift_after_t3, &assert_hidden)?;
+    assert_eq!(state.status()?.last_event_seq, restored_seq);
+    assert_eq!(
+        state.lean_spec_recheck(TARGET, t3_hash)?.as_ref(),
+        Some(&recheck)
+    );
     assert_eq!(state.sediment_lineage(&digest)?.as_ref(), Some(&lineage));
     assert_eq!(fs::read(&archive_path)?, archive_bytes);
     assert!(fs::read_dir(wiki_root.join("core"))?.next().is_none());

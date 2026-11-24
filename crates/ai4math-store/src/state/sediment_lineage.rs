@@ -49,6 +49,14 @@ pub struct SedimentLineage {
     pub event_seq: i64,
 }
 
+/// A current ledger candidate for native CORE projection, not a Git verification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SedimentCoreEvidence {
+    pub lineage: SedimentLineage,
+    /// The recorded T1 promotion or the exact current T3 review snapshot.
+    pub verified_at_commit: String,
+}
+
 impl SedimentLineage {
     fn event_payload(&self) -> Value {
         json!({
@@ -143,6 +151,110 @@ fn exact_comparison(
     Ok(comparison)
 }
 
+/// Find the recheck bound to the current receipt, never merely the newest
+/// recheck for a Claim or any recheck of the same declaration.
+fn current_recheck_commit(
+    db: &Connection,
+    lineage: &SedimentLineage,
+    receipt_id: &str,
+) -> Result<Option<String>> {
+    let plan_hash: Option<String> = db
+        .query_row(
+            "SELECT q.plan_sha256 FROM verification_receipts r
+             JOIN applied_t3_plans p ON p.reviewed_commit=r.base_commit
+             JOIN lean_spec_rechecks q ON q.plan_sha256=p.plan_sha256 AND q.claim_id=?1
+             WHERE r.receipt_id=?2 AND q.promoted_commit=?3
+             AND r.tier='T3_TAINT_REBUILD' AND r.engine='lean4'
+             AND r.allowlist_passed=1 AND r.external_checker_passed IS NOT 0
+             AND q.candidate_receipt_sha256=r.receipt_sha256 AND q.reviewed_commit=r.base_commit
+             AND q.candidate_file=json_extract(r.raw_receipt_json,'$.file_path')
+             AND q.candidate_decl=r.target_decl AND q.candidate_source_sha256=r.patch_sha256",
+            params![lineage.target_claim, receipt_id, lineage.promoted_commit],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(plan_hash) = plan_hash else {
+        return Ok(None);
+    };
+    let recheck = reviewed_lean::read_recheck(db, &lineage.target_claim, &plan_hash)?
+        .context("matched Lean recheck vanished during projection")?;
+    let approval = sediment_adaptation::read_approval(db, &lineage.approval_sha256)?
+        .context("lineage approval vanished during projection")?;
+    let plan = approval.plan;
+    let Some(binding) = reviewed_lean::read_binding(db, &lineage.target_claim)? else {
+        return Ok(None);
+    };
+    let Some(recipe) =
+        read_managed_proof_recipe(db, &lineage.target_claim, Some(&lineage.promoted_commit))?
+    else {
+        return Ok(None);
+    };
+    let Some(comparison) = reviewed_lean::read_comparison(db, &lineage.promoted_commit)? else {
+        return Ok(None);
+    };
+    let spec = (&plan.spec_file, &plan.spec_decl, &plan.spec_prefix_sha256);
+    if binding.repo != plan.repo
+        || (
+            &binding.spec_file,
+            &binding.spec_decl,
+            &binding.spec_prefix_sha256,
+        ) != spec
+        || (
+            &comparison.spec_file,
+            &comparison.spec_decl,
+            &comparison.spec_prefix_sha256,
+        ) != spec
+        || (
+            &recheck.spec_file,
+            &recheck.spec_decl,
+            &recheck.spec_prefix_sha256,
+        ) != spec
+        || comparison.candidate_receipt_sha256 != lineage.candidate_receipt_sha256
+        || comparison.receipt_sha256 != lineage.comparison_receipt_sha256
+        || recipe.base_commit != plan.reviewed_commit
+        || recipe.file_path != plan.target_module
+        || recipe.target_decl != plan.target_decl
+        || recheck.candidate_file != recipe.file_path
+        || recheck.candidate_decl != recipe.target_decl
+        || recheck.candidate_source_sha256 != recipe.source_sha256
+        || !reviewed_lean::matches_managed_t1(db, &recipe, Some(&comparison), None)?
+    {
+        return Ok(None);
+    }
+
+    // Rechecks are written atomically with this trust event. A historical
+    // match is insufficient: require the latest local trust or taint event
+    // for the Claim to be this exact restoration and name this receipt ID.
+    let trust: Option<String> = db
+        .query_row(
+            "SELECT payload_json FROM events WHERE event_seq=(
+                 SELECT event_seq FROM events WHERE entity_type='claim' AND entity_id=?1
+                 AND event_type IN ('CLAIM_TRUST_CHANGED','CLAIM_TAINTED')
+                 ORDER BY event_seq DESC LIMIT 1
+             ) AND event_type='CLAIM_TRUST_CHANGED' AND git_commit=?2 AND event_seq>?3",
+            params![
+                lineage.target_claim,
+                recheck.reviewed_commit,
+                lineage.event_seq
+            ],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let expected = json!({
+        "previous_local": Trust::L5,
+        "local": Trust::L5,
+        "was_stale": true,
+        "detail": {"receipt_id": receipt_id, "lean_spec_recheck": recheck},
+    });
+    if trust.as_deref().and_then(|p| serde_json::from_str(p).ok()) != Some(expected) {
+        return Ok(None);
+    }
+    let applied = super::require_applied_t3_plan(db, &plan_hash)?;
+    Ok((applied.approval.reviewed_commit == recheck.reviewed_commit
+        && applied.claims.contains(&lineage.target_claim))
+    .then_some(recheck.reviewed_commit))
+}
+
 // Mirror the native proof-body envelope. Deserialize the typed variant rather
 // than projecting JSON with SQL: alternate/duplicate/unknown fields must fail
 // closed, and equality is over the exact decoded body (no trimming).
@@ -163,27 +275,51 @@ impl StateStore {
     }
 
     /// Bounded projection input only. Historical lineage readback is separate.
-    /// Select records whose destination still names that exact non-stale L5 T1;
-    /// the caller must separately establish current Git/source compatibility.
-    pub fn current_sediment_lineages(&self) -> Result<Vec<SedimentLineage>> {
+    /// The destination must be non-stale L5 under the exact recorded T1 or a
+    /// sealed T3 recheck that restores that same latest T1 promotion. The caller
+    /// must separately establish current Git ancestry and source compatibility.
+    pub fn current_sediment_lineages(&self) -> Result<Vec<SedimentCoreEvidence>> {
         const LIMIT: usize = 64;
         Ok(reviewed_lean::read_optional_table(&self.db, TABLE, |db| {
-            let mut statement=db.prepare("SELECT l.approval_sha256 FROM sediment_adaptation_lineage l
-                JOIN sediment_adaptation_approvals a USING(approval_sha256)
-                JOIN recorded_promotions p ON p.git_commit=l.promoted_commit AND p.claim_id=a.target_claim
-                JOIN claims c ON c.claim_id=a.target_claim AND c.receipt_id=p.receipt_id
-                JOIN verification_receipts r ON r.receipt_id=p.receipt_id AND r.receipt_sha256=l.candidate_receipt_sha256
-                WHERE c.engine='lean4' AND c.stale=0 AND c.effective_stale=0
-                AND c.local_trust_level='L5' AND c.effective_trust_level='L5'
-                AND r.tier='T1_PROMOTION' AND r.engine='lean4'
-                AND c.module_path=a.target_module AND c.formal_target=(a.target_module || '#' || a.target_decl)
-                AND NOT EXISTS(SELECT 1 FROM recorded_promotions newer WHERE newer.claim_id=c.claim_id AND newer.event_seq>p.event_seq)
-                ORDER BY l.event_seq LIMIT ?1")?;
-            let ids=statement.query_map([(LIMIT+1) as i64],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            ensure!(ids.len()<=LIMIT,"managed CORE projection limit exceeded; narrow the projection before rebuilding");
-            let rows=ids.iter().map(|id|read_lineage(db,id)?.context("lineage vanished during projection"))
-                .collect::<Result<Vec<_>>>()?;
-            Ok(Some(rows))
+            let snapshot = db.unchecked_transaction()?;
+            let mut statement = snapshot.prepare(
+                "SELECT l.approval_sha256,c.receipt_id,(c.receipt_id=p.receipt_id)
+                 FROM sediment_adaptation_lineage l
+                 JOIN sediment_adaptation_approvals a USING(approval_sha256)
+                 JOIN recorded_promotions p ON p.git_commit=l.promoted_commit AND p.claim_id=a.target_claim
+                 JOIN claims c ON c.claim_id=a.target_claim
+                 JOIN verification_receipts t1 ON t1.receipt_id=p.receipt_id
+                    AND t1.receipt_sha256=l.candidate_receipt_sha256
+                 JOIN verification_receipts r ON r.receipt_id=c.receipt_id
+                 WHERE c.engine='lean4' AND c.stale=0 AND c.effective_stale=0
+                 AND c.local_trust_level='L5' AND c.effective_trust_level='L5'
+                 AND t1.tier='T1_PROMOTION' AND t1.engine='lean4'
+                 AND (r.receipt_id=p.receipt_id OR (r.tier='T3_TAINT_REBUILD' AND r.engine='lean4'))
+                 AND c.module_path=a.target_module AND c.formal_target=(a.target_module || '#' || a.target_decl)
+                 AND NOT EXISTS(SELECT 1 FROM recorded_promotions newer WHERE newer.claim_id=c.claim_id AND newer.event_seq>p.event_seq)
+                 ORDER BY l.event_seq LIMIT ?1",
+            )?;
+            let mut candidates = statement.query([(LIMIT + 1) as i64])?;
+            let mut evidence = Vec::new();
+            let mut examined = 0;
+            while let Some(row) = candidates.next()? {
+                examined += 1;
+                ensure!(examined <= LIMIT, "managed CORE projection limit exceeded; narrow the projection before rebuilding");
+                let approval: String = row.get(0)?;
+                let lineage = read_lineage(&snapshot, &approval)?
+                    .context("lineage vanished during projection")?;
+                let verified_at_commit = if row.get::<_, bool>(2)? {
+                    lineage.promoted_commit.clone()
+                } else {
+                    let receipt_id: String = row.get(1)?;
+                    let Some(commit) = current_recheck_commit(&snapshot, &lineage, &receipt_id)? else {
+                        continue;
+                    };
+                    commit
+                };
+                evidence.push(SedimentCoreEvidence { lineage, verified_at_commit });
+            }
+            Ok(Some(evidence))
         })?.unwrap_or_default())
     }
 

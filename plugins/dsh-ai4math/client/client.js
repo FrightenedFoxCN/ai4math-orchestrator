@@ -755,6 +755,8 @@ function WikiCard({ hit, inspectProvenance }) {
       badge((derived ? 'Indexed trust ' : '') + text(hit.trust_level)), badge(text(hit.status))),
     h(MathCard, { informal: hit.informal_gloss, formal: hit.formal_signature }),
     hasPath && labelValue(virtual ? 'Virtual index location' : 'Source path', h('code', null, hit.file_path)),
+    derived && typeof hit.verified_at_commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hit.verified_at_commit)
+      && labelValue('Verified at Git commit', h('code', null, hit.verified_at_commit)),
     derived && note('This derived index record is not an authored Wiki page or a proof source.'),
     validProvenanceId(hit.id) && h('div', { className: 'ai4m-actions' },
       button('Inspect provenance for ' + hit.id, () => inspectProvenance(hit.id, derived))))

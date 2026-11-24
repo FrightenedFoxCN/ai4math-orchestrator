@@ -28,7 +28,7 @@ pub use pivot::{BreakerTripReport, PivotIntent, PivotPlan, PivotResult};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
 pub use reviewed_lean::{LeanSpecComparison, LeanSpecRecheck, ReviewedLeanSpec};
 pub use sediment_adaptation::{SedimentAdaptationApproval, SedimentAdaptationPlan};
-pub use sediment_lineage::{SedimentLineage, SedimentLineageInput};
+pub use sediment_lineage::{SedimentCoreEvidence, SedimentLineage, SedimentLineageInput};
 pub use sediment_recheck::{RetainedSedimentReplay, SedimentReplayScope};
 pub use sweep::{T3SweepState, T3SweepStatus, T3SweepStep};
 pub(crate) use tasks::scheduler_snapshot;

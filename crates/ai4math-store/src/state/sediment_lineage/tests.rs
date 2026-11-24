@@ -1,6 +1,9 @@
 use super::*;
 use crate::state::sediment_adaptation::tests::approved_fixture;
-use crate::{PromotionIntent, SedimentAdaptationApproval, TaskRunOutcome, VerifiedReceipt};
+use crate::{
+    PromotionIntent, RecheckOutcome, SedimentAdaptationApproval, T3PlanApproval, TaskRunOutcome,
+    VerifiedReceipt,
+};
 use std::time::Duration;
 
 const NEW: &str = "dddddddddddddddddddddddddddddddddddddddd";
@@ -268,7 +271,7 @@ fn core_selector_requires_current_exact_t1_and_preserves_historical_lineage() ->
     assert!(store.current_sediment_lineages()?.is_empty());
     let seq = last_seq(&store.db)?;
     let record = store.retain_sediment_lineage(input(&approval, seq))?;
-    assert_eq!(store.current_sediment_lineages()?, vec![record.clone()]);
+    assert_core_evidence(&store, &record, NEW)?;
     let receipt = store
         .claim(&approval.plan.target_claim)?
         .unwrap()
@@ -289,6 +292,203 @@ fn core_selector_requires_current_exact_t1_and_preserves_historical_lineage() ->
         store.sediment_lineage(&approval.approval_sha256)?,
         Some(record)
     );
+    Ok(())
+}
+
+fn assert_core_evidence(store: &StateStore, record: &SedimentLineage, commit: &str) -> Result<()> {
+    assert_eq!(
+        store.current_sediment_lineages()?,
+        [SedimentCoreEvidence {
+            lineage: record.clone(),
+            verified_at_commit: commit.into(),
+        }]
+    );
+    Ok(())
+}
+
+fn apply_core_t3_plan(
+    store: &mut StateStore,
+    adaptation: &SedimentAdaptationPlan,
+    base: &str,
+    reviewed: &str,
+    n: usize,
+) -> Result<T3PlanApproval> {
+    let approval = T3PlanApproval {
+        plan_sha256: format!("{n:064x}"),
+        base_commit: base.into(),
+        reviewed_commit: reviewed.into(),
+        anchor_module: adaptation.target_module.clone(),
+        preview_event_seq: last_seq(&store.db)?,
+    };
+    let impact = store
+        .apply_t3_plan(&approval, &[&adaptation.target_module])?
+        .context("fixture T3 plan was already applied")?;
+    assert_eq!(impact.claims, [adaptation.target_claim.as_str()]);
+    Ok(approval)
+}
+
+fn restore_core_t3(
+    store: &mut StateStore,
+    adaptation: &SedimentAdaptationPlan,
+    plan: &T3PlanApproval,
+    n: usize,
+) -> Result<String> {
+    let (_, mut receipt) = promotion(adaptation, NEW, &format!("{n:064x}"));
+    receipt.base_commit = plan.reviewed_commit.clone();
+    receipt.tier = "T3_TAINT_REBUILD".into();
+    receipt.regression_checked = false;
+    receipt.lean_comparison.as_mut().unwrap().receipt_sha256 = format!("{:064x}", n + 1000);
+    let id = receipt.id.clone();
+    let mut receipt = Some(receipt);
+    let report = store.recheck_one_stale_for_plan(
+        &plan.plan_sha256,
+        &adaptation.target_claim,
+        "fixture:recheck",
+        |_| Ok(RecheckOutcome::Verified(Box::new(receipt.take().unwrap()))),
+    )?;
+    assert_eq!(report.verified, [adaptation.target_claim.as_str()]);
+    Ok(id)
+}
+
+fn retained_core_fixture(
+    store: &mut StateStore,
+) -> Result<(SedimentAdaptationApproval, SedimentLineage)> {
+    let adaptation = fixture(store, Some(valid_result()))?;
+    let record = store.retain_sediment_lineage(input(&adaptation, last_seq(&store.db)?))?;
+    Ok((adaptation, record))
+}
+
+#[test]
+fn core_selector_tracks_exact_current_recheck_across_repeated_taint() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let db = temp.path().join("state.sqlite");
+    let mut store = StateStore::open(&db)?;
+    let (adaptation, record) = retained_core_fixture(&mut store)?;
+    assert_core_evidence(&store, &record, NEW)?;
+
+    let first = apply_core_t3_plan(&mut store, &adaptation.plan, NEW, LATER, 1)?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    let old_receipt = restore_core_t3(&mut store, &adaptation.plan, &first, 1)?;
+    assert_core_evidence(&StateStore::open_readonly(&db)?, &record, LATER)?;
+
+    let newest = "ffffffffffffffffffffffffffffffffffffffff";
+    let second = apply_core_t3_plan(&mut store, &adaptation.plan, LATER, newest, 2)?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    let current_receipt = restore_core_t3(&mut store, &adaptation.plan, &second, 2)?;
+    let seq = last_seq(&store.db)?;
+    assert_core_evidence(&store, &record, newest)?;
+    assert_eq!(last_seq(&store.db)?, seq);
+
+    // Merely reattaching an older, otherwise exact sealed receipt cannot
+    // select the earlier review snapshot after a later trust restoration.
+    store.db.execute(
+        "UPDATE claims SET receipt_id=?2 WHERE claim_id=?1",
+        params![adaptation.plan.target_claim, old_receipt],
+    )?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    store.db.execute(
+        "UPDATE claims SET receipt_id=?2 WHERE claim_id=?1",
+        params![adaptation.plan.target_claim, current_receipt],
+    )?;
+    assert_core_evidence(&store, &record, newest)?;
+    assert_eq!(
+        store.sediment_lineage(&adaptation.approval_sha256)?,
+        Some(record)
+    );
+    Ok(())
+}
+
+#[test]
+fn core_selector_rejects_generic_t3_and_recheck_of_a_newer_promotion() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    let (adaptation, record) = retained_core_fixture(&mut store)?;
+    let newest = "ffffffffffffffffffffffffffffffffffffffff";
+    // A different T1 promotion of this Claim supersedes the lineage anchor.
+    let (intent, receipt) = promotion(&adaptation.plan, LATER, &"a".repeat(64));
+    store.prepare_promotion(&intent, &receipt)?;
+    store.finish_promotion(&intent, &receipt)?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    let t3 = apply_core_t3_plan(&mut store, &adaptation.plan, LATER, newest, 1)?;
+    restore_core_t3(&mut store, &adaptation.plan, &t3, 1)?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    assert_eq!(
+        store.sediment_lineage(&adaptation.approval_sha256)?,
+        Some(record)
+    );
+
+    // Even an otherwise identical current T3 receipt is not eligible without
+    // its own sealed comparison and exact recorded trust restoration.
+    let mut store = StateStore::open(":memory:")?;
+    let (adaptation, record) = retained_core_fixture(&mut store)?;
+    let t3 = apply_core_t3_plan(&mut store, &adaptation.plan, NEW, LATER, 1)?;
+    let verified = restore_core_t3(&mut store, &adaptation.plan, &t3, 1)?;
+    assert_core_evidence(&store, &record, LATER)?;
+    let generic_sha = "b".repeat(64);
+    store.db.execute(
+        "INSERT INTO verification_receipts
+         SELECT 'generic',issued_at,tier,engine,base_commit,patch_sha256,target_decl,allowlist_passed,
+                axioms_used_json,external_checker_passed,compile_seconds,max_heartbeats,?2,raw_receipt_json
+         FROM verification_receipts WHERE receipt_id=?1",
+        params![verified, generic_sha],
+    )?;
+    store.db.execute(
+        "UPDATE claims SET receipt_id='generic' WHERE claim_id=?1",
+        [&adaptation.plan.target_claim],
+    )?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    store
+        .db
+        .execute_batch("DROP TRIGGER lean_spec_rechecks_no_update")?;
+    store.db.execute(
+        "UPDATE lean_spec_rechecks SET candidate_receipt_sha256=?1",
+        [&generic_sha],
+    )?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    Ok(())
+}
+
+#[test]
+fn core_selector_checks_t3_ledger_bindings_and_current_l5_state() -> Result<()> {
+    for mutation in [
+        "UPDATE claims SET stale=1 WHERE receipt_id=?1",
+        "UPDATE claims SET effective_stale=1 WHERE receipt_id=?1",
+        "UPDATE claims SET local_trust_level='L4b' WHERE receipt_id=?1",
+        "UPDATE claims SET effective_trust_level='L4b' WHERE receipt_id=?1",
+        "UPDATE verification_receipts SET tier='T2_AUDIT' WHERE receipt_id=?1",
+        "UPDATE verification_receipts SET engine='agda' WHERE receipt_id=?1",
+        "UPDATE verification_receipts SET base_commit='different' WHERE receipt_id=?1",
+        "UPDATE verification_receipts SET target_decl='different' WHERE receipt_id=?1",
+        "UPDATE verification_receipts SET patch_sha256='different' WHERE receipt_id=?1",
+        r#"UPDATE verification_receipts SET raw_receipt_json='{"file_path":"Other.lean"}' WHERE receipt_id=?1"#,
+        "UPDATE verification_receipts SET patch_sha256='different' WHERE tier='T1_PROMOTION' AND receipt_id<>?1",
+        "UPDATE applied_t3_plans SET reviewed_commit='different' WHERE ?1 IS NOT NULL",
+        "UPDATE lean_spec_rechecks SET promoted_commit=(SELECT promoted_commit FROM sediment_adaptation_approvals) WHERE ?1 IS NOT NULL",
+        "UPDATE lean_spec_rechecks SET spec_file='Other.lean' WHERE ?1 IS NOT NULL",
+        "UPDATE lean_spec_rechecks SET spec_decl='different' WHERE ?1 IS NOT NULL",
+        "UPDATE lean_spec_rechecks SET spec_prefix_sha256=printf('%064x',42) WHERE ?1 IS NOT NULL",
+        "UPDATE reviewed_lean_specs SET spec_decl='different' WHERE ?1 IS NOT NULL",
+        "UPDATE lean_spec_comparisons SET receipt_sha256=printf('%064x',42) WHERE ?1 IS NOT NULL",
+        "UPDATE events SET payload_json=json_set(payload_json,'$.claims',json('[]'))
+         WHERE event_type='T3_TAINT_APPLIED' AND ?1 IS NOT NULL",
+        "UPDATE events SET payload_json=json_set(payload_json,'$.detail.receipt_id','generic')
+         WHERE event_type='CLAIM_TRUST_CHANGED' AND json_extract(payload_json,'$.detail.receipt_id')=?1",
+        "UPDATE events SET payload_json=json_set(payload_json,'$.detail.lean_spec_recheck.comparison_receipt_sha256','different')
+         WHERE event_type='CLAIM_TRUST_CHANGED' AND json_extract(payload_json,'$.detail.receipt_id')=?1",
+    ] {
+        let mut store = StateStore::open(":memory:")?;
+        let (adaptation, record) = retained_core_fixture(&mut store)?;
+        let t3 = apply_core_t3_plan(&mut store, &adaptation.plan, NEW, LATER, 1)?;
+        let receipt = restore_core_t3(&mut store, &adaptation.plan, &t3, 1)?;
+        assert_core_evidence(&store, &record, LATER)?;
+        store.db.execute_batch(
+            "DROP TRIGGER lean_spec_rechecks_no_update;
+             DROP TRIGGER reviewed_lean_specs_no_update;
+             DROP TRIGGER lean_spec_comparisons_no_update;
+             DROP TRIGGER events_no_update;",
+        )?;
+        assert!(store.db.execute(mutation, [&receipt])? > 0, "{mutation}");
+        assert!(store.current_sediment_lineages()?.is_empty(), "{mutation}");
+    }
     Ok(())
 }
 

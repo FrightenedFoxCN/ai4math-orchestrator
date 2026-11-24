@@ -181,7 +181,8 @@ test('Wiki shows managed CORE as derived metadata alongside authored CORE and la
         { id: 'COR-A', title: 'Authored CORE theorem', engine: 'lean4', stratum: 'core', trust_level: 'L5',
           status: 'active', file_path: 'core/authored.md' },
         { id, title: 'Derived CORE theorem', engine: 'lean4', stratum: 'core', trust_level: 'L5',
-          status: 'active', informal_gloss: 'An indexed adaptation', formal_signature: null, file_path: virtualPath },
+          status: 'active', informal_gloss: 'An indexed adaptation', formal_signature: null, file_path: virtualPath,
+          verified_at_commit: 'b'.repeat(40) },
       ] });
     },
     async wikiProvenance(params) {
@@ -197,6 +198,7 @@ test('Wiki shows managed CORE as derived metadata alongside authored CORE and la
   wiki.find('input').props.onChange({ target: { value: 'theorem' } });
   wiki.find('form').props.onSubmit({ preventDefault() {} });
   await expectText(wiki, /Authored CORE theorem COR-A lean4 core L5 active .*Source path core\/authored\.md .*Derived CORE theorem CORE-ADAPT-[0-9a-f]+ lean4 Derived CORE Indexed trust L5 active .*Virtual index location/);
+  assert.match(wiki.text(), /Verified at Git commit b{40}/);
   const location = wiki.find('code', virtualPath);
   assert.equal(location.props.onClick, undefined);
   assert.equal(location.props.href, undefined);
