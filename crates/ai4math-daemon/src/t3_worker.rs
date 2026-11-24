@@ -25,6 +25,8 @@ const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 const MAX_STEPS: usize = 256;
 pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+mod follow;
+
 #[derive(Deserialize)]
 #[serde(try_from = "ConfigDocument")]
 pub struct Config {
@@ -40,6 +42,7 @@ pub struct Config {
 enum Plans {
     Single(String),
     RoundRobin(Vec<String>),
+    AppliedCurrentMain,
 }
 
 #[derive(Deserialize)]
@@ -52,6 +55,8 @@ struct ConfigDocument {
     plan_sha256: Option<String>,
     #[serde(default, deserialize_with = "present")]
     plan_sha256s: Option<Vec<String>>,
+    #[serde(default, deserialize_with = "present")]
+    selection: Option<String>,
     native_executable: PathBuf,
     page_limit: usize,
     interval_ms: u64,
@@ -78,9 +83,14 @@ impl TryFrom<ConfigDocument> for Config {
     type Error = anyhow::Error;
 
     fn try_from(doc: ConfigDocument) -> Result<Self> {
-        let plans = match (doc.version, doc.plan_sha256, doc.plan_sha256s) {
-            (1, Some(hash), None) if canonical_sha(&hash) => Plans::Single(hash),
-            (2, None, Some(hashes))
+        let plans = match (
+            doc.version,
+            doc.plan_sha256,
+            doc.plan_sha256s,
+            doc.selection.as_deref(),
+        ) {
+            (1, Some(hash), None, None) if canonical_sha(&hash) => Plans::Single(hash),
+            (2, None, Some(hashes), None)
                 if (1..=8).contains(&hashes.len())
                     && hashes
                         .iter()
@@ -89,6 +99,7 @@ impl TryFrom<ConfigDocument> for Config {
             {
                 Plans::RoundRobin(hashes)
             }
+            (3, None, None, Some("applied_current_main")) => Plans::AppliedCurrentMain,
             _ => anyhow::bail!("invalid worker plan selection"),
         };
         ensure!(
@@ -144,6 +155,7 @@ impl Config {
         let result = match &self.plans {
             Plans::Single(hash) => self.sweep_single(root, hash),
             Plans::RoundRobin(hashes) => self.sweep_multiple(root, hashes),
+            Plans::AppliedCurrentMain => return follow::run(self, root),
         };
         match result {
             Ok(()) => Stop::Complete,
@@ -401,6 +413,8 @@ enum Stop {
     NoProgress,
     StepLimit,
     HeadChanged,
+    NonForwardMain,
+    HeadTransitionLimit,
     PlanDisabled,
 }
 
@@ -414,6 +428,8 @@ impl Stop {
             Self::NoProgress => "checkpoint did not advance",
             Self::StepLimit => "startup step limit reached",
             Self::HeadChanged => "reviewed main changed or became unavailable",
+            Self::NonForwardMain => "reviewed main did not advance by fast-forward",
+            Self::HeadTransitionLimit => "startup reviewed main transition limit reached",
             Self::PlanDisabled => "one or more plans disabled",
         }
     }
@@ -678,6 +694,51 @@ mod tests {
         let duplicate = format!(
             "{},\"version\":2}}",
             single.to_string().trim_end_matches('}')
+        );
+        assert!(serde_json::from_str::<Config>(&duplicate).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn v3_requires_exact_selection_without_any_catalog_fields() -> Result<()> {
+        let mut valid = document(3);
+        valid["selection"] = json!("applied_current_main");
+        assert!(matches!(
+            serde_json::from_value::<Config>(valid.clone())?.plans,
+            Plans::AppliedCurrentMain
+        ));
+        assert!(serde_json::from_value::<Config>(document(3)).is_err());
+        for (key, value) in [
+            ("selection", Value::Null),
+            ("selection", json!("applied-current-main")),
+            ("selection", json!(true)),
+            ("plan_sha256", Value::Null),
+            ("plan_sha256", json!("a".repeat(64))),
+            ("plan_sha256s", Value::Null),
+            ("plan_sha256s", json!(["a".repeat(64)])),
+            ("page_limit", json!(9)),
+            ("interval_ms", json!(99)),
+            ("step_timeout_ms", json!(3_600_001)),
+            ("native_executable", json!("/cli")),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[key] = value;
+            assert!(serde_json::from_value::<Config>(invalid).is_err(), "{key}");
+        }
+        for (version, key, hash) in [
+            (1, "plan_sha256", json!("a".repeat(64))),
+            (2, "plan_sha256s", json!(["a".repeat(64)])),
+        ] {
+            for selection in [Value::Null, valid["selection"].clone()] {
+                let mut invalid = document(version);
+                invalid[key] = hash.clone();
+                invalid["selection"] = selection;
+                assert!(serde_json::from_value::<Config>(invalid).is_err());
+            }
+        }
+        let duplicate = format!(
+            "{},\"selection\":\"applied_current_main\"}}",
+            valid.to_string().trim_end_matches('}')
         );
         assert!(serde_json::from_str::<Config>(&duplicate).is_err());
         Ok(())

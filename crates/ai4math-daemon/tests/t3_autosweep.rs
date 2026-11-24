@@ -591,6 +591,74 @@ mod native {
 
     #[test]
     #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
+    fn native_follow_autosweep_requires_approval_per_forward_main() -> Result<()> {
+        let tmp = short_tempdir()?;
+        let f = Fixture::new(
+            tmp.path().canonicalize()?,
+            &native_binary("AI4MATH_TEST_CLI")?,
+            native_binary("AI4MATH_TEST_LEAN")?,
+        )?;
+        let base = f.main()?;
+        let config = f.root.join("follow.json");
+        write_new(
+            &config,
+            0o600,
+            &serde_json::to_vec(&json!({
+                "version":3,"selection":"applied_current_main","cli_executable":f.cli,"bare_repo":f.bare,
+                "native_executable":f.lean,"page_limit":1,"interval_ms":200,"step_timeout_ms":60_000
+            }))?,
+        )?;
+        let mut daemon = Daemon::spawn(&f.root, Some(&config))?;
+        ready(&mut daemon, &f.root)?;
+        let first = f.review_defs("Nat.succ 1")?;
+        let preview1 = f.preview(&base, &first)?;
+        let hash1 = digest(&preview1)?;
+        assert!(f.state()?.applied_t3_plan(hash1)?.is_none());
+        assert_eq!(f.receipt_count()?, 1);
+        f.apply(&base, &first, hash1)?;
+        let completed1 = daemon.poll(Duration::from_secs(35), "first reviewed T3 sweep", || {
+            let progress = f.checkpoint(hash1)?;
+            Ok((progress.status == T3SweepState::Complete).then_some(progress))
+        })?;
+        assert_eq!(completed1.reviewed_commit, first);
+        assert_eq!(f.receipt_count()?, 2);
+        assert_eq!(f.claim("C")?.local_trust, Trust::L5);
+
+        let second = f.review_defs("1 + 1")?;
+        let preview2 = f.preview(&first, &second)?;
+        let hash2 = digest(&preview2)?;
+        assert_ne!(hash2, hash1);
+        assert!(f.state()?.applied_t3_plan(hash2)?.is_none());
+        assert_eq!(f.receipt_count()?, 2);
+        f.apply(&first, &second, hash2)?;
+        let completed2 =
+            daemon.poll(Duration::from_secs(35), "second reviewed T3 sweep", || {
+                let progress = f.checkpoint(hash2)?;
+                Ok((progress.status == T3SweepState::Complete).then_some(progress))
+            })?;
+        assert_eq!(completed2.reviewed_commit, second);
+        assert_eq!(f.checkpoint(hash1)?, completed1);
+        assert_eq!(f.receipt_count()?, 3);
+        assert!(!f.claim("C")?.stale);
+        let seq = f.state()?.status()?.last_event_seq;
+
+        git(&f.bare, &["update-ref", "refs/heads/main", &first, &second])?;
+        let log = daemon.log.path().to_path_buf();
+        daemon.poll(Duration::from_secs(12), "rejected main rollback", || {
+            Ok(fs::read_to_string(&log)?
+                .contains("reviewed main did not advance by fast-forward")
+                .then_some(()))
+        })?;
+        assert_eq!(f.checkpoint(hash2)?, completed2);
+        assert_eq!(f.state()?.status()?.last_event_seq, seq);
+        assert_eq!(f.receipt_count()?, 3);
+        assert_eq!(status(&f.root)?["event_seq"], seq);
+        f.stop(daemon)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
     fn native_multi_autosweep_does_not_duplicate_proof_evidence() -> Result<()> {
         let tmp = short_tempdir()?;
         let f = Fixture::new(

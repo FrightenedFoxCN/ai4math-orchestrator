@@ -30,6 +30,7 @@ mod sediment_lineage;
 mod sediment_recheck;
 mod sweep;
 mod t3_baseline;
+mod t3_follow;
 mod tasks;
 pub use claim_replay::{ClaimReplay, ReplayedClaim};
 pub use graph_audit::{GraphAudit, GraphMismatch, GraphMismatchKind};
