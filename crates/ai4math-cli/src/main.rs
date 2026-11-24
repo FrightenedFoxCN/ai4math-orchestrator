@@ -1022,6 +1022,15 @@ fn run() -> Result<()> {
             StateStore::open_readonly(Path::new(root).join(".runtime/state.sqlite"))?
                 .task_scheduler_status()?,
         ),
+        #[cfg(unix)]
+        [
+            "t3-discover",
+            root,
+            repo,
+            anchor,
+            baseline,
+            "--daemon-parent",
+        ] => t3::discover_for_daemon(Path::new(root), Path::new(repo), anchor, baseline),
         ["t3-discover", root, repo, anchor, baseline] => {
             t3::discover(Path::new(root), Path::new(repo), anchor, baseline)
         }

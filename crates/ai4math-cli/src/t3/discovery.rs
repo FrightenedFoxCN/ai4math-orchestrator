@@ -28,6 +28,39 @@ struct Observation {
 }
 
 pub(crate) fn discover(root: &Path, repo: &Path, anchor: &str, baseline: &str) -> Result<()> {
+    print_json(observe(root, repo, anchor, baseline, false)?)
+}
+
+#[cfg(unix)]
+pub(crate) fn discover_for_daemon(
+    root: &Path,
+    repo: &Path,
+    anchor: &str,
+    baseline: &str,
+) -> Result<()> {
+    super::parent::arm()?;
+    let observed = observe(root, repo, anchor, baseline, true)?;
+    // Omit Claim details, source bytes, and the unbounded advisory plan from
+    // the subprocess protocol. The digest can be used only for human review.
+    print_json(serde_json::json!({
+        "status":observed.status,
+        "base_commit":observed.base_commit,
+        "observed_head":observed.observed_head,
+        "ledger_event_seq":observed.ledger_event_seq,
+        "module_order_changed":observed.module_order_changed,
+        "changed_module_count":observed.changed_modules.len(),
+        "plan_sha256":observed.plan.as_ref().map(|p|&p.plan_sha256),
+        "advisory_only":true,
+    }))
+}
+
+fn observe(
+    root: &Path,
+    repo: &Path,
+    anchor: &str,
+    baseline: &str,
+    existing_lock: bool,
+) -> Result<Observation> {
     let engine = bound_engine(root, anchor)?;
     let mut store = StateStore::open_readonly(private_state_path(root)?)?;
     let stamp = store.managed_wiki_stamp()?.context(
@@ -38,7 +71,11 @@ pub(crate) fn discover(root: &Path, repo: &Path, anchor: &str, baseline: &str) -
         Path::new(&stamp.0) == canonical,
         "project is not bound to the supplied managed repository"
     );
-    let git = PromotionRepo::try_lock(&canonical)?;
+    let git = if existing_lock {
+        PromotionRepo::try_lock_existing(&canonical)?
+    } else {
+        PromotionRepo::try_lock(&canonical)?
+    };
     ensure!(
         git.path() == canonical,
         "managed repository moved while obtaining its lock"
@@ -81,5 +118,5 @@ pub(crate) fn discover(root: &Path, repo: &Path, anchor: &str, baseline: &str) -
         git.main_head()? == head && store.managed_wiki_stamp()?.as_ref() == Some(&stamp),
         "managed main or ledger changed during T3 discovery; retry"
     );
-    print_json(observed)
+    Ok(observed)
 }

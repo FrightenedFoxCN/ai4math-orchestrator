@@ -3,6 +3,8 @@ mod discovery;
 #[cfg(unix)]
 mod parent;
 pub(crate) use discovery::discover;
+#[cfg(unix)]
+pub(crate) use discovery::discover_for_daemon;
 #[cfg(test)]
 mod tests;
 use super::{

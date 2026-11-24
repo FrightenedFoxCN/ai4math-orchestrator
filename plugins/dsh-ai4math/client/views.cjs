@@ -47,6 +47,30 @@ function BreakerTotals({ snapshot }) {
       halfOpen > 0 ? 'warn' : undefined))
 }
 
+function DiscoveryBadge({ value, currentSeq }) {
+  if (!value || typeof value !== 'object') return null
+  if (value.status === 'starting') return labelValue('T3 discovery', 'Waiting for first sample')
+  if (value.status === 'unavailable') return labelValue('T3 discovery', 'Unavailable')
+  const hash = value.observed_head
+  if (value.advisory_only !== true || !isCount(value.ledger_event_seq)
+    || typeof hash !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hash)) return null
+  let summary
+  switch (value.status) {
+    case 'unchanged': summary = 'No structural change'; break
+    case 'diverged': summary = 'Main diverged · review baseline'; break
+    case 'structural_change':
+      if (!isCount(value.changed_module_count) || value.changed_module_count > 255
+        || typeof value.module_order_changed !== 'boolean') return null
+      summary = 'Structure changed · ' + value.changed_module_count + ' source change(s)'
+        + (value.module_order_changed ? ' · module list changed' : '')
+      break
+    default: return null
+  }
+  return h('span', { title: 'Observed Git commit: ' + hash + '. This sample does not approve or apply a T3 plan.' },
+    labelValue('Last T3 discovery', summary + ' · advisory only'
+      + (isCount(currentSeq) && value.ledger_event_seq < currentSeq ? ' · older ledger sample' : '')))
+}
+
 function LiveHud({ live, open }) {
   const [navigationError, setNavigationError] = useState(false)
   const state = useSyncExternalStore(live.subscribe, live.getSnapshot)
@@ -73,6 +97,7 @@ function LiveHud({ live, open }) {
       labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active)),
       trustTape(snapshot?.trust),
       labelValue('Stale', count(snapshot?.stale_claims)),
+      phase === 'live' && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
       h(BreakerTotals, { snapshot }),
       phase === 'live' && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
         title: 'Temporary exploration scheduling hold; not a Claim refutation.',

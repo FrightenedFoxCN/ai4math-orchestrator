@@ -112,15 +112,21 @@ fn text(bytes: Vec<u8>) -> Result<String> {
 
 impl PromotionRepo {
     pub fn lock(repo: &Path) -> Result<Self> {
-        Self::acquire_lock(repo, false)
+        Self::acquire_lock(repo, false, true)
     }
 
     /// Do not wait behind a native promotion after issuing an expiring lease.
     pub(crate) fn try_lock(repo: &Path) -> Result<Self> {
-        Self::acquire_lock(repo, true)
+        Self::acquire_lock(repo, true, true)
     }
 
-    fn acquire_lock(repo: &Path, no_wait: bool) -> Result<Self> {
+    /// Starter/supervisor paths can observe only a project whose operator
+    /// already initialized the coordination file; they must not recreate it.
+    pub(crate) fn try_lock_existing(repo: &Path) -> Result<Self> {
+        Self::acquire_lock(repo, true, false)
+    }
+
+    fn acquire_lock(repo: &Path, no_wait: bool, create: bool) -> Result<Self> {
         let path = repo.canonicalize()?;
         ensure!(
             text(git(
@@ -131,11 +137,31 @@ impl PromotionRepo {
             )?)? == "true",
             "promotion requires an operator-owned bare Git repository"
         );
-        let lock = OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path.join("ai4math-promotion.lock"))?;
+        let mut options = OpenOptions::new();
+        options.write(true).create(create).truncate(false);
+        #[cfg(unix)]
+        if !create {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        }
+        let lock = options.open(path.join("ai4math-promotion.lock"))?;
+        if !create {
+            let metadata = lock.metadata()?;
+            ensure!(
+                metadata.is_file(),
+                "expected an existing regular Git coordination file"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                ensure!(
+                    metadata.nlink() == 1
+                        && metadata.uid() == unsafe { libc::geteuid() }
+                        && metadata.mode() & 0o022 == 0,
+                    "unsafe managed Git coordination file"
+                );
+            }
+        }
         if no_wait {
             fs2::FileExt::try_lock_exclusive(&lock).context("managed Git coordination is busy")?;
         } else {

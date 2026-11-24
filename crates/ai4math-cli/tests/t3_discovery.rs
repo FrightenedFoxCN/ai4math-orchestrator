@@ -376,6 +376,27 @@ fn sibling_of_main_is_diverged_even_when_its_tree_is_identical() {
     f.assert_no_plan(&sibling, &head, "diverged");
 }
 
+#[cfg(unix)]
+#[test]
+fn daemon_summary_refuses_a_direct_cli_call_without_lifeline() {
+    use std::os::unix::process::CommandExt;
+    let f = Fixture::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_ai4math"))
+        .arg("t3-discover")
+        .arg(&f.root)
+        .arg(&f.bare)
+        .arg(ANCHOR)
+        .arg(&f.base)
+        .arg("--daemon-parent")
+        .process_group(0)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("lifeline"));
+}
+
 #[test]
 fn discovery_rejects_inputs_outside_its_managed_scope_without_writes() {
     let f = Fixture::new();

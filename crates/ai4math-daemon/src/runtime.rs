@@ -1,6 +1,7 @@
 use crate::{
     facts::{self, FactPack},
     proofs::{self, Probes},
+    t3_discovery::{self, DiscoveryState},
     t3_worker,
     transport::{self, Connection, Hub, RpcError},
 };
@@ -231,6 +232,7 @@ struct Project {
     wiki: Mutex<Wiki>,
     retained_dir: PathBuf,
     probes: Probes,
+    t3_discovery: Option<Arc<Mutex<DiscoveryState>>>,
 }
 
 impl Project {
@@ -289,6 +291,12 @@ impl Project {
         // These counters cover the daemon broker, not independent CLI processes.
         data["broker"] = serde_json::to_value(self.probes.load()?)?;
         data["workers"] = Value::Null;
+        if let Some(discovery) = &self.t3_discovery {
+            data["t3_discovery"] = match discovery.lock() {
+                Ok(observation) => serde_json::to_value(&*observation)?,
+                Err(_) => serde_json::to_value(DiscoveryState::Unavailable)?,
+            };
+        }
         Ok(data)
     }
     fn method(
@@ -590,9 +598,12 @@ pub fn run(
     tick: Duration,
     catalog: Option<&Path>,
     worker: Option<t3_worker::Config>,
+    discovery: Option<t3_discovery::Config>,
 ) -> Result<()> {
     let root = if worker.is_some() {
         t3_worker::verified_root(project)?
+    } else if discovery.is_some() {
+        t3_discovery::verified_root(project)?
     } else {
         project.canonicalize()?
     };
@@ -620,11 +631,15 @@ pub fn run(
             ordinary_path(&dir.join(format!("{db}{suffix}")))?;
         }
     }
+    let discovery_state = discovery
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(DiscoveryState::Starting)));
     let service = Arc::new(Project {
         store: Mutex::new(StateStore::open(runtime.join("state.sqlite"))?),
         wiki: Mutex::new(Wiki::open(wiki.join(".index.sqlite"))?),
         retained_dir,
         probes: Probes::open(&root, catalog)?,
+        t3_discovery: discovery_state.clone(),
     });
     let hub = Hub::new();
     let ticker = hub.clone();
@@ -649,7 +664,10 @@ pub fn run(
                 })?;
             if let Some(worker) = worker {
                 // The listener is bound now. A worker failure must not take RPC down.
-                worker.start(root);
+                worker.start(root.clone());
+            }
+            if let (Some(discovery), Some(state)) = (discovery, discovery_state) {
+                discovery.start(root, state);
             }
             Ok(())
         },

@@ -27,6 +27,34 @@ function streamHandle(frames, controller) {
   return { [Symbol.asyncIterator]: () => frames, dispose: () => controller.abort() };
 }
 
+test('HUD shows resident T3 as a read-only last sample and clears it when unavailable', async t => {
+  const channel = new AbortController()
+  let report;
+  const gate = new Promise(resolve => { report = resolve; });
+  const app = await browser(t, {
+    subscribe(_params, signal) {
+      return streamHandle((async function* () {
+        yield { topic: 'ai4math.connection', data: { state: 'connected' } };
+        await gate;
+        yield { topic: 'vital_signs.tick', data: snapshot(13, { t3_discovery: { status: 'unavailable' } }) };
+        const active = AbortSignal.any([signal, channel.signal]);
+        if (!active.aborted) await once(active, 'abort');
+      })(), channel);
+    },
+    async status() {
+      return ok(snapshot(12, { t3_discovery: { status: 'structural_change', observed_head: 'b'.repeat(40),
+        ledger_event_seq: 10, changed_module_count: 3, module_order_changed: true, advisory_only: true } }));
+    },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+  });
+  const hud = app.mount('shell.bottom');
+  await expectText(hud, /Last T3 discovery Structure changed · 3 source change\(s\) · module list changed · advisory only · older ledger sample/);
+  assert.throws(() => hud.find('button', 'Apply T3'), /render did not contain/);
+  report();
+  await expectText(hud, /T3 discovery Unavailable/);
+  assert.doesNotMatch(hud.text(), /Structure changed|older ledger sample/);
+});
+
 test('lazy browser bundle mounts shell.bottom and four sidebar tabs with owned cleanup', async t => {
   const calls = [];
   const remote = Object.fromEntries(Object.entries({

@@ -1,7 +1,7 @@
 //! Opt-in operator sweep. The CLI, not this timer or its checkpoint, holds proof authority.
 use ai4math_store::{StateStore, T3SweepState, T3SweepStatus};
 use anyhow::{Result, ensure};
-use serde::Deserialize;
+use serde::{Deserialize, de::DeserializeOwned};
 use std::{
     fs::{self, Metadata, OpenOptions},
     io::{self, Read},
@@ -21,7 +21,7 @@ const MILLIS: std::ops::RangeInclusive<u64> = 100..=3_600_000;
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
 // Healthy but repeatedly rewound pages still advance revision. Limit work per daemon run.
 const MAX_STEPS: usize = 256;
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
+pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,25 +48,7 @@ impl Config {
     }
 
     fn read(path: &Path) -> Result<Self> {
-        let expected = trusted_metadata(path)?;
-        check_config_file(&expected)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-            .open(path)?;
-        let opened = file.metadata()?;
-        check_config_file(&opened)?;
-        ensure!(
-            (expected.dev(), expected.ino()) == (opened.dev(), opened.ino()),
-            "configuration replaced while opening"
-        );
-        let mut bytes = Vec::new();
-        file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
-        ensure!(
-            bytes.len() as u64 <= MAX_CONFIG_BYTES,
-            "configuration too large"
-        );
-        let config: Self = serde_json::from_slice(&bytes)?;
+        let config: Self = read_trusted_config(path)?;
         ensure!(
             config.version == 1
                 && config.plan_sha256.len() == 64
@@ -87,11 +69,7 @@ impl Config {
     fn check_paths(&self) -> Result<()> {
         trusted_directory(&self.bare_repo)?;
         for executable in [&self.cli_executable, &self.native_executable] {
-            let meta = trusted_metadata(executable)?;
-            ensure!(
-                meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o7100 == 0o100,
-                "expected an ordinary owner-executable file"
-            );
+            trusted_executable(executable)?;
         }
         Ok(())
     }
@@ -142,26 +120,7 @@ impl Config {
     }
 
     fn progress(&self, root: &Path) -> Result<T3SweepStatus> {
-        trusted_directory(root)?;
-        let runtime = root.join(".runtime");
-        trusted_directory(&runtime)?;
-        let path = runtime.join("state.sqlite");
-        check_state_file(&trusted_metadata(&path)?)?;
-        for name in [
-            "state.sqlite-wal",
-            "state.sqlite-shm",
-            "state.sqlite-journal",
-        ] {
-            let path = runtime.join(name);
-            match fs::symlink_metadata(&path) {
-                Ok(meta) => {
-                    check_state_file(&meta)?;
-                    reject_acl_grants(&path)?;
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e.into()),
-            }
-        }
+        let path = trusted_state_path(root)?;
         // Each observation uses a separate read-only connection, dropped before a child runs.
         let state = StateStore::open_readonly(path)?;
         let repo = state.managed_repo()?;
@@ -223,7 +182,7 @@ impl Config {
     }
 }
 
-fn kill_and_reap(child: &mut Child) {
+pub(super) fn kill_and_reap(child: &mut Child) {
     // Signal before reaping so the child's PID (and group identity) cannot be reused yet.
     // SAFETY: Negative pid targets the private group established by process_group(0).
     let pgid = child.id() as libc::pid_t;
@@ -265,7 +224,7 @@ pub fn verified_root(project: &Path) -> Result<PathBuf> {
     result.map_err(|_| anyhow::anyhow!("invalid project root for --t3-autosweep"))
 }
 
-fn trusted_directory(path: &Path) -> Result<()> {
+pub(super) fn trusted_directory(path: &Path) -> Result<()> {
     ensure!(
         trusted_metadata(path)?.is_dir(),
         "expected a trusted directory"
@@ -273,7 +232,7 @@ fn trusted_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn trusted_metadata(path: &Path) -> Result<Metadata> {
+pub(super) fn trusted_metadata(path: &Path) -> Result<Metadata> {
     ensure!(
         path.is_absolute()
             && path
@@ -310,6 +269,61 @@ fn trusted_metadata(path: &Path) -> Result<Metadata> {
     Ok(meta)
 }
 
+pub(super) fn read_trusted_config<T: DeserializeOwned>(path: &Path) -> Result<T> {
+    let expected = trusted_metadata(path)?;
+    check_config_file(&expected)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    check_config_file(&opened)?;
+    ensure!(
+        (expected.dev(), expected.ino()) == (opened.dev(), opened.ino()),
+        "configuration replaced while opening"
+    );
+    let mut bytes = Vec::new();
+    file.take(MAX_CONFIG_BYTES + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() as u64 <= MAX_CONFIG_BYTES,
+        "configuration too large"
+    );
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+pub(super) fn trusted_executable(path: &Path) -> Result<()> {
+    let meta = trusted_metadata(path)?;
+    ensure!(
+        meta.is_file() && meta.nlink() == 1 && meta.mode() & 0o7100 == 0o100,
+        "expected an ordinary owner-executable file"
+    );
+    Ok(())
+}
+
+pub(super) fn trusted_state_path(root: &Path) -> Result<PathBuf> {
+    trusted_directory(root)?;
+    let runtime = root.join(".runtime");
+    trusted_directory(&runtime)?;
+    let path = runtime.join("state.sqlite");
+    check_state_file(&trusted_metadata(&path)?)?;
+    for name in [
+        "state.sqlite-wal",
+        "state.sqlite-shm",
+        "state.sqlite-journal",
+    ] {
+        let path = runtime.join(name);
+        match fs::symlink_metadata(&path) {
+            Ok(meta) => {
+                check_state_file(&meta)?;
+                reject_acl_grants(&path)?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => (),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(path)
+}
+
 fn check_config_file(meta: &Metadata) -> Result<()> {
     ensure!(
         meta.is_file()
@@ -322,7 +336,7 @@ fn check_config_file(meta: &Metadata) -> Result<()> {
     Ok(())
 }
 
-fn check_state_file(meta: &Metadata) -> Result<()> {
+pub(super) fn check_state_file(meta: &Metadata) -> Result<()> {
     // SAFETY: geteuid takes no arguments.
     let uid = unsafe { libc::geteuid() };
     ensure!(
