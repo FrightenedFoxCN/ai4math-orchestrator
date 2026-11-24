@@ -151,10 +151,10 @@ fn claim_matches(claim: &ClaimState, file: &str, decl: &str) -> bool {
             == Some((file, decl))
 }
 
-fn validate_for_append(db: &Connection, plan: &SedimentAdaptationPlan) -> Result<()> {
+pub(super) fn validate_for_append(db: &Connection, plan: &SedimentAdaptationPlan) -> Result<()> {
     ensure!(
         read_intent(db)?.is_none() && pivot::read_pending(db)?.is_none(),
-        "recover the pending promotion or Pivot before approving sediment adaptation"
+        "recover the pending promotion or Pivot before proceeding with sediment adaptation"
     );
     let repo: Option<String> = db
         .query_row("SELECT repo FROM managed_repo WHERE singleton=1", [], |r| {
@@ -233,7 +233,10 @@ fn validate_for_append(db: &Connection, plan: &SedimentAdaptationPlan) -> Result
     Ok(())
 }
 
-fn read_approval(db: &Connection, approval: &str) -> Result<Option<SedimentAdaptationApproval>> {
+pub(super) fn read_approval(
+    db: &Connection,
+    approval: &str,
+) -> Result<Option<SedimentAdaptationApproval>> {
     let record = db
         .query_row(
             "SELECT approval_sha256,event_seq,archive_id,origin_claim,promoted_commit,target_claim,
@@ -268,6 +271,29 @@ fn read_approval(db: &Connection, approval: &str) -> Result<Option<SedimentAdapt
         ensure!(
             record.plan.approval_sha256()? == approval,
             "retained sediment adaptation approval identity mismatch"
+        );
+        ensure!(
+            db.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE event_seq=?1 AND event_type=?2
+                 AND entity_type='claim' AND entity_id=?3 AND git_commit=?4
+                 AND actor='operator:sediment-adaptation'
+                 AND json_extract(payload_json,'$.approval_sha256')=?5
+                 AND json_extract(payload_json,'$.archive_id')=?6
+                 AND json_extract(payload_json,'$.origin_claim')=?7
+                 AND json_extract(payload_json,'$.promoted_commit')=?8)",
+                params![
+                    record.event_seq,
+                    APPROVED,
+                    record.plan.target_claim,
+                    record.plan.reviewed_commit,
+                    approval,
+                    record.plan.archive_id,
+                    record.plan.origin_claim,
+                    record.plan.promoted_commit
+                ],
+                |r| r.get::<_, bool>(0),
+            )?,
+            "retained sediment adaptation approval event identity mismatch"
         );
     }
     Ok(record)
@@ -364,4 +390,4 @@ impl StateStore {
 }
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;

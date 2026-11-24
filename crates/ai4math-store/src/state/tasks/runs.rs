@@ -1,5 +1,6 @@
 use super::{
-    Change, StateStore, TaskLease, TaskTrack, event, release_lease, valid_task_id, valid_token,
+    Change, StateStore, TaskLease, TaskTrack, event, release_lease, sediment, valid_task_id,
+    valid_token,
 };
 use anyhow::{Context, Result, ensure};
 use rusqlite::{OptionalExtension, Row, params};
@@ -121,7 +122,8 @@ fn read_candidate(
 impl StateStore {
     /// Consume a live, unfrozen lease and atomically record the run disposition.
     /// A candidate completes scheduler bookkeeping only. An explicit failure
-    /// releases the lease for ordinary retry; a crash leaves TTL recovery intact.
+    /// releases the lease for retry; scoped tasks require another explicit lease.
+    /// A crash leaves TTL recovery intact.
     /// The coordinator must validate Git and the output protocol before calling;
     /// Change is attribution, not authorization.
     pub fn finish_task_run(
@@ -173,6 +175,15 @@ impl StateStore {
             let seq = release_lease(tx, lease, candidate.is_some())?
                 .context("task lease is no longer valid for worker outcome")?;
             if let Some((base_commit, claim_id, role, executable_sha256, result_json)) = candidate {
+                sediment::check_candidate_scope(
+                    tx,
+                    seq,
+                    lease,
+                    base_commit,
+                    claim_id,
+                    role,
+                    executable_sha256.is_some(),
+                )?;
                 let recorded = match executable_sha256 {
                     Some(sha) => tx.execute(
                         &format!(

@@ -12,7 +12,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::{path::Path, time::Duration};
 
+mod adaptation;
 mod model_pipe;
+pub(crate) use adaptation::run_adaptation;
 pub(crate) use model_pipe::run_model;
 
 const RESULT_CAP: usize = 32 * 1024;
@@ -321,16 +323,7 @@ fn check_lease(lease: &TaskLease, subject: &Prepared) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn run(
-    root: &Path,
-    repo: &Path,
-    task_id: &str,
-    claim_id: &str,
-    role: Role,
-    exe: &Path,
-    sha: &str,
-    seconds: u64,
-) -> Result<()> {
+fn validate_native_worker(exe: &Path, sha: &str, seconds: u64) -> Result<()> {
     ensure!(
         (1..=60).contains(&seconds),
         "worker wall seconds must be in 1..=60"
@@ -343,6 +336,20 @@ pub(crate) fn run(
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
         "provide an absolute native worker path and lowercase SHA-256 pin"
     );
+    Ok(())
+}
+
+pub(crate) fn run(
+    root: &Path,
+    repo: &Path,
+    task_id: &str,
+    claim_id: &str,
+    role: Role,
+    exe: &Path,
+    sha: &str,
+    seconds: u64,
+) -> Result<()> {
+    validate_native_worker(exe, sha, seconds)?;
     let track = role_track(role)?;
     let _native = crate::managed_native(root)?;
     let mut store = StateStore::open(private_state_path(root)?)?;

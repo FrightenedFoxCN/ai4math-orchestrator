@@ -206,13 +206,52 @@ pub(crate) fn approve(
     )
 }
 
+/// An old approval is historical. Re-resolve every Git and Claim binding under
+/// today's ledger; only its reviewed event sequence may differ.
+pub(crate) fn revalidate(
+    root: &Path,
+    git: &PromotionRepo,
+    state: &StateStore,
+    approval: &str,
+) -> Result<(SedimentAdaptationPlan, String)> {
+    let saved = state
+        .sediment_adaptation(approval)?
+        .context("no retained sediment adaptation approval")?
+        .plan;
+    let mut current = prepare(
+        root,
+        git,
+        state,
+        &saved.archive_id,
+        &saved.reviewed_commit,
+        &saved.target_claim,
+    )?;
+    let seq = current.expected_event_seq;
+    current.expected_event_seq = saved.expected_event_seq;
+    ensure!(
+        current == saved,
+        "sediment adaptation approval no longer matches its reviewed inputs"
+    );
+    current.expected_event_seq = seq;
+    let recipe = state
+        .managed_proof_recipe_at(&saved.origin_claim, &saved.promoted_commit)?
+        .context("historical sediment proof recipe is no longer available")?;
+    ensure!(
+        state.status()?.last_event_seq == seq && git.main_head()? == saved.reviewed_commit,
+        "main or ledger changed during adaptation dispatch preparation"
+    );
+    Ok((current, recipe.proof_body))
+}
+
 pub(crate) fn result(root: &Path, id: &str) -> Result<()> {
     let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
     let approval = state
         .sediment_adaptation(id)?
         .context("no retained sediment adaptation approval")?;
+    let task_id = StateStore::sediment_adaptation_task_id(id)?;
     print_json(
-        serde_json::json!({"approval":approval,"task_enqueued":false,"current_proof_authority":false}),
+        serde_json::json!({"approval":approval,"dispatch_task_id":task_id,
+        "approval_enqueues_task":false,"current_proof_authority":false}),
     )
 }
 

@@ -455,6 +455,23 @@ WHEN EXISTS (SELECT 1 FROM sediment_adaptation_approvals
              WHERE approval_sha256=NEW.approval_sha256 OR event_seq=NEW.event_seq)
 BEGIN SELECT RAISE(ABORT, 'sediment adaptation approvals are immutable'); END;
 
+-- A scoped scheduler row can be leased only by explicitly citing its immutable
+-- approval. Ordinary scheduling never discovers this row after enrollment.
+CREATE TABLE IF NOT EXISTS scheduler_sediment_adaptations (
+  task_seq INTEGER PRIMARY KEY REFERENCES scheduler_tasks(queue_seq),
+  approval_sha256 TEXT NOT NULL UNIQUE REFERENCES sediment_adaptation_approvals(approval_sha256),
+  registered_event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS scheduler_sediment_adaptations_no_update BEFORE UPDATE ON scheduler_sediment_adaptations
+BEGIN SELECT RAISE(ABORT, 'sediment adaptation scheduler links are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS scheduler_sediment_adaptations_no_delete BEFORE DELETE ON scheduler_sediment_adaptations
+BEGIN SELECT RAISE(ABORT, 'sediment adaptation scheduler links are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS scheduler_sediment_adaptations_no_replace BEFORE INSERT ON scheduler_sediment_adaptations
+WHEN EXISTS (SELECT 1 FROM scheduler_sediment_adaptations
+             WHERE task_seq=NEW.task_seq OR approval_sha256=NEW.approval_sha256
+               OR registered_event_seq=NEW.registered_event_seq)
+BEGIN SELECT RAISE(ABORT, 'sediment adaptation scheduler links are immutable'); END;
+
 -- Immutable advisory observations tied to the reviewed Claim snapshot, not to
 -- its current row. No trigger may turn this evidence into a trust transition.
 CREATE TABLE IF NOT EXISTS oracle_observations (

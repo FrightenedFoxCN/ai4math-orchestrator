@@ -10,11 +10,13 @@ use std::{collections::BTreeSet, fmt, str::FromStr, time::Duration};
 
 mod oracle_holds;
 mod runs;
+mod sediment;
 mod starvation;
 pub use oracle_holds::OracleTaskHold;
 pub(super) use oracle_holds::{HELD, RELEASED};
 use oracle_holds::{HELD_FOR_ORACLE, hold_table_exists};
 pub use runs::{TaskCandidate, TaskCandidateSource, TaskRunOutcome};
+use sediment::{ADAPTATION_LINKED, ADAPTATION_TASK_PREFIX, link_table_exists};
 pub(super) use starvation::ALL_TRACKS_BLOCKED;
 
 const TASK_LIMIT: i64 = 4096;
@@ -99,12 +101,12 @@ impl fmt::Debug for TaskFence {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct TaskTrackStatus {
-    /// Eligible disregarding lease capacity. Expired leases can be ready again.
+    /// Ordinary tasks eligible disregarding lease capacity. Expired leases can be ready again.
     pub ready: i64,
     /// Unexpired scheduler leases, not operating-system process count.
     pub active: i64,
     pub completed: i64,
-    /// Overlapping diagnostic: deadline passed, including tasks now blocked.
+    /// Overlapping diagnostic for ordinary tasks: deadline passed, including tasks now blocked.
     pub expired: i64,
     /// Unleased or expired, not held, and blocked by a matching non-CLOSED breaker.
     pub breaker_blocked: i64,
@@ -201,6 +203,10 @@ fn validate(task: &NewTask<'_>) -> Result<()> {
             valid_task_id(dependency) && dependency != task.id,
             "invalid task dependency ID"
         );
+        ensure!(
+            !dependency.starts_with(ADAPTATION_TASK_PREFIX),
+            "ordinary tasks cannot depend on scoped sediment adaptation tasks"
+        );
         ensure!(seen.insert(dependency), "duplicate task dependency ID");
     }
     Ok(())
@@ -214,6 +220,10 @@ impl StateStore {
     /// Enroll an ordinary task. Only the operator/coordinator may call this API.
     pub fn register_task(&mut self, task: NewTask<'_>, change: Change<'_>) -> Result<()> {
         validate(&task)?;
+        ensure!(
+            !task.id.starts_with(ADAPTATION_TASK_PREFIX),
+            "task ID uses the reserved sediment adaptation namespace"
+        );
         self.write(|tx| {
             let count: i64 = tx.query_row("SELECT count(*) FROM scheduler_tasks", [], |r| r.get(0))?;
             ensure!(count < TASK_LIMIT, "task scheduler registry is full");
@@ -266,54 +276,87 @@ impl StateStore {
         lease_for: Duration,
         change: Change<'_>,
     ) -> Result<Option<TaskLease>> {
-        ensure!(
-            lease_for.as_millis() > 0 && lease_for <= MAX_LEASE,
-            "task lease duration must be between 1 ms and 1 hour"
-        );
+        validate_lease_duration(lease_for)?;
         self.write(|tx| {
             let now = now_ms(tx)?;
-            let (exploration, infrastructure): (i64, i64) = tx.query_row(
-                "SELECT count(*) FILTER (WHERE track='exploration'),
-                        count(*) FILTER (WHERE track='infrastructure')
-                 FROM scheduler_tasks WHERE lease_expires_at_ms > ?1", [now], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (exploration, infrastructure) = active_counts(tx, now)?;
             if exploration + infrastructure >= ACTIVE_LIMIT {
                 return Ok(None);
             }
-            let can_explore = exploration < TRACK_ACTIVE_LIMIT && track != Some(TaskTrack::Infrastructure);
-            let can_build = infrastructure < TRACK_ACTIVE_LIMIT && track != Some(TaskTrack::Exploration);
+            let can_explore =
+                exploration < TRACK_ACTIVE_LIMIT && track != Some(TaskTrack::Infrastructure);
+            let can_build =
+                infrastructure < TRACK_ACTIVE_LIMIT && track != Some(TaskTrack::Exploration);
             if !can_explore && !can_build {
                 return Ok(None);
             }
-            let last_track: Option<String> = tx.query_row("SELECT last_track FROM task_scheduler_control WHERE singleton=1", [], |r| r.get(0))?;
-            let candidate = tx.query_row(&format!("SELECT t.queue_seq,t.task_id,t.track,t.engine,t.module_path,t.target
+            let last_track: Option<String> = tx.query_row(
+                "SELECT last_track FROM task_scheduler_control WHERE singleton=1",
+                [],
+                |r| r.get(0),
+            )?;
+            let candidate = tx
+                .query_row(
+                    &format!(
+                        "SELECT t.queue_seq,t.task_id,t.track,t.engine,t.module_path,t.target
                 FROM scheduler_tasks t WHERE t.completed_at_ms IS NULL
                 AND (t.lease_expires_at_ms IS NULL OR t.lease_expires_at_ms <= ?1)
                 AND ((?2 AND t.track='exploration') OR (?3 AND t.track='infrastructure'))
                 AND NOT {HELD_FOR_ORACLE} AND NOT {MODULE_GATED} AND NOT {DEPENDENCY_BLOCKED}
-                ORDER BY CASE WHEN t.track=?4 THEN 1 ELSE 0 END,t.queue_seq LIMIT 1"),
-                params![now, can_explore, can_build, last_track], |r| Ok((
-                    r.get::<_, i64>(0)?,r.get::<_, String>(1)?,r.get::<_, String>(2)?,r.get(3)?,r.get(4)?,r.get(5)?
-                ))).optional()?;
-            let Some((seq, id, track, engine, module_path, target)) = candidate else { return Ok(None); };
+                AND NOT {ADAPTATION_LINKED}
+                ORDER BY CASE WHEN t.track=?4 THEN 1 ELSE 0 END,t.queue_seq LIMIT 1"
+                    ),
+                    params![now, can_explore, can_build, last_track],
+                    |r| {
+                        Ok((
+                            r.get::<_, i64>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                            r.get(3)?,
+                            r.get(4)?,
+                            r.get(5)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((seq, id, track, engine, module_path, target)) = candidate else {
+                return Ok(None);
+            };
             if expected_id.is_some_and(|expected| expected != id) {
                 return Ok(None);
             }
             let track: TaskTrack = track.parse()?;
-            let fence = tx.query_row("UPDATE task_scheduler_control SET last_track=?1,last_fence=last_fence+1
-                WHERE singleton=1 AND last_fence<9223372036854775807 RETURNING scope_id,last_fence", [track.as_str()],
-                |r| Ok(TaskFence { scope_id: r.get(0)?, generation: r.get(1)? }))?;
-            let expires_at_ms = now_ms(tx)? + lease_for.as_millis() as i64;
-            tx.execute("UPDATE scheduler_tasks SET last_fence=?2,lease_expires_at_ms=?3 WHERE queue_seq=?1",
-                params![seq, fence.generation, expires_at_ms])?;
-            event(tx, change, "TASK_LEASED", "task", &id, json!({"track":track, "expires_at_ms":expires_at_ms}))?;
-            Ok(Some(TaskLease { id, track, engine, module_path, target, expires_at_ms, fence }))
+            let (fence, expires_at_ms) = issue_lease(tx, seq, Some(track), lease_for)?;
+            event(
+                tx,
+                change,
+                "TASK_LEASED",
+                "task",
+                &id,
+                json!({"track":track, "expires_at_ms":expires_at_ms}),
+            )?;
+            Ok(Some(TaskLease {
+                id,
+                track,
+                engine,
+                module_path,
+                target,
+                expires_at_ms,
+                fence,
+            }))
         })
     }
 
-    /// Complete scheduler bookkeeping only. This confirms neither a proof nor a
+    /// Complete ordinary scheduler bookkeeping only. This confirms neither a proof nor a
     /// worker output. Expired, reclaimed, frozen, foreign, and replayed leases fail.
     pub fn complete_task(&mut self, lease: &TaskLease, change: Change<'_>) -> Result<()> {
         self.write(|tx| {
+            let scoped = tx.query_row(
+                &format!("SELECT EXISTS(SELECT 1 FROM scheduler_tasks t WHERE t.task_id=?1 AND {ADAPTATION_LINKED})"),
+                [&lease.id],
+                |r| r.get::<_, bool>(0),
+            )?;
+            ensure!(!scoped, "sediment adaptation requires a native worker outcome");
             ensure!(
                 release_lease(tx, lease, true)?.is_some(),
                 "task lease is no longer valid for completion"
@@ -326,6 +369,45 @@ impl StateStore {
     pub fn task_scheduler_status(&self) -> Result<TaskSchedulerStatus> {
         scheduler_snapshot(&self.db)
     }
+}
+
+fn validate_lease_duration(lease_for: Duration) -> Result<()> {
+    ensure!(
+        lease_for.as_millis() > 0 && lease_for <= MAX_LEASE,
+        "task lease duration must be between 1 ms and 1 hour"
+    );
+    Ok(())
+}
+
+fn active_counts(db: &Connection, now: i64) -> Result<(i64, i64)> {
+    Ok(db.query_row(
+        "SELECT count(*) FILTER (WHERE track='exploration'),
+                count(*) FILTER (WHERE track='infrastructure')
+         FROM scheduler_tasks WHERE lease_expires_at_ms > ?1",
+        [now],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?)
+}
+
+// Explicit scoped leases share the fence and capacity, but do not steer ordinary alternation.
+fn issue_lease(
+    tx: &Transaction<'_>,
+    seq: i64,
+    alternate: Option<TaskTrack>,
+    lease_for: Duration,
+) -> Result<(TaskFence, i64)> {
+    let fence = tx.query_row(
+        "UPDATE task_scheduler_control SET last_track=coalesce(?1,last_track),last_fence=last_fence+1
+         WHERE singleton=1 AND last_fence<9223372036854775807 RETURNING scope_id,last_fence",
+        [alternate.map(TaskTrack::as_str)],
+        |r| Ok(TaskFence { scope_id: r.get(0)?, generation: r.get(1)? }),
+    )?;
+    let expires_at_ms = now_ms(tx)? + lease_for.as_millis() as i64;
+    tx.execute(
+        "UPDATE scheduler_tasks SET last_fence=?2,lease_expires_at_ms=?3 WHERE queue_seq=?1",
+        params![seq, fence.generation, expires_at_ms],
+    )?;
+    Ok((fence, expires_at_ms))
 }
 
 // All terminalization paths consume exactly one live database-scoped fence.
@@ -362,6 +444,11 @@ fn scheduler_snapshot_at(db: &Connection, now: i64) -> Result<TaskSchedulerStatu
     } else {
         "0"
     };
+    let scoped = if link_table_exists(db)? {
+        ADAPTATION_LINKED
+    } else {
+        "0"
+    };
     let mut stmt = db.prepare(&format!(
         "WITH task_flags AS (
         SELECT t.track, t.completed_at_ms IS NOT NULL AS completed,
@@ -369,6 +456,7 @@ fn scheduler_snapshot_at(db: &Connection, now: i64) -> Result<TaskSchedulerStatu
             coalesce(t.lease_expires_at_ms <= ?1,0) AS expired,
             {MODULE_GATED} AS gated, {DEPENDENCY_BLOCKED} AS waiting, {held} AS held
         FROM scheduler_tasks t
+        WHERE t.completed_at_ms IS NOT NULL OR t.lease_expires_at_ms > ?1 OR NOT {scoped}
     ) SELECT track,
         count(*) FILTER (WHERE NOT completed AND NOT active AND NOT held AND NOT gated AND NOT waiting),
         count(*) FILTER (WHERE active), count(*) FILTER (WHERE completed),

@@ -1,7 +1,12 @@
 use super::*;
 use crate::{NewClaim, PromotionIntent, ReviewedLeanSpec, VerifiedReceipt};
 
-const REPO: &str = "/managed/project";
+const REPO: &str = if cfg!(windows) {
+    r"C:\managed\project"
+} else {
+    "/managed/project"
+};
+const OTHER_REPO: &str = if cfg!(windows) { r"C:\other" } else { "/other" };
 const ORIGIN: &str = "claim:origin";
 const TARGET: &str = "claim:destination";
 const ORIGIN_MODULE: &str = "Old.lean";
@@ -113,6 +118,15 @@ fn plan(seq: i64) -> SedimentAdaptationPlan {
         spec_prefix_sha256: spec.spec_prefix_sha256,
         expected_event_seq: seq,
     }
+}
+
+pub(in crate::state) fn approved_fixture(
+    store: &mut StateStore,
+) -> Result<SedimentAdaptationApproval> {
+    install(store)?;
+    store.bind_lean_spec(&binding(TARGET))?;
+    let plan = plan(last_seq(&store.db)?);
+    store.approve_sediment_adaptation(&plan, &plan.approval_sha256()?)
 }
 
 fn assert_rejected(
@@ -307,7 +321,7 @@ fn append_requires_exact_historical_and_destination_identities() -> Result<()> {
     for (invalid, error) in [
         (
             SedimentAdaptationPlan {
-                repo: "/other".into(),
+                repo: OTHER_REPO.into(),
                 ..plan.clone()
             },
             "bound managed repository",
