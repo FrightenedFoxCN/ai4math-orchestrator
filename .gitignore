@@ -1,0 +1,27 @@
+# Local rebuildable SQLite indexes and runtime artifacts
+.mathwiki/.index.sqlite
+.mathwiki/.index.sqlite-shm
+.mathwiki/.index.sqlite-wal
+.runtime/
+.scratch/
+.worktrees/
+
+# Formal verification build artifacts
+.lake/
+*.olean
+*.ilean
+*.trace
+*.vo
+*.vok
+*.vos
+*.glob
+.lia.cache
+*.agdai
+_build/
+
+# Python / Node / OS
+__pycache__/
+*.pyc
+.venv/
+node_modules/
+.DS_Store

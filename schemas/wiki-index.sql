@@ -1,0 +1,92 @@
+-- Local Math Wiki SQLite Index Schema
+-- Source of truth lives in .mathwiki/{core,sediment,graveyard}/*.md (Git-tracked).
+-- This SQLite database (.mathwiki/.index.sqlite) is local, single-file, and fully rebuildable.
+
+PRAGMA foreign_keys = ON;
+PRAGMA journal_mode = WAL;
+
+-- 1. Core metadata table (never hard-delete unreferenced entries; demote stratum instead)
+CREATE TABLE IF NOT EXISTS entries (
+  id TEXT PRIMARY KEY,
+  stratum TEXT NOT NULL CHECK (stratum IN ('core', 'sediment', 'graveyard')),
+  trust_level TEXT NOT NULL CHECK (trust_level IN ('L0', 'L1', 'L2', 'L3', 'L4', 'L5')),
+  engine TEXT NOT NULL CHECK (engine IN ('lean4', 'rocq', 'agda', 'smt', 'informal')),
+  status TEXT NOT NULL CHECK (status IN ('active', 'unreferenced', 'superseded', 'refuted')),
+  pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
+  title TEXT NOT NULL,
+  informal_gloss TEXT NOT NULL,
+  formal_signature TEXT,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  verified_at_commit TEXT,
+  origin_branch TEXT,
+  origin_claim TEXT,
+  def_fingerprints_json TEXT NOT NULL DEFAULT '{}',
+  compat_status TEXT NOT NULL DEFAULT 'unknown' CHECK (
+    compat_status IN ('compatible', 'needs_adaptation', 'incompatible', 'unknown')
+  ),
+  ref_count INTEGER NOT NULL DEFAULT 0,
+  access_count INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  last_accessed_at TEXT,
+  file_path TEXT NOT NULL UNIQUE
+);
+
+CREATE INDEX IF NOT EXISTS idx_entries_stratum_trust
+  ON entries (stratum, trust_level, engine);
+
+CREATE INDEX IF NOT EXISTS idx_entries_status_ref
+  ON entries (stratum, status, ref_count, pinned);
+
+-- 2. Symbolic structure inverted index (Loogle/Hoogle-style formal signature retrieval)
+CREATE TABLE IF NOT EXISTS entry_symbols (
+  entry_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+  role TEXT NOT NULL CHECK (
+    role IN ('conclusion_head', 'hypothesis_head', 'typeclass', 'const')
+  ),
+  symbol TEXT NOT NULL,
+  PRIMARY KEY (entry_id, role, symbol)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entry_symbols_lookup
+  ON entry_symbols (role, symbol, entry_id);
+
+-- 3. Provenance and mathematical dependency graph edges
+CREATE TABLE IF NOT EXISTS entry_edges (
+  src_id TEXT NOT NULL REFERENCES entries(id) ON DELETE CASCADE,
+  dst_id TEXT NOT NULL,
+  edge_type TEXT NOT NULL CHECK (
+    edge_type IN (
+      'depends_on',
+      'used_by',
+      'refutes',
+      'generalizes',
+      'superseded_by',
+      'born_from_claim',
+      'bridge_source'
+    )
+  ),
+  metadata_json TEXT NOT NULL DEFAULT '{}',
+  PRIMARY KEY (src_id, dst_id, edge_type)
+);
+
+CREATE INDEX IF NOT EXISTS idx_entry_edges_dst
+  ON entry_edges (dst_id, edge_type);
+
+-- 4. Full-text search index (FTS5 BM25 over cross-engine math concepts and signatures)
+CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
+  entry_id UNINDEXED,
+  stratum UNINDEXED,
+  title,
+  informal_gloss,
+  tags,
+  formal_signature,
+  notes,
+  tokenize = 'unicode61'
+);
+
+-- 5. Optional local vector index (enable when sqlite-vec extension is loaded)
+-- CREATE VIRTUAL TABLE IF NOT EXISTS entries_vec USING vec0(
+--   entry_id TEXT PRIMARY KEY,
+--   embedding FLOAT[768]
+-- );

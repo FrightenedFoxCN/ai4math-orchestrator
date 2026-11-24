@@ -1,0 +1,610 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.ai4math-orchestrator/schemas/contracts.schema.json",
+  "title": "AI4Math Orchestrator Core Contracts",
+  "description": "Structured delegation, result reporting, infrastructure RFC, cross-engine bridge, trust ledger, and decision inbox schemas.",
+  "$defs": {
+    "Engine": {
+      "type": "string",
+      "enum": [
+        "lean4",
+        "rocq",
+        "agda",
+        "smt",
+        "python"
+      ]
+    },
+    "FormalEngine": {
+      "type": "string",
+      "enum": [
+        "lean4",
+        "rocq",
+        "agda",
+        "smt"
+      ]
+    },
+    "Role": {
+      "type": "string",
+      "enum": [
+        "chief_orchestrator",
+        "regional_orchestrator",
+        "explorer",
+        "infra_builder",
+        "prover_worker",
+        "independent_reviewer"
+      ]
+    },
+    "TrustLevel": {
+      "type": "string",
+      "enum": [
+        "L0",
+        "L1",
+        "L2",
+        "L3",
+        "L4",
+        "L5"
+      ]
+    },
+    "WikiStratum": {
+      "type": "string",
+      "enum": [
+        "core",
+        "sediment",
+        "graveyard"
+      ]
+    },
+    "Budget": {
+      "type": "object",
+      "required": [
+        "max_wall_seconds",
+        "max_turns",
+        "max_broker_calls",
+        "max_recursion_depth"
+      ],
+      "properties": {
+        "max_wall_seconds": {
+          "type": "integer",
+          "minimum": 10
+        },
+        "max_turns": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_broker_calls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_recursion_depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        }
+      },
+      "additionalProperties": false
+    },
+    "DispatchContract": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "role",
+        "engine",
+        "claim_id",
+        "base_commit",
+        "workspace_mode",
+        "objective_mode",
+        "budget"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "parent_task_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "role": {
+          "$ref": "#/$defs/Role"
+        },
+        "engine": {
+          "$ref": "#/$defs/Engine"
+        },
+        "claim_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "rfc_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "base_commit": {
+          "type": "string",
+          "minLength": 7
+        },
+        "workspace_mode": {
+          "type": "string",
+          "enum": [
+            "readonly",
+            "scratch",
+            "cow_worktree"
+          ]
+        },
+        "objective_mode": {
+          "type": "string",
+          "enum": [
+            "PROVE_ONLY",
+            "PROVE_OR_REFUTE",
+            "BUILD_INFRA",
+            "EXPLORE",
+            "AUDIT_SPEC",
+            "AUDIT_BRIDGE",
+            "GOLF_PROOF",
+            "REHYDRATE_SEDIMENT"
+          ]
+        },
+        "frozen_targets": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "relevant_wiki_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "instructions": {
+          "type": "string"
+        },
+        "budget": {
+          "$ref": "#/$defs/Budget"
+        },
+        "early_escalate_if": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "HarvestedLemma": {
+      "type": "object",
+      "required": [
+        "name",
+        "engine",
+        "verified_level",
+        "formal_signature",
+        "patch_ref"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "engine": {
+          "$ref": "#/$defs/FormalEngine"
+        },
+        "verified_level": {
+          "type": "string",
+          "enum": [
+            "L4",
+            "L5"
+          ]
+        },
+        "formal_signature": {
+          "type": "string"
+        },
+        "informal_gloss": {
+          "type": "string"
+        },
+        "patch_ref": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "ResultContract": {
+      "type": "object",
+      "required": [
+        "task_id",
+        "status",
+        "trace_path",
+        "usage"
+      ],
+      "properties": {
+        "task_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "PROVED",
+            "REFUTED",
+            "PARTIAL_PROGRESS",
+            "BLOCKED_MISSING_INFRA",
+            "BLOCKED_SPEC_DEFECT",
+            "BUDGET_EXHAUSTED",
+            "CANCELLED"
+          ]
+        },
+        "achieved_trust_level": {
+          "$ref": "#/$defs/TrustLevel"
+        },
+        "patch_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "evidence": {
+          "type": "object",
+          "properties": {
+            "comparator_receipt_hash": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "axioms_used": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "counterexample_witness": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "reviewer_ticket_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "harvested_lemmas": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/HarvestedLemma"
+          }
+        },
+        "diagnosis": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "category",
+            "summary"
+          ],
+          "properties": {
+            "category": {
+              "type": "string",
+              "enum": [
+                "conceptual_gap",
+                "missing_mathlib_api",
+                "tactic_timeout",
+                "missing_hypothesis",
+                "definition_mismatch",
+                "engine_limitation"
+              ]
+            },
+            "summary": {
+              "type": "string"
+            },
+            "suggested_next_action": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "usage": {
+          "type": "object",
+          "required": [
+            "wall_seconds",
+            "turns",
+            "broker_calls"
+          ],
+          "properties": {
+            "wall_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "turns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "broker_calls": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "trace_path": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "InfraRFC": {
+      "type": "object",
+      "required": [
+        "rfc_id",
+        "requested_by_claim",
+        "engine",
+        "motivation",
+        "proposed_definitions",
+        "required_api_lemmas",
+        "consumer_usage_sketch",
+        "smoke_test_criteria",
+        "status"
+      ],
+      "properties": {
+        "rfc_id": {
+          "type": "string"
+        },
+        "requested_by_claim": {
+          "type": "string"
+        },
+        "engine": {
+          "$ref": "#/$defs/FormalEngine"
+        },
+        "motivation": {
+          "type": "string"
+        },
+        "proposed_definitions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "required_api_lemmas": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "consumer_usage_sketch": {
+          "type": "string",
+          "minLength": 1
+        },
+        "smoke_test_criteria": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "DRAFT",
+            "APPROVED",
+            "BUILDING_SMOKE",
+            "FROZEN_PROVING",
+            "COMPLETED",
+            "SUPERSEDED",
+            "REJECTED"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CrossEngineBridgeContract": {
+      "type": "object",
+      "required": [
+        "bridge_id",
+        "source_engine",
+        "source_commit",
+        "source_decl",
+        "target_engine",
+        "target_axiom",
+        "target_signature",
+        "logic_assumptions",
+        "reviewer_approved"
+      ],
+      "properties": {
+        "bridge_id": {
+          "type": "string"
+        },
+        "source_engine": {
+          "$ref": "#/$defs/FormalEngine"
+        },
+        "source_commit": {
+          "type": "string"
+        },
+        "source_decl": {
+          "type": "string"
+        },
+        "target_engine": {
+          "$ref": "#/$defs/FormalEngine"
+        },
+        "target_axiom": {
+          "type": "string"
+        },
+        "target_signature": {
+          "type": "string"
+        },
+        "logic_assumptions": {
+          "type": "object",
+          "properties": {
+            "classical": {
+              "type": "boolean"
+            },
+            "uip_or_k": {
+              "type": "boolean"
+            },
+            "funext": {
+              "type": "boolean"
+            },
+            "propext": {
+              "type": "boolean"
+            },
+            "notes": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "reviewer_approved": {
+          "type": "boolean"
+        },
+        "adr_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "ClaimNode": {
+      "type": "object",
+      "required": [
+        "claim_id",
+        "title",
+        "informal_statement",
+        "trust_level",
+        "stale"
+      ],
+      "properties": {
+        "claim_id": {
+          "type": "string"
+        },
+        "title": {
+          "type": "string"
+        },
+        "informal_statement": {
+          "type": "string"
+        },
+        "formal_target": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "engine": {
+          "$ref": "#/$defs/FormalEngine"
+        },
+        "trust_level": {
+          "$ref": "#/$defs/TrustLevel"
+        },
+        "stale": {
+          "type": "boolean"
+        },
+        "depends_on": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "bridge_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wiki_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "DecisionInboxItem": {
+      "type": "object",
+      "required": [
+        "inbox_id",
+        "created_at",
+        "category",
+        "summary",
+        "options",
+        "status"
+      ],
+      "properties": {
+        "inbox_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "category": {
+          "type": "string",
+          "enum": [
+            "breaking_def_change",
+            "strategy_branch_pruning",
+            "hard_bottleneck_escalation",
+            "cross_engine_admission"
+          ]
+        },
+        "related_claims": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "summary": {
+          "type": "string"
+        },
+        "evidence_refs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "options": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "type": "object",
+            "required": [
+              "label",
+              "tradeoff"
+            ],
+            "properties": {
+              "label": {
+                "type": "string"
+              },
+              "tradeoff": {
+                "type": "string"
+              },
+              "recommended": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "PENDING",
+            "RESOLVED",
+            "DISMISSED"
+          ]
+        },
+        "resolved_adr": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
