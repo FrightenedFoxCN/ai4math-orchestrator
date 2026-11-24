@@ -10,9 +10,12 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
+mod managed_core;
 mod sediment;
+pub use managed_core::{WikiManagedCoreEntry, WikiManagedGeneration};
 pub use sediment::{
     SedimentArtifact, SedimentInput, StoredSediment, publish_sediment, read_sediment,
     render_sediment,
@@ -95,7 +98,8 @@ pub struct WikiHit {
     pub status: String,
     pub informal_gloss: String,
     pub formal_signature: Option<String>,
-    /// Path relative to the Wiki root, not the runtime database or process cwd.
+    /// Path relative to the Wiki root. Managed Core hits use a virtual
+    /// `.managed-core/<id>` identifier, never a path to Markdown or trusted source.
     pub file_path: String,
 }
 
@@ -145,20 +149,57 @@ impl Wiki {
         })
     }
 
-    /// Replace the disposable index from the Git-tracked Markdown files as one transaction.
+    /// Open an existing index without creating a database or applying schema changes.
+    pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("open Wiki index {} read-only", path.display()))?;
+        db.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { db })
+    }
+
+    /// Replace the disposable index from Markdown alone, dropping any managed Core projection.
     /// Missing strata are empty (Git does not track empty directories). Invalid input leaves
     /// the previously published index intact. This never writes or deletes a Markdown file.
     pub fn rebuild(&mut self, root: impl AsRef<Path>) -> Result<usize> {
-        let root = root.as_ref();
+        self.rebuild_index(root.as_ref(), None, &[])
+    }
+
+    /// Replace Markdown and managed Core metadata in one transaction, returning the total
+    /// number of indexed entries. The caller validates the managed evidence and generation.
+    /// No Markdown, Git history, or ledger state is written by this operation.
+    pub fn rebuild_with_managed_core(
+        &mut self,
+        root: impl AsRef<Path>,
+        generation: WikiManagedGeneration<'_>,
+        entries: &[WikiManagedCoreEntry],
+    ) -> Result<usize> {
+        self.rebuild_index(root.as_ref(), Some(generation), entries)
+    }
+
+    fn rebuild_index(
+        &mut self,
+        root: &Path,
+        generation: Option<WikiManagedGeneration<'_>>,
+        managed_entries: &[WikiManagedCoreEntry],
+    ) -> Result<usize> {
+        // Normalize trailing local components so symlink_metadata checks the final directory.
+        let root: PathBuf = root.components().collect();
         ensure!(
-            root.is_dir(),
-            "Wiki root is not a directory: {}",
+            fs::symlink_metadata(&root)
+                .with_context(|| format!("inspect Wiki root {}", root.display()))?
+                .is_dir(),
+            "Wiki root is not a regular directory: {}",
             root.display()
         );
+        let mut archives = managed_core::Archives::new(managed_entries)?;
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        tx.execute_batch("DELETE FROM entries_fts; DELETE FROM entries;")?;
+        tx.execute_batch(
+            "DELETE FROM managed_core_generation; DELETE FROM managed_core_fts;
+             DELETE FROM entries_fts; DELETE FROM entries;",
+        )?;
         let mut indexed = 0;
         for stratum in STRATA {
             let dir = root.join(stratum.as_str());
@@ -173,7 +214,7 @@ impl Wiki {
             }
             for path in markdown_files(&dir)? {
                 let relative = path
-                    .strip_prefix(root)?
+                    .strip_prefix(&root)?
                     .to_str()
                     .context("Wiki path is not UTF-8")?;
                 (|| -> Result<()> {
@@ -183,11 +224,16 @@ impl Wiki {
                         entry.stratum == stratum,
                         "frontmatter stratum does not match the directory"
                     );
+                    archives.observe(&entry.id, stratum, &source)?;
                     insert_entry(&tx, &entry, body, relative)
                 })()
                 .with_context(|| format!("index {}", path.display()))?;
                 indexed += 1;
             }
+        }
+        if let Some(generation) = generation {
+            archives.install(&tx, generation, managed_entries)?;
+            indexed += managed_entries.len();
         }
         tx.commit()?;
         Ok(indexed)
@@ -197,18 +243,46 @@ impl Wiki {
     /// their text. Graveyard warnings do not depend on how many CORE results match.
     /// The offline search ranks exact symbol filters and literal FTS5 matches without embeddings.
     pub fn search(&self, query: WikiQuery<'_>) -> Result<WikiSearchResult> {
+        self.search_index(query, None)
+    }
+
+    /// As in [`Self::search`], but also consider managed Core entries when the generation matches
+    /// the one installed in this index. An absent or stale projection is treated as empty.
+    pub fn search_at(
+        &self,
+        query: WikiQuery<'_>,
+        generation: WikiManagedGeneration<'_>,
+    ) -> Result<WikiSearchResult> {
+        self.search_index(query, Some(generation))
+    }
+
+    fn search_index(
+        &self,
+        query: WikiQuery<'_>,
+        generation: Option<WikiManagedGeneration<'_>>,
+    ) -> Result<WikiSearchResult> {
         let search = Search::new(query);
         // Read hits and hints from the same published rebuild, even with another connection.
         let db = self.db.unchecked_transaction()?;
-        let core = search.candidates(&db, query.scope, false, false, query.limit.max(1))?;
+        let include_managed =
+            query.scope == WikiStratum::Core && managed_core::visible(&db, generation)?;
+        let core = search.candidates(
+            &db,
+            query.scope,
+            include_managed,
+            false,
+            false,
+            query.limit.max(1),
+        )?;
         let mut hint = ShadowHint::default();
         if query.scope == WikiStratum::Core && query.include_shadow_hint && search.has_terms() {
             if core.high_count < 2 {
-                let sediment = search.candidates(&db, WikiStratum::Sediment, true, false, 1)?;
+                let sediment =
+                    search.candidates(&db, WikiStratum::Sediment, false, true, false, 1)?;
                 hint.sediment_count = sediment.high_count;
                 hint.top_sediment = sediment.rows.into_iter().next();
             }
-            let graveyard = search.candidates(&db, WikiStratum::Graveyard, true, true, 1)?;
+            let graveyard = search.candidates(&db, WikiStratum::Graveyard, false, true, true, 1)?;
             hint.graveyard_count = graveyard.high_count;
             hint.top_graveyard_id = graveyard.rows.into_iter().next().map(|row| row.id);
         }
@@ -249,6 +323,28 @@ impl Wiki {
     /// and emitting it only once. The root may be a Wiki ID or an external endpoint ID.
     /// Accepts at most 16 hops and 256 edges; depth 0 returns no edges.
     pub fn provenance(&self, id: &str, max_depth: u32, limit: u32) -> Result<WikiProvenance> {
+        self.provenance_index(id, max_depth, limit, None)
+    }
+
+    /// As in [`Self::provenance`], but follow edges incident to managed entries only
+    /// when the generation matches the one installed in this index.
+    pub fn provenance_at(
+        &self,
+        id: &str,
+        max_depth: u32,
+        limit: u32,
+        generation: WikiManagedGeneration<'_>,
+    ) -> Result<WikiProvenance> {
+        self.provenance_index(id, max_depth, limit, Some(generation))
+    }
+
+    fn provenance_index(
+        &self,
+        id: &str,
+        max_depth: u32,
+        limit: u32,
+        generation: Option<WikiManagedGeneration<'_>>,
+    ) -> Result<WikiProvenance> {
         ensure!(
             !id.trim().is_empty(),
             "Wiki provenance root ID cannot be blank"
@@ -263,13 +359,16 @@ impl Wiki {
         );
 
         let db = self.db.unchecked_transaction()?;
+        let include_managed = managed_core::visible(&db, generation)?;
         let mut result = WikiProvenance::default();
         {
             let mut incident = db.prepare_cached(
                 "SELECT e.src_id,e.dst_id,e.edge_type,e.metadata_json,src.stratum,dst.stratum
                 FROM entry_edges e JOIN entries src ON src.id=e.src_id
                 LEFT JOIN entries dst ON dst.id=e.dst_id
-                WHERE e.src_id=?1 OR e.dst_id=?1
+                WHERE (e.src_id=?1 OR e.dst_id=?1)
+                  AND (?3 OR (upper(e.src_id) NOT GLOB 'CORE-ADAPT-*'
+                          AND upper(e.dst_id) NOT GLOB 'CORE-ADAPT-*'))
                 ORDER BY e.src_id,e.dst_id,e.edge_type LIMIT ?2",
             )?;
             let mut visited = BTreeSet::from([id.to_owned()]);
@@ -281,7 +380,7 @@ impl Wiki {
                 }
                 // At most limit edges can have been seen before this query. The extra row
                 // is enough to find the first omitted edge even when revisiting edges.
-                let mut rows = incident.query(params![current, limit + 1])?;
+                let mut rows = incident.query(params![current, limit + 1, include_managed])?;
                 while let Some(row) = rows.next()? {
                     let src_id: String = row.get(0)?;
                     let dst_id: String = row.get(1)?;
@@ -479,6 +578,17 @@ fn insert_entry(
     relative: &str,
 ) -> Result<()> {
     ensure!(!entry.id.trim().is_empty(), "Wiki entry ID cannot be blank");
+    ensure!(
+        !managed_core::reserved_id(&entry.id),
+        "Wiki Markdown entry {} uses the reserved Core ID namespace",
+        entry.id
+    );
+    if let Some(claim) = &entry.origin_claim {
+        ensure!(
+            !managed_core::reserved_id(claim),
+            "Wiki Markdown origin claim uses the reserved Core ID namespace"
+        );
+    }
     if let Some(statuses) = positive_statuses(entry.stratum) {
         ensure!(
             entry.trust_level != Trust::L2b && statuses.contains(&entry.status.as_str()),
@@ -535,6 +645,11 @@ fn insert_entry(
         ensure!(
             !edge.dst_id.trim().is_empty(),
             "blank Wiki edge destination"
+        );
+        ensure!(
+            !managed_core::reserved_id(&edge.dst_id),
+            "Wiki Markdown edge destination {} uses the reserved Core ID namespace",
+            edge.dst_id
         );
         edges.execute(params![
             entry.id,
@@ -604,6 +719,7 @@ impl<'a> Search<'a> {
         &self,
         db: &Connection,
         stratum: WikiStratum,
+        include_managed: bool,
         only_high: bool,
         refuted_only: bool,
         limit: u32,
@@ -623,9 +739,17 @@ impl<'a> Search<'a> {
                 "WITH lexical(entry_id,rank) AS (SELECT NULL,NULL WHERE 0), strong(entry_id) AS (SELECT NULL WHERE 0)",
             )
         } else {
+            args.extend([self.fts.clone().into(), stratum.to_owned().into()]);
+            // Materialize BM25 at the FTS cursors rather than evaluating it on outer joins.
+            // Separate corpora preserve static BM25 ranking when managed hits are hidden.
+            let mut sql = String::from("WITH lexical AS MATERIALIZED (
+                SELECT entry_id,bm25(entries_fts,0,0,4,2,2,2,1) AS rank FROM entries_fts WHERE entries_fts MATCH ? AND stratum=?");
+            if include_managed {
+                sql.push_str(" UNION ALL SELECT entry_id,bm25(managed_core_fts,0,4,2) FROM managed_core_fts WHERE managed_core_fts MATCH ?");
+                args.push(self.fts.clone().into());
+            }
+            sql.push_str("), strong AS (SELECT entry_id FROM entries_fts WHERE entries_fts MATCH ? AND stratum=?");
             args.extend([
-                self.fts.clone().into(),
-                stratum.to_owned().into(),
                 format!(
                     "{{title informal_gloss tags formal_signature}} : ({})",
                     self.fts
@@ -633,10 +757,12 @@ impl<'a> Search<'a> {
                 .into(),
                 stratum.to_owned().into(),
             ]);
-            // Materialize BM25 at the FTS cursor (rather than evaluating it on outer-join rows).
-            String::from("WITH lexical AS MATERIALIZED (
-                SELECT entry_id,bm25(entries_fts,0,0,4,2,2,2,1) AS rank FROM entries_fts WHERE entries_fts MATCH ? AND stratum=?
-            ), strong AS (SELECT entry_id FROM entries_fts WHERE entries_fts MATCH ? AND stratum=?)")
+            if include_managed {
+                sql.push_str(" UNION ALL SELECT entry_id FROM managed_core_fts WHERE managed_core_fts MATCH ?");
+                args.push(self.fts.clone().into());
+            }
+            sql.push(')');
+            sql
         };
         let symbolic = if self.query.conclusion_head.is_some() {
             0.95
@@ -649,6 +775,7 @@ impl<'a> Search<'a> {
         };
         let combined = if self.symbols.is_empty() { 0.85 } else { 1.0 };
         sql.push_str(", matches AS (SELECT e.id,e.title,e.engine,e.verified_at_commit,l.rank,
+            (upper(e.id) NOT GLOB 'CORE-ADAPT-*') AS static_entry,
             CASE WHEN s.entry_id IS NOT NULL THEN ? WHEN l.entry_id IS NOT NULL THEN max(?,0.65) ELSE ? END AS score
             FROM entries e LEFT JOIN lexical l ON l.entry_id=e.id LEFT JOIN strong s ON s.entry_id=e.id WHERE e.stratum=?");
         args.extend([
@@ -657,6 +784,10 @@ impl<'a> Search<'a> {
             symbolic.into(),
             stratum.to_owned().into(),
         ]);
+        if !include_managed {
+            // The namespace check also hides spoofed IDs already in a legacy index.
+            sql.push_str(" AND upper(e.id) NOT GLOB 'CORE-ADAPT-*'");
+        }
         if let Some(engine) = self.query.engine {
             sql.push_str(" AND e.engine=?");
             args.push(engine.as_str().to_owned().into());
@@ -683,8 +814,9 @@ impl<'a> Search<'a> {
             sql.push_str(" AND EXISTS (SELECT 1 FROM entry_symbols WHERE entry_id=e.id AND role=? AND symbol=?)");
             args.extend([role.to_owned().into(), symbol.to_owned().into()]);
         }
+        // Managed hits never appear in or suppress cold-stratum shadow hints.
         sql.push_str(
-            ") SELECT id,title,engine,verified_at_commit,score,sum(score > ?) OVER () FROM matches",
+            ") SELECT id,title,engine,verified_at_commit,score,sum(score > ? AND static_entry) OVER () FROM matches",
         );
         args.push(HIGH_SCORE.into());
         if only_high {

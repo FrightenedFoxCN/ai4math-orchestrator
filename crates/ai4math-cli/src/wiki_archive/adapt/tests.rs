@@ -7,7 +7,8 @@ use crate::{
 };
 use ai4math_core::{Engine, FrozenTarget, ProofBodySubmission, render_proof_body};
 use ai4math_store::{
-    Change, StateStore, TaskCandidateSource, TaskSchedulerStatus, TaskTrack, Trust,
+    Change, StateStore, TaskCandidateSource, TaskSchedulerStatus, TaskTrack, Trust, Wiki,
+    WikiManagedGeneration, WikiQuery, WikiStratum,
 };
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -221,6 +222,8 @@ fn native_sediment_adaptation_approves_only_a_fresh_target_without_granting_auth
         wiki_archive::prepare(root, &locked, &state, ORIGIN, &promoted)?.0
     };
     wiki_archive::archive(root, &repo, ORIGIN, &promoted, &archive.approval_sha256)?;
+    let archive_path = root.join(&archive.relative_path);
+    let archive_bytes = fs::read(&archive_path)?;
     let original_comparison = state
         .lean_spec_comparison(&promoted)?
         .context("missing historical comparison")?;
@@ -583,5 +586,152 @@ fn native_sediment_adaptation_approves_only_a_fresh_target_without_granting_auth
         Some(&comparison)
     );
     retain_before.assert_unchanged(root, &repo, &state)?;
+
+    // The project-aware rebuild indexes the cold source and projects one CORE row.
+    // Neither the CORE row nor its supersession edge is written to Markdown.
+    let live = WikiManagedGeneration {
+        head: &adapted,
+        event_seq: state.status()?.last_event_seq,
+    };
+    let wiki_root = root.join(".mathwiki");
+    assert_eq!(
+        wiki_archive::core_projection::rebuild(root, &repo, &adapted)?,
+        2
+    );
+    assert_eq!(fs::read(&archive_path)?, archive_bytes);
+    assert!(fs::read_dir(wiki_root.join("core"))?.next().is_none());
+    assert_eq!(state.status()?.last_event_seq, live.event_seq);
+
+    let wiki = Wiki::open(wiki_root.join(".index.sqlite"))?;
+    let core_query = WikiQuery::new("adapted");
+    let sediment_query = WikiQuery {
+        scope: WikiStratum::Sediment,
+        ..WikiQuery::default()
+    };
+    let assert_cold_source = |index: &Wiki, generation: WikiManagedGeneration<'_>| -> Result<()> {
+        let cold = index.search_at(sediment_query, generation)?.hits;
+        assert_eq!(cold.len(), 1);
+        assert_eq!(cold[0].summary.id, archive.id);
+        assert_eq!(
+            cold[0].summary.verified_at_commit.as_deref(),
+            Some(promoted.as_str())
+        );
+        assert_eq!(cold[0].stratum, WikiStratum::Sediment);
+        Ok(())
+    };
+    assert_cold_source(&wiki, live)?;
+    assert_eq!(wiki.search_at(WikiQuery::default(), live)?.hits.len(), 1);
+    let core = wiki.search_at(core_query, live)?.hits;
+    assert_eq!(core.len(), 1);
+    assert_eq!(core[0].summary.id, lineage.core_entry_id);
+    assert_eq!(
+        core[0].summary.verified_at_commit.as_deref(),
+        Some(adapted.as_str())
+    );
+    assert_eq!(core[0].stratum, WikiStratum::Core);
+    assert_eq!(core[0].trust_level, Trust::L5);
+    assert!(core[0].formal_signature.is_none());
+    let provenance = wiki.provenance_at(&archive.id, 1, 16, live)?;
+    let supersession = provenance
+        .edges
+        .iter()
+        .find(|edge| edge.edge_type == "superseded_by")
+        .context("missing generated supersession edge")?;
+    assert_eq!(supersession.src_id, archive.id);
+    assert_eq!(supersession.dst_id, lineage.core_entry_id);
+    assert_eq!(supersession.src_stratum, WikiStratum::Sediment);
+    assert_eq!(supersession.dst_stratum, Some(WikiStratum::Core));
+
+    // Default readers still see historical provenance, but no managed projection.
+    assert!(wiki.search(WikiQuery::default())?.hits.is_empty());
+    assert!(wiki.search(core_query)?.hits.is_empty());
+    let legacy = wiki.provenance(&archive.id, 1, 16)?;
+    assert_eq!(legacy.edges.len(), 1);
+    assert_eq!(legacy.edges[0].edge_type, "born_from_claim");
+    assert_eq!(legacy.edges[0].dst_id, ORIGIN);
+    let assert_hidden = |index: &Wiki, generation: WikiManagedGeneration<'_>| -> Result<()> {
+        assert!(
+            index
+                .search_at(WikiQuery::default(), generation)?
+                .hits
+                .is_empty()
+        );
+        assert!(index.search_at(core_query, generation)?.hits.is_empty());
+        let provenance = index.provenance_at(&archive.id, 1, 16, generation)?;
+        assert_eq!(provenance.edges.len(), 1);
+        assert_eq!(provenance.edges[0].edge_type, "born_from_claim");
+        assert_eq!(provenance.edges[0].dst_id, ORIGIN);
+        assert_cold_source(index, generation)
+    };
+
+    // Git drift invalidates the generation even before the ledger marks T3 stale.
+    git(&review, &["fetch", "origin", MAIN]);
+    git(&review, &["checkout", "--detach", "FETCH_HEAD"]);
+    fs::write(review.join("Defs.lean"), "def x : Nat := 4\n")?;
+    git(&review, &["add", "Defs.lean"]);
+    git(&review, &["commit", "-m", "review drift after adaptation"]);
+    git(&review, &["push", "origin", "HEAD:refs/heads/main"]);
+    let drifted = git(&repo, &["rev-parse", MAIN]);
+    assert_ne!(drifted, adapted);
+    assert_eq!(state.status()?.last_event_seq, live.event_seq);
+    assert!(
+        !state
+            .claim(TARGET)?
+            .context("missing destination Claim")?
+            .stale
+    );
+    let err =
+        wiki_archive::core_projection::checked_read(root, &repo, &adapted, |_, _| -> Result<()> {
+            panic!("query with an outdated reviewed head must be refused")
+        })
+        .unwrap_err();
+    assert!(format!("{err:#}").contains("not current main"), "{err:#}");
+    let ((), observed_seq) =
+        wiki_archive::core_projection::checked_read(root, &repo, &drifted, &assert_hidden)?;
+    assert_eq!(observed_seq, live.event_seq);
+    // Rebuilding at the new HEAD must still omit the proof, even though
+    // the ledger has not observed or marked the changed dependency yet.
+    assert_eq!(
+        wiki_archive::core_projection::rebuild(root, &repo, &drifted)?,
+        1
+    );
+    wiki_archive::core_projection::checked_read(root, &repo, &drifted, &assert_hidden)?;
+
+    // Restore main to isolate the independent ledger-generation gate.
+    git(&repo, &["update-ref", MAIN, &adapted, &drifted]);
+    assert_eq!(
+        wiki_archive::core_projection::rebuild(root, &repo, &adapted)?,
+        2
+    );
+    assert_eq!(wiki.search_at(core_query, live)?.hits.len(), 1);
+    StateStore::open(root.join(DB))?.mark_t3(
+        &[TARGET],
+        &[],
+        Change {
+            actor: "adaptation fixture",
+            git_commit: Some(&adapted),
+        },
+    )?;
+    assert!(
+        state
+            .claim(TARGET)?
+            .context("missing destination Claim")?
+            .stale
+    );
+    let stale = WikiManagedGeneration {
+        head: &adapted,
+        event_seq: state.status()?.last_event_seq,
+    };
+    assert!(stale.event_seq > live.event_seq);
+    assert_hidden(&wiki, stale)?;
+    assert_eq!(
+        wiki_archive::core_projection::rebuild(root, &repo, &adapted)?,
+        1
+    );
+    assert_hidden(&wiki, stale)?;
+    assert_eq!(state.status()?.last_event_seq, stale.event_seq);
+    assert_eq!(state.sediment_lineage(&digest)?.as_ref(), Some(&lineage));
+    assert_eq!(fs::read(&archive_path)?, archive_bytes);
+    assert!(fs::read_dir(wiki_root.join("core"))?.next().is_none());
     Ok(())
 }

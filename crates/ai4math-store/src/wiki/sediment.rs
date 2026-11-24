@@ -241,7 +241,7 @@ pub fn read_sediment(project_root: &Path, id: &str) -> Result<StoredSediment> {
     Ok(stored)
 }
 
-fn parse_sediment(id: &str, markdown: &str) -> Result<StoredSediment> {
+pub(super) fn parse_sediment(id: &str, markdown: &str) -> Result<StoredSediment> {
     let (header, body) = markdown
         .strip_prefix("---\n")
         .and_then(|document| document.split_once("\n---\n"))

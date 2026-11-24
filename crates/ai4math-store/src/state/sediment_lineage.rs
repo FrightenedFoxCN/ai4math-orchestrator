@@ -162,6 +162,31 @@ impl StateStore {
         reviewed_lean::read_optional_table(&self.db, TABLE, |db| read_lineage(db, approval))
     }
 
+    /// Bounded projection input only. Historical lineage readback is separate.
+    /// Select records whose destination still names that exact non-stale L5 T1;
+    /// the caller must separately establish current Git/source compatibility.
+    pub fn current_sediment_lineages(&self) -> Result<Vec<SedimentLineage>> {
+        const LIMIT: usize = 64;
+        Ok(reviewed_lean::read_optional_table(&self.db, TABLE, |db| {
+            let mut statement=db.prepare("SELECT l.approval_sha256 FROM sediment_adaptation_lineage l
+                JOIN sediment_adaptation_approvals a USING(approval_sha256)
+                JOIN recorded_promotions p ON p.git_commit=l.promoted_commit AND p.claim_id=a.target_claim
+                JOIN claims c ON c.claim_id=a.target_claim AND c.receipt_id=p.receipt_id
+                JOIN verification_receipts r ON r.receipt_id=p.receipt_id AND r.receipt_sha256=l.candidate_receipt_sha256
+                WHERE c.engine='lean4' AND c.stale=0 AND c.effective_stale=0
+                AND c.local_trust_level='L5' AND c.effective_trust_level='L5'
+                AND r.tier='T1_PROMOTION' AND r.engine='lean4'
+                AND c.module_path=a.target_module AND c.formal_target=(a.target_module || '#' || a.target_decl)
+                AND NOT EXISTS(SELECT 1 FROM recorded_promotions newer WHERE newer.claim_id=c.claim_id AND newer.event_seq>p.event_seq)
+                ORDER BY l.event_seq LIMIT ?1")?;
+            let ids=statement.query_map([(LIMIT+1) as i64],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            ensure!(ids.len()<=LIMIT,"managed CORE projection limit exceeded; narrow the projection before rebuilding");
+            let rows=ids.iter().map(|id|read_lineage(db,id)?.context("lineage vanished during projection"))
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Some(rows))
+        })?.unwrap_or_default())
+    }
+
     /// Retain an explicitly reviewed historical lineage edge. The coordinator
     /// establishes Git/archive provenance under the repository lock; the Store
     /// validates the exact ledger relationships. This writes only lineage and

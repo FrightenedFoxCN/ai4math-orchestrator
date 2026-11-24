@@ -1,5 +1,6 @@
 -- Local Math Wiki SQLite Index Schema
--- Source of truth lives in .mathwiki/{core,sediment,graveyard}/*.md (Git-tracked).
+-- Static entries come from .mathwiki/{core,sediment,graveyard}/*.md (Git-tracked).
+-- Managed Core metadata comes from a caller-validated Git/ledger generation.
 -- This SQLite database (.mathwiki/.index.sqlite) is local, single-file, and fully rebuildable.
 
 PRAGMA foreign_keys = ON;
@@ -85,7 +86,23 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entries_fts USING fts5(
   tokenize = 'unicode61'
 );
 
--- 5. Optional local vector index (enable when sqlite-vec extension is loaded)
+-- 5. Disposable managed Core projection. CORE-ADAPT-* entries and their incident
+-- edges use the tables above. The generation marker and FTS corpus are separate
+-- so old indexes need no table migration and hidden rows cannot change default rank.
+CREATE TABLE IF NOT EXISTS managed_core_generation (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  head TEXT NOT NULL CHECK (length(head) IN (40, 64) AND head NOT GLOB '*[^0-9a-f]*'),
+  event_seq INTEGER NOT NULL CHECK (event_seq >= 0)
+);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS managed_core_fts USING fts5(
+  entry_id UNINDEXED,
+  title,
+  informal_gloss,
+  tokenize = 'unicode61'
+);
+
+-- 6. Optional local vector index (enable when sqlite-vec extension is loaded)
 -- CREATE VIRTUAL TABLE IF NOT EXISTS entries_vec USING vec0(
 --   entry_id TEXT PRIMARY KEY,
 --   embedding FLOAT[768]

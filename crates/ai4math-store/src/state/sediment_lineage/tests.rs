@@ -227,6 +227,37 @@ fn lineage_is_atomic_immutable_readback_and_historically_idempotent() -> Result<
 }
 
 #[test]
+fn core_selector_requires_current_exact_t1_and_preserves_historical_lineage() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    let approval = fixture(&mut store, Some(valid_result()))?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    let seq = last_seq(&store.db)?;
+    let record = store.retain_sediment_lineage(input(&approval, seq))?;
+    assert_eq!(store.current_sediment_lineages()?, vec![record.clone()]);
+    let receipt = store
+        .claim(&approval.plan.target_claim)?
+        .unwrap()
+        .receipt_id
+        .unwrap();
+    store.db.execute(
+        "UPDATE claims SET receipt_id=NULL WHERE claim_id=?1",
+        [&approval.plan.target_claim],
+    )?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    store.db.execute(
+        "UPDATE claims SET receipt_id=?2 WHERE claim_id=?1",
+        params![approval.plan.target_claim, receipt],
+    )?;
+    store.mark_t3(&[&approval.plan.target_claim], &[], CHANGE)?;
+    assert!(store.current_sediment_lineages()?.is_empty());
+    assert_eq!(
+        store.sediment_lineage(&approval.approval_sha256)?,
+        Some(record)
+    );
+    Ok(())
+}
+
+#[test]
 fn lineage_requires_completed_exact_scoped_native_result_and_body() -> Result<()> {
     for (candidate, message) in [
         (None, "completed native candidate"),

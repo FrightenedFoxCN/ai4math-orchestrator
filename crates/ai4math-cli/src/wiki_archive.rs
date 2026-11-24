@@ -323,6 +323,7 @@ pub(crate) fn wake_preview(root: &Path, repo: &Path, id: &str, reviewed_main: &s
 }
 
 pub(crate) mod adapt;
+pub(crate) mod core_projection;
 pub(crate) mod lineage;
 pub(crate) mod recheck;
 #[cfg(test)]
