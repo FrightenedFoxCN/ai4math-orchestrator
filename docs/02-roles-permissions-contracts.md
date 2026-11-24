@@ -1,8 +1,8 @@
 # 02. 角色拓扑、权限边界与通信契约（Roles, Permissions & Contracts）
 
-## 1. 角色拓扑（5 核心角色 + 受控二级区域编排）
+## 1. 角色拓扑（6 核心角色 + 受控二级区域编排）
 
-本系统采用 **1 个主编排器 + 4 类执行角色** 的最小完备拓扑；当单个基建 RFC 规模较大（涉及多文件与数十条引理）时，允许主编排器派生一层 **Regional Infra Orchestrator**，但**硬锁最大编排层级 = 2**，防止无限套娃。
+本系统采用 **1 个主编排器 + 5 类专业执行角色** 的最小完备拓扑（含由 [ADR-0003](adr/ADR-0003-multi-engine-oracles-and-hammers.md) 引入的按需 `Tool / Automation Subagent`）；当单个基建 RFC 规模较大（涉及多文件与数十条引理）时，允许主编排器派生一层 **Regional Infra Orchestrator**，但**硬锁最大编排层级 = 2**，防止无限套娃。
 
 | 角色 | 推荐模型层级 | 核心职责 | 严禁越界红线 |
 | :--- | :--- | :--- | :--- |
@@ -22,23 +22,23 @@
 
 > 图例：`R` = 只读；`W` = 受控写；`Run` = 执行受控动作；`—` = 该角色工具表中根本不暴露此工具。
 
-| 工具 / 能力类别 | Chief Orchestrator | Regional Orchestrator | Explorer | Infra Builder | Prover Worker | Independent Reviewer |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| `claim_graph_read` / `update` | **R / W** | R / 局部 W | R | R | — | R / 写审计字段 |
-| `decision_inbox_push` / `adr_write` | **W** | —（仅上报 Chief） | — | — | — | — |
-| `rfc_create` / `rfc_approve` | **R / Approve** | R | **Create 草案** | R | — | R / 审签 |
-| `spawn_subagent` / `cancel_subagent` | **Run**（全角色） | **Run**（限 Builder/Prover） | — | — | 仅浅层子引理递归（depth ≤ 1） | — |
-| `repo_read` / `mathlib_search` | **R** | **R** | **R** | **R** | **R** | **R** |
-| `wiki_search` | **R**（全层） | **R**（默认 core） | **R**（全层） | **R**（默认 core） | **R**（默认 core） | **R**（全层） |
-| `wiki_check_graveyard` | **Run** | **Run** | **Run**（提猜想前必调） | **Run**（建定义前必调） | — | **Run** |
-| `wiki_rehydrate` | **Run** | **Run** | — | **Run** | — | — |
-| `python_sandbox` / `smt_probe` | — | — | **W / Run** | **W / Run**（烟雾探针） | **Run**（仅反例/SMT 辅助） | **Run**（独立空真复核） |
-| `scratch_write` | — | — | **W** | — | — | — |
-| `worktree_write` | — | — | — | **W**（限指定 worktree） | — | — |
-| `submit_proof_body`（前缀冻结写入） | — | — | — | — | **W** | 仅 Golfing 模式 |
-| `broker_fast_check`（热池 REPL） | — | — | **Run** | **Run** | **Run** | **Run** |
-| `broker_heavy_build`（限流增量构建） | — | **Run** | — | **Run** | — | **Run** |
-| `comparator_verify` / `promote_patch` | **触发合并**（须持 Reviewer 票据或 L5 回执） | 申请提升 | — | — | — | **签发审签票据** |
+| 工具 / 能力类别 | Chief Orchestrator | Regional Orchestrator | Explorer | Infra Builder | Prover Worker | Tool / Automation | Independent Reviewer |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| `claim_graph_read` / `update` | **R / W** | R / 局部 W | R | R | — | — | R / 写审计字段 |
+| `decision_inbox_push` / `adr_write` | **W** | —（仅上报 Chief） | — | — | — | — | — |
+| `rfc_create` / `rfc_approve` | **R / Approve** | R | **Create 草案** | R | — | — | R / 审签 |
+| `spawn_subagent` / `cancel_subagent` | **Run**（全角色） | **Run**（限 Builder/Prover/Tool） | — | — | 仅浅层子引理递归（depth ≤ 1） | — | — |
+| `repo_read` / `mathlib_search` | **R** | **R** | **R** | **R** | **R** | **R** | **R** |
+| `wiki_search` | **R**（全层） | **R**（默认 core） | **R**（全层） | **R**（默认 core） | **R**（默认 core） | **R**（前提选择） | **R**（全层） |
+| `wiki_check_graveyard` | **Run** | **Run** | **Run**（提猜想前必调） | **Run**（建定义前必调） | — | — | **Run** |
+| `wiki_rehydrate` | **Run** | **Run** | — | **Run** | — | — | — |
+| `python_sandbox` / `smt_probe` / `cas_oracle` | — | — | **W / Run** | **W / Run**（烟雾探针） | **Run**（仅反例/SMT 辅助） | **W / Run**（Hammer/Oracle/交叉印证） | **Run**（独立空真复核） |
+| `scratch_write` | — | — | **W** | — | — | **W**（限临时求解脚本） | — |
+| `worktree_write` | — | — | — | **W**（限指定 worktree） | — | — | — |
+| `submit_proof_body`（前缀冻结写入） | — | — | — | — | **W** | **W**（仅 Hammer 内核重建补丁） | 仅 Golfing 模式 |
+| `broker_fast_check`（热池 REPL / Hammer 槽） | — | — | **Run** | **Run** | **Run** | **Run** | **Run** |
+| `broker_heavy_build`（限流增量构建） | — | **Run** | — | **Run** | — | — | **Run** |
+| `comparator_verify` / `promote_patch` | **触发合并**（须持 Broker `VerificationReceipt`） | 申请提升 | — | — | — | — | **签发审签票据** |
 
 ### 四道不可逾越的物理防火墙
 

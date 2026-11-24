@@ -143,11 +143,17 @@ Broker 每 2 秒采样宿主机可用内存，执行三级背压（并实时输�
 * **`70%–85%`（YELLOW）**：暂停受理新 Heavy 与重型 Hammer 租约；按 LRU 回收闲置辅助引擎与多余 REPL worker；
 * **`> 85%`（RED）**：拒绝新探索期租约；按优先级从低到高优雅中止最低优先级探索子任务（回收局部引理后退出），全力保障主干 T1 回归不 OOM；连续触发 RED 超过阈值时向人类推送 P0 `BROKER_REGRESSION_MELTDOWN` Alert。
 
-### 6.3 CoW Worktree 缓存隔离策略
-* **全局只读共享上游大库**：Mathlib 预编译 `.olean`、Agda stdlib、Rocq opam switch 跨所有任务只读共享；
-* **单引理证明（Prover）**：不创建 `git worktree`，直接在内存中拼装临时 scratch 提交 Fast Lane 热池；
-* **成片基建开发（InfraRFC）**：创建独立 detached `git worktree`，通过文件系统写时复制（macOS APFS `cp -c` / Linux Btrfs/XFS `cp --reflink=auto`）瞬时克隆主干构建缓存——写入完全物理隔离、零共享锁损坏风险、磁盘开销近乎为零；
-* **熔断挂起保留**：当某 worktree 关联的定义触发 `Definition Smell` 局部熔断时，打上 `breaker_pinned = true` 标签，免于 LRU 磁盘 GC，直到人类拍板恢复或归档。
+### 6.3 安全的 `.olean` / `.agdai` / `.vo` 黄金快照缓存复用与 CoW 隔离
+为同时解决**“不可信缓存投毒”**、**“`.trace` 失配触发全量重编”**与**“叶证明修改引发虚假下游失效”**三大痛点，采用三级缓存复用体系：
+
+1. **全局只读上游大库（`upstream-ro/`）**：Mathlib 预编译 `.olean`、Agda stdlib、Rocq opam switch 跨所有任务只读共享；
+2. **提交绑定的黄金快照池（`.runtime/artifact-cache/golden/<commit_sha>/`）**：
+   * **防投毒铁律**：**只有通过 Broker 洁净室验收并合入 `main` 的 commit**，其完整构建产物（含 `.olean` + `.ilean` + `.trace` / `.agdai` / `.vo`）才允许发布进黄金快照池；任何不可信子代理 worktree 的临时产物用完即弃，**绝不反哺共享缓存**；
+   * **CoW 瞬时克隆**：新开 `InfraRFC` worktree 或 T1 洁净室时，从 `golden/<base_commit>/` 通过文件系统写时复制（macOS APFS `cp -c` / Linux Btrfs/XFS `cp --reflink=auto`）瞬时克隆完整缓存及 `.trace`——零共享写锁冲突、零误判全量重编、近乎零额外磁盘；
+   * **保活与 GC（`pinned`）**：自动保活最近 `N` 个 `main` commit、所有处于 `TRIPPED` 熔断挂起状态的 `base_commit`、以及人类 ADR 里程碑 commit（确保熔断恢复或策略回退时零冷启动）；其余陈旧快照按 LRU 回收。
+3. **物理模块分层减少重编半径（`Defs/Spec` 与 `Leaf Proofs` 分离）**：
+   * 规范要求 `Infra Builder` 将核心定义、冻结签名与烟雾引理放在 `Module/Defs.*`，将可并行消解的常规证明放在叶模块 `Module/Proofs/*`（不被兄弟分支 `import`）；
+   * **直接收益**：叶证明合入 `main` 时下游兄弟模块 `.olean` **零失效**；Fast Lane 热池 REPL 只预加载 `upstream-ro + CORE Defs 层`，叶证明合入时热池**零重启**，仅在 `Defs` 层或全局 `@[simp]`/`instance` 变更时执行滚动重载（Rolling Reload）。
 
 ### 6.4 T0–T3 回归闭环
 * **T0（秒级）**：Fast Lane 交互试错与 SMT 探针；

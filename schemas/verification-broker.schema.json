@@ -246,7 +246,16 @@
           "type": "string"
         },
         "role": {
-          "type": "string"
+          "type": "string",
+          "enum": [
+            "chief_orchestrator",
+            "regional_orchestrator",
+            "explorer",
+            "infra_builder",
+            "prover_worker",
+            "tool_automation",
+            "independent_reviewer"
+          ]
         },
         "lane": {
           "$ref": "#/$defs/LaneKind"
@@ -308,7 +317,8 @@
         "statement_defeq_verified",
         "axioms_used",
         "allowlist_passed",
-        "metrics"
+        "metrics",
+        "receipt_sha256"
       ],
       "properties": {
         "receipt_id": {

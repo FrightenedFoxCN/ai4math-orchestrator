@@ -119,6 +119,6 @@
 
 ## 7. 分阶段落地路线图
 
-* **Phase 1（最小闭环底座）**：Lean 4 + SMT（Z3/cvc5）主线；落地 Local Verification Broker、Comparator 门禁、基础 Claim Graph（L0–L5）及 5 角色核心权限隔离。
+* **Phase 1（最小闭环底座）**：选定主引擎（默认 Lean 4）+ SMT（Z3/cvc5）主线；落地 Local Verification Broker（沙箱 + 洁净室 `VerificationReceipt`）、基础 AND-OR Claim Graph（`L0`–`L5`）及核心角色物理权限隔离。
 * **Phase 2（双轨协作 + 分层 Wiki + 异步共驾）**：落地 Exploration/Infra 双轨（RFC + Smoke Test + Freeze Window）、三层本地 Wiki 索引（CORE/SEDIMENT/GRAVEYARD）、Decision Inbox 与 5 分钟复盘简报。
 * **Phase 3（多引擎扩展）**：通过统一 Proof-Assistant Adapter 支持项目级可配置主引擎（Lean 4 / Agda / Rocq）、`tool_automation` Hammer 子代理及剪枝前 Oracle 交叉印证门禁。

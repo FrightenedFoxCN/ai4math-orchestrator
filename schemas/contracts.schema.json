@@ -255,7 +255,13 @@
         "evidence": {
           "type": "object",
           "properties": {
-            "comparator_receipt_hash": {
+            "verification_receipt_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "receipt_sha256": {
               "type": [
                 "string",
                 "null"
@@ -268,6 +274,18 @@
               }
             },
             "counterexample_witness": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "oracle_check_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "hammer_probe_id": {
               "type": [
                 "string",
                 "null"
@@ -368,7 +386,7 @@
           "type": "string"
         },
         "engine": {
-          "$ref": "#/$defs/FormalEngine"
+          "$ref": "#/$defs/PrimaryITP"
         },
         "motivation": {
           "type": "string"
@@ -423,14 +441,15 @@
         "target_axiom",
         "target_signature",
         "logic_assumptions",
-        "reviewer_approved"
+        "reviewer_approved",
+        "adr_ref"
       ],
       "properties": {
         "bridge_id": {
           "type": "string"
         },
         "source_engine": {
-          "$ref": "#/$defs/FormalEngine"
+          "$ref": "#/$defs/PrimaryITP"
         },
         "source_commit": {
           "type": "string"
@@ -439,7 +458,7 @@
           "type": "string"
         },
         "target_engine": {
-          "$ref": "#/$defs/FormalEngine"
+          "$ref": "#/$defs/PrimaryITP"
         },
         "target_axiom": {
           "type": "string"
@@ -472,10 +491,8 @@
           "type": "boolean"
         },
         "adr_ref": {
-          "type": [
-            "string",
-            "null"
-          ]
+          "type": "string",
+          "minLength": 1
         }
       },
       "additionalProperties": false
@@ -486,7 +503,8 @@
         "claim_id",
         "title",
         "informal_statement",
-        "trust_level",
+        "local_trust_level",
+        "effective_trust_level",
         "stale"
       ],
       "properties": {
@@ -499,22 +517,59 @@
         "informal_statement": {
           "type": "string"
         },
+        "formal_signature": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "formal_target": {
           "type": [
             "string",
             "null"
           ]
         },
-        "engine": {
-          "$ref": "#/$defs/FormalEngine"
+        "module_path": {
+          "type": [
+            "string",
+            "null"
+          ]
         },
-        "trust_level": {
+        "engine": {
+          "$ref": "#/$defs/ClaimEngine"
+        },
+        "is_critical_path": {
+          "type": "boolean",
+          "default": false
+        },
+        "local_trust_level": {
           "$ref": "#/$defs/TrustLevel"
+        },
+        "effective_trust_level": {
+          "$ref": "#/$defs/TrustLevel"
+        },
+        "prior_trust_level": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/TrustLevel"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "stale": {
           "type": "boolean"
         },
-        "depends_on": {
+        "effective_stale": {
+          "type": "boolean",
+          "default": false
+        },
+        "oracle_debt": {
+          "type": "boolean",
+          "default": false
+        },
+        "active_plan_ids": {
           "type": "array",
           "items": {
             "type": "string"
@@ -531,6 +586,12 @@
             "string",
             "null"
           ]
+        },
+        "receipt_id": {
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "additionalProperties": false
@@ -540,7 +601,9 @@
       "required": [
         "inbox_id",
         "created_at",
+        "priority",
         "category",
+        "leverage_score",
         "summary",
         "options",
         "status"
@@ -553,14 +616,27 @@
           "type": "string",
           "format": "date-time"
         },
+        "priority": {
+          "type": "string",
+          "enum": [
+            "P0",
+            "P1",
+            "P2"
+          ]
+        },
         "category": {
           "type": "string",
           "enum": [
             "breaking_def_change",
             "strategy_branch_pruning",
             "hard_bottleneck_escalation",
-            "cross_engine_admission"
+            "cross_engine_admission",
+            "oracle_debt_waiver"
           ]
+        },
+        "leverage_score": {
+          "type": "number",
+          "minimum": 0
         },
         "related_claims": {
           "type": "array",
@@ -613,6 +689,101 @@
             "string",
             "null"
           ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PrimaryITP": {
+      "type": "string",
+      "enum": [
+        "lean4",
+        "agda",
+        "rocq"
+      ]
+    },
+    "ClaimEngine": {
+      "type": "string",
+      "enum": [
+        "lean4",
+        "agda",
+        "rocq",
+        "smt",
+        "atp",
+        "cas",
+        "informal"
+      ]
+    },
+    "ProofPlan": {
+      "type": "object",
+      "description": "AND-node in the AND-OR Claim Graph representing one concrete proof strategy for a target Claim.",
+      "required": [
+        "plan_id",
+        "target_claim_id",
+        "name",
+        "track",
+        "status",
+        "effective_trust_level",
+        "dependencies"
+      ],
+      "properties": {
+        "plan_id": {
+          "type": "string"
+        },
+        "target_claim_id": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        },
+        "track": {
+          "type": "string",
+          "enum": [
+            "exploration",
+            "infrastructure"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "PROVED",
+            "SUSPENDED_SOFT_PRUNE",
+            "INVALIDATED_BY_REFUTATION",
+            "ARCHIVED_BY_ADR"
+          ]
+        },
+        "effective_trust_level": {
+          "$ref": "#/$defs/TrustLevel"
+        },
+        "rfc_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "dependencies": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "dep_claim_id",
+              "dep_kind"
+            ],
+            "properties": {
+              "dep_claim_id": {
+                "type": "string"
+              },
+              "dep_kind": {
+                "type": "string",
+                "enum": [
+                  "lemma",
+                  "definition",
+                  "oracle_placeholder"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
         }
       },
       "additionalProperties": false

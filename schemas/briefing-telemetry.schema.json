@@ -275,9 +275,11 @@
           "type": "string",
           "enum": [
             "lean4",
-            "rocq",
             "agda",
+            "rocq",
             "smt",
+            "atp",
+            "cas",
             "informal"
           ]
         },
@@ -319,9 +321,8 @@
           "type": "string",
           "enum": [
             "lean4",
-            "rocq",
             "agda",
-            "smt"
+            "rocq"
           ]
         },
         "state": {
@@ -394,6 +395,12 @@
             "PATCH_DEFINITION",
             "ARCHIVE_AND_PIVOT",
             null
+          ]
+        },
+        "pinned_snapshot_id": {
+          "type": [
+            "string",
+            "null"
           ]
         }
       },
