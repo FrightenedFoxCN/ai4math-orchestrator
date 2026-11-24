@@ -6,6 +6,7 @@ use std::collections::HashSet;
 
 const BLOCKED: &str = "BLOCKED_BY_REFUTATION";
 const INVALIDATED: &str = PlanStatus::InvalidatedByRefutation.as_str();
+const ARCHIVED: &str = PlanStatus::ArchivedByAdr.as_str();
 
 /// Historical ProofPlan projection from one ledger snapshot, not proof authority.
 #[derive(Debug, Serialize)]
@@ -33,6 +34,9 @@ pub struct ReplayedPlan {
     pub blocking_claim_id: Option<String>,
     /// Direct dependency recorded by invalidation, distinct from a route blocker.
     pub refuted_claim_id: Option<String>,
+    /// ADR ID recorded by PLAN_ARCHIVED; not independently authenticated by replay.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub archived_by_adr: Option<String>,
     pub last_event_seq: i64,
 }
 
@@ -48,7 +52,7 @@ impl StateStore {
     /// cursor before creation yields no plan, not a live projection lookup.
     ///
     /// Rejects malformed or inconsistent ProofPlan histories within the shared bounded
-    /// ledger reader. Does not read live projections, infer ADR archival, or recompute
+    /// ledger reader. Does not read live projections, authenticate ADRs, or recompute
     /// authority from peer plans or claims.
     pub fn replay_plan(&self, plan_id: &str, through_event_seq: Option<i64>) -> Result<PlanReplay> {
         let mut plan = None;
@@ -105,6 +109,13 @@ struct RouteBlocked {
 #[serde(deny_unknown_fields)]
 struct RouteUnblocked {}
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Archived {
+    target: String,
+    adr_id: String,
+}
+
 pub(super) fn apply(
     state: &mut Option<ReplayedPlan>,
     id: &str,
@@ -152,11 +163,16 @@ pub(super) fn apply(
             effective_trust: Trust::L0,
             blocking_claim_id: None,
             refuted_claim_id: None,
+            archived_by_adr: None,
             last_event_seq: seq,
         });
         return Ok(());
     }
     let plan = state.as_mut().context("missing preceding PLAN_CREATED")?;
+    ensure!(
+        plan.durable_status != ARCHIVED,
+        "archived ProofPlan cannot transition"
+    );
     let live = plan.durable_status != INVALIDATED;
     match kind {
         "PLAN_TRUST_CHANGED" => {
@@ -190,6 +206,28 @@ pub(super) fn apply(
             // Invalidation's writer resets trust itself; there is no companion trust event.
             plan.effective_trust = Trust::L0;
             plan.refuted_claim_id = Some(p.refuted_claim);
+        }
+        "PLAN_ARCHIVED" => {
+            let p: Archived = serde_json::from_str(payload)?;
+            ensure!(
+                plan.durable_status == PlanStatus::Active.as_str()
+                    && plan.blocking_claim_id.is_none(),
+                "only an active, unblocked ProofPlan can be archived"
+            );
+            ensure!(p.target == plan.target_claim_id, "wrong ProofPlan target");
+            ensure!(
+                p.adr_id.strip_prefix("ADR-PIVOT-").is_some_and(|hash| {
+                    hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                }),
+                "invalid ProofPlan archival ADR ID"
+            );
+            plan.durable_status = ARCHIVED;
+            plan.archived_by_adr = Some(p.adr_id);
+            // Archive resets effective trust without a companion trust event.
+            plan.effective_trust = Trust::L0;
         }
         "PLAN_ROUTE_BLOCKED" => {
             let p: RouteBlocked = serde_json::from_str(payload)?;
@@ -293,6 +331,85 @@ mod tests {
         assert_eq!(plan.status, INVALIDATED);
         assert_eq!(plan.blocking_claim_id, None);
         assert_eq!(plan.last_event_seq, 6);
+        Ok(())
+    }
+
+    #[test]
+    fn archive_is_exact_active_only_and_terminal() -> Result<()> {
+        let adr_id = format!("ADR-PIVOT-{}", "a".repeat(64));
+        let archive = format!(r#"{{"target":"target","adr_id":"{adr_id}"}}"#);
+        let active = CREATE.replace("PROVED", "ACTIVE");
+        let mut state = None;
+        assert!(apply(&mut state, "plan", 1, "PLAN_ARCHIVED", &archive).is_err());
+        apply(&mut state, "plan", 1, "PLAN_CREATED", &active)?;
+        apply(
+            &mut state,
+            "plan",
+            2,
+            "PLAN_TRUST_CHANGED",
+            r#"{"previous":"L0","effective":"L3"}"#,
+        )?;
+        for malformed in [
+            archive.replace(r#""target":"target""#, r#""target":"other""#),
+            archive.replace(r#""target":"target","#, ""),
+            archive.replace(
+                r#""target":"target","#,
+                r#""target":"target","target":"target","#,
+            ),
+            archive.replace(&adr_id, "ADR-PIVOT-123"),
+            archive.replace(&adr_id, &"f".repeat(64)),
+            archive.replace(&adr_id, &format!("ADR-PIVOT-{}", "A".repeat(64))),
+            archive.replace(&adr_id, &format!("ADR-PIVOT-{}", "é".repeat(32))),
+            format!(r#"{{"target":"target","adr_id":"{adr_id}","extra":null}}"#),
+            format!(r#"["target","{adr_id}"]"#),
+        ] {
+            assert!(
+                apply(&mut state, "plan", 3, "PLAN_ARCHIVED", &malformed).is_err(),
+                "accepted {malformed}"
+            );
+        }
+        let live = state.as_ref().unwrap();
+        assert_eq!(live.last_event_seq, 2);
+        assert_eq!(live.effective_trust, Trust::L3);
+        assert_eq!(live.durable_status, "ACTIVE");
+        assert!(serde_json::to_value(live)?.get("archived_by_adr").is_none());
+
+        apply(&mut state, "plan", 3, "PLAN_ROUTE_BLOCKED", BLOCK)?;
+        assert!(apply(&mut state, "plan", 4, "PLAN_ARCHIVED", &archive).is_err());
+        apply(&mut state, "plan", 4, "PLAN_ROUTE_UNBLOCKED", "{}")?;
+        apply(&mut state, "plan", 5, "PLAN_ARCHIVED", &archive)?;
+        for (kind, payload) in [
+            ("PLAN_ARCHIVED", archive.as_str()),
+            ("PLAN_ROUTE_BLOCKED", BLOCK),
+            ("PLAN_ROUTE_UNBLOCKED", "{}"),
+            ("PLAN_INVALIDATED", INVALIDATE),
+            (
+                "PLAN_TRUST_CHANGED",
+                r#"{"previous":"L0","effective":"L1"}"#,
+            ),
+        ] {
+            assert!(
+                apply(&mut state, "plan", 6, kind, payload).is_err(),
+                "accepted {kind}"
+            );
+        }
+        let archived = state.unwrap();
+        assert_eq!(archived.last_event_seq, 5);
+        assert_eq!(archived.status, ARCHIVED);
+        assert_eq!(archived.durable_status, ARCHIVED);
+        assert_eq!(archived.archived_by_adr.as_deref(), Some(adr_id.as_str()));
+        assert_eq!(archived.effective_trust, Trust::L0);
+        assert_eq!(archived.dependencies.len(), 2);
+        assert_eq!(archived.blocking_claim_id, None);
+        assert_eq!(archived.refuted_claim_id, None);
+
+        let mut proved = None;
+        apply(&mut proved, "plan", 1, "PLAN_CREATED", CREATE)?;
+        assert!(apply(&mut proved, "plan", 2, "PLAN_ARCHIVED", &archive).is_err());
+        let mut invalidated = None;
+        apply(&mut invalidated, "plan", 1, "PLAN_CREATED", &active)?;
+        apply(&mut invalidated, "plan", 2, "PLAN_INVALIDATED", INVALIDATE)?;
+        assert!(apply(&mut invalidated, "plan", 3, "PLAN_ARCHIVED", &archive).is_err());
         Ok(())
     }
 

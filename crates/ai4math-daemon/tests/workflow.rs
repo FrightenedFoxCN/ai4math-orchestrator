@@ -1064,9 +1064,8 @@ fn operator_pivot_archive_observed_by_real_daemon() -> Result<()> {
     let mut listener = Rpc::new(UnixStream::connect(&socket)?)?;
     listener.call(
         "subscribe",
-        json!({"topics":["alert.p0","breaker.state_changed","vital_signs.tick"]}),
+        json!({"topics":["alert.p0","breaker.state_changed"]}),
     )?;
-    listener.event("vital_signs.tick")?;
     fixture.trip_critical()?;
     assert_eq!(listener.event("breaker.state_changed")?["entity_id"], "B");
     let alert = listener.event("alert.p0")?;
@@ -1079,6 +1078,7 @@ fn operator_pivot_archive_observed_by_real_daemon() -> Result<()> {
         listener.event("breaker.state_changed")?["entity_id"],
         "B-other"
     );
+    drop(listener);
     run(
         "task-register",
         &["leased", "exploration", "Unblocked.lean", "target"],
@@ -1211,6 +1211,13 @@ fn operator_pivot_archive_observed_by_real_daemon() -> Result<()> {
     assert!(store.pivot_intent()?.is_none());
     assert!(store.recorded_pivot(archive_id)?.is_none());
 
+    // Subscribe after the read-only preview/rejection work so ticks cannot
+    // fill a non-reading fixture's socket under concurrent workspace tests.
+    let mut listener = Rpc::new(UnixStream::connect(&socket)?)?;
+    listener.result(
+        "subscribe",
+        json!({"topics":["breaker.state_changed","vital_signs.tick"]}),
+    )?;
     let apply_args = [fact, "B", reason, archive_id];
     let applied = run("pivot-archive-apply", &apply_args)?;
     let commit = applied["git_commit"]
@@ -1364,6 +1371,370 @@ fn operator_pivot_archive_observed_by_real_daemon() -> Result<()> {
         assert!(store.task_candidate(id)?.is_none());
     }
     assert_eq!(store.status()?.last_event_seq, reviewed + 2);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires AI4MATH_TEST_CLI pointing to the built ai4math operator binary"]
+fn operator_pivot_routes_observed_by_real_daemon() -> Result<()> {
+    use ai4math_store::Trust;
+
+    let fixture = PivotWorkflow::new(&["Separate.lean"])?;
+    let (project, bare) = fixture.paths()?;
+    let git = |args: &[&str]| PivotWorkflow::git(&fixture.repo, args);
+    let run = |command, args: &[&str]| fixture.run(&[&[command, project, bare], args].concat());
+    let reject = |command, args: &[&str]| -> Result<String> {
+        let out = Command::new(&fixture.cli)
+            .args([command, project, bare])
+            .args(args)
+            .output()?;
+        assert!(
+            !out.status.success() && out.stdout.is_empty(),
+            "{command} {args:?}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        Ok(String::from_utf8(out.stderr)?)
+    };
+    let base = git(&["rev-parse", "refs/heads/main"])?;
+    let base = base.trim();
+    let runtime = fixture.root.path().join(".runtime");
+    let state = runtime.join("state.sqlite");
+    let mut store = StateStore::open(&state)?;
+    let change = Change {
+        actor: "route-archive-fixture",
+        git_commit: Some(base),
+    };
+    fixture.run(&[
+        "declare-claim",
+        project,
+        "WrongTarget",
+        "Separate.lean",
+        "target",
+        "Different definition",
+        "A different formal target with the same declaration name",
+    ])?;
+    for (id, level) in [
+        ("StrongDefinition", Trust::L3),
+        ("StrongLemma", Trust::L3),
+        ("WeakLemma", Trust::L1),
+    ] {
+        store.create_claim(
+            NewClaim {
+                id,
+                title: id,
+                informal_statement: id,
+                engine: "lean4",
+                formal_target: None,
+                module_path: None,
+                critical: false,
+            },
+            change,
+        )?;
+        store.set_local_trust(id, level, change)?;
+    }
+    store.set_local_trust("CriticalDefinition", Trust::L3, change)?;
+    for (id, target, dependencies) in [
+        (
+            "route-a",
+            "CriticalDefinition",
+            &[("StrongDefinition", "definition"), ("StrongLemma", "lemma")][..],
+        ),
+        (
+            "route-b",
+            "CriticalDefinition",
+            &[("WeakLemma", "lemma")][..],
+        ),
+        ("route-other", "WrongTarget", &[][..]),
+    ] {
+        store.create_plan(
+            NewPlan {
+                id,
+                target,
+                name: id,
+                track: "exploration",
+                status: PlanStatus::Active,
+                dependencies,
+            },
+            change,
+        )?;
+    }
+    assert_eq!(
+        store.plan_state("route-a")?,
+        Some(("ACTIVE".into(), Trust::L3))
+    );
+    assert_eq!(
+        store.plan_state("route-b")?,
+        Some(("ACTIVE".into(), Trust::L1))
+    );
+    let claim_before = store
+        .claim("CriticalDefinition")?
+        .context("fixture Claim")?;
+    assert_eq!(claim_before.effective_trust, Trust::L3);
+
+    let socket = runtime.join("ai4mathd.sock");
+    let mut child = boot(fixture.root.path())?;
+    let mut rpc = wait_connection(&socket, &mut child)?;
+    let mut listener = Rpc::new(UnixStream::connect(&socket)?)?;
+    listener.result(
+        "subscribe",
+        json!({"topics":["alert.p0","breaker.state_changed"]}),
+    )?;
+    fixture.trip_critical()?;
+    assert_eq!(listener.event("breaker.state_changed")?["entity_id"], "B");
+    let alert = listener.event("alert.p0")?;
+    assert_eq!(alert["reason_code"], "CRITICAL_BREAKER_TRIPPED");
+    run(
+        "task-register",
+        &["blocked-task", "exploration", "Spec.lean", "target"],
+    )?;
+    let db =
+        rusqlite::Connection::open_with_flags(&state, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    let task_row = || -> Result<Vec<rusqlite::types::Value>> {
+        let mut stmt = db.prepare("SELECT * FROM scheduler_tasks WHERE task_id='blocked-task'")?;
+        let n = stmt.column_count();
+        Ok(stmt.query_row([], |r| (0..n).map(|i| r.get(i)).collect())?)
+    };
+    let task_before = task_row()?;
+    assert!(store.module_breaker_gated("lean4", "Spec.lean")?);
+
+    let before = rpc.result("briefing.pull", json!({}))?;
+    let fact = before["retained_id"]
+        .as_str()
+        .context("retained Fact Pack")?;
+    let reviewed = before["fact_pack"]["event_to_inclusive"]
+        .as_i64()
+        .context("reviewed sequence")?;
+    let initial_frontier = rpc.result("frontier.list", json!({}))?;
+    let reviewed_plans = &before["fact_pack"]["frontier"]["plans"];
+    assert_eq!(reviewed_plans, &initial_frontier["plans"]);
+    assert_eq!(reviewed_plans["truncated"], false);
+    let reviewed_edges = reviewed_plans["items"]
+        .as_array()
+        .context("reviewed frontier edges")?;
+    assert_eq!(reviewed_edges.len(), 4);
+    let route_a_edges = reviewed_edges
+        .iter()
+        .filter(|edge| edge["plan_id"] == "route-a")
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(route_a_edges.len(), 2);
+    let refs = git(&["show-ref"])?;
+    let worktrees = git(&["worktree", "list", "--porcelain"])?;
+    let objects = git(&["count-objects", "-v"])?;
+
+    let reason = "Retire one proposed route while keeping the independent alternative";
+    let preview = run("pivot-routes-preview", &[fact, "B", reason, "route-a"])?;
+    let id = preview["adr_id"].as_str().context("route archive ADR ID")?;
+    assert_eq!(preview["action"], "ARCHIVE_ROUTES");
+    assert_eq!(preview["to_state"], "ARCHIVED");
+    assert_eq!(preview["plan"]["archive_plans"], preview["archive_plans"]);
+    assert_eq!(
+        preview["archive_plans"],
+        json!([{
+            "plan_id":"route-a", "target_claim_id":"CriticalDefinition", "frontier_edges":route_a_edges,
+        }])
+    );
+    let both = run(
+        "pivot-routes-preview",
+        &[fact, "B", reason, "route-b", "route-a"],
+    )?;
+    assert_eq!(
+        both,
+        run(
+            "pivot-routes-preview",
+            &[fact, "B", reason, "route-a", "route-b"]
+        )?
+    );
+    assert_eq!(both["archive_plans"][0]["plan_id"], "route-a");
+    assert_eq!(both["archive_plans"][1]["plan_id"], "route-b");
+    assert_ne!(both["adr_id"], id);
+    for (plans, diagnostic) in [
+        (&["route-other"][..], "exact eligible breaker Claim"),
+        (
+            &["route-a", "route-a"][..],
+            "duplicate selected proof plan ID",
+        ),
+        (
+            &["route-a", "route-b", "c", "d", "e", "f", "g", "h", "i"][..],
+            "select 1 to 8 valid proof plan IDs",
+        ),
+    ] {
+        let error = reject(
+            "pivot-routes-preview",
+            &[&[fact, "B", reason], plans].concat(),
+        )?;
+        assert!(error.contains(diagnostic), "{error}");
+    }
+    for (prev, apply) in [
+        ("pivot-preview", "pivot-apply"),
+        ("pivot-archive-preview", "pivot-archive-apply"),
+    ] {
+        let legacy = run(prev, &[fact, "B", reason])?;
+        assert!(legacy.get("archive_plans").is_none());
+        assert!(legacy["plan"].get("archive_plans").is_none());
+        let legacy_id = legacy["adr_id"].as_str().context("legacy ADR ID")?;
+        assert_ne!(legacy_id, id);
+        assert!(
+            reject(
+                "pivot-routes-apply",
+                &[fact, "B", reason, legacy_id, "route-a"]
+            )?
+            .contains("approval ID does not match")
+        );
+        assert!(reject(apply, &[fact, "B", reason, id])?.contains("approval ID does not match"));
+    }
+    let params = json!({"fact_sha256":fact,"breaker_id":"B","reason":reason,"approved_adr_id":id,"plan_ids":["route-a"]});
+    for method in ["pivot.routes_apply", "pivot-routes-apply"] {
+        assert_eq!(
+            rpc.call(method, params.clone())?["error"]["code"],
+            -32601,
+            "{method}"
+        );
+    }
+    assert_eq!(store.status()?.last_event_seq, reviewed);
+    assert!(store.pivot_intent()?.is_none());
+    assert_eq!(git(&["show-ref"])?, refs);
+    assert_eq!(git(&["count-objects", "-v"])?, objects);
+
+    let apply_args = [fact, "B", reason, id, "route-a"];
+    let applied = run("pivot-routes-apply", &apply_args)?;
+    assert_eq!(applied["adr_id"], id);
+    assert_eq!(applied["breaker_state"], "ARCHIVED");
+    assert_eq!(applied["probes_started"], false);
+    assert_eq!(run("pivot-routes-apply", &apply_args)?, applied);
+    for plans in [&["route-b"][..], &["route-a", "route-b"][..]] {
+        let args = [&[fact, "B", reason, id], plans].concat();
+        assert!(reject("pivot-routes-apply", &args)?.contains("replay arguments do not match"));
+    }
+    let commit = applied["git_commit"]
+        .as_str()
+        .context("landed ADR commit")?;
+    let transition = listener.event("breaker.state_changed")?;
+    assert_eq!(transition["entity_id"], "B");
+    assert_eq!(transition["event_type"], "BREAKER_ARCHIVED");
+    assert_eq!(transition["payload"]["adr_id"], id);
+    assert_eq!(transition["git_commit"], commit);
+    let later = rpc.result("briefing.peek", json!({}))?;
+    let pack = &later["fact_pack"];
+    assert_eq!(
+        pack["checkpoint"],
+        json!({"cursor_id":id,"event_seq":reviewed,"git_commit":commit,"last_adr_id":id})
+    );
+    assert_eq!(pack["breakers"]["items"][0]["state"], "ARCHIVED");
+    assert_eq!(rpc.result("inbox.list", json!({}))?["items"], json!([]));
+    let resolved: (String, String) = db.query_row(
+        "SELECT status,resolved_adr FROM decision_inbox WHERE inbox_id='DEF-B'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(resolved, ("RESOLVED".into(), id.into()));
+    assert_eq!(
+        rpc.result("alerts.list", json!({}))?["items"],
+        json!([alert])
+    );
+    assert_eq!(rpc.result("briefing.get", json!({"id":fact}))?, before);
+
+    // Archived plans remain in the frontier and historical edge set, but no longer contribute trust.
+    let mut expected_graph = initial_frontier["plans"].clone();
+    for edge in expected_graph["items"]
+        .as_array_mut()
+        .context("frontier edges")?
+    {
+        if edge["plan_id"] == "route-a" {
+            edge["plan_status"] = json!("ARCHIVED_BY_ADR");
+        }
+    }
+    assert_eq!(
+        rpc.result("frontier.list", json!({}))?["plans"],
+        expected_graph
+    );
+    assert_eq!(pack["frontier"]["plans"], expected_graph);
+    assert_eq!(
+        store.plan_state("route-a")?,
+        Some(("ARCHIVED_BY_ADR".into(), Trust::L0))
+    );
+    assert_eq!(
+        store.plan_state("route-b")?,
+        Some(("ACTIVE".into(), Trust::L1))
+    );
+    let claim_after = store
+        .claim("CriticalDefinition")?
+        .context("archived route Claim")?;
+    assert_eq!(claim_after.effective_trust, Trust::L1);
+    assert_eq!(claim_after.local_trust, claim_before.local_trust);
+    assert_eq!(claim_after.receipt_id, claim_before.receipt_id);
+    let recorded = store.events_after(reviewed, 32)?;
+    let archives = recorded
+        .iter()
+        .filter(|e| e.event_type == "PLAN_ARCHIVED")
+        .collect::<Vec<_>>();
+    assert_eq!(archives.len(), 1);
+    let event = archives[0];
+    assert_eq!(event.entity_id, "route-a");
+    assert_eq!(event.entity_type, "proof_plan");
+    assert_eq!(event.git_commit.as_deref(), Some(commit));
+    assert_eq!(
+        event.payload,
+        json!({"target":"CriticalDefinition","adr_id":id})
+    );
+    let visible = pack["events"]["items"]
+        .as_array()
+        .context("retained event page")?
+        .iter()
+        .find(|item| item["event_type"] == "PLAN_ARCHIVED")
+        .context("daemon projection of archived route event")?;
+    assert_eq!(visible, &serde_json::to_value(event)?);
+    assert!(recorded.iter().all(|e| !matches!(
+        e.event_type.as_str(),
+        "CRITICAL_BREAKER_TRIPPED" | "ALL_TRACKS_BLOCKED" | "CLAIM_TRUST_CHANGED"
+    )));
+    let replay_before = fixture.run(&["plan-replay", project, "route-a", &reviewed.to_string()])?;
+    let replay_after = fixture.run(&["plan-replay", project, "route-a"])?;
+    assert_eq!(replay_before["plan"]["status"], "ACTIVE");
+    assert_eq!(replay_after["plan"]["status"], "ARCHIVED_BY_ADR");
+    assert_eq!(replay_after["plan"]["effective_trust"], "L0");
+    assert_eq!(
+        replay_after["plan"]["dependencies"],
+        replay_before["plan"]["dependencies"]
+    );
+    assert_eq!(fixture.run(&["graph-audit", project])?["consistent"], true);
+
+    let adr = format!("docs/adr/{id}.md");
+    assert_eq!(
+        git(&[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            base,
+            commit
+        ])?,
+        format!("A\t{adr}\n")
+    );
+    assert_eq!(
+        git(&["show", &format!("{commit}:{adr}")])?,
+        preview["adr_markdown"]
+    );
+    assert_eq!(git(&["rev-parse", &format!("{commit}^1")])?.trim(), base);
+    assert_eq!(
+        git(&["show-ref"])?,
+        refs.replace(
+            &format!("{base} refs/heads/main"),
+            &format!("{commit} refs/heads/main")
+        )
+    );
+    assert_eq!(git(&["worktree", "list", "--porcelain"])?, worktrees);
+    assert_eq!(
+        PivotWorkflow::git(
+            &fixture.source,
+            &["status", "--porcelain", "--untracked-files=all"]
+        )?,
+        ""
+    );
+    assert_eq!(task_row()?, task_before);
+    assert!(store.module_breaker_gated("lean4", "Spec.lean")?);
+    assert!(store.pivot_intent()?.is_none());
     Ok(())
 }
 

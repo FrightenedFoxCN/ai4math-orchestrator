@@ -1,7 +1,7 @@
 //! Shared verification of content-addressed briefing fact packs.
 
-use crate::Checkpoint;
 pub use crate::{BreakerProjection as ReviewedBreaker, InboxProjection as ReviewedInbox};
+use crate::{Checkpoint, FrontierEdge};
 use anyhow::{Context, Result, ensure};
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
@@ -30,6 +30,8 @@ pub struct RetainedReview {
     pub presentation_truncated: bool,
     pub breakers: Vec<ReviewedBreaker>,
     pub inbox: Vec<ReviewedInbox>,
+    /// Only the displayed edge rows; a route selection must prove completeness against the ledger.
+    pub frontier_edges: Vec<FrontierEdge>,
 }
 
 impl RetainedReview {
@@ -91,6 +93,7 @@ fn review_metadata(pack: &Value) -> Result<RetainedReview> {
         presentation_truncated,
         breakers,
         inbox,
+        frontier_edges: field(pack, "/frontier/plans/items")?,
     })
 }
 

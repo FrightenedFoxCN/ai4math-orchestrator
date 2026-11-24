@@ -8,7 +8,9 @@ use crate::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+mod archive_routes;
 mod critical_routes;
+pub use archive_routes::PivotArchivePlan;
 
 pub(crate) const CRITICAL_BREAKER_TRIPPED: &str = "CRITICAL_BREAKER_TRIPPED";
 
@@ -26,6 +28,7 @@ pub enum PivotAction {
     #[default]
     ResumeAsIs,
     ArchiveBreaker,
+    ArchiveRoutes,
 }
 
 impl PivotAction {
@@ -33,13 +36,14 @@ impl PivotAction {
         match self {
             Self::ResumeAsIs => "RESUME_AS_IS",
             Self::ArchiveBreaker => "ARCHIVE_BREAKER",
+            Self::ArchiveRoutes => "ARCHIVE_ROUTES",
         }
     }
 
     pub const fn target_state(self) -> &'static str {
         match self {
             Self::ResumeAsIs => "HALF_OPEN",
-            Self::ArchiveBreaker => "ARCHIVED",
+            Self::ArchiveBreaker | Self::ArchiveRoutes => "ARCHIVED",
         }
     }
 
@@ -51,6 +55,7 @@ impl PivotAction {
         match self {
             Self::ResumeAsIs => "RESUME_AS_IS/v1",
             Self::ArchiveBreaker => "ARCHIVE_BREAKER/v1",
+            Self::ArchiveRoutes => "ARCHIVE_ROUTES/v1",
         }
     }
 }
@@ -71,11 +76,50 @@ pub struct PivotPlan {
     // Resume plans are also the legacy on-disk ADR identity input. Preserve their bytes.
     #[serde(default, skip_serializing_if = "PivotAction::is_resume")]
     pub action: PivotAction,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub archive_plans: Vec<PivotArchivePlan>,
     target_sha256: String,
 }
 
 impl PivotPlan {
+    /// Reviewed route IDs in the canonical approval order.
+    pub fn archive_plan_ids(&self) -> impl Iterator<Item = &str> {
+        self.archive_plans.iter().map(|plan| plan.plan_id.as_str())
+    }
+
+    /// Validate the requested selection and return it sorted by exact plan ID.
+    pub fn normalize_archive_plan_ids<'a>(ids: &[&'a str]) -> Result<Vec<&'a str>> {
+        ensure!(
+            (1..=8).contains(&ids.len()) && ids.iter().all(|id| safe_text(id, 256)),
+            "select 1 to 8 valid proof plan IDs"
+        );
+        let mut sorted = ids.to_vec();
+        sorted.sort_unstable();
+        ensure!(
+            sorted.windows(2).all(|pair| pair[0] != pair[1]),
+            "duplicate selected proof plan ID"
+        );
+        Ok(sorted)
+    }
+
+    fn validate_archive_selection(&self) -> Result<()> {
+        if self.action == PivotAction::ArchiveRoutes {
+            let ids: Vec<_> = self.archive_plan_ids().collect();
+            ensure!(
+                Self::normalize_archive_plan_ids(&ids)? == ids,
+                "noncanonical proof plan selection"
+            );
+        } else {
+            ensure!(
+                self.archive_plans.is_empty(),
+                "route selection requires ARCHIVE_ROUTES"
+            );
+        }
+        Ok(())
+    }
+
     pub fn adr_id(&self) -> Result<String> {
+        self.validate_archive_selection()?;
         Ok(format!(
             "ADR-PIVOT-{}",
             digest(&(self.action.adr_domain(), self))?
@@ -188,7 +232,17 @@ fn confirm_context(db: &Connection, plan: &PivotPlan, before_cas: bool) -> Resul
     }
     let (breaker, inbox, hash) = read_target(db, &plan.breaker.breaker_id)?;
     ensure!(
-        breaker == plan.breaker && inbox.inbox_id == plan.inbox_id && hash == plan.target_sha256,
+        breaker == plan.breaker && inbox.inbox_id == plan.inbox_id,
+        "selected Pivot target changed since review"
+    );
+    plan.validate_archive_selection()?;
+    let hash = if plan.action == PivotAction::ArchiveRoutes {
+        archive_routes::confirm(db, &breaker, &hash, &plan.archive_plans)?
+    } else {
+        hash
+    };
+    ensure!(
+        hash == plan.target_sha256,
         "selected Pivot target changed since review"
     );
     Ok(())
@@ -301,6 +355,46 @@ impl StateStore {
         action: PivotAction,
     ) -> Result<PivotPlan> {
         ensure!(
+            action != PivotAction::ArchiveRoutes,
+            "ARCHIVE_ROUTES requires explicit route IDs"
+        );
+        self.preview_selection(repo, base, fact, review, breaker_id, reason, (action, &[]))
+    }
+
+    /// Preview an operator archive of an exact, reviewed proof-plan selection.
+    pub fn preview_archive_routes(
+        &mut self,
+        repo: &str,
+        base: &str,
+        fact: &str,
+        review: &RetainedReview,
+        breaker_id: &str,
+        reason: &str,
+        plan_ids: &[&str],
+    ) -> Result<PivotPlan> {
+        let sorted = PivotPlan::normalize_archive_plan_ids(plan_ids)?;
+        self.preview_selection(
+            repo,
+            base,
+            fact,
+            review,
+            breaker_id,
+            reason,
+            (PivotAction::ArchiveRoutes, &sorted),
+        )
+    }
+
+    fn preview_selection(
+        &mut self,
+        repo: &str,
+        base: &str,
+        fact: &str,
+        review: &RetainedReview,
+        breaker_id: &str,
+        reason: &str,
+        (action, plan_ids): (PivotAction, &[&str]),
+    ) -> Result<PivotPlan> {
+        ensure!(
             oid(base) && fact.len() == 64 && oid(fact) && valid_id(breaker_id) && reason_ok(reason),
             "invalid Pivot approval inputs"
         );
@@ -330,6 +424,11 @@ impl StateStore {
                 && review.reviewed_inbox(&inbox.inbox_id) == Some(&inbox),
             "selected breaker and linked inbox must both appear unchanged in retained review"
         );
+        let (archive_plans, target_sha256) = if action == PivotAction::ArchiveRoutes {
+            archive_routes::preview(&tx, &breaker, &target_sha256, review, plan_ids)?
+        } else {
+            (Vec::new(), target_sha256)
+        };
         let plan = PivotPlan {
             repo: repo.into(),
             base_commit: base.into(),
@@ -342,6 +441,7 @@ impl StateStore {
             inbox_id: inbox.inbox_id,
             decision_reason: reason.into(),
             action,
+            archive_plans,
             target_sha256,
         };
         tx.commit()?;
@@ -410,9 +510,12 @@ impl StateStore {
                     transition["probe_status"] = json!("AWAITING_REVIEW");
                     "BREAKER_STATE_CHANGED"
                 }
-                PivotAction::ArchiveBreaker => "BREAKER_ARCHIVED",
+                PivotAction::ArchiveBreaker | PivotAction::ArchiveRoutes => "BREAKER_ARCHIVED",
             };
             event(tx,change,breaker_event,"breaker",&p.breaker.breaker_id,transition)?;
+            if p.action == PivotAction::ArchiveRoutes {
+                archive_routes::land(tx, change, id, &p.archive_plans)?;
+            }
             tx.execute(&format!("UPDATE decision_inbox SET status='RESOLVED',resolved_adr=?2,resolved_at={NOW} WHERE inbox_id=?1"),params![p.inbox_id,id])?;
             tx.execute("UPDATE human_checkpoints SET is_current=0 WHERE is_current=1",[])?;
             // Never hide events that arrived between a successful CAS and recovery.
@@ -513,6 +616,7 @@ mod tests {
             presentation_truncated: false,
             breakers: facts.breakers.items,
             inbox: facts.inbox.items,
+            frontier_edges: facts.frontier.plans.items,
         };
         let resume = store.preview_resume(repo, &base, &fact, &review, "chosen", "reviewed")?;
         assert_eq!(resume.action, PivotAction::ResumeAsIs);

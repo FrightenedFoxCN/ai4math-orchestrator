@@ -99,7 +99,7 @@ fn post_cas_recovery_preserves_unreviewed_events_and_finalizes_once() -> Result<
             &id,
             B,
             REASON,
-            PivotAction::ResumeAsIs,
+            Selection::just(PivotAction::ResumeAsIs),
         )?;
         let pin = repo.pivot_pending_ref(&state)?;
         let intent = prepare(&mut store, &repo, &pin, p)?;
@@ -222,7 +222,7 @@ fn stale_unadopted_plan_cannot_land_and_requires_fresh_human_review() -> Result<
             &facts,
             B,
             REASON,
-            PivotAction::ResumeAsIs,
+            Selection::just(PivotAction::ResumeAsIs),
         )?;
         let pin = git.pivot_pending_ref(&state)?;
         prepare(&mut store, &git, &pin, p)?
@@ -247,7 +247,7 @@ fn stale_unadopted_plan_cannot_land_and_requires_fresh_human_review() -> Result<
             &fresh,
             B,
             REASON,
-            PivotAction::ResumeAsIs,
+            Selection::just(PivotAction::ResumeAsIs),
         )?
         .adr_id()?
     };
@@ -294,7 +294,7 @@ fn main_movement_between_prepare_and_recovery_requires_no_state_change() -> Resu
             &facts,
             B,
             REASON,
-            PivotAction::ResumeAsIs,
+            Selection::just(PivotAction::ResumeAsIs),
         )?;
         let pin = git.pivot_pending_ref(&state)?;
         prepare(&mut store, &git, &pin, p)?
@@ -346,7 +346,7 @@ fn archive_recovery_validates_adr_and_keeps_scope_gated_after_git_cas() -> Resul
             &fact,
             B,
             REASON,
-            PivotAction::ResumeAsIs,
+            Selection::just(PivotAction::ResumeAsIs),
         )?;
         let archive = plan(
             root,
@@ -355,7 +355,7 @@ fn archive_recovery_validates_adr_and_keeps_scope_gated_after_git_cas() -> Resul
             &fact,
             B,
             REASON,
-            PivotAction::ArchiveBreaker,
+            Selection::just(PivotAction::ArchiveBreaker),
         )?;
         assert_ne!(resume.adr_id()?, archive.adr_id()?);
         assert_eq!(git.main_head()?, archive.base_commit);
@@ -443,5 +443,129 @@ fn archive_recovery_validates_adr_and_keeps_scope_gated_after_git_cas() -> Resul
     )?;
     recover(root, &repo)?;
     assert_eq!(store.status()?.last_event_seq, latest);
+    Ok(())
+}
+
+#[test]
+fn approved_route_batch_recovers_after_git_cas_and_replays_exact_ids() -> Result<()> {
+    use ai4math_store::{NewPlan, PlanStatus};
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let repo = setup(root)?;
+    let db = root.join(".runtime/state.sqlite");
+    let approved_plans = ["B-route", "A-route"];
+    let (intent, untouched_event) = {
+        let mut state = StateStore::open(&db)?;
+        let git = PromotionRepo::lock(&repo)?;
+        let base = git.main_head()?;
+        for id in ["A-route", "B-route", "Untouched-route"] {
+            state.create_plan(
+                NewPlan {
+                    id,
+                    target: "CriticalDefinition",
+                    name: id,
+                    track: "exploration",
+                    status: PlanStatus::Active,
+                    dependencies: &[],
+                },
+                Change {
+                    actor: "fixture",
+                    git_commit: Some(&base),
+                },
+            )?;
+        }
+        let fact = retain(root, serde_json::to_value(state.briefing_facts()?)?)?;
+        let choose = |plan_ids| Selection {
+            action: PivotAction::ArchiveRoutes,
+            plan_ids,
+        };
+        let p = plan(
+            root,
+            &git,
+            &mut state,
+            &fact,
+            B,
+            REASON,
+            choose(&approved_plans),
+        )?;
+        let reversed = plan(
+            root,
+            &git,
+            &mut state,
+            &fact,
+            B,
+            REASON,
+            choose(&["A-route", "B-route"]),
+        )?;
+        assert_eq!(p.adr_id()?, reversed.adr_id()?);
+        assert_eq!(
+            p.archive_plan_ids().collect::<Vec<_>>(),
+            ["A-route", "B-route"]
+        );
+        let md = markdown(&p)?;
+        assert!(md.contains("ARCHIVE_ROUTES") && md.contains("A-route") && md.contains("B-route"));
+        assert!(!md.contains("Untouched-route"));
+        let pin = git.pivot_pending_ref(&db)?;
+        let intent = prepare(&mut state, &git, &pin, p)?;
+        git.advance_adr(&base, &intent.new_commit, &intent.adr_id, &md)?;
+        assert_eq!(state.plan_state("A-route")?.unwrap().0, "ACTIVE");
+        let untouched_event = fixture_event(&mut state)?;
+        (intent, untouched_event)
+    };
+    recover(root, &repo)?;
+    let mut state = StateStore::open(&db)?;
+    let report = state.audit_graph()?;
+    assert!(report.consistent, "{report:#?}");
+    for id in approved_plans {
+        let old = state
+            .replay_plan(id, Some(intent.plan.reviewed_through))?
+            .plan
+            .context("missing historical route")?;
+        let new = state
+            .replay_plan(id, None)?
+            .plan
+            .context("missing archived route")?;
+        assert_eq!(old.durable_status, "ACTIVE");
+        assert_eq!(new.durable_status, "ARCHIVED_BY_ADR");
+        assert_eq!(new.archived_by_adr.as_deref(), Some(intent.adr_id.as_str()));
+    }
+    assert_eq!(state.plan_state("Untouched-route")?.unwrap().0, "ACTIVE");
+    assert!(
+        state
+            .briefing_facts()?
+            .events
+            .items
+            .iter()
+            .any(|e| e.event_seq == untouched_event)
+    );
+    let done = state.status()?.last_event_seq;
+    for wrong in [
+        vec!["A-route"],
+        vec!["A-route", "Untouched-route"],
+        vec!["A-route", "A-route"],
+    ] {
+        assert!(
+            apply_routes(
+                root,
+                &repo,
+                &intent.plan.fact_sha256,
+                B,
+                REASON,
+                &intent.adr_id,
+                &wrong
+            )
+            .is_err()
+        );
+    }
+    apply_routes(
+        root,
+        &repo,
+        &intent.plan.fact_sha256,
+        B,
+        REASON,
+        &intent.adr_id,
+        &approved_plans,
+    )?;
+    assert_eq!(state.status()?.last_event_seq, done);
     Ok(())
 }

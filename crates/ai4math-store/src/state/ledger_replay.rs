@@ -145,7 +145,7 @@ pub(super) fn replay_graph_rows_in_snapshot(
                    WHEN (entity_type='proof_plan' AND CAST(event_type AS TEXT) GLOB 'PLAN_*')
                         OR CAST(event_type AS TEXT) IN (
                           'PLAN_CREATED','PLAN_TRUST_CHANGED','PLAN_INVALIDATED',
-                          'PLAN_ROUTE_BLOCKED','PLAN_ROUTE_UNBLOCKED'
+                          'PLAN_ROUTE_BLOCKED','PLAN_ROUTE_UNBLOCKED','PLAN_ARCHIVED'
                         ) THEN 'proof_plan'
                  END AS expected_entity
                FROM events NOT INDEXED WHERE event_seq<=:through_seq

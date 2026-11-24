@@ -49,6 +49,21 @@ pub(crate) fn trip(
     )
 }
 
+#[derive(Clone, Copy)]
+struct Selection<'a> {
+    action: PivotAction,
+    plan_ids: &'a [&'a str],
+}
+
+impl Selection<'_> {
+    fn just(action: PivotAction) -> Self {
+        Self {
+            action,
+            plan_ids: &[],
+        }
+    }
+}
+
 fn plan(
     root: &Path,
     git: &PromotionRepo,
@@ -56,20 +71,24 @@ fn plan(
     fact: &str,
     breaker: &str,
     reason: &str,
-    action: PivotAction,
+    selection: Selection<'_>,
 ) -> Result<PivotPlan> {
     let base = git.main_head()?;
     let review = read_retained_review(&root.join(".runtime/briefings"), fact)?
         .context("retained Fact Pack not found; pull a human briefing first")?;
-    let plan = store.preview_pivot(
-        repo_name(git)?,
-        &base,
-        fact,
-        &review,
-        breaker,
-        reason,
-        action,
-    )?;
+    let repo = repo_name(git)?;
+    let plan = match selection.action {
+        PivotAction::ArchiveRoutes => store.preview_archive_routes(
+            repo,
+            &base,
+            fact,
+            &review,
+            breaker,
+            reason,
+            selection.plan_ids,
+        )?,
+        action => store.preview_pivot(repo, &base, fact, &review, breaker, reason, action)?,
+    };
     if let Some(c) = plan.checkpoint.as_ref() {
         ensure!(
             git.is_ancestor(&c.git_commit, &base)?,
@@ -90,6 +109,9 @@ fn markdown(p: &PivotPlan) -> Result<String> {
         PivotAction::ArchiveBreaker => {
             "The approved breaker moves from TRIPPED to ARCHIVED, and its linked decision is resolved. Its module remains gated. No worktree, task, route, Claim, proof or mathematical definition changes."
         }
+        PivotAction::ArchiveRoutes => {
+            "The approved breaker remains gated as ARCHIVED. Only the explicitly selected ProofPlans are archived; dependency records are kept and derived Claim/route status is recomputed. No worktree, task, mathematical source, local Claim trust or proof receipt is changed."
+        }
     };
     let mut s = format!(
         "# {id}: {action}\n\n- Base Git commit: {}\n- Retained Fact Pack SHA-256: {}\n- Reviewed event interval: ({}, {}]\n- Pack presentation truncated: {}\n\n{effect}\n\n## Approved decision\n\n",
@@ -101,7 +123,10 @@ fn markdown(p: &PivotPlan) -> Result<String> {
     );
     // Treat model/workspace-sourced labels and the operator's explanation as
     // literal evidence, not active Markdown or directives.
-    let decision = json!({"breaker_id":p.breaker.breaker_id,"definition_id":p.breaker.target_definition_id,"module_path":p.breaker.module_path,"engine":p.breaker.engine,"inbox_id":p.inbox_id,"previous_checkpoint":p.checkpoint,"reason":p.decision_reason});
+    let mut decision = json!({"breaker_id":p.breaker.breaker_id,"definition_id":p.breaker.target_definition_id,"module_path":p.breaker.module_path,"engine":p.breaker.engine,"inbox_id":p.inbox_id,"previous_checkpoint":p.checkpoint,"reason":p.decision_reason});
+    if p.action == PivotAction::ArchiveRoutes {
+        decision["archive_plans"] = serde_json::to_value(&p.archive_plans)?;
+    }
     for line in serde_json::to_string_pretty(&decision)?.lines() {
         s.push_str("    ");
         s.push_str(line);
@@ -118,12 +143,47 @@ pub(crate) fn preview(
     reason: &str,
     action: PivotAction,
 ) -> Result<()> {
+    preview_with(root, repo, fact, breaker, reason, Selection::just(action))
+}
+
+pub(crate) fn preview_routes(
+    root: &Path,
+    repo: &Path,
+    fact: &str,
+    breaker: &str,
+    reason: &str,
+    plan_ids: &[&str],
+) -> Result<()> {
+    preview_with(
+        root,
+        repo,
+        fact,
+        breaker,
+        reason,
+        Selection {
+            action: PivotAction::ArchiveRoutes,
+            plan_ids,
+        },
+    )
+}
+
+fn preview_with(
+    root: &Path,
+    repo: &Path,
+    fact: &str,
+    breaker: &str,
+    reason: &str,
+    selection: Selection<'_>,
+) -> Result<()> {
     let git = PromotionRepo::lock(repo)?;
     let mut store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
-    let p = plan(root, &git, &mut store, fact, breaker, reason, action)?;
-    print_json(
-        json!({"adr_id":p.adr_id()?,"action":action.as_str(),"to_state":action.target_state(),"probe_tasks":[],"stopped_tasks":[],"tainted_claims":[],"archived_claims":[],"new_tasks":[],"plan":p,"adr_markdown":markdown(&p)?}),
-    )
+    let p = plan(root, &git, &mut store, fact, breaker, reason, selection)?;
+    let action = p.action;
+    let mut preview = json!({"adr_id":p.adr_id()?,"action":action.as_str(),"to_state":action.target_state(),"probe_tasks":[],"stopped_tasks":[],"tainted_claims":[],"archived_claims":[],"new_tasks":[],"plan":p,"adr_markdown":markdown(&p)?});
+    if action == PivotAction::ArchiveRoutes {
+        preview["archive_plans"] = serde_json::to_value(&p.archive_plans)?;
+    }
+    print_json(preview)
 }
 
 fn cleanup(pin: &PendingRef<'_>, commit: &str) {
@@ -208,16 +268,66 @@ pub(crate) fn apply(
     approved_id: &str,
     action: PivotAction,
 ) -> Result<()> {
+    apply_with(
+        root,
+        repo,
+        fact,
+        breaker,
+        reason,
+        approved_id,
+        Selection::just(action),
+    )
+}
+
+pub(crate) fn apply_routes(
+    root: &Path,
+    repo: &Path,
+    fact: &str,
+    breaker: &str,
+    reason: &str,
+    approved_id: &str,
+    plan_ids: &[&str],
+) -> Result<()> {
+    apply_with(
+        root,
+        repo,
+        fact,
+        breaker,
+        reason,
+        approved_id,
+        Selection {
+            action: PivotAction::ArchiveRoutes,
+            plan_ids,
+        },
+    )
+}
+
+fn apply_with(
+    root: &Path,
+    repo: &Path,
+    fact: &str,
+    breaker: &str,
+    reason: &str,
+    approved_id: &str,
+    selection: Selection<'_>,
+) -> Result<()> {
     let git = PromotionRepo::lock(repo)?;
     let state_path = root.join(".runtime/state.sqlite");
     let mut store = StateStore::open(&state_path)?;
     if let Some((p, r)) = store.recorded_pivot(approved_id)? {
+        let identical_selection = if selection.action == PivotAction::ArchiveRoutes {
+            p.archive_plan_ids()
+                .eq(PivotPlan::normalize_archive_plan_ids(selection.plan_ids)?)
+        } else {
+            p.archive_plan_ids().next().is_none()
+        };
         ensure!(
             repo_name(&git)? == p.repo
                 && fact == p.fact_sha256
                 && breaker == p.breaker.breaker_id
                 && reason == p.decision_reason
-                && p.action == action
+                && p.action == selection.action
+                && identical_selection
                 && p.adr_id()? == approved_id,
             "Pivot replay arguments do not match the committed approval"
         );
@@ -228,7 +338,7 @@ pub(crate) fn apply(
         );
         return print_json(r);
     }
-    let p = plan(root, &git, &mut store, fact, breaker, reason, action)?;
+    let p = plan(root, &git, &mut store, fact, breaker, reason, selection)?;
     ensure!(
         p.adr_id()? == approved_id,
         "approval ID does not match current Pivot preview"

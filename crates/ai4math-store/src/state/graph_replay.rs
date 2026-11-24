@@ -222,7 +222,9 @@ fn take_state<T>(states: &mut BTreeMap<String, T>, id: &str) -> (String, Option<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Change, NewClaim};
+    use crate::{Change, NewClaim, NewPlan, PlanStatus, Trust};
+    use rusqlite::params;
+    use serde_json::json;
 
     fn create_claim(store: &mut StateStore, id: &str) -> Result<()> {
         store.create_claim(
@@ -240,6 +242,142 @@ mod tests {
                 git_commit: None,
             },
         )
+    }
+
+    #[test]
+    fn archive_replays_with_graph_parity_and_no_new_refutation_alerts() -> Result<()> {
+        let mut store = StateStore::open(":memory:")?;
+        let fixture = Change {
+            actor: "test",
+            git_commit: None,
+        };
+        for (id, critical) in [
+            ("target", true),
+            ("dep", false),
+            ("refuted", false),
+            ("next", true),
+        ] {
+            store.create_claim(
+                NewClaim {
+                    id,
+                    title: id,
+                    informal_statement: id,
+                    engine: "lean4",
+                    module_path: None,
+                    formal_target: None,
+                    critical,
+                },
+                fixture,
+            )?;
+            store.set_local_trust(id, Trust::L3, fixture)?;
+        }
+        for (id, target, dep) in [
+            ("route", "target", "dep"),
+            ("invalidated", "target", "refuted"),
+            ("downstream", "next", "target"),
+        ] {
+            store.create_plan(
+                NewPlan {
+                    id,
+                    target,
+                    name: id,
+                    track: "exploration",
+                    status: PlanStatus::Active,
+                    dependencies: &[(dep, "lemma")],
+                },
+                fixture,
+            )?;
+        }
+        store.write(|tx| super::super::apply_refutation(tx, "refuted", "graveyard", fixture))?;
+        let before = store.replay_plan("route", None)?;
+        assert_eq!(before.plan.as_ref().unwrap().effective_trust, Trust::L3);
+        assert_eq!(store.claim("target")?.unwrap().effective_trust, Trust::L3);
+
+        let archive = json!({"target":"target", "adr_id":format!("ADR-PIVOT-{}", "a".repeat(64))});
+        let append_error = store
+            .append_event(
+                fixture,
+                "PLAN_ARCHIVED",
+                "proof_plan",
+                "route",
+                archive.clone(),
+            )
+            .unwrap_err();
+        assert!(append_error.to_string().contains("finalized ADR"));
+        let archive_seq = store.write(|tx| {
+            tx.execute(
+                "UPDATE proof_plans SET status='ARCHIVED_BY_ADR',effective_trust_level='L0' WHERE plan_id='route'",
+                [],
+            )?;
+            let archive_seq = super::super::event(tx, fixture, "PLAN_ARCHIVED", "proof_plan", "route", archive)?;
+            super::super::recompute_without_route_alerts(tx, fixture)?;
+            Ok(archive_seq)
+        })?;
+        assert_eq!(archive_seq, before.through_event_seq + 1);
+        for cursor in [archive_seq, store.replay_graph(None)?.ledger_head_event_seq] {
+            let single = store.replay_plan("route", Some(cursor))?;
+            let plan = single.plan.as_ref().unwrap();
+            assert_eq!(plan.status, "ARCHIVED_BY_ADR");
+            assert_eq!(plan.effective_trust, Trust::L0);
+            assert_eq!(plan.last_event_seq, archive_seq);
+            assert_eq!(single.applied_events, before.applied_events + 1);
+            let graph = store.replay_graph(Some(cursor))?;
+            assert_eq!(graph.dependency_edge_count, 3);
+            let graph_route = graph
+                .plans
+                .iter()
+                .find(|plan| plan.plan_id == "route")
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(graph_route)?,
+                serde_json::to_value(plan)?
+            );
+        }
+        let head = store.replay_graph(None)?;
+        for id in ["target", "next"] {
+            let claim = head
+                .claims
+                .iter()
+                .find(|claim| claim.claim_id == id)
+                .unwrap();
+            assert!(claim.routes_exhausted);
+            assert_eq!(claim.local_trust, Trust::L3);
+            assert_eq!(claim.effective_trust, Trust::L0);
+        }
+        let p0: i64 = store.db.query_row(
+            "SELECT COUNT(*) FROM decision_inbox WHERE priority='P0'",
+            [],
+            |r| r.get(0),
+        )?;
+        let alerts: i64 = store.db.query_row(
+            "SELECT COUNT(*) FROM events WHERE event_type='CRITICAL_CLAIM_REFUTED'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert_eq!((p0, alerts), (0, 0));
+        assert!(store.audit_graph()?.consistent);
+        assert!(store.check_graph()?.consistent);
+        Ok(())
+    }
+
+    #[test]
+    fn graph_replay_rejects_archive_event_on_wrong_entity() -> Result<()> {
+        let store = StateStore::open(":memory:")?;
+        store.db.execute(
+            "INSERT INTO events (occurred_at,event_type,entity_type,entity_id,actor,payload_json)
+             VALUES ('timestamp','PLAN_ARCHIVED','claim','not-a-plan','test',?1)",
+            params![
+                json!({"target":"target", "adr_id":format!("ADR-PIVOT-{}", "a".repeat(64))})
+                    .to_string()
+            ],
+        )?;
+        let error = store.replay_graph(None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("expected entity type proof_plan")
+        );
+        Ok(())
     }
 
     #[test]

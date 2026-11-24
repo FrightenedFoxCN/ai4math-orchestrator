@@ -36,6 +36,8 @@ ai4math pivot-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
 ai4math pivot-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID
 ai4math pivot-archive-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
 ai4math pivot-archive-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID
+ai4math pivot-routes-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON PLAN...
+ai4math pivot-routes-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID PLAN...
 ai4math pivot-recover ROOT BARE_REPO
 ai4math pivot-abandon ROOT BARE_REPO APPROVED_ADR_ID
 ai4math breaker-probes-preview ROOT BARE_REPO BREAKER THEOREM [THEOREM]
@@ -1058,6 +1060,33 @@ fn run() -> Result<()> {
                 action,
             )
         }
+        [
+            "pivot-routes-preview",
+            root,
+            repo,
+            fact,
+            id,
+            reason,
+            plans @ ..,
+        ] => pivot::preview_routes(Path::new(root), Path::new(repo), fact, id, reason, plans),
+        [
+            "pivot-routes-apply",
+            root,
+            repo,
+            fact,
+            id,
+            reason,
+            approved,
+            plans @ ..,
+        ] => pivot::apply_routes(
+            Path::new(root),
+            Path::new(repo),
+            fact,
+            id,
+            reason,
+            approved,
+            plans,
+        ),
         ["pivot-recover", root, repo] => pivot::recover(Path::new(root), Path::new(repo)),
         ["pivot-abandon", root, repo, id] => pivot::abandon(Path::new(root), Path::new(repo), id),
         ["breaker-probes-preview", root, repo, id, cases @ ..] => {

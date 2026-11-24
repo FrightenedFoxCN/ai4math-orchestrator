@@ -42,7 +42,9 @@ pub use graph_audit::{GraphAudit, GraphMismatch, GraphMismatchKind};
 pub use graph_check::{GraphSemanticCheck, GraphSemanticMismatch};
 pub use graph_replay::GraphReplay;
 pub use oracle::{OracleApproval, RetainedOracleObservation};
-pub use pivot::{BreakerTripReport, PivotAction, PivotIntent, PivotPlan, PivotResult};
+pub use pivot::{
+    BreakerTripReport, PivotAction, PivotArchivePlan, PivotIntent, PivotPlan, PivotResult,
+};
 pub use plan_replay::{PlanReplay, ReplayedPlan, ReplayedPlanDependency};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
 pub use reviewed_lean::{LeanSpecComparison, LeanSpecRecheck, ReviewedLeanSpec};
@@ -675,6 +677,7 @@ impl StateStore {
                 kind,
                 "PIVOT_APPLIED"
                     | "BREAKER_ARCHIVED"
+                    | "PLAN_ARCHIVED"
                     | "BREAKER_PROBES_ARMED"
                     | "BREAKER_PROBES_STARTED"
                     | "BREAKER_PROBES_FAILED"
@@ -1866,6 +1869,7 @@ fn refresh_route_blocks(
     order: &[String],
     claims: &BTreeMap<String, ClaimState>,
     change: Change<'_>,
+    alert_on_exhaustion: bool,
 ) -> Result<BTreeMap<String, String>> {
     let mut routed=tx.prepare("SELECT plan_id,status FROM proof_plans WHERE target_claim_id=?1 AND status<>'ARCHIVED_BY_ADR' ORDER BY plan_id")?;
     let mut deps = tx.prepare(
@@ -1957,7 +1961,8 @@ fn refresh_route_blocks(
                 id,
                 json!({"refuted_claim":cause}),
             )?;
-            if claims[id].critical
+            if alert_on_exhaustion
+                && claims[id].critical
                 && (change.actor != "migration:route-projection"
                     || !legacy_exhaustion_alert_exists(tx, id)?)
             {
@@ -2121,9 +2126,23 @@ fn module_graph(db: &Connection) -> Result<Dag> {
 }
 
 fn recompute(tx: &Transaction<'_>, change: Change<'_>) -> Result<()> {
+    recompute_graph(tx, change, true)
+}
+
+/// An approved route archive can expose existing refuted alternatives. Record
+/// derived exhaustion, but do not open a new critical refutation alert for the ADR.
+fn recompute_without_route_alerts(tx: &Transaction<'_>, change: Change<'_>) -> Result<()> {
+    recompute_graph(tx, change, false)
+}
+
+fn recompute_graph(
+    tx: &Transaction<'_>,
+    change: Change<'_>,
+    alert_on_exhaustion: bool,
+) -> Result<()> {
     let mut claims = all_claims(tx)?;
     let order = graph_order(tx)?;
-    let blocked = refresh_route_blocks(tx, &order, &claims, change)?;
+    let blocked = refresh_route_blocks(tx, &order, &claims, change, alert_on_exhaustion)?;
     let mut plans = tx.prepare("SELECT plan_id,status,effective_trust_level FROM proof_plans WHERE target_claim_id=?1 ORDER BY plan_id")?;
     let mut deps = tx.prepare(
         "SELECT dep_claim_id FROM plan_dependencies WHERE plan_id=?1 ORDER BY dep_claim_id",

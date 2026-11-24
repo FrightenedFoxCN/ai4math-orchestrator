@@ -62,7 +62,7 @@ pub struct FrontierClaim {
     pub wiki_id: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FrontierEdge {
     pub target_claim_id: String,
     pub plan_id: String,
@@ -408,6 +408,7 @@ fn event_payload(kind: &str, raw: Option<Value>) -> Map<String, Value> {
         "ALL_TRACKS_BLOCKED" => &["exploration_blocked", "infrastructure_blocked"],
         regression::MELTDOWN => &["failed_module", "distinct_candidates", "window_seconds"],
         "PLAN_INVALIDATED" => &["refuted_claim", "target"],
+        "PLAN_ARCHIVED" => &["target", "adr_id"],
         "PLAN_ROUTE_BLOCKED" | "CLAIM_ROUTES_EXHAUSTED" => &["refuted_claim"],
         "WITNESS_VERIFIED" => &["wiki_id", "witness_sha256", "file_path", "target_decl"],
         "BREAKER_TRIPPED" | "BREAKER_STATE_CHANGED" | "BREAKER_CLOSED" | "BREAKER_ARCHIVED" => &[

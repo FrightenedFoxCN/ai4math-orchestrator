@@ -140,7 +140,7 @@
 * **路径 2（`PATCH_DEFINITION`）**：人类批准修正定义，Infra Builder 在保留的 worktree 上改定义、跑烟雾测试、触发下游受影响切片 T3 标脏，再恢复证明队列；
 * **路径 3（`ARCHIVE_AND_PIVOT`）**：确认抽象路线彻底走不通，将已有独立引理无损沉降进 `SEDIMENT`，记录教训进 `GRAVEYARD`，释放 worktree 资源并转向新 RFC。
 
-当前可用的是 [独立审批、仅归档指定熔断的 `ARCHIVE_BREAKER`](architecture-acceptance.md#L650)。它保留模块门禁和所有现场，不替代完整的归档转向。
+当前可用的是 [独立审批、仅归档指定熔断的 `ARCHIVE_BREAKER`](architecture-acceptance.md#L650)。它保留模块门禁和所有现场，不替代完整的归档转向。 还可 [明确选中并审批实际证明路线](architecture-acceptance.md#L658)，归档不删除依赖边，也不产生替代任务。
 
 ---
 
