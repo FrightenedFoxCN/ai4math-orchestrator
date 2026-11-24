@@ -1,5 +1,5 @@
 //! One-shot advisory observation of managed main against an explicit baseline
-//! or one Claim's current managed T1 receipt. Neither path confers approval.
+//! or one Claim's current managed T1 or sealed T3 receipt. Neither path confers approval.
 use super::{Plan, ProjectDelta, bound_engine, predecessors, print_json, validate_recipe};
 use crate::{promotion::PromotionRepo, reviewed_spec, worker_dispatch::private_state_path};
 use ai4math_broker::lean_breaker_sources_sha256;
@@ -52,10 +52,9 @@ pub(crate) fn discover_claim_observation(
     claim: &str,
 ) -> Result<ClaimDiscovery> {
     let mut session = DiscoverySession::open(root, repo, true)?;
-    let evidence = session
-        .store
-        .t3_discovery_baseline(claim)?
-        .context("no current exact managed Lean T1 baseline for this Claim")?;
+    let evidence = session.store.t3_discovery_baseline(claim)?.context(
+        "no current exact managed Lean T1 baseline or sealed T3 baseline for this Claim",
+    )?;
     let recipe = &evidence.recipe;
     let engine = bound_engine(root, &recipe.file_path)?;
     ensure!(
@@ -65,13 +64,13 @@ pub(crate) fn discover_claim_observation(
             && evidence.claim_id == claim,
         "selected T3 baseline does not match the managed project and Claim"
     );
-    let baseline = recipe.promoted_commit.as_str();
+    let baseline = evidence.verified_at_commit.as_str();
     // Reproduce the frozen body and prove the recorded promotion changed
     // only that module, with the claimed base as its sole physical parent.
     let (_, _, source) = validate_recipe(&session.git, engine, recipe, baseline)?;
     session.git.assert_exact_proof_commit(
         &recipe.base_commit,
-        baseline,
+        &recipe.promoted_commit,
         &recipe.file_path,
         source.as_bytes(),
     )?;
@@ -81,10 +80,14 @@ pub(crate) fn discover_claim_observation(
         .iter()
         .position(|(file, _)| *file == recipe.file_path)
         .context("baseline target absent from Git")?;
+    ensure!(
+        files[index].1 == source,
+        "T3 baseline target differs from the exact promoted proof bytes"
+    );
     let dependencies = predecessors(&files, index);
     ensure!(
         lean_breaker_sources_sha256(&dependencies) == evidence.dependencies_sha256,
-        "baseline dependency bytes do not match the exact T1 receipt"
+        "baseline dependency bytes do not match the exact verification receipt"
     );
     if let Some(spec) = session.store.lean_spec(claim)? {
         reviewed_spec::check_snapshot(&session.git, &git_snapshot, &spec)?;
@@ -98,7 +101,7 @@ pub(crate) fn discover_claim_observation(
     Ok(ClaimDiscovery {
         baseline_claim: evidence.claim_id,
         baseline_receipt_sha256: evidence.receipt_sha256,
-        baseline_scope: "claim_t1",
+        baseline_scope: evidence.baseline_scope,
         observation,
     })
 }

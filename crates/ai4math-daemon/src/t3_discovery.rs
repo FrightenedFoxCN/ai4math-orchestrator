@@ -258,7 +258,7 @@ impl Summary {
                 },
                 None,
             ) => summary.base_commit == *baseline_commit,
-            (Baseline::Claim { .. }, Some("claim_t1")) => true,
+            (Baseline::Claim { .. }, Some("claim_t1" | "claim_t3")) => true,
             _ => false,
         };
         ensure!(
@@ -645,6 +645,12 @@ mod tests {
                 assert!(parse_claim(&scoped).is_err());
             }
         }
+        assert_eq!(
+            serde_json::to_value(DiscoveryState::Observation(parse_claim(&scoped)?))?,
+            scoped
+        );
+        scoped["baseline_scope"] = json!("claim_t3");
+        assert!(parse(&scoped, BASE).is_err());
         assert_eq!(
             serde_json::to_value(DiscoveryState::Observation(parse_claim(&scoped)?))?,
             scoped

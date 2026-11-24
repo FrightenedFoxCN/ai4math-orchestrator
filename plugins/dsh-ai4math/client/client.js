@@ -404,8 +404,8 @@ function DiscoveryBadge({ value, currentSeq }) {
   if (value.status === 'starting') return labelValue('T3 discovery', 'Waiting for first sample')
   if (value.status === 'unavailable') return labelValue('T3 discovery', 'Unavailable')
   const hash = value.observed_head
-  if (Object.hasOwn(value, 'baseline_scope') && value.baseline_scope !== 'claim_t1') return null
-  const claimScoped = value.baseline_scope === 'claim_t1'
+  const claimTier = value.baseline_scope === 'claim_t1' ? 'T1' : value.baseline_scope === 'claim_t3' ? 'T3' : null
+  if (Object.hasOwn(value, 'baseline_scope') && !claimTier) return null
   if (value.advisory_only !== true || !isCount(value.ledger_event_seq)
     || typeof hash !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hash)) return null
   let summary
@@ -420,9 +420,9 @@ function DiscoveryBadge({ value, currentSeq }) {
       break
     default: return null
   }
-  const scopeNote = claimScoped ? ' Baseline verified for one Claim, not for all of main.' : ''
+  const scopeNote = claimTier ? ' Baseline verified for one Claim, not for all of main.' : ''
   return h('span', { title: 'Observed Git commit: ' + hash + '. This sample does not approve or apply a T3 plan.' + scopeNote },
-    labelValue('Last T3 discovery', summary + (claimScoped ? ' · Claim T1 baseline' : '') + ' · advisory only'
+    labelValue('Last T3 discovery', summary + (claimTier ? ' · Claim ' + claimTier + ' baseline' : '') + ' · advisory only'
       + (isCount(currentSeq) && value.ledger_event_seq < currentSeq ? ' · older ledger sample' : '')))
 }
 

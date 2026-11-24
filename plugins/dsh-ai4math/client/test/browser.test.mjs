@@ -29,14 +29,18 @@ function streamHandle(frames, controller) {
 
 test('HUD shows resident T3 as a read-only last sample and clears it when unavailable', async t => {
   const channel = new AbortController()
-  let report;
+  let report, clear;
   const gate = new Promise(resolve => { report = resolve; });
+  const clearGate = new Promise(resolve => { clear = resolve; });
   const app = await browser(t, {
     subscribe(_params, signal) {
       return streamHandle((async function* () {
         yield { topic: 'ai4math.connection', data: { state: 'connected' } };
         await gate;
-        yield { topic: 'vital_signs.tick', data: snapshot(13, { t3_discovery: { status: 'unavailable' } }) };
+        yield { topic: 'vital_signs.tick', data: snapshot(13, { t3_discovery: { status: 'unchanged', observed_head: 'c'.repeat(40),
+          ledger_event_seq: 13, changed_module_count: 0, module_order_changed: false, advisory_only: true, baseline_scope: 'claim_t3' } }) };
+        await clearGate;
+        yield { topic: 'vital_signs.tick', data: snapshot(14, { t3_discovery: { status: 'unavailable' } }) };
         const active = AbortSignal.any([signal, channel.signal]);
         if (!active.aborted) await once(active, 'abort');
       })(), channel);
@@ -53,8 +57,10 @@ test('HUD shows resident T3 as a read-only last sample and clears it when unavai
   assert.doesNotMatch(hud.text(), /PrivateClaimName|a{64}/);
   assert.throws(() => hud.find('button', 'Apply T3'), /render did not contain/);
   report();
+  await expectText(hud, /No structural change · Claim T3 baseline · advisory only/);
+  clear();
   await expectText(hud, /T3 discovery Unavailable/);
-  assert.doesNotMatch(hud.text(), /Structure changed|older ledger sample|Claim T1 baseline/);
+  assert.doesNotMatch(hud.text(), /Structure changed|older ledger sample|Claim T[13] baseline/);
 });
 
 test('lazy browser bundle mounts shell.bottom and four sidebar tabs with owned cleanup', async t => {

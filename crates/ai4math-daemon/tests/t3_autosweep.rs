@@ -247,6 +247,15 @@ mod native {
 
     impl Fixture {
         fn new(root: PathBuf, original_cli: &Path, lean: PathBuf) -> Result<Self> {
+            Self::new_with_spec(root, original_cli, lean, false)
+        }
+
+        fn new_with_spec(
+            root: PathBuf,
+            original_cli: &Path,
+            lean: PathBuf,
+            reviewed_spec: bool,
+        ) -> Result<Self> {
             // Cargo binaries can be hard links. The daemon catalog requires a private,
             // ordinary executable, so use an independent copy of the actual CLI.
             let cli = root.join("ai4math");
@@ -266,8 +275,18 @@ mod native {
             )?;
             fs::write(
                 source.join("ai4math-modules.txt"),
-                "Defs.lean\nProof.lean\n",
+                if reviewed_spec {
+                    "TrustedSpec.lean\nDefs.lean\nProof.lean\n"
+                } else {
+                    "Defs.lean\nProof.lean\n"
+                },
             )?;
+            if reviewed_spec {
+                fs::write(
+                    source.join("TrustedSpec.lean"),
+                    "def approved : Prop := (2 : Nat) = 2\n",
+                )?;
+            }
             git(&source, &["add", "."])?;
             git(&source, &["commit", "-m", "freeze proof input"])?;
             git(&root, &["clone", "--bare", "source", "repo.git"])?;
@@ -281,6 +300,18 @@ mod native {
             f.run("init", &["lean4"])?;
             f.declare("A", "Defs.lean", "x")?;
             f.declare("C", ANCHOR, "target")?;
+            if reviewed_spec {
+                f.run(
+                    "bind-lean-spec",
+                    &[
+                        utf8(&f.bare),
+                        "C",
+                        "TrustedSpec.lean",
+                        "approved",
+                        &f.main()?,
+                    ],
+                )?;
+            }
             let body = f.root.join("proof-body.txt");
             fs::write(&body, "by\n  rfl")?;
             f.run(
@@ -460,12 +491,13 @@ mod native {
 
     #[test]
     #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
-    fn native_resident_claim_discovery_tracks_t1_then_clears_on_taint() -> Result<()> {
+    fn native_resident_claim_discovery_tracks_t1_taint_and_sealed_t3() -> Result<()> {
         let tmp = short_tempdir()?;
-        let f = Fixture::new(
+        let f = Fixture::new_with_spec(
             tmp.path().canonicalize()?,
             &native_binary("AI4MATH_TEST_CLI")?,
             native_binary("AI4MATH_TEST_LEAN")?,
+            true,
         )?;
         let promoted = f.main()?;
         let receipt = f.claim("C")?.receipt_id.context("no native T1 receipt")?;
@@ -527,6 +559,31 @@ mod native {
         assert!(f.claim("C")?.stale);
         assert_eq!(f.receipt_count()?, 1);
         assert_eq!(f.state()?.status()?.last_event_seq, applied_seq);
+        assert_eq!(f.main()?, reviewed);
+        // Explicitly perform a real comparator-backed T3; observation alone never does this.
+        f.run("t3-recheck-one", &[utf8(&f.bare), hash, "C", utf8(&f.lean)])?;
+        let state = f.state()?;
+        let verified_seq = state.status()?.last_event_seq;
+        let sealed = state
+            .lean_spec_recheck("C", hash)?
+            .context("no sealed T3 comparison")?;
+        assert_eq!(f.receipt_count()?, 2);
+        let restored = daemon.poll(Duration::from_secs(15), "sealed Claim T3 discovery", || {
+            let sample = status(&f.root)?["t3_discovery"].clone();
+            Ok((sample["baseline_scope"] == "claim_t3").then_some(sample))
+        })?;
+        assert_eq!(
+            restored,
+            json!({"status":"unchanged","baseline_scope":"claim_t3","base_commit":reviewed,
+            "observed_head":reviewed,"ledger_event_seq":verified_seq,"module_order_changed":false,"changed_module_count":0,
+            "plan_sha256":null,"advisory_only":true})
+        );
+        assert!(
+            !restored
+                .to_string()
+                .contains(&sealed.candidate_receipt_sha256)
+        );
+        assert_eq!(state.status()?.last_event_seq, verified_seq);
         assert_eq!(f.main()?, reviewed);
         f.stop(daemon)?;
         Ok(())
