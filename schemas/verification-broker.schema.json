@@ -1,0 +1,500 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.ai4math-orchestrator/schemas/verification-broker.schema.json",
+  "title": "AI4Math Local Verification Broker, Sandbox & Formal Admission Schemas",
+  "$defs": {
+    "SandboxBackend": {
+      "type": "string",
+      "enum": [
+        "macos_seatbelt",
+        "linux_bwrap_cgroups",
+        "rootless_container"
+      ]
+    },
+    "LaneKind": {
+      "type": "string",
+      "enum": [
+        "fast_repl",
+        "fast_oracle",
+        "fast_hammer",
+        "heavy_promotion",
+        "heavy_taint",
+        "heavy_smoke",
+        "heavy_t2_audit"
+      ]
+    },
+    "MemoryPressureState": {
+      "type": "string",
+      "enum": [
+        "GREEN",
+        "YELLOW",
+        "RED"
+      ]
+    },
+    "BrokerConfig": {
+      "type": "object",
+      "required": [
+        "sandbox_backend",
+        "network_disabled",
+        "fast_repl_pool_size",
+        "heavy_lane_max_concurrency",
+        "ram_yellow_watermark_pct",
+        "ram_red_watermark_pct",
+        "cow_clone_mode",
+        "axiom_allowlists",
+        "enable_t2_external_kernel_checker"
+      ],
+      "properties": {
+        "sandbox_backend": {
+          "$ref": "#/$defs/SandboxBackend"
+        },
+        "network_disabled": {
+          "type": "boolean",
+          "const": true
+        },
+        "fast_repl_pool_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        },
+        "heavy_lane_max_concurrency": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4
+        },
+        "ram_yellow_watermark_pct": {
+          "type": "number",
+          "minimum": 40,
+          "maximum": 90,
+          "default": 70
+        },
+        "ram_red_watermark_pct": {
+          "type": "number",
+          "minimum": 50,
+          "maximum": 95,
+          "default": 85
+        },
+        "cow_clone_mode": {
+          "type": "string",
+          "enum": [
+            "apfs_clonefile",
+            "btrfs_xfs_reflink",
+            "full_copy_fallback"
+          ]
+        },
+        "axiom_allowlists": {
+          "type": "object",
+          "required": [
+            "lean4",
+            "agda",
+            "rocq"
+          ],
+          "properties": {
+            "lean4": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": [
+                "propext",
+                "Classical.choice",
+                "Quot.sound"
+              ]
+            },
+            "agda": {
+              "type": "object",
+              "required": [
+                "require_safe_flag",
+                "consistency_flag"
+              ],
+              "properties": {
+                "require_safe_flag": {
+                  "type": "boolean",
+                  "const": true
+                },
+                "consistency_flag": {
+                  "type": "string",
+                  "enum": [
+                    "--without-K",
+                    "--cubical",
+                    "--cubical-compatible"
+                  ]
+                }
+              },
+              "additionalProperties": false
+            },
+            "rocq": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              },
+              "default": []
+            }
+          },
+          "additionalProperties": false
+        },
+        "enable_t2_external_kernel_checker": {
+          "type": "boolean",
+          "default": true
+        },
+        "lean4_external_checker": {
+          "type": "string",
+          "enum": [
+            "lean4checker",
+            "nanoda",
+            "none"
+          ],
+          "default": "lean4checker"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreFlightViolation": {
+      "type": "object",
+      "required": [
+        "rule_id",
+        "severity",
+        "file_path",
+        "detail"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "DENY",
+            "WARN"
+          ]
+        },
+        "file_path": {
+          "type": "string"
+        },
+        "line": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "matched_construct": {
+          "type": "string"
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PreFlightScanResult": {
+      "type": "object",
+      "required": [
+        "passed",
+        "engine",
+        "patch_sha256",
+        "violations"
+      ],
+      "properties": {
+        "passed": {
+          "type": "boolean"
+        },
+        "engine": {
+          "type": "string",
+          "enum": [
+            "lean4",
+            "agda",
+            "rocq",
+            "smt",
+            "atp",
+            "cas",
+            "python"
+          ]
+        },
+        "patch_sha256": {
+          "type": "string",
+          "minLength": 16
+        },
+        "authorized_scope_checked": {
+          "type": "boolean"
+        },
+        "violations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PreFlightViolation"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "VerificationLeaseRequest": {
+      "type": "object",
+      "required": [
+        "request_id",
+        "task_id",
+        "role",
+        "lane",
+        "engine",
+        "timeout_seconds",
+        "max_memory_mb"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string"
+        },
+        "task_id": {
+          "type": "string"
+        },
+        "role": {
+          "type": "string"
+        },
+        "lane": {
+          "$ref": "#/$defs/LaneKind"
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "engine": {
+          "type": "string",
+          "enum": [
+            "lean4",
+            "agda",
+            "rocq",
+            "smt",
+            "atp",
+            "cas",
+            "python"
+          ]
+        },
+        "base_commit": {
+          "type": "string",
+          "minLength": 7
+        },
+        "worktree_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "timeout_seconds": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 3600
+        },
+        "max_memory_mb": {
+          "type": "integer",
+          "minimum": 128
+        }
+      },
+      "additionalProperties": false
+    },
+    "VerificationReceipt": {
+      "type": "object",
+      "description": "Broker-issued cryptographic/hash-bound formal admission proof; sole authority for main branch promotion.",
+      "required": [
+        "receipt_id",
+        "issued_at",
+        "tier",
+        "engine",
+        "toolchain_version",
+        "base_commit",
+        "patch_sha256",
+        "target_decl",
+        "preflight_passed",
+        "sandbox_enforced",
+        "clean_room_passed",
+        "statement_defeq_verified",
+        "axioms_used",
+        "allowlist_passed",
+        "metrics"
+      ],
+      "properties": {
+        "receipt_id": {
+          "type": "string"
+        },
+        "issued_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "tier": {
+          "type": "string",
+          "enum": [
+            "T1_PROMOTION",
+            "T2_AUDIT",
+            "T3_TAINT_REBUILD"
+          ]
+        },
+        "engine": {
+          "type": "string",
+          "enum": [
+            "lean4",
+            "agda",
+            "rocq"
+          ]
+        },
+        "toolchain_version": {
+          "type": "string"
+        },
+        "base_commit": {
+          "type": "string",
+          "minLength": 7
+        },
+        "patch_sha256": {
+          "type": "string",
+          "minLength": 16
+        },
+        "target_decl": {
+          "type": "string"
+        },
+        "preflight_passed": {
+          "type": "boolean"
+        },
+        "sandbox_enforced": {
+          "type": "object",
+          "required": [
+            "backend",
+            "network_disabled",
+            "readonly_host_enforced"
+          ],
+          "properties": {
+            "backend": {
+              "$ref": "#/$defs/SandboxBackend"
+            },
+            "network_disabled": {
+              "type": "boolean",
+              "const": true
+            },
+            "readonly_host_enforced": {
+              "type": "boolean",
+              "const": true
+            }
+          },
+          "additionalProperties": false
+        },
+        "clean_room_passed": {
+          "type": "boolean"
+        },
+        "statement_defeq_verified": {
+          "type": "boolean"
+        },
+        "axioms_used": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "allowlist_passed": {
+          "type": "boolean"
+        },
+        "external_checker": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "required": [
+            "tool",
+            "passed"
+          ],
+          "properties": {
+            "tool": {
+              "type": "string"
+            },
+            "passed": {
+              "type": "boolean"
+            }
+          },
+          "additionalProperties": false
+        },
+        "metrics": {
+          "type": "object",
+          "required": [
+            "compile_seconds",
+            "peak_rss_mb"
+          ],
+          "properties": {
+            "compile_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "peak_rss_mb": {
+              "type": "number",
+              "minimum": 0
+            },
+            "max_heartbeats_observed": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "minimum": 0
+            },
+            "heartbeat_ratio_vs_baseline": {
+              "type": [
+                "number",
+                "null"
+              ],
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "receipt_sha256": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "PromotionResult": {
+      "type": "object",
+      "required": [
+        "promotion_id",
+        "status",
+        "receipt_id",
+        "affected_modules_checked"
+      ],
+      "properties": {
+        "promotion_id": {
+          "type": "string"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "PROMOTED",
+            "REJECTED_PREFLIGHT",
+            "REJECTED_CLEAN_ROOM",
+            "REJECTED_AXIOM_VIOLATION",
+            "REJECTED_AFFECTED_CONE_REGRESSION",
+            "REJECTED_HEARTBEAT_REGRESSION",
+            "ROLLED_BACK_CONFLICT"
+          ]
+        },
+        "receipt_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "new_head_commit": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "affected_modules_checked": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "failure_diagnostics": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -19,15 +19,17 @@
 | [docs/03-local-math-wiki.md](docs/03-local-math-wiki.md) | 本地数学 Wiki 索引设计：三层沉降库（CORE / SEDIMENT / GRAVEYARD）、惰性重验、三级渐进唤醒（含 Shadow Hint）、四维混合检索与双层存储 |
 | [docs/04-review-briefing-and-hitl.md](docs/04-review-briefing-and-hitl.md) | 常驻生命体征监控（Live HUD）、按需+P0推送双语复盘简报、可恢复 Definition Smell 局部熔断器与 Pivot Dry-Run 闭环 |
 | [docs/05-multi-engine-and-hammers.md](docs/05-multi-engine-and-hammers.md) | 多引擎协同、对称 Trust Ledger（`L2a/L2b`, `L4a/L4b`）、项目级可配置主引擎、按需 Hammer 工具子代理与 Oracle 剪枝前补充验证防线 |
+| [docs/06-verification-broker.md](docs/06-verification-broker.md) | Local Verification Broker：四层纵深防御（静态禁入、OS 混合沙箱、洁净室形式化准入与 `VerificationReceipt`）、双车道调度、内存水位线与 CoW 缓存隔离 |
 | [docs/adr/ADR-0001-core-workflow-decisions.md](docs/adr/ADR-0001-core-workflow-decisions.md) | 架构决策记录 #0001：首轮核心编排、权限与知识库策略拍板（D1–D6） |
 | [docs/adr/ADR-0002-review-briefing-and-telemetry.md](docs/adr/ADR-0002-review-briefing-and-telemetry.md) | 架构决策记录 #0002：生命体征解耦、Push Alert、双语呈现与可恢复熔断器决策（D7–D11） |
 | [docs/adr/ADR-0003-multi-engine-oracles-and-hammers.md](docs/adr/ADR-0003-multi-engine-oracles-and-hammers.md) | 架构决策记录 #0003：对称 Trust Ledger、主引擎可配置、默认禁用跨 ITP 桥接、动态 Hammer 与 Oracle 防线（D12–D15，修订 D4） |
+| [docs/adr/ADR-0004-verification-broker-and-sandboxing.md](docs/adr/ADR-0004-verification-broker-and-sandboxing.md) | 架构决策记录 #0004：Broker 四层防御、`L5` 禁入 `native_decide`、混合 OS 沙箱与 T2 外部内核校验（D16–D19） |
 | [schemas/contracts.schema.json](schemas/contracts.schema.json) | 编排契约、信任账本与决策收件箱的 JSON Schema 定义 |
 | [schemas/briefing-telemetry.schema.json](schemas/briefing-telemetry.schema.json) | 常驻生命体征、复盘 Fact Pack、Push Alert、可恢复熔断器与 Pivot 计划的 JSON Schema |
 | [schemas/multi-engine.schema.json](schemas/multi-engine.schema.json) | 项目主引擎配置、Oracle 交叉印证记录、Hammer 探测结果与适配器能力的 JSON Schema |
+| [schemas/verification-broker.schema.json](schemas/verification-broker.schema.json) | Broker 配置、静态禁入扫描、资源租约、洁净室 `VerificationReceipt` 与 Promotion 结果的 JSON Schema |
 | [schemas/wiki-index.sql](schemas/wiki-index.sql) | 本地 Wiki SQLite 索引库 DDL（关系表、符号倒排、图谱边表、FTS5 与可选向量表） |
 
 ## 后续待细化模块（Roadmap）
 
-- [ ] `docs/06-verification-broker.md`：单机多核 Local Verification Broker（热池 REPL、Fast/Heavy 双车道、APFS/Btrfs CoW Worktree、内存准入控制）
-- [ ] `docs/07-claim-graph-state-machine.md`：Claim Graph 状态机与上游变更自动标脏传播（Taint Propagation）
+- [ ] `docs/07-claim-graph-state-machine.md`：Claim Graph 状态机、上游变更自动标脏传播（Taint Propagation）与 `L2a → L2b` / `L4a → L5` 消债流转规则
