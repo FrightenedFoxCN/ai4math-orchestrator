@@ -1,7 +1,7 @@
 #![cfg(unix)]
 
 use ai4math_broker::ProjectNativeGate;
-use ai4math_store::StateStore;
+use ai4math_store::{Change, NewClaim, StateStore, Trust};
 use std::{
     fs,
     path::Path,
@@ -120,6 +120,30 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
             ],
         )
     };
+    let release = |repo: &str, reviewed: &str, policy: &str| {
+        ai(
+            &root,
+            "t2-release-check",
+            &[
+                repo,
+                "Audit.lean",
+                reviewed,
+                nonexistent,
+                policy,
+                &pin,
+                &pin,
+                &pin,
+            ],
+        )
+    };
+    rejects(
+        release(repo_str, &head, "bad"),
+        "policy SHA-256 must be 64 lowercase hex digits",
+    );
+    rejects(
+        release(repo_str, &head, &pin),
+        "initialized private project",
+    );
     rejects(
         managed_batch(repo_str, &head),
         "initialized private project",
@@ -164,6 +188,14 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
         managed_batch(repo_str, &old),
         "reviewed T2 commit is not current main",
     );
+    rejects(
+        release(other_str, &head, &pin),
+        "not bound to the supplied managed repository",
+    );
+    rejects(
+        release(repo_str, &old, &pin),
+        "reviewed T2 commit is not current main",
+    );
     let lease = ProjectNativeGate::new(&root).try_heavy().unwrap();
     rejects(audit(repo_str, &head), "project native execution is busy");
     rejects(
@@ -174,7 +206,13 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
         managed_batch(repo_str, &head),
         "project native execution is busy",
     );
+    rejects(
+        release(repo_str, &head, &pin),
+        "project native execution is busy",
+    );
     drop(lease);
+    fs::copy(&manifest, root.join("ai4math-t2-release.json")).unwrap();
+    rejects(release(repo_str, &head, &pin), "ai4math-t2-release.json");
     let after = StateStore::open_readonly(&state)
         .unwrap()
         .status()
@@ -183,4 +221,38 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
     assert_eq!(after, before);
     assert_eq!(git(&repo, &["show-ref"]), main_before);
     assert!(!repo.join("ai4math-golden").exists());
+
+    let mut store = StateStore::open(&state).unwrap();
+    let change = Change {
+        actor: "release-guard-fixture",
+        git_commit: Some(&head),
+    };
+    store
+        .create_claim(
+            NewClaim {
+                id: "oracle_claim",
+                title: "Oracle",
+                informal_statement: "Unrepaid debt",
+                engine: "lean4",
+                formal_target: None,
+                module_path: None,
+                critical: false,
+            },
+            change,
+        )
+        .unwrap();
+    store
+        .set_local_trust("oracle_claim", Trust::L4a, change)
+        .unwrap();
+    let with_debt = store.status().unwrap().last_event_seq;
+    rejects(
+        release(repo_str, &head, &pin),
+        "T2 release requires zero audited L4 trust debt findings",
+    );
+    assert_eq!(store.status().unwrap().last_event_seq, with_debt);
+    assert_eq!(
+        store.claim("oracle_claim").unwrap().unwrap().local_trust,
+        Trust::L4a
+    );
+    assert_eq!(git(&repo, &["show-ref"]), main_before);
 }

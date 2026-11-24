@@ -1,6 +1,8 @@
 //! Operator-only T2 clean build of a pinned managed Lean snapshot, without proof authority.
 use crate::{
-    bound_engine, managed_native, promotion::PromotionRepo, trusted_toolchain,
+    bound_engine, managed_native,
+    promotion::{Promotion, PromotionRepo},
+    trusted_toolchain,
     worker_dispatch::private_state_path,
 };
 use ai4math_broker::{Broker, LeanBuildAudit, ManagedLeanTheoremAudit};
@@ -207,6 +209,24 @@ pub(crate) fn at_generation<T, B>(
     observe: impl FnOnce(&StateStore, i64) -> Result<T>,
     build: impl FnOnce(Engine, &[(&str, &str)]) -> Result<B>,
 ) -> Result<(B, T, i64, Engine)> {
+    at_snapshot_generation(
+        root,
+        repo,
+        anchor,
+        reviewed,
+        observe,
+        |engine, _, modules| build(engine, modules),
+    )
+}
+
+pub(crate) fn at_snapshot_generation<T, B>(
+    root: &Path,
+    repo: &Path,
+    anchor: &str,
+    reviewed: &str,
+    observe: impl FnOnce(&StateStore, i64) -> Result<T>,
+    build: impl FnOnce(Engine, &Promotion<'_>, &[(&str, &str)]) -> Result<B>,
+) -> Result<(B, T, i64, Engine)> {
     let path =
         private_state_path(root).context("T2 build requires an initialized private project")?;
     let engine = bound_engine(root, anchor)?;
@@ -251,7 +271,7 @@ pub(crate) fn at_generation<T, B>(
         .iter()
         .map(|(file, source)| (*file, source.as_str()))
         .collect();
-    let build = build(engine, &ordered)?;
+    let build = build(engine, &pinned, &ordered)?;
     // An external Git writer need not honor our lock. Suppress stale telemetry rather
     // than labeling a changed head or a different ledger generation as the audited state.
     ensure!(

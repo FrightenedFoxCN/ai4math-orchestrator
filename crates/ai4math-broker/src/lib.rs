@@ -84,6 +84,11 @@ fn file_digest(path: &Path) -> Result<String> {
 }
 
 impl Toolchain {
+    /// SHA-256 observed when opening the operator-approved compiler.
+    pub fn compiler_sha256(&self) -> &str {
+        &self.binary_sha256
+    }
+
     fn native_executable(executable: impl AsRef<Path>) -> Result<PathBuf> {
         let executable = executable
             .as_ref()

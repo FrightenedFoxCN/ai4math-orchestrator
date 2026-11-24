@@ -1,8 +1,12 @@
 //! Operator-only manifest for a selected, independently checked Lean batch.
-use crate::{t2_build::at_generation, trusted_toolchain};
+use crate::{
+    t2_build::{at_generation, at_snapshot_generation},
+    trusted_toolchain,
+};
 use ai4math_broker::{Broker, MAX_MANAGED_T2_THEOREMS, ManagedLeanBatchAudit};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer, Serialize, de};
+use sha2::{Digest, Sha256};
 use std::{fmt, fs, io::Read, path::Path};
 
 const MAX_MANIFEST_BYTES: u64 = 8 * 1024;
@@ -90,8 +94,12 @@ fn read_targets(path: &Path) -> Result<Vec<ObjectTarget>> {
         bytes.len() as u64 <= MAX_MANIFEST_BYTES,
         "T2 target manifest exceeds 8 KiB"
     );
+    parse_targets(&bytes)
+}
+
+fn parse_targets(bytes: &[u8]) -> Result<Vec<ObjectTarget>> {
     let targets: Vec<ObjectTarget> =
-        serde_json::from_slice(&bytes).context("invalid T2 target manifest JSON")?;
+        serde_json::from_slice(bytes).context("invalid T2 target manifest JSON")?;
     ensure!(
         (1..=MAX_MANAGED_T2_THEOREMS).contains(&targets.len()),
         "T2 target manifest must contain 1..={MAX_MANAGED_T2_THEOREMS} targets"
@@ -133,6 +141,116 @@ pub(crate) fn run(request: BatchRequest<'_>) -> Result<ManagedBatchReport> {
     })
 }
 
+pub(crate) struct ReleaseRequest<'a> {
+    pub root: &'a Path,
+    pub repo: &'a Path,
+    pub anchor: &'a str,
+    pub reviewed: &'a str,
+    pub executable: &'a Path,
+    pub policy_sha256: &'a str,
+    pub compiler_sha256: &'a str,
+    pub exporter_sha256: &'a str,
+    pub checker_sha256: &'a str,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ReleaseReport {
+    schema: &'static str,
+    gate_passed: bool,
+    reviewed_commit: String,
+    ledger_event_seq: i64,
+    policy_sha256: String,
+    trust_debt_findings: usize,
+    #[serde(flatten)]
+    result: ManagedLeanBatchAudit,
+}
+
+fn require_pin(value: &str, label: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+        "expected {label} SHA-256 must be 64 lowercase hex digits"
+    );
+    Ok(())
+}
+
+fn release_targets(bytes: &[u8], pinned: &str) -> Result<Vec<ObjectTarget>> {
+    ensure!(
+        format!("{:x}", Sha256::digest(bytes)) == pinned,
+        "T2 release policy SHA-256 mismatch"
+    );
+    parse_targets(bytes).context("invalid reviewed T2 release policy")
+}
+
+fn release_debt(state: &ai4math_store::StateStore, seq: i64) -> Result<usize> {
+    let report = state
+        .scan_trust_debt()
+        .context("T2 release trust debt scan failed")?;
+    ensure!(
+        report.ledger_event_seq == seq,
+        "managed ledger changed before T2 release check; retry"
+    );
+    ensure!(
+        report.finding_count == 0,
+        "T2 release requires zero audited L4 trust debt findings (found {})",
+        report.finding_count
+    );
+    Ok(report.finding_count)
+}
+
+pub(crate) fn release(request: ReleaseRequest<'_>) -> Result<ReleaseReport> {
+    for (value, label) in [
+        (request.policy_sha256, "T2 release policy"),
+        (request.compiler_sha256, "Lean compiler"),
+        (request.exporter_sha256, "Lean exporter"),
+        (request.checker_sha256, "Nanoda checker"),
+    ] {
+        require_pin(value, label)?;
+    }
+    let (result, trust_debt_findings, ledger_event_seq, _) = at_snapshot_generation(
+        request.root,
+        request.repo,
+        request.anchor,
+        request.reviewed,
+        release_debt,
+        |engine, snapshot, modules| {
+            let bytes = snapshot.t2_release_policy()?;
+            let targets = release_targets(&bytes, request.policy_sha256)?;
+            let targets: Vec<_> = targets
+                .iter()
+                .map(|ObjectTarget(target)| {
+                    (target.target_module.as_str(), target.declaration.as_str())
+                })
+                .collect();
+            let toolchain = trusted_toolchain(engine, request.executable, None)?;
+            ensure!(
+                toolchain.compiler_sha256() == request.compiler_sha256,
+                "Lean compiler SHA-256 mismatch"
+            );
+            Broker::new()
+                .audit_lean_theorems(
+                    &toolchain,
+                    modules,
+                    &targets,
+                    request.exporter_sha256,
+                    request.checker_sha256,
+                )
+                .context("T2 release independent theorem checks failed")
+        },
+    )?;
+    Ok(ReleaseReport {
+        schema: "ai4math.t2.release-check.v1",
+        gate_passed: true,
+        reviewed_commit: request.reviewed.into(),
+        ledger_event_seq,
+        policy_sha256: request.policy_sha256.into(),
+        trust_debt_findings,
+        result,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +287,20 @@ mod tests {
                 "accepted invalid manifest: {invalid}"
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn release_policy_pin_commits_to_exact_raw_bytes_before_decoding() -> Result<()> {
+        let clean = br#"[{"target_module":"A.lean","declaration":"A.x"}]"#;
+        let pin = format!("{:x}", Sha256::digest(clean));
+        assert_eq!(release_targets(clean, &pin)?.len(), 1);
+        let whitespace = [clean.as_slice(), b"\n"].concat();
+        let err = release_targets(&whitespace, &pin).err().expect("stale pin");
+        assert!(err.to_string().contains("SHA-256 mismatch"));
+        let invalid = b"[]";
+        let pin = format!("{:x}", Sha256::digest(invalid));
+        assert!(release_targets(invalid, &pin).is_err());
         Ok(())
     }
 

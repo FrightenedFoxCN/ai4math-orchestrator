@@ -10,6 +10,8 @@ use std::{
 
 const MAIN: &str = "refs/heads/main";
 const MODULE_MANIFEST: &str = "ai4math-modules.txt";
+const T2_RELEASE_POLICY: &str = "ai4math-t2-release.json";
+const MAX_T2_RELEASE_POLICY_BYTES: usize = 8 * 1024;
 const ADR_DOCS_DIR: &str = "docs";
 const ADR_DIR: &str = "adr";
 const MAX_PROJECT_FILES: usize = 129; // Modules plus the optional manifest.
@@ -33,6 +35,7 @@ pub struct Promotion<'repo> {
     main_at_lock: String,
     module: String,
     modules: Vec<String>,
+    t2_release_policy_oid: Option<String>,
 }
 
 fn run_git(
@@ -417,8 +420,10 @@ impl PromotionRepo {
         let repo = self.path();
         let main_at_lock = self.main_head()?;
         let base = prior.unwrap_or(&main_at_lock).to_owned();
-        let tree = self.project_tree(&base)?;
+        let mut tree = self.project_tree(&base)?;
         tree.check_adr_contents(repo)?;
+        // The policy is part of the exact project tree, not a proof input.
+        let t2_release_policy_oid = tree.files.remove(T2_RELEASE_POLICY);
         let mut tracked: BTreeSet<_> = tree.files.into_keys().collect();
         let modules: Vec<String> = if tracked.remove(MODULE_MANIFEST) {
             let list = Promotion::read_blob(repo, &base, MODULE_MANIFEST)?;
@@ -448,6 +453,7 @@ impl PromotionRepo {
             main_at_lock,
             module: module.to_owned(),
             modules,
+            t2_release_policy_oid,
         })
     }
 }
@@ -564,7 +570,8 @@ impl ProjectTree {
     fn read(repo: &Path, oid: &str) -> Result<Self> {
         let mut files = BTreeMap::new();
         let mut adrs = BTreeMap::new();
-        for entry in read_tree(repo, oid, MAX_PROJECT_FILES + 1)? {
+        // The root may additionally contain the ADR directory and the T2 policy.
+        for entry in read_tree(repo, oid, MAX_PROJECT_FILES + 2)? {
             if entry.name == ADR_DOCS_DIR {
                 ensure!(
                     entry.mode == TreeMode::Dir,
@@ -595,14 +602,16 @@ impl ProjectTree {
                 ensure!(
                     entry.mode == TreeMode::File
                         && (entry.name == MODULE_MANIFEST
+                            || entry.name == T2_RELEASE_POLICY
                             || module_extension(&entry.name).is_some()),
-                    "project tree permits only root-level proof modules, their manifest, and Pivot ADRs"
+                    "project tree permits only root-level proof modules, their manifest, the T2 release policy, and Pivot ADRs"
                 );
                 files.insert(entry.name, entry.oid);
             }
         }
+        let project_inputs = files.len() - usize::from(files.contains_key(T2_RELEASE_POLICY));
         ensure!(
-            (1..=MAX_PROJECT_FILES).contains(&files.len()),
+            (1..=MAX_PROJECT_FILES).contains(&project_inputs),
             "unsupported project tree size"
         );
         Ok(Self { files, adrs })
@@ -711,6 +720,17 @@ impl Promotion<'_> {
     }
     pub fn main_at_lock(&self) -> &str {
         &self.main_at_lock
+    }
+
+    /// Read the exact raw policy bytes selected by the pinned project tree.
+    pub fn t2_release_policy(&self) -> Result<Vec<u8>> {
+        let oid = self
+            .t2_release_policy_oid
+            .as_deref()
+            .with_context(|| format!("pinned project is missing {T2_RELEASE_POLICY}"))?;
+        read_object(self.repo, "blob", oid, MAX_T2_RELEASE_POLICY_BYTES).with_context(|| {
+            format!("read pinned {T2_RELEASE_POLICY} (limit {MAX_T2_RELEASE_POLICY_BYTES} bytes)")
+        })
     }
 
     fn read_blob(repo: &Path, base: &str, filename: &str) -> Result<String> {
@@ -918,6 +938,228 @@ mod tests {
 
     fn id(digit: char) -> String {
         format!("ADR-PIVOT-{}", digit.to_string().repeat(64))
+    }
+
+    #[test]
+    fn t2_release_policy_reads_pinned_raw_bytes_and_preserves_module_order() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let base = branch(&repo)?;
+        let raw = b"\xff\0\r\n ";
+        let tree = tree_with_blob(repo.path(), &base, T2_RELEASE_POLICY, raw)?;
+        let reviewed = commit_tree(&repo, &tree, &base)?;
+        git(
+            repo.path(),
+            &["update-ref", MAIN, &reviewed, &base],
+            None,
+            None,
+        )?;
+        let project = repo.snapshot("A.lean", None)?;
+        let tree = tree_with_blob(repo.path(), &reviewed, T2_RELEASE_POLICY, b"current")?;
+        let current = commit_tree(&repo, &tree, &reviewed)?;
+        git(
+            repo.path(),
+            &["update-ref", MAIN, &current, &reviewed],
+            None,
+            None,
+        )?;
+
+        assert_eq!(project.t2_release_policy()?, raw);
+        assert_eq!(
+            repo.snapshot("A.lean", Some(&reviewed))?
+                .t2_release_policy()?,
+            raw
+        );
+        assert_eq!(
+            repo.snapshot("A.lean", None)?.t2_release_policy()?,
+            b"current"
+        );
+        assert_eq!(
+            project.project()?,
+            repo.snapshot("A.lean", Some(&base))?.project()?
+        );
+        assert_eq!(project.modules, ["B.lean", "A.lean"]);
+        assert!(
+            repo.snapshot("A.lean", Some(&base))?
+                .t2_release_policy()
+                .unwrap_err()
+                .to_string()
+                .contains("missing ai4math-t2-release.json")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn t2_release_policy_enforces_the_inclusive_byte_limit() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let base = branch(&repo)?;
+        let mut bytes = vec![b'x'; 8192];
+        let tree = tree_with_blob(repo.path(), &base, T2_RELEASE_POLICY, &bytes)?;
+        let boundary = commit_tree(&repo, &tree, &base)?;
+        assert_eq!(
+            repo.snapshot("A.lean", Some(&boundary))?
+                .t2_release_policy()?,
+            bytes
+        );
+        bytes.push(b'x');
+        let tree = tree_with_blob(repo.path(), &base, T2_RELEASE_POLICY, &bytes)?;
+        let oversized = commit_tree(&repo, &tree, &base)?;
+        let error = repo
+            .snapshot("A.lean", Some(&oversized))?
+            .t2_release_policy()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("Git blob exceeds the supported size"));
+        Ok(())
+    }
+
+    #[test]
+    fn t2_release_policy_rejects_symlinks_executables_and_other_paths() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let base = branch(&repo)?;
+        let blob = text(git(
+            repo.path(),
+            &["hash-object", "-w", "--stdin"],
+            None,
+            Some(b"A.lean"),
+        )?)?;
+        // Construct modes in Git, independent of the host filesystem's capabilities.
+        for mode in ["120000", "100755"] {
+            let mut rows = git(repo.path(), &["ls-tree", "-z", &base], None, None)?;
+            rows.extend_from_slice(format!("{mode} blob {blob}\t{T2_RELEASE_POLICY}\0").as_bytes());
+            let tree = text(git(repo.path(), &["mktree", "-z"], None, Some(&rows))?)?;
+            let candidate = commit_tree(&repo, &tree, &base)?;
+            assert!(
+                repo.snapshot("A.lean", Some(&candidate)).is_err(),
+                "accepted {mode}"
+            );
+        }
+        for path in [
+            "AI4Math-t2-release.json",
+            "ai4math-t2-release.json/contents",
+            "docs/adr/ai4math-t2-release.json",
+        ] {
+            let tree = tree_with_blob(repo.path(), &base, path, b"{}")?;
+            let candidate = commit_tree(&repo, &tree, &base)?;
+            assert!(
+                repo.snapshot("A.lean", Some(&candidate)).is_err(),
+                "accepted {path}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn t2_release_policy_cannot_be_smuggled_into_proof_or_adr_commits() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let absent = branch(&repo)?;
+        let tree = tree_with_blob(repo.path(), &absent, T2_RELEASE_POLICY, b"before")?;
+        let present = commit_tree(&repo, &tree, &absent)?;
+        let tree = tree_with_blob(repo.path(), &present, T2_RELEASE_POLICY, b"after")?;
+        let changed = commit_tree(&repo, &tree, &present)?;
+        let source = b"import B\n-- promoted module\n";
+        let approved = id('a');
+        let markdown = "# Reviewed ADR\n";
+        let adr_path = format!("docs/adr/{approved}.md");
+
+        for (base, extra) in [
+            (&absent, &present),
+            (&present, &absent),
+            (&present, &changed),
+        ] {
+            let project = repo.snapshot("A.lean", Some(base))?;
+            let tree = project.candidate_tree(source)?;
+            let proof = commit_tree(&repo, &tree, base)?;
+            repo.assert_exact_proof_commit(base, &proof, "A.lean", source)?;
+            project.assert_prepared_commit(&proof, source)?;
+            let tree = tree_with_blob(repo.path(), extra, "A.lean", source)?;
+            let smuggled = commit_tree(&repo, &tree, base)?;
+            assert!(
+                repo.assert_exact_proof_commit(base, &smuggled, "A.lean", source)
+                    .is_err()
+            );
+            assert!(project.assert_prepared_commit(&smuggled, source).is_err());
+
+            let tree = tree_with_blob(repo.path(), base, &adr_path, markdown.as_bytes())?;
+            let adr = commit_tree(&repo, &tree, base)?;
+            repo.validate_adr(base, &adr, &approved, markdown)?;
+            let tree = tree_with_blob(repo.path(), extra, &adr_path, markdown.as_bytes())?;
+            let smuggled = commit_tree(&repo, &tree, base)?;
+            assert!(
+                repo.validate_adr(base, &smuggled, &approved, markdown)
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn t2_release_policy_does_not_change_project_file_count_limits() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let parent = branch(&repo)?;
+        let blob = text(git(
+            repo.path(),
+            &["hash-object", "-w", "--stdin"],
+            None,
+            Some(b"{}"),
+        )?)?;
+        let mut rows = format!("100644 blob {blob}\t{T2_RELEASE_POLICY}\0");
+        let only_policy = text(git(
+            repo.path(),
+            &["mktree", "-z"],
+            None,
+            Some(rows.as_bytes()),
+        )?)?;
+        assert!(ProjectTree::read(repo.path(), &only_policy).is_err());
+        rows.push_str(&format!("100644 blob {blob}\tA000.lean\0"));
+        let single = text(git(
+            repo.path(),
+            &["mktree", "-z"],
+            None,
+            Some(rows.as_bytes()),
+        )?)?;
+        let single = commit_tree(&repo, &single, &parent)?;
+        assert_eq!(
+            repo.snapshot("A000.lean", Some(&single))?.modules,
+            ["A000.lean"]
+        );
+
+        let mut modules: Vec<_> = (0..128).map(|i| format!("A{i:03}.lean")).collect();
+        for name in &modules[1..] {
+            rows.push_str(&format!("100644 blob {blob}\t{name}\0"));
+        }
+        modules.reverse();
+        let manifest = text(git(
+            repo.path(),
+            &["hash-object", "-w", "--stdin"],
+            None,
+            Some(modules.join("\n").as_bytes()),
+        )?)?;
+        rows.push_str(&format!("100644 blob {manifest}\t{MODULE_MANIFEST}\0"));
+        let tree = text(git(
+            repo.path(),
+            &["mktree", "-z"],
+            None,
+            Some(rows.as_bytes()),
+        )?)?;
+        let base = commit_tree(&repo, &tree, &parent)?;
+        git(
+            repo.path(),
+            &["update-ref", MAIN, &base, &parent],
+            None,
+            None,
+        )?;
+        let adr = repo.prepare_adr(&base, &id('a'), "# Fits with policy at the module limit\n")?;
+        assert_eq!(repo.snapshot("A000.lean", Some(&adr))?.modules, modules);
+
+        // With no ADR, the extra root slot must not allow one more proof input.
+        rows.push_str(&format!("100644 blob {blob}\tZ.lean\0"));
+        let too_many = text(git(
+            repo.path(),
+            &["mktree", "-z"],
+            None,
+            Some(rows.as_bytes()),
+        )?)?;
+        assert!(ProjectTree::read(repo.path(), &too_many).is_err());
+        Ok(())
     }
 
     #[test]
