@@ -2,7 +2,7 @@
 use super::{UNKNOWN_DATE, WikiStratum, sediment};
 use crate::retained::valid_id as valid_sha256;
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
 
 const PREFIX: &str = "CORE-ADAPT-";
@@ -169,6 +169,37 @@ fn insert(tx: &Transaction<'_>, entry: &WikiManagedCoreEntry) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn installed_generation(db: &Connection) -> Result<Option<(String, i64)>> {
+    if !generation_tables_exist(db)? {
+        return Ok(None);
+    }
+    // Empty projections are a cheap static-only read: no Git subprocess is needed.
+    let installed: Option<(String, i64)> = db
+        .query_row(
+            "SELECT head,event_seq FROM managed_core_generation WHERE singleton=1
+         AND EXISTS (SELECT 1 FROM entries WHERE id GLOB 'CORE-ADAPT-*')",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    Ok(installed.filter(|(head, event_seq)| {
+        WikiManagedGeneration {
+            head,
+            event_seq: *event_seq,
+        }
+        .is_valid()
+    }))
+}
+
+fn generation_tables_exist(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT count(*)=2 FROM main.sqlite_schema
+        WHERE type='table' AND name IN ('managed_core_generation','managed_core_fts')",
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 pub(super) fn visible(
     db: &Connection,
     generation: Option<WikiManagedGeneration<'_>>,
@@ -177,13 +208,7 @@ pub(super) fn visible(
         return Ok(false);
     };
     // A read-only handle may be using an index built before the additive schema.
-    let exists: bool = db.query_row(
-        "SELECT count(*)=2 FROM main.sqlite_schema
-        WHERE type='table' AND name IN ('managed_core_generation','managed_core_fts')",
-        [],
-        |row| row.get(0),
-    )?;
-    if !exists {
+    if !generation_tables_exist(db)? {
         return Ok(false);
     }
     Ok(db.query_row(

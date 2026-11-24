@@ -397,6 +397,21 @@ impl StateStore {
             .optional()?)
     }
 
+    /// Compact read stamp for guarded Wiki reads. Pending Git state must not be
+    /// presented as current even when the journal did not append a new event.
+    pub fn managed_wiki_stamp(&self) -> Result<Option<(String, i64)>> {
+        Ok(self
+            .db
+            .query_row(
+                "SELECT repo,(SELECT coalesce(max(event_seq),0) FROM events) FROM managed_repo
+             WHERE singleton=1 AND NOT EXISTS (SELECT 1 FROM promotion_intent)
+             AND NOT EXISTS (SELECT 1 FROM pivot_resume_intent)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
     /// Trust-boundary setup called by the operator with the canonical repository
     /// path and fully reviewed main OID, under the Git coordination lock.
     pub fn bind_task_repository(&mut self, repo: &str, main: &str) -> Result<()> {

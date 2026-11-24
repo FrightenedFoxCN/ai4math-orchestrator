@@ -227,6 +227,41 @@ fn lineage_is_atomic_immutable_readback_and_historically_idempotent() -> Result<
 }
 
 #[test]
+fn managed_wiki_stamp_refuses_pending_journals_without_advancing_sequence() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    assert!(store.managed_wiki_stamp()?.is_none());
+    let approval = fixture(&mut store, Some(valid_result()))?;
+    let seq = last_seq(&store.db)?;
+    let expected = Some((approval.plan.repo.clone(), seq));
+    assert_eq!(store.managed_wiki_stamp()?, expected);
+    store.db.execute(
+        "INSERT INTO pivot_resume_intent VALUES (1,'fixture','{}',?1)",
+        [NEW],
+    )?;
+    assert!(store.managed_wiki_stamp()?.is_none());
+    assert_eq!(last_seq(&store.db)?, seq);
+    store.db.execute("DELETE FROM pivot_resume_intent", [])?;
+    let plan = &approval.plan;
+    store.db.execute(
+        "INSERT INTO promotion_intent VALUES (1,?1,?2,?3,?4,?5,?6,?7)",
+        params![
+            plan.repo,
+            plan.target_claim,
+            plan.reviewed_commit,
+            NEW,
+            plan.target_module,
+            plan.target_decl,
+            BODY
+        ],
+    )?;
+    assert!(store.managed_wiki_stamp()?.is_none());
+    assert_eq!(last_seq(&store.db)?, seq);
+    store.db.execute("DELETE FROM promotion_intent", [])?;
+    assert_eq!(store.managed_wiki_stamp()?, expected);
+    Ok(())
+}
+
+#[test]
 fn core_selector_requires_current_exact_t1_and_preserves_historical_lineage() -> Result<()> {
     let mut store = StateStore::open(":memory:")?;
     let approval = fixture(&mut store, Some(valid_result()))?;

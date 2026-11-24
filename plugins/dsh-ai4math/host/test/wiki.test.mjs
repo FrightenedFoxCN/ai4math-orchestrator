@@ -42,6 +42,28 @@ test('Wiki provenance and warnings are exposed only to their bound roles', async
   assert.deepEqual(seen, expected);
 });
 
+test('Wiki responses forward the optional managed CORE flag without adding request fields', async t => {
+  const id = 'CORE-ADAPT-' + 'a'.repeat(64);
+  const search = { text: 'lemma', scope: 'core', limit: 24 };
+  const provenance = { id, max_depth: 2, limit: 24 };
+  const searchResult = { managed_core: true, hits: [{ id, stratum: 'core', file_path: '.managed-core/' + id }] };
+  const provenanceResult = { managed_core: false, edges: [], truncated: false };
+  const seen = [];
+  const socketPath = await fixture(t, (request, socket) => {
+    seen.push([request.method, request.params]);
+    reply(socket, request.id, request.method === 'wiki.search' ? searchResult : provenanceResult);
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  const owner = bridge.bind('owner');
+  assert.deepEqual(await owner.call('wikiSearch', search), searchResult);
+  assert.deepEqual(await owner.call('wikiProvenance', provenance), provenanceResult);
+  for (const [key, params] of [['wikiSearch', search], ['wikiProvenance', provenance]]) {
+    await assert.rejects(owner.call(key, { ...params, managed_core: true }), fails('invalid'));
+  }
+  assert.deepEqual(seen, [['wiki.search', search], ['wiki.provenance', provenance]]);
+});
+
 test('Wiki requests accept only their declared types and bounded keys', () => {
   const search = { text: 'lemma', scope: 'core', engine: 'lean4', conclusion_head: 'LE.le',
     hypothesis_heads: ['Integrable'], typeclasses: [], include_shadow_hint: false, limit: 24 };

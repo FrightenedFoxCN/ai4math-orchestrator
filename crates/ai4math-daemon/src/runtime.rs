@@ -4,7 +4,7 @@ use crate::{
     t3_worker,
     transport::{self, Connection, Hub, RpcError},
 };
-use ai4math_store::{StateStore, Wiki, WikiQuery};
+use ai4math_store::{StateStore, Wiki, WikiManagedGeneration, WikiQuery};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -16,6 +16,8 @@ use std::{
     thread,
     time::Duration,
 };
+
+mod managed_wiki;
 
 const TOPICS: [&str; 3] = ["vital_signs.tick", "alert.p0", "breaker.state_changed"];
 
@@ -237,6 +239,50 @@ impl Project {
             .lock()
             .map_err(|_| anyhow::anyhow!("state lock poisoned"))
     }
+    fn wiki(&self) -> Result<std::sync::MutexGuard<'_, Wiki>> {
+        self.wiki
+            .lock()
+            .map_err(|_| anyhow::anyhow!("wiki lock poisoned"))
+    }
+
+    fn wiki_read<T>(
+        &self,
+        permit_managed: bool,
+        read: impl Fn(&Wiki, Option<WikiManagedGeneration<'_>>) -> Result<T>,
+    ) -> Result<(T, bool)> {
+        let installed = if permit_managed {
+            self.wiki()?.managed_generation()?
+        } else {
+            None
+        };
+        if let Some((head, event_seq)) = installed {
+            let stamp = self.store()?.managed_wiki_stamp()?;
+            if let Some((repo, seq)) = stamp
+                && seq == event_seq
+                && managed_wiki::still_at(&repo, &head)
+            {
+                let generation = WikiManagedGeneration {
+                    head: &head,
+                    event_seq,
+                };
+                let result = {
+                    let wiki = self.wiki()?;
+                    read(&wiki, Some(generation))?
+                };
+                // Do not hold either DB mutex while the local Git observation runs.
+                // No response with derived data leaves the service if either authority drifted.
+                if managed_wiki::still_at(&repo, &head)
+                    && self.store()?.managed_wiki_stamp()?.as_ref() == Some(&(repo, event_seq))
+                    && self.wiki()?.managed_generation()?.as_ref() == Some(&(head, event_seq))
+                {
+                    return Ok((result, true));
+                }
+            }
+        }
+        let wiki = self.wiki()?;
+        Ok((read(&wiki, None)?, false))
+    }
+
     fn status(&self) -> Result<Value> {
         let mut data = serde_json::to_value(self.store()?.live_telemetry()?)?;
         data["memory"] = memory_sample().unwrap_or(Value::Null);
@@ -373,13 +419,18 @@ impl Project {
                 q.hypothesis_heads = &hypotheses;
                 q.typeclasses = &classes;
                 q.include_shadow_hint = args.include_shadow_hint.unwrap_or(true);
-                let result = self
-                    .wiki
-                    .lock()
-                    .map_err(|_| RpcError::new(-32603, "wiki lock poisoned"))?
-                    .search(q)
+                let core = q.scope == ai4math_store::WikiStratum::Core;
+                let (result, managed) = self
+                    .wiki_read(core, |wiki, generation| match generation {
+                        Some(generation) => wiki.search_at(q, generation),
+                        None => wiki.search(q),
+                    })
                     .map_err(internal)?;
-                wiki_page("hits", result.hits, limit, false, result.shadow_hint)
+                let mut page = wiki_page("hits", result.hits, limit, false, result.shadow_hint)?;
+                if core {
+                    page["managed_core"] = Value::Bool(managed);
+                }
+                Ok(page)
             }
             "wiki.check_graveyard" => {
                 let args: WikiGraveyardArgs = parse(params)?;
@@ -420,13 +471,17 @@ impl Project {
                     return Err(RpcError::new(-32602, "max_depth must be in 1..=16"));
                 }
                 let limit = cap(args.limit, 24, 64)?;
-                let result = self
-                    .wiki
-                    .lock()
-                    .map_err(|_| RpcError::new(-32603, "wiki lock poisoned"))?
-                    .provenance(&args.id, max_depth, limit as u32)
+                let (result, managed) = self
+                    .wiki_read(true, |wiki, generation| match generation {
+                        Some(generation) => {
+                            wiki.provenance_at(&args.id, max_depth, limit as u32, generation)
+                        }
+                        None => wiki.provenance(&args.id, max_depth, limit as u32),
+                    })
                     .map_err(internal)?;
-                wiki_page("edges", result.edges, limit, result.truncated, None)
+                let mut page = wiki_page("edges", result.edges, limit, result.truncated, None)?;
+                page["managed_core"] = Value::Bool(managed);
+                Ok(page)
             }
             _ => Err(RpcError::new(-32601, "method not found")),
         }

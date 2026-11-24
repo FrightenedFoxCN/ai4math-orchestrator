@@ -147,19 +147,104 @@ test('Wiki provenance is fetched on demand and rendered as bounded text-only lin
   const wiki = mountTab(app, 'wiki');
   wiki.find('input').props.onChange({ target: { value: 'lemma' } });
   wiki.find('form').props.onSubmit({ preventDefault() {} });
-  await expectText(wiki, /Archived relation/);
+  await expectText(wiki, /Derived CORE coverage was not reported for this search. .*Archived relation/);
+  assert.doesNotMatch(wiki.text(), /Static Wiki only/);
   assert.deepEqual(calls, [['search', { text: 'lemma', scope: 'core', limit: 24 }]]);
   wiki.find('button', 'Inspect provenance for COR-A').props.onClick();
   await expectText(wiki, /Provenance for COR-A .*SED-A sediment → COR-A core .*superseded_by .*bounded provenance slice/);
   assert.deepEqual(calls.at(-1), ['provenance', { id: 'COR-A', max_depth: 2, limit: 24 }]);
   assert.doesNotThrow(() => wiki.find('summary', 'Indexed edge metadata'));
+  assert.match(wiki.text(), /Derived CORE coverage was not reported for this provenance response./);
   assert.throws(() => wiki.find('img'), /render did not contain img/);
   const methods = app.registrations[0].descriptors;
   const input = key => methods.find(d => d.method === key).parameters[0].codec.create();
   assert.equal(input('wikiSearch').safeParse({ text: 'x', include_shadow_hint: false }).success, true);
   assert.equal(input('wikiSearch').safeParse({ text: 'x', include_shadow_hint: 1 }).success, false);
+  assert.equal(input('wikiSearch').safeParse({ text: 'x', managed_core: true }).success, false);
   assert.equal(input('wikiProvenance').safeParse({ id: 'α'.repeat(65) }).success, false);
   assert.equal(input('wikiProvenance').safeParse({ id: 'COR-A', scope: 'core' }).success, false);
+  assert.equal(input('wikiProvenance').safeParse({ id: 'COR-A', managed_core: true }).success, false);
+});
+
+test('Wiki shows managed CORE as derived metadata alongside authored CORE and labels both lineage directions', async t => {
+  const id = 'CORE-ADAPT-' + 'a'.repeat(64);
+  const virtualPath = '.managed-core/' + id;
+  const calls = [];
+  let provenanceCalls = 0;
+  const app = await browser(t, {
+    async *subscribe() {},
+    async status() { return ok(snapshot(5)); },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+    async wikiSearch(params) {
+      calls.push(['search', fromWire(params)]);
+      return ok({ managed_core: true, hits: [
+        { id: 'COR-A', title: 'Authored CORE theorem', engine: 'lean4', stratum: 'core', trust_level: 'L5',
+          status: 'active', file_path: 'core/authored.md' },
+        { id, title: 'Derived CORE theorem', engine: 'lean4', stratum: 'core', trust_level: 'L5',
+          status: 'active', informal_gloss: 'An indexed adaptation', formal_signature: null, file_path: virtualPath },
+      ] });
+    },
+    async wikiProvenance(params) {
+      calls.push(['provenance', fromWire(params)]);
+      if (provenanceCalls++ > 0) return ok({ managed_core: false, edges: [], truncated: false });
+      return ok({ managed_core: true, edges: [
+        { src_id: 'SED-A', src_stratum: 'sediment', dst_id: id, dst_stratum: 'core', edge_type: 'superseded_by', depth: 1 },
+        { src_id: id, src_stratum: 'core', dst_id: 'Claim-A', dst_stratum: null, edge_type: 'born_from_claim', depth: 1 },
+      ], truncated: false });
+    },
+  });
+  const wiki = mountTab(app, 'wiki');
+  wiki.find('input').props.onChange({ target: { value: 'theorem' } });
+  wiki.find('form').props.onSubmit({ preventDefault() {} });
+  await expectText(wiki, /Authored CORE theorem COR-A lean4 core L5 active .*Source path core\/authored\.md .*Derived CORE theorem CORE-ADAPT-[0-9a-f]+ lean4 Derived CORE Indexed trust L5 active .*Virtual index location/);
+  const location = wiki.find('code', virtualPath);
+  assert.equal(location.props.onClick, undefined);
+  assert.equal(location.props.href, undefined);
+  assert.throws(() => wiki.find('a'), /render did not contain a/);
+  assert.match(wiki.text(), /not an authored Wiki page or a proof source/);
+  assert.match(wiki.text(), /Search again to check for changes/);
+  assert.doesNotMatch(wiki.text(), /Static Wiki only|coverage was not reported/);
+  assert.deepEqual(calls, [['search', { text: 'theorem', scope: 'core', limit: 24 }]]);
+
+  wiki.find('button', 'Inspect provenance for ' + id).props.onClick();
+  await expectText(wiki, /Provenance for CORE-ADAPT-[0-9a-f]+ .*not authored Wiki pages or proof sources[.] .*born_from_claim/);
+  wiki.find('li', 'SED-A sediment → ' + id + ' Derived CORE · superseded_by · Hops 1');
+  wiki.find('li', id + ' Derived CORE → Claim-A Outside index · born_from_claim · Hops 1');
+  assert.doesNotMatch(wiki.text(), /Static Wiki lineage only|coverage was not reported/);
+  assert.match(wiki.text(), /Inspect again to check for changes/);
+  assert.deepEqual(calls.at(-1), ['provenance', { id, max_depth: 2, limit: 24 }]);
+  assert.throws(() => wiki.find('a'), /render did not contain a/);
+
+  // A later response can fail the generation gate independently of the search.
+  wiki.find('button', 'Inspect provenance for ' + id).props.onClick();
+  await expectText(wiki, /Static Wiki lineage only; derived CORE edges were not included[.] No edges returned/);
+  assert.doesNotMatch(wiki.text(), /superseded_by|born_from_claim|Static Wiki only;/);
+});
+
+test('Wiki reports explicit static-only responses without implying a daemon failure or a cold search gap', async t => {
+  const app = await browser(t, {
+    async *subscribe() {},
+    async status() { return ok(snapshot(5)); },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+    async wikiSearch({ scope }) {
+      return ok({ managed_core: false, hits: scope === 'core'
+        ? [{ id: 'COR-B', title: 'Static result', stratum: 'core', file_path: 'core/static.md' }]
+        : [] });
+    },
+    async wikiProvenance() { return ok({ managed_core: false, edges: [] }); },
+  });
+  const wiki = mountTab(app, 'wiki');
+  wiki.find('input').props.onChange({ target: { value: 'lemma' } });
+  wiki.find('form').props.onSubmit({ preventDefault() {} });
+  await expectText(wiki, /Static Wiki only; derived CORE entries were not included. .*Static result/);
+  wiki.find('button', 'Inspect provenance for COR-B').props.onClick();
+  await expectText(wiki, /Static Wiki lineage only; derived CORE edges were not included. .*No edges returned/);
+  assert.doesNotMatch(wiki.text(), /unavailable|connection|coverage was not reported/i);
+
+  wiki.find('select').props.onChange({ target: { value: 'graveyard' } });
+  wiki.find('form').props.onSubmit({ preventDefault() {} });
+  await expectText(wiki, /· GRAVEYARD Graveyard matches are historical warnings, not verified evidence[.] No matching records returned/);
+  assert.doesNotMatch(wiki.text(), /Static Wiki|Derived CORE|Provenance for/);
 });
 
 test('opening a retained P0 pack shows its source events outside the review window', async t => {

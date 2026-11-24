@@ -728,24 +728,49 @@ const validProvenanceId = id => typeof id === 'string'
   && new TextEncoder().encode(id).byteLength <= provenanceIdSchema['x-ai4math-maxUtf8Bytes']
   && new RegExp(provenanceIdSchema.pattern, 'u').test(id)
 
+// Identity comes from the reserved index namespace, not from L5 or the
+// response-wide generation flag. Provenance endpoints have no file_path.
+const managedCorePath = '.managed-core/'
+const isDerivedCore = (id, stratum) => stratum === 'core'
+  && typeof id === 'string' && /^CORE-ADAPT-[0-9a-f]{64}$/.test(id)
+
+function wikiCoverageNote(value, surface) {
+  if (value.managed_core === true) return note(surface === 'search'
+    ? 'Derived CORE was checked for this search. Search again to check for changes.'
+    : 'Derived CORE lineage was checked for this response. Inspect again to check for changes.')
+  if (value.managed_core !== false) return note('Derived CORE coverage was not reported for this ' + surface + '.')
+  return note(surface === 'search'
+    ? 'Static Wiki only; derived CORE entries were not included.'
+    : 'Static Wiki lineage only; derived CORE edges were not included.')
+}
+
 function WikiCard({ hit, inspectProvenance }) {
+  const hasPath = typeof hit.file_path === 'string'
+  const virtual = hasPath && hit.file_path.startsWith(managedCorePath)
+  const derived = virtual && isDerivedCore(hit.id, hit.stratum) && hit.file_path === managedCorePath + hit.id
   return h('article', { className: 'ai4m-card' },
     h('h4', null, text(hit.title, text(hit.id, 'Untitled Wiki entry'))),
     h('div', { className: 'ai4m-meta' }, h('code', null, text(hit.id)), badge(text(hit.engine)),
-      badge(text(hit.stratum)), badge(text(hit.trust_level)), badge(text(hit.status))),
+      badge(derived ? 'Derived CORE' : text(hit.stratum)),
+      badge((derived ? 'Indexed trust ' : '') + text(hit.trust_level)), badge(text(hit.status))),
     h(MathCard, { informal: hit.informal_gloss, formal: hit.formal_signature }),
-    typeof hit.file_path === 'string' && labelValue('Source path', h('code', null, hit.file_path)),
+    hasPath && labelValue(virtual ? 'Virtual index location' : 'Source path', h('code', null, hit.file_path)),
+    derived && note('This derived index record is not an authored Wiki page or a proof source.'),
     validProvenanceId(hit.id) && h('div', { className: 'ai4m-actions' },
-      button('Inspect provenance for ' + hit.id, () => inspectProvenance(hit.id))))
+      button('Inspect provenance for ' + hit.id, () => inspectProvenance(hit.id, derived))))
 }
 
-function WikiProvenance({ id, query }) {
+function WikiProvenance({ target, query }) {
   const edges = rows(query.value?.edges, 24)
+  const hasDerived = target.derived || edges.some(edge => isDerivedCore(edge.src_id, edge.src_stratum)
+    || isDerivedCore(edge.dst_id, edge.dst_stratum))
   const endpoint = (value, stratum) => h('span', null, h('code', null, text(value)), ' ',
-    badge(text(stratum, 'Outside index')))
-  return h(Section, { title: 'Provenance for ' + id },
+    badge(isDerivedCore(value, stratum) ? 'Derived CORE' : text(stratum, 'Outside index')))
+  return h(Section, { title: 'Provenance for ' + target.id },
     note('Read-only lineage across strata; recorded edges do not confer proof status.'),
+    hasDerived && note('Derived CORE nodes are index records, not authored Wiki pages or proof sources.'),
     queryNote(query),
+    query.value && wikiCoverageNote(query.value, 'provenance response'),
     query.phase === 'done' && (edges.length ? h('ol', { className: 'ai4m-edges' }, edges.map((edge, index) =>
       h('li', { key: index }, endpoint(edge.src_id, edge.src_stratum), ' → ', endpoint(edge.dst_id, edge.dst_stratum),
         ' · ', text(edge.edge_type), ' · ', labelValue('Hops', count(edge.depth)),
@@ -757,7 +782,7 @@ function WikiProvenance({ id, query }) {
 function Wiki({ remote }) {
   const query = useQuery(remote)
   const provenance = useQuery(remote)
-  const [provenanceId, setProvenanceId] = useState(null)
+  const [provenanceTarget, setProvenanceTarget] = useState(null)
   const [input, setInput] = useState('')
   const [scope, setScope] = useState('core')
   const [searched, setSearched] = useState(null)
@@ -769,11 +794,11 @@ function Wiki({ remote }) {
   const submit = (term, stratum) => {
     if (!term || busy || new TextEncoder().encode(term).byteLength > 512 || term.includes('\0')) return
     setSearched({ term, stratum })
-    setProvenanceId(null)
+    setProvenanceTarget(null)
     void query.run('wikiSearch', { text: term, scope: stratum, limit: 24 })
   }
-  const inspectProvenance = id => {
-    setProvenanceId(id)
+  const inspectProvenance = (id, derived) => {
+    setProvenanceTarget({ id, derived })
     void provenance.run('wikiProvenance', { id, max_depth: 2, limit: 24 })
   }
   return h(Panel, { title: 'Math Wiki', subtitle: 'Search CORE first; inspect SEDIMENT and GRAVEYARD as separate strata.' },
@@ -786,8 +811,9 @@ function Wiki({ remote }) {
     invalid && note('Queries must be at most 512 UTF-8 bytes and cannot contain a NUL character.', 'status'),
     queryNote(query, 'Enter a title, mathematical phrase, or identifier.'),
     query.value && searched && note('Results for “' + searched.term + '” · ' + searched.stratum.toUpperCase()),
+    query.value && searched?.stratum === 'core' && wikiCoverageNote(query.value, 'search'),
     query.value && searched?.stratum === 'graveyard' && note('Graveyard matches are historical warnings, not verified evidence.'),
-    provenanceId && h(WikiProvenance, { id: provenanceId, query: provenance }),
+    provenanceTarget && h(WikiProvenance, { target: provenanceTarget, query: provenance }),
     query.value && (hits.length > 0 ? h('div', { className: 'ai4m-stack' },
       hits.map((hit, index) => h(WikiCard, { key: text(hit.id, 'hit') + ':' + index, hit, inspectProvenance }))) : empty('No matching records returned.')),
     query.value?.truncated === true && note('Only a bounded search slice is shown.'),

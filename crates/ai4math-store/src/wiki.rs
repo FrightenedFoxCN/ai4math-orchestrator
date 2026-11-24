@@ -158,6 +158,12 @@ impl Wiki {
         Ok(Self { db })
     }
 
+    /// Return the installed managed generation, if the index contains derived CORE rows.
+    /// This untrusted hint is not evidence; callers must check Git and ledger independently.
+    pub fn managed_generation(&self) -> Result<Option<(String, i64)>> {
+        managed_core::installed_generation(&self.db)
+    }
+
     /// Replace the disposable index from Markdown alone, dropping any managed Core projection.
     /// Missing strata are empty (Git does not track empty directories). Invalid input leaves
     /// the previously published index intact. This never writes or deletes a Markdown file.
