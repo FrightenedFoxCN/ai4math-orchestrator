@@ -53,6 +53,67 @@ fn archive_refuses_unproved_claim_and_symbolic_review_without_writing() -> Resul
     Ok(())
 }
 
+#[test]
+fn canonical_but_unbacked_archive_cannot_be_woken() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let (repo, head) = fixture(root)?;
+    let source = "theorem target : True := by trivial\n";
+    let fabricated = render_sediment(SedimentInput {
+        claim_id: "C",
+        engine: "lean4",
+        verified_at_commit: &head,
+        source_module: "Proof.lean",
+        target_decl: "target",
+        source,
+        source_sha256: &sha(source.as_bytes()),
+        dependency_hashes: &BTreeMap::new(),
+        dependency_order: &[],
+    })?;
+    publish_sediment(root, &fabricated)?;
+    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let seq = state.status()?.last_event_seq;
+    let git = PromotionRepo::try_lock(&repo)?;
+    assert!(
+        prepare_wake(root, &git, &state, fabricated.id(), &head)
+            .unwrap_err()
+            .to_string()
+            .contains("no exact managed promotion")
+    );
+    assert_eq!(state.status()?.last_event_seq, seq);
+    Ok(())
+}
+
+#[test]
+fn prefix_comparison_distinguishes_add_remove_edits_and_order() {
+    let old = (
+        vec!["A".into(), "B".into(), "C".into()],
+        BTreeMap::from([
+            ("A".into(), "a".into()),
+            ("B".into(), "b".into()),
+            ("C".into(), "c".into()),
+        ]),
+    );
+    let new = (
+        vec!["C".into(), "B".into(), "D".into()],
+        BTreeMap::from([
+            ("C".into(), "c".into()),
+            ("B".into(), "changed".into()),
+            ("D".into(), "d".into()),
+        ]),
+    );
+    let diff = compare_prefix(&old, &new);
+    assert_eq!(diff.added, ["D"]);
+    assert_eq!(diff.removed, ["A"]);
+    assert_eq!(diff.modified, ["B"]);
+    assert!(!diff.order_matches);
+    let mut reordered = old.clone();
+    reordered.0.swap(0, 1);
+    let diff = compare_prefix(&old, &reordered);
+    assert!(!diff.order_matches);
+    assert!(diff.modified.is_empty() && diff.added.is_empty() && diff.removed.is_empty());
+}
+
 #[cfg(target_os = "macos")]
 #[test]
 #[ignore = "requires native macOS Seatbelt and absolute AI4MATH_TEST_LEAN"]
@@ -114,6 +175,83 @@ fn native_managed_wiki_archive_preserves_cold_provenance_without_authority() -> 
         },
     )?;
     assert!(archive(root, &repo, "C", &head, &p.approval_sha256).is_err());
+    assert_eq!(fs::read_to_string(&abs)?, artifact.markdown());
+    let stale_seq = state.status()?.last_event_seq;
+    let wake = |reviewed: &str| -> Result<WakePreview> {
+        let locked = PromotionRepo::try_lock(&repo)?;
+        prepare_wake(root, &locked, &state, &p.id, reviewed)
+    };
+    let same = wake(&head)?;
+    assert!(matches!(
+        same.compatibility,
+        Compatibility::ProjectBytesMatch
+    ));
+    assert!(same.requires_review_and_verification && !same.current_proof_authority);
+    let forged_source = "theorem target : True := by trivial\n";
+    let forged = render_sediment(SedimentInput {
+        claim_id: "C",
+        engine: "lean4",
+        verified_at_commit: &head,
+        source_module: "Proof.lean",
+        target_decl: "target",
+        source: forged_source,
+        source_sha256: &sha(forged_source.as_bytes()),
+        dependency_hashes: &p.dependency_hashes,
+        dependency_order: &p.dependency_order,
+    })?;
+    publish_sediment(root, &forged)?;
+    {
+        let locked = PromotionRepo::try_lock(&repo)?;
+        let error = prepare_wake(root, &locked, &state, forged.id(), &head).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("differs from the historical managed proof")
+        );
+    }
+    let review = root.join("review");
+    git(root, &["clone", "repo.git", "review"]);
+    let push = || {
+        git(&review, &["add", "-A"]);
+        git(
+            &review,
+            &["commit", "-m", "reviewed archive comparison fixture"],
+        );
+        git(&review, &["push", "origin", "HEAD:refs/heads/main"]);
+        git(&repo, &["rev-parse", "refs/heads/main"])
+    };
+    fs::write(review.join("Defs.lean"), "def x : Nat := Nat.succ 1\n")?;
+    let changed = push();
+    assert!(wake(&head).is_err());
+    let against = wake(&changed)?;
+    assert!(matches!(
+        against.compatibility,
+        Compatibility::PrefixChanged
+    ));
+    assert_eq!(against.prefix.unwrap().modified, ["Defs.lean"]);
+    fs::write(
+        review.join("Proof.lean"),
+        "import Defs\ntheorem target : x = 2 := by rfl\n",
+    )?;
+    assert!(matches!(
+        wake(&push())?.compatibility,
+        Compatibility::TargetAndPrefixChanged
+    ));
+    fs::write(review.join("Defs.lean"), "def x : Nat := 2\n")?;
+    assert!(matches!(
+        wake(&push())?.compatibility,
+        Compatibility::TargetChanged
+    ));
+    git(&review, &["mv", "Proof.lean", "Other.lean"]);
+    fs::write(
+        review.join("ai4math-modules.txt"),
+        "Defs.lean\nOther.lean\n",
+    )?;
+    let absent = wake(&push())?;
+    assert!(matches!(absent.compatibility, Compatibility::ModuleAbsent));
+    assert!(absent.prefix.is_none() && absent.current_source_sha256.is_none());
+    assert_eq!(state.status()?.last_event_seq, stale_seq);
+    assert!(state.claim("C")?.unwrap().stale);
     assert_eq!(fs::read_to_string(&abs)?, artifact.markdown());
     Ok(())
 }

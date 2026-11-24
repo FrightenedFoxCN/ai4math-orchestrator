@@ -280,6 +280,13 @@ impl PromotionRepo {
         Ok(())
     }
 
+    pub(crate) fn contains_module_at(&self, commit: &str, module: &str) -> Result<bool> {
+        module_extension(module).context("invalid root-level project module name")?;
+        let tree = self.project_tree(commit)?;
+        tree.check_adr_contents(self.path())?;
+        Ok(tree.files.contains_key(module))
+    }
+
     fn project_tree(&self, commit: &str) -> Result<ProjectTree> {
         self.require_commit(commit)?;
         let spec = format!("{commit}^{{tree}}");

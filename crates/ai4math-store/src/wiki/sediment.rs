@@ -1,12 +1,12 @@
 //! Deterministic, historical-only proof archives for the Wiki's Sediment stratum.
 use super::ClaimEngine;
 use anyhow::{Context, Result, ensure};
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{CStr, CString},
-    fs::{File, OpenOptions},
+    fs::{File, Metadata, OpenOptions},
     io::{self, Read, Write},
     mem::MaybeUninit,
     os::{
@@ -16,6 +16,17 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+
+// Match the Phase 1 rendered proof limit in ai4math-core's proof.rs. The archive
+// needs a separate cap: two Markdown fences can each be longer than the source.
+const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024;
+const BODY_PREAMBLE: &str = concat!(
+    "\n# Historical proof archive\n\n",
+    "This is an L5 historical archive, not current proof evidence or authorization.\n",
+    "Dependency fingerprints conservatively hash whole module bytes, not individual definitions.\n\n",
+    "## Formal Artifact\n\n",
+);
 
 /// Pinned historical provenance. Selecting and verifying the snapshot is the caller's job.
 #[derive(Debug, Clone, Copy)]
@@ -119,12 +130,8 @@ pub fn render_sediment(input: SedimentInput<'_>) -> Result<SedimentArtifact> {
     field(&mut content, "def_fingerprints", &fingerprints)?;
     field(&mut content, "dependency_order", input.dependency_order)?;
     field(&mut content, "source_bytes", &input.source.len())?;
-    content.push_str(concat!(
-        "---\n\n# Historical proof archive\n\n",
-        "This is an L5 historical archive, not current proof evidence or authorization.\n",
-        "Dependency fingerprints conservatively hash whole module bytes, not individual definitions.\n\n",
-        "## Formal Artifact\n\n",
-    ));
+    content.push_str("---\n");
+    content.push_str(BODY_PREAMBLE);
     // A fence longer than any run in the source cannot be closed by source text,
     // even if the source contains Markdown with untrusted headings or code fences.
     let longest = input
@@ -179,34 +186,181 @@ fn lowercase_sha256(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
+/// Historical recipe fields recovered from a canonical v1 Sediment archive.
+/// Archive consistency does not authenticate the historical proof or its provenance.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct StoredSediment {
+    pub claim_id: String,
+    pub engine: String,
+    pub verified_at_commit: String,
+    pub source_module: String,
+    pub target_decl: String,
+    pub source_sha256: String,
+    /// Module names mapped to raw lowercase SHA-256, without the wire-format prefix.
+    pub dependency_hashes: BTreeMap<String, String>,
+    pub dependency_order: Vec<String>,
+}
+
+/// Read a canonical generated archive, with a 2 MiB source and 8 MiB Markdown limit.
+/// Checks the named archive's content address; does not authenticate proof evidence.
+/// Neither creates directories nor updates the Wiki index.
+pub fn read_sediment(project_root: &Path, id: &str) -> Result<StoredSediment> {
+    ensure!(
+        id.strip_prefix("SED-").is_some_and(lowercase_sha256),
+        "invalid Sediment id; expected SED- followed by 64 lowercase hex digits"
+    );
+    let dirs = ArchiveDirs::open(project_root, DirMode::Existing)?;
+    let name = CString::new(format!("{id}.md"))?;
+    let (mut file, meta) =
+        open_existing(&dirs.sediment, &name, dirs.uid)?.context("Sediment archive not found")?;
+    ensure!(
+        meta.len() <= MAX_ARCHIVE_BYTES,
+        "Sediment archive exceeds the {MAX_ARCHIVE_BYTES}-byte file limit"
+    );
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    (&mut file)
+        .take(MAX_ARCHIVE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("read Sediment archive")?;
+    ensure!(
+        bytes.len() as u64 <= MAX_ARCHIVE_BYTES,
+        "Sediment archive exceeds the {MAX_ARCHIVE_BYTES}-byte file limit"
+    );
+    let stored = parse_sediment(
+        id,
+        std::str::from_utf8(&bytes).context("Sediment archive is not UTF-8")?,
+    )?;
+    let after = file.metadata()?;
+    validate_file(&after, dirs.uid)?;
+    ensure!(
+        bytes.len() as u64 == meta.len() && meta.len() == after.len(),
+        "Sediment archive size changed while reading"
+    );
+    verify_named(&dirs.sediment, &file, &name)?;
+    dirs.verify_named()?;
+    Ok(stored)
+}
+
+fn parse_sediment(id: &str, markdown: &str) -> Result<StoredSediment> {
+    let (header, body) = markdown
+        .strip_prefix("---\n")
+        .and_then(|document| document.split_once("\n---\n"))
+        .context("invalid Sediment v1 header envelope")?;
+    // This is a generated, ordered subset of YAML (one JSON value per key),
+    // not a permissive YAML parser. The renderer below checks ignored fields too.
+    let mut fields = header.split('\n');
+    let header_id: String = json_field(&mut fields, "id")?;
+    ensure!(
+        header_id == id,
+        "Sediment header id does not match requested id"
+    );
+    expect_field(&mut fields, "stratum")?;
+    expect_field(&mut fields, "trust_level")?;
+    let engine = json_field(&mut fields, "engine")?;
+    expect_field(&mut fields, "status")?;
+    expect_field(&mut fields, "title")?;
+    let verified_at_commit = json_field(&mut fields, "verified_at_commit")?;
+    let claim_id = json_field(&mut fields, "origin_claim")?;
+    let source_module = json_field(&mut fields, "source_module")?;
+    let target_decl = json_field(&mut fields, "target_decl")?;
+    let source_sha256 = json_field(&mut fields, "source_sha256")?;
+    expect_field(&mut fields, "def_fingerprint_kind")?;
+    let fingerprints: BTreeMap<String, String> = json_field(&mut fields, "def_fingerprints")?;
+    let dependency_hashes = fingerprints
+        .into_iter()
+        .map(|(module, fingerprint)| {
+            let sha = fingerprint
+                .strip_prefix("sha256:")
+                .context("invalid Sediment dependency fingerprint")?;
+            Ok((module, sha.to_owned()))
+        })
+        .collect::<Result<_>>()?;
+    let dependency_order = json_field(&mut fields, "dependency_order")?;
+    let source_bytes: usize = json_field(&mut fields, "source_bytes")?;
+    ensure!(fields.next().is_none(), "unexpected Sediment header field");
+    ensure!(
+        source_bytes <= MAX_SOURCE_BYTES,
+        "Sediment source exceeds the {MAX_SOURCE_BYTES}-byte limit"
+    );
+    let (fence, payload) = body
+        .strip_prefix(BODY_PREAMBLE)
+        .and_then(|body| body.split_once('\n'))
+        .context("invalid Sediment v1 body envelope")?;
+    ensure!(
+        fence.len() >= 3 && fence.bytes().all(|b| b == b'~'),
+        "invalid Sediment source fence"
+    );
+    let source = payload
+        .get(..source_bytes)
+        .context("invalid Sediment source byte length or UTF-8 boundary")?;
+    let stored = StoredSediment {
+        claim_id,
+        engine,
+        verified_at_commit,
+        source_module,
+        target_decl,
+        source_sha256,
+        dependency_hashes,
+        dependency_order,
+    };
+    let rendered = render_sediment(SedimentInput {
+        claim_id: &stored.claim_id,
+        engine: &stored.engine,
+        verified_at_commit: &stored.verified_at_commit,
+        source_module: &stored.source_module,
+        target_decl: &stored.target_decl,
+        source,
+        source_sha256: &stored.source_sha256,
+        dependency_hashes: &stored.dependency_hashes,
+        dependency_order: &stored.dependency_order,
+    })?;
+    ensure!(
+        rendered.id() == id,
+        "Sediment archive digest does not match requested id"
+    );
+    ensure!(
+        rendered.markdown().as_bytes() == markdown.as_bytes(),
+        "Sediment archive is not canonical v1 Markdown"
+    );
+    Ok(stored)
+}
+
+fn expect_field<'a>(fields: &mut impl Iterator<Item = &'a str>, key: &str) -> Result<&'a str> {
+    fields
+        .next()
+        .and_then(|line| line.strip_prefix(key)?.strip_prefix(": "))
+        .with_context(|| format!("invalid or missing Sediment {key} field"))
+}
+
+fn json_field<'a, T: DeserializeOwned>(
+    fields: &mut impl Iterator<Item = &'a str>,
+    key: &str,
+) -> Result<T> {
+    serde_json::from_str(expect_field(fields, key)?)
+        .with_context(|| format!("invalid JSON in Sediment {key} field"))
+}
+
 /// Publish the rendered bytes without replacing an existing entry or updating the index.
 /// Returns true for a new file, or false for a safe byte-identical replay.
 pub fn publish_sediment(project_root: &Path, artifact: &SedimentArtifact) -> Result<bool> {
-    let root = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-        .open(project_root)
-        .with_context(|| format!("open Sediment project root {}", project_root.display()))?;
-    // SAFETY: geteuid has no pointer arguments or preconditions.
-    let uid = unsafe { libc::geteuid() };
-    validate_dir(&root, uid).context("unsafe Sediment project root")?;
-    let wiki = archive_dir(&root, c".mathwiki", uid).context("unsafe .mathwiki directory")?;
-    let sediment = archive_dir(&wiki, c"sediment", uid).context("unsafe sediment directory")?;
+    let dirs = ArchiveDirs::open(project_root, DirMode::CreateMissing)?;
+    let sediment = &dirs.sediment;
+    let uid = dirs.uid;
     let name = CString::new(artifact.filename())?;
     let bytes = artifact.markdown.as_bytes();
-    let installed = if read_existing(&sediment, &name, bytes, uid)? {
+    let installed = if read_existing(sediment, &name, bytes, uid)? {
         false
     } else {
-        let (mut staged, temp) = Staged::new(&sediment)?;
+        let (mut staged, temp) = Staged::new(sediment)?;
         staged
             .write_all(bytes)
             .context("write staged Sediment archive")?;
         staged.sync_all().context("sync staged Sediment archive")?;
-        match rename_exclusive(&sediment, &temp.name, &name) {
+        match rename_exclusive(sediment, &temp.name, &name) {
             Ok(()) => true,
             Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
                 ensure!(
-                    read_existing(&sediment, &name, bytes, uid)?,
+                    read_existing(sediment, &name, bytes, uid)?,
                     "Sediment archive disappeared during publication"
                 );
                 false
@@ -215,11 +369,54 @@ pub fn publish_sediment(project_root: &Path, artifact: &SedimentArtifact) -> Res
         }
     };
     sediment.sync_all().context("sync sediment directory")?;
-    wiki.sync_all().context("sync .mathwiki directory")?;
-    root.sync_all().context("sync Sediment project root")?;
-    verify_named(&wiki, &sediment, c"sediment")?;
-    verify_named(&root, &wiki, c".mathwiki")?;
+    dirs.wiki.sync_all().context("sync .mathwiki directory")?;
+    dirs.root.sync_all().context("sync Sediment project root")?;
+    dirs.verify_named()?;
     Ok(installed)
+}
+
+#[derive(Clone, Copy)]
+enum DirMode {
+    Existing,
+    CreateMissing,
+}
+
+struct ArchiveDirs {
+    root: File,
+    wiki: File,
+    sediment: File,
+    uid: libc::uid_t,
+}
+
+impl ArchiveDirs {
+    fn open(project_root: &Path, mode: DirMode) -> Result<Self> {
+        // A trailing slash or "/." would make the project root an intermediate
+        // component, bypassing O_NOFOLLOW on that directory name.
+        let root_path: PathBuf = project_root.components().collect();
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(root_path)
+            .with_context(|| format!("open Sediment project root {}", project_root.display()))?;
+        // SAFETY: geteuid has no pointer arguments or preconditions.
+        let uid = unsafe { libc::geteuid() };
+        validate_dir(&root, uid).context("unsafe Sediment project root")?;
+        let wiki =
+            archive_dir(&root, c".mathwiki", uid, mode).context("open safe .mathwiki directory")?;
+        let sediment =
+            archive_dir(&wiki, c"sediment", uid, mode).context("open safe sediment directory")?;
+        Ok(Self {
+            root,
+            wiki,
+            sediment,
+            uid,
+        })
+    }
+
+    fn verify_named(&self) -> Result<()> {
+        verify_named(&self.wiki, &self.sediment, c"sediment")?;
+        verify_named(&self.root, &self.wiki, c".mathwiki")
+    }
 }
 
 fn validate_dir(dir: &File, uid: libc::uid_t) -> Result<()> {
@@ -231,10 +428,12 @@ fn validate_dir(dir: &File, uid: libc::uid_t) -> Result<()> {
     Ok(())
 }
 
-fn archive_dir(parent: &File, name: &CStr, uid: libc::uid_t) -> Result<File> {
+fn archive_dir(parent: &File, name: &CStr, uid: libc::uid_t, mode: DirMode) -> Result<File> {
     let flags = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW;
     let dir = match open_at(parent, name, flags) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+        Err(err)
+            if matches!(mode, DirMode::CreateMissing) && err.kind() == io::ErrorKind::NotFound =>
+        {
             // SAFETY: the parent descriptor is live; name is a single NUL-terminated component.
             if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } < 0 {
                 let err = io::Error::last_os_error();
@@ -291,15 +490,23 @@ fn verify_named(parent: &File, file: &File, name: &CStr) -> Result<()> {
     let actual = file.metadata()?;
     ensure!(
         named.st_dev == actual.dev() as libc::dev_t && named.st_ino == actual.ino() as libc::ino_t,
-        "Sediment path changed while publishing"
+        "Sediment path changed while accessing archive"
     );
     Ok(())
 }
 
-/// Returns false only for absence, never for aliases or stale bytes.
-fn read_existing(dir: &File, name: &CStr, expected: &[u8], uid: libc::uid_t) -> Result<bool> {
+fn validate_file(meta: &Metadata, uid: libc::uid_t) -> Result<()> {
+    ensure!(
+        meta.is_file() && meta.nlink() == 1 && meta.uid() == uid && meta.mode() & 0o022 == 0,
+        "unsafe existing Sediment archive"
+    );
+    Ok(())
+}
+
+/// Returns None only for absence, never for aliases or unsafe paths.
+fn open_existing(dir: &File, name: &CStr, uid: libc::uid_t) -> Result<Option<(File, Metadata)>> {
     let named = match stat_at(dir, name) {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         result => result.context("inspect existing Sediment archive")?,
     };
     // Reject visible special files before opening and validate the opened inode too.
@@ -310,22 +517,26 @@ fn read_existing(dir: &File, name: &CStr, expected: &[u8], uid: libc::uid_t) -> 
             && named.st_mode & 0o022 == 0,
         "unsafe existing Sediment archive"
     );
-    let mut file = open_at(
+    let file = open_at(
         dir,
         name,
         libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK,
     )
     .context("open existing Sediment archive")?;
     let meta = file.metadata()?;
+    validate_file(&meta, uid)?;
     ensure!(
-        meta.is_file()
-            && meta.nlink() == 1
-            && meta.uid() == uid
-            && meta.mode() & 0o022 == 0
-            && named.st_dev == meta.dev() as libc::dev_t
-            && named.st_ino == meta.ino() as libc::ino_t,
-        "unsafe existing Sediment archive"
+        named.st_dev == meta.dev() as libc::dev_t && named.st_ino == meta.ino() as libc::ino_t,
+        "Sediment archive changed while opening"
     );
+    Ok(Some((file, meta)))
+}
+
+/// Returns false only for absence, never for aliases or stale bytes.
+fn read_existing(dir: &File, name: &CStr, expected: &[u8], uid: libc::uid_t) -> Result<bool> {
+    let Some((mut file, meta)) = open_existing(dir, name, uid)? else {
+        return Ok(false);
+    };
     let mut actual = Vec::new();
     ensure!(
         meta.len() == expected.len() as u64,

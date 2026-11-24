@@ -1,12 +1,13 @@
 use ai4math_store::{
-    SedimentInput, Trust, Wiki, WikiQuery, WikiStratum, publish_sediment, render_sediment,
+    SedimentInput, StoredSediment, Trust, Wiki, WikiQuery, WikiStratum, publish_sediment,
+    read_sediment, render_sediment,
 };
 use anyhow::Result;
 use serde_yaml::Value;
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
-    fs::{self, Permissions},
+    fs::{self, File, Permissions},
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
     path::Path,
     sync::Barrier,
@@ -257,6 +258,21 @@ fn path_and_frontmatter_strings_are_data_only() -> Result<()> {
     );
     assert_eq!(fm["stratum"], "sediment");
     assert_eq!(fm["trust_level"], "L5");
+    let stored = read_sediment(root.path(), artifact.id())?;
+    assert_eq!(
+        stored,
+        StoredSediment {
+            claim_id: attack.into(),
+            engine: "lean4".into(),
+            verified_at_commit: attack.into(),
+            source_module: attack.into(),
+            target_decl: attack.into(),
+            source_sha256: source_sha,
+            dependency_hashes,
+            dependency_order: vec![dep],
+        }
+    );
+    assert!(serde_json::to_value(&stored)?.get("source").is_none());
     let mut wiki = Wiki::open(":memory:")?;
     assert_eq!(wiki.rebuild(root.path().join(".mathwiki"))?, 1);
     assert!(wiki.search(WikiQuery::new("escape"))?.hits.is_empty());
@@ -300,6 +316,164 @@ fn directory_and_output_aliases_and_shared_paths_are_refused() -> Result<()> {
     assert!(publish_sediment(root.path(), &artifact).is_err());
     assert_eq!(fs::read(&outside_file)?, bytes);
     assert_eq!(fs::read_dir(outside.path())?.count(), 1);
+    Ok(())
+}
+
+#[test]
+fn read_refuses_invalid_ids_without_creating_directories() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let id = format!("SED-{}", "a".repeat(64));
+    for invalid in [
+        "../escape".into(),
+        format!("{id}.md"),
+        format!("SED-{}", "A".repeat(64)),
+        format!("SED-{}", "a".repeat(63)),
+        format!("SED-{}g", "a".repeat(63)),
+    ] {
+        let err = read_sediment(root.path(), &invalid).unwrap_err();
+        assert!(err.to_string().contains("invalid Sediment id"), "{err:#}");
+    }
+    let wiki = root.path().join(".mathwiki");
+    assert!(read_sediment(root.path(), &id).is_err());
+    assert!(!wiki.exists());
+    fs::create_dir(&wiki)?;
+    assert!(read_sediment(root.path(), &id).is_err());
+    assert!(!wiki.join("sediment").exists());
+    Ok(())
+}
+
+#[test]
+fn read_rejects_digest_and_exact_byte_tampering() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let source = "é🙂\r\n";
+    let source_sha = sha(source);
+    let base = SedimentInput {
+        source,
+        ..input(&source_sha)
+    };
+    let archive = render_sediment(base)?;
+    let dest = root.path().join(archive.relative_path());
+    assert!(publish_sediment(root.path(), &archive)?);
+    assert_eq!(
+        read_sediment(root.path(), archive.id())?.source_sha256,
+        source_sha
+    );
+
+    let different = render_sediment(SedimentInput {
+        claim_id: "CLM-201",
+        ..base
+    })?;
+    fs::write(
+        &dest,
+        different
+            .markdown()
+            .replacen(different.id(), archive.id(), 1),
+    )?;
+    let err = read_sediment(root.path(), archive.id()).unwrap_err();
+    assert!(err.to_string().contains("archive digest"), "{err:#}");
+
+    let markdown = archive.markdown();
+    for (tampered, reason) in [
+        (markdown.replace(source, "å🙂\r\n"), "source SHA-256"),
+        (
+            markdown.replace(
+                &format!("source_bytes: {}", source.len()),
+                "source_bytes: 1",
+            ),
+            "UTF-8 boundary",
+        ),
+        (
+            markdown.replace("status: \"unreferenced\"", "status: \"active\""),
+            "not canonical",
+        ),
+        (
+            markdown.replace("engine: \"lean4\"", "engine: \"lean4\" "),
+            "not canonical",
+        ),
+        (format!("{markdown}\n"), "not canonical"),
+    ] {
+        assert_ne!(tampered, markdown);
+        fs::write(&dest, tampered)?;
+        let err = read_sediment(root.path(), archive.id()).unwrap_err();
+        assert!(err.to_string().contains(reason), "{err:#}");
+    }
+    Ok(())
+}
+
+#[test]
+fn read_refuses_aliased_or_unsafe_paths_even_with_valid_contents() -> Result<()> {
+    let outside = tempfile::tempdir()?;
+    let archive = render_sediment(input(&sha(SOURCE)))?;
+    assert!(publish_sediment(outside.path(), &archive)?);
+    let root = tempfile::tempdir()?;
+    let root_alias = root.path().join("project");
+    symlink(outside.path(), &root_alias)?;
+    for alias in [&root_alias, &root_alias.join(""), &root_alias.join(".")] {
+        assert!(read_sediment(alias, archive.id()).is_err());
+    }
+
+    for path in [".mathwiki", ".mathwiki/sediment"] {
+        let dir = root.path().join(path);
+        fs::create_dir_all(dir.parent().unwrap())?;
+        symlink(outside.path().join(path), &dir)?;
+        assert!(read_sediment(root.path(), archive.id()).is_err());
+        fs::remove_file(dir)?;
+    }
+
+    dirs(root.path())?;
+    let dest = root.path().join(archive.relative_path());
+    let original = outside.path().join(archive.relative_path());
+    symlink(&original, &dest)?;
+    assert!(read_sediment(root.path(), archive.id()).is_err());
+    fs::remove_file(&dest)?;
+    fs::hard_link(&original, &dest)?;
+    assert!(read_sediment(root.path(), archive.id()).is_err());
+    fs::remove_file(&dest)?;
+    fs::create_dir(&dest)?;
+    assert!(read_sediment(root.path(), archive.id()).is_err());
+    fs::remove_dir(&dest)?;
+    fs::write(&dest, archive.markdown())?;
+    fs::set_permissions(&dest, Permissions::from_mode(0o662))?;
+    assert!(read_sediment(root.path(), archive.id()).is_err());
+    fs::set_permissions(&dest, Permissions::from_mode(0o600))?;
+    assert!(read_sediment(root.path(), archive.id()).is_ok());
+    fs::set_permissions(dest.parent().unwrap(), Permissions::from_mode(0o775))?;
+    assert!(read_sediment(root.path(), archive.id()).is_err());
+    Ok(())
+}
+
+#[test]
+fn read_bounds_source_and_archive_separately() -> Result<()> {
+    let root = tempfile::tempdir()?;
+    let source = "~".repeat(2 * 1024 * 1024);
+    let digest = sha(&source);
+    let archive = render_sediment(SedimentInput {
+        source: &source,
+        ..input(&digest)
+    })?;
+    assert!(archive.markdown().len() > 3 * source.len());
+    assert!(publish_sediment(root.path(), &archive)?);
+    assert_eq!(
+        read_sediment(root.path(), archive.id())?.source_sha256,
+        digest
+    );
+
+    let source = format!("{source}x");
+    let digest = sha(&source);
+    let large_source = render_sediment(SedimentInput {
+        source: &source,
+        ..input(&digest)
+    })?;
+    assert!(publish_sediment(root.path(), &large_source)?);
+    let err = read_sediment(root.path(), large_source.id()).unwrap_err();
+    assert!(err.to_string().contains("2097152-byte limit"), "{err:#}");
+
+    File::create(root.path().join(archive.relative_path()))?.set_len(8 * 1024 * 1024 + 1)?;
+    let err = read_sediment(root.path(), archive.id()).unwrap_err();
+    assert!(
+        err.to_string().contains("8388608-byte file limit"),
+        "{err:#}"
+    );
     Ok(())
 }
 

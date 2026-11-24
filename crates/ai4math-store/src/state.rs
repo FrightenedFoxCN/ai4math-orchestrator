@@ -464,7 +464,17 @@ impl StateStore {
 
     /// Older promotions may have no recipe. Do not silently fall back to a different claim or commit.
     pub fn managed_proof_recipe(&self, claim: &str) -> Result<Option<ManagedProofRecipe>> {
-        read_managed_proof_recipe(&self.db, claim)
+        read_managed_proof_recipe(&self.db, claim, None)
+    }
+
+    /// Resolve an exact historical promotion recipe. Never fall back to the latest recipe
+    /// or to an arbitrary receipt if this Claim was not promoted at the pinned commit.
+    pub fn managed_proof_recipe_at(
+        &self,
+        claim: &str,
+        commit: &str,
+    ) -> Result<Option<ManagedProofRecipe>> {
+        read_managed_proof_recipe(&self.db, claim, Some(commit))
     }
 
     pub fn promotion_intent(&self) -> Result<Option<PromotionIntent>> {
@@ -1342,10 +1352,14 @@ impl StateStore {
     }
 }
 
-fn read_managed_proof_recipe(db: &Connection, claim: &str) -> Result<Option<ManagedProofRecipe>> {
+fn read_managed_proof_recipe(
+    db: &Connection,
+    claim: &str,
+    commit: Option<&str>,
+) -> Result<Option<ManagedProofRecipe>> {
     Ok(db.query_row("SELECT p.claim_id,p.base_commit,p.git_commit,m.file_path,m.target_decl,m.proof_body,r.patch_sha256
         FROM recorded_promotions p LEFT JOIN managed_proof_recipes m USING(git_commit)
-        JOIN verification_receipts r ON r.receipt_id=p.receipt_id WHERE p.claim_id=?1 ORDER BY p.event_seq DESC LIMIT 1",[claim],|r| {
+        JOIN verification_receipts r ON r.receipt_id=p.receipt_id WHERE p.claim_id=?1 AND (?2 IS NULL OR p.git_commit=?2) ORDER BY p.event_seq DESC LIMIT 1",params![claim, commit],|r| {
         let file=r.get::<_,Option<String>>(3)?;
         Ok(if let Some(file_path)=file {Some(ManagedProofRecipe {claim_id:r.get(0)?,base_commit:r.get(1)?,promoted_commit:r.get(2)?,file_path,target_decl:r.get(4)?,proof_body:r.get(5)?,source_sha256:r.get(6)?})} else {None})
     }).optional()?.flatten())

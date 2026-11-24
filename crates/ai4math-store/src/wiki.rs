@@ -13,7 +13,10 @@ use std::{
 };
 
 mod sediment;
-pub use sediment::{SedimentArtifact, SedimentInput, publish_sediment, render_sediment};
+pub use sediment::{
+    SedimentArtifact, SedimentInput, StoredSediment, publish_sediment, read_sediment,
+    render_sediment,
+};
 
 const DDL: &str = include_str!("../../../schemas/wiki-index.sql");
 const STRATA: [WikiStratum; 3] = [

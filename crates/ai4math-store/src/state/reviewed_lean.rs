@@ -411,7 +411,7 @@ pub(super) fn validate_recheck(
             && comparison.spec_prefix_sha256 == spec.spec_prefix_sha256,
         "verified Lean comparison does not match the reviewed spec binding"
     );
-    let recipe = read_managed_proof_recipe(db, &claim.id)?
+    let recipe = read_managed_proof_recipe(db, &claim.id, None)?
         .context("bound Lean claim lacks a latest managed proof recipe")?;
     let original = read_comparison(db, &recipe.promoted_commit)?
         .context("latest managed promotion is missing its retained Lean comparison")?;
