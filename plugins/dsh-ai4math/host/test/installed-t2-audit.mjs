@@ -3,21 +3,24 @@
 //   '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness' \
 //   plugins/dsh-ai4math/host/test/installed-t2-audit.mjs \
 //   '/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh' \
-//   /absolute/ai4mathd /absolute/ai4math /absolute/lean-toolchain/bin/lean
+//   /absolute/ai4mathd /absolute/ai4math /absolute/lean-toolchain/bin/lean [--independent]
 // Only the installed SDK libraries and a disposable ai4math project are used; no DSH profile or GUI.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { constants } from 'node:fs';
+import { constants, createReadStream } from 'node:fs';
+import { createHash } from 'node:crypto';
 import * as fs from 'node:fs/promises';
 import { createRequire, registerHooks } from 'node:module';
-import { isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 import { NdjsonConnection, requireSocketPath } from '../connection.mjs';
 
 const args = process.argv.slice(2);
+const independent = args.at(-1) === '--independent';
+if (independent) args.pop();
 assert.ok(args.length === 4 && args.every(isAbsolute),
-  'usage: installed-t2-audit.mjs DSH_SDK_ROOT AI4MATHD_BINARY AI4MATH_BINARY NATIVE_LEAN');
+  'usage: installed-t2-audit.mjs DSH_SDK_ROOT AI4MATHD_BINARY AI4MATH_BINARY NATIVE_LEAN [--independent]');
 const [dshRoot, daemonPath, cliPath, leanPath] = args.map((arg) => resolve(arg));
 const [daemonExe, cliExe, nativeLean] = await Promise.all([daemonPath, cliPath, leanPath].map((path) => fs.realpath(path)));
 const lookup = createRequire(join(dshRoot, 'package.json'));
@@ -40,7 +43,13 @@ const hook = registerHooks({ resolve(specifier, ctx, next) {
   return next(specifier, ctx);
 }});
 
-const AUDIT_TIMEOUT_MS = 30_000;
+const AUDIT_TIMEOUT_MS = independent ? 90_000 : 30_000;
+const POLICY = 'ai4math-t2-release.json';
+async function sha256(path) {
+  const digest = createHash('sha256');
+  for await (const bytes of createReadStream(path)) digest.update(bytes);
+  return digest.digest('hex');
+}
 const RPC_TIMEOUT_MS = 1_000;
 const MAIN = 'refs/heads/main';
 const ANCHOR = 'Proof.lean';
@@ -87,8 +96,10 @@ function startDaemon(root, configPath, env, controller) {
 
 // Failure-only, opt-in local diagnostic. Use the same private CLI mode and a
 // dedicated group/lifeline so no native process survives a diagnostic timeout.
-async function diagnoseUnavailable(cli, root, bareRepo, reviewed, signal) {
-  const child = spawn(cli, ['t2-audit', root, bareRepo, ANCHOR, reviewed, nativeLean, '--daemon-parent'], {
+async function diagnoseUnavailable(cli, root, bareRepo, reviewed, pins, signal) {
+  const child = spawn(cli, [independent ? 't2-release-check' : 't2-audit', root, bareRepo, ANCHOR, reviewed, nativeLean,
+    ...(independent ? [pins.policy_sha256, pins.compiler_sha256, pins.exporter_sha256, pins.checker_sha256] : []),
+    '--daemon-parent'], {
     cwd: root, env: { PATH: '/usr/bin:/bin' }, detached: true, stdio: ['pipe', 'ignore', 'pipe'],
   });
   const output = Buffer.alloc(8_192);
@@ -127,9 +138,10 @@ function assertObservation(status, reviewed, seq) {
   assert.deepEqual(audit, {
     status: 'observation', attempts: 1, exhausted: true,
     observation: {
-      schema: 'ai4math.t2.resident-sample.v1', advisory_only: true,
+      schema: 'ai4math.t2.resident-sample.v' + (independent ? '2' : '1'), advisory_only: true,
       reviewed_commit: reviewed, ledger_event_seq: seq, compile_ms: compileMs,
       module_count: 1, debt_findings: 0,
+      ...(independent ? { independent_checks: 1 } : {}),
     },
   });
   return audit;
@@ -168,8 +180,16 @@ try {
 
   await fs.mkdir(work, { mode: 0o700 });
   git(work, 'init', '--quiet', '--initial-branch=main', '--template=');
-  await fs.writeFile(join(work, ANCHOR), 'theorem fixtureProof : True := True.intro\n');
-  git(work, 'add', '--', ANCHOR);
+  await fs.writeFile(join(work, ANCHOR), independent
+    ? 'prelude\nnamespace Fixture\ntheorem identity {P : Prop} : P → P := fun h => h\nend Fixture\n'
+    : 'theorem fixtureProof : True := True.intro\n');
+  const pins = {};
+  if (independent) {
+    await fs.writeFile(join(work, POLICY), JSON.stringify([{ target_module: ANCHOR, declaration: 'Fixture.identity' }]) + '\n');
+    [pins.policy_sha256, pins.compiler_sha256, pins.exporter_sha256, pins.checker_sha256] = await Promise.all(
+      [join(work, POLICY), nativeLean, join(dirname(nativeLean), 'leanexport'), join(dirname(nativeLean), 'nanoda_bin')].map(sha256));
+  }
+  git(work, 'add', '--', ANCHOR, ...(independent ? [POLICY] : []));
   git(work, 'commit', '--quiet', '-m', 'reviewed T2 fixture');
   const reviewed = git(work, 'rev-parse', '--verify', MAIN);
   git(root, 'clone', '--quiet', '--bare', '--no-hardlinks', '--template=', work, bareRepo);
@@ -185,9 +205,9 @@ try {
 
   const configPath = join(root, 't2.json');
   await fs.writeFile(configPath, JSON.stringify({
-    version: 1, cli_executable: cli, bare_repo: bareRepo, anchor_module: ANCHOR,
+    version: independent ? 2 : 1, cli_executable: cli, bare_repo: bareRepo, anchor_module: ANCHOR,
     reviewed_main: reviewed, native_executable: nativeLean,
-    interval_ms: 1_000, audit_timeout_ms: AUDIT_TIMEOUT_MS, max_runs: 1,
+    interval_ms: 1_000, audit_timeout_ms: AUDIT_TIMEOUT_MS, max_runs: 1, ...pins,
   }), { flag: 'wx', mode: 0o600 });
   await fs.chmod(configPath, 0o600);
 
@@ -233,7 +253,7 @@ try {
     }
     if (audit?.status === 'unavailable') {
       if (process.env.AI4MATH_T2_DIAG === '1') {
-        try { await diagnoseUnavailable(cli, root, bareRepo, reviewed, signal); }
+        try { await diagnoseUnavailable(cli, root, bareRepo, reviewed, pins, signal); }
         catch (error) { errors.push(error); }
       } else {
         console.error('Set AI4MATH_T2_DIAG=1 for a bounded local-only diagnostic on resident unavailability.');
@@ -260,7 +280,7 @@ try {
   // The observation must already exist before making any launch-shaped requests.
   const uds = new NdjsonConnection(socket, { timeoutMs: RPC_TIMEOUT_MS });
   try {
-    for (const [remote, local] of [['t2Audit', 't2.audit'], ['t2AuditRun', 't2.audit.run']]) {
+    for (const [remote, local] of [['t2Audit', 't2.audit'], ['t2AuditRun', 't2.audit.run'], ['t2ReleaseCheck', 't2.releaseCheck']]) {
       assert.equal(ctx.typert.local.get('ai4math/' + remote), undefined);
       assert.equal((await wait(() => dispatch(remote))).ok, false);
       await assert.rejects(uds.request(local, {}, signal), { code: 'daemon', rpcCode: -32601 });
@@ -291,4 +311,5 @@ try {
 }
 if (errors.length === 1) throw errors[0];
 if (errors.length > 1) throw new AggregateError(errors, 'installed T2 audit or fixture cleanup failed');
-console.log('Installed Typert + resident T2: matching advisory status/tick, guest denied, no launch RPC, Git and ledger unchanged');
+console.log('Installed Typert + resident T2 ' + (independent ? 'v2 independent' : 'v1 clean build')
+  + ': matching advisory status/tick, guest denied, no launch RPC, Git and ledger unchanged');

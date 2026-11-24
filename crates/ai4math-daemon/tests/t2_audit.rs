@@ -23,6 +23,16 @@ const MAIN: &str = "refs/heads/main";
 const ANCHOR: &str = "Proof.lean";
 const INTERVAL_MS: u64 = 1_000;
 const WAIT: Duration = Duration::from_secs(8);
+const PIN_FIELDS: [&str; 4] = [
+    "policy_sha256",
+    "compiler_sha256",
+    "exporter_sha256",
+    "checker_sha256",
+];
+
+fn release_pins() -> [String; 4] {
+    ["a", "b", "c", "d"].map(|hex| hex.repeat(64))
+}
 
 fn write_private(path: &Path, mode: u32, content: &[u8]) -> Result<()> {
     let mut file = OpenOptions::new()
@@ -116,15 +126,27 @@ impl Fixture {
         drop(state);
 
         fs::write(root.join("reviewed-oid"), format!("{reviewed}\n"))?;
+        fs::write(root.join("release-pins"), release_pins().join(" ") + "\n")?;
         write_private(
             &root.join("fixture-cli"),
             0o700,
             br#"#!/bin/sh
 set -eu
 IFS= read -r reviewed < reviewed-oid
-[ "$#" -eq 7 ] && [ "$1" = t2-audit ] && [ "$2" = "$PWD" ] &&
-    [ "$3" = "$2/repo.git" ] && [ "$4" = Proof.lean ] && [ "$5" = "$reviewed" ] &&
-    [ "$6" = "$2/unused-native" ] && [ "$7" = --daemon-parent ] || exit 97
+[ "$2" = "$PWD" ] && [ "$3" = "$2/repo.git" ] && [ "$4" = Proof.lean ] &&
+    [ "$5" = "$reviewed" ] && [ "$6" = "$2/unused-native" ] || exit 97
+case "$1" in
+    t2-audit)
+        [ "$#" -eq 7 ] && [ "$7" = --daemon-parent ] || exit 97
+        ;;
+    t2-release-check)
+        read -r policy compiler exporter checker < release-pins
+        [ "$#" -eq 11 ] && [ "$7" = "$policy" ] && [ "$8" = "$compiler" ] &&
+            [ "$9" = "$exporter" ] && [ "${10}" = "$checker" ] &&
+            [ "${11}" = --daemon-parent ] || exit 97
+        ;;
+    *) exit 97 ;;
+esac
 if ! /bin/mkdir child-active 2>/dev/null; then
     printf 'overlap\n' >> calls
     exit 98
@@ -162,6 +184,15 @@ printf 'end\n' >> calls
         })
     }
 
+    fn release_config(&self, max_runs: u64, timeout_ms: u64) -> Value {
+        let mut config = self.config(max_runs, timeout_ms);
+        config["version"] = json!(2);
+        for (field, pin) in PIN_FIELDS.into_iter().zip(release_pins()) {
+            config[field] = json!(pin);
+        }
+        config
+    }
+
     fn write_config(&self, label: &str, config: &Value) -> Result<PathBuf> {
         let path = self.root.join(format!("{label}.json"));
         write_private(&path, 0o600, &serde_json::to_vec(config)?)?;
@@ -178,6 +209,15 @@ printf 'end\n' >> calls
             "module_count": 2,
             "debt_findings": 1,
         })
+    }
+
+    fn release_sample(&self) -> Value {
+        let mut sample = self.sample();
+        sample["schema"] = json!("ai4math.t2.resident-sample.v2");
+        sample["debt_findings"] = json!(0);
+        sample["independent_checks"] = json!(2);
+        sample["policy_sha256"] = json!(release_pins()[0]);
+        sample
     }
 
     fn write_sample(&self, payload: &Value) -> Result<()> {
@@ -558,6 +598,61 @@ fn resident_t2_refuses_unaudited_worker_payloads() -> Result<()> {
             )
             .with_context(|| format!("worker payload with invalid {field}"))?;
         assert!(!daemon.log().contains("private-fixture-path"));
+        assert_eq!(f.calls()?, "begin\nend\n");
+        f.check_state(&f.reviewed)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn resident_t2_release_dispatches_pins_but_does_not_publish_them() -> Result<()> {
+    let f = Fixture::new()?;
+    let config = f.write_config("t2-release", &f.release_config(1, 270_000))?;
+    let mut public = f.release_sample();
+    f.write_sample(&public)?;
+    public.as_object_mut().unwrap().remove("policy_sha256");
+    let mut daemon = Daemon::spawn(&f, Some(&config))?;
+    daemon.wait_audit(
+        &f,
+        &json!({"status":"observation", "attempts":1, "exhausted":true, "observation":public}),
+    )?;
+    for pin in release_pins() {
+        assert!(!daemon.log().contains(&pin));
+    }
+    assert_eq!(f.calls()?, "begin\nend\n");
+    f.check_state(&f.reviewed)
+}
+
+#[test]
+fn resident_t2_release_refuses_cross_version_and_unaudited_payloads() -> Result<()> {
+    for (config_v2, sample_v2, invalid_field) in [
+        (true, false, None),
+        (false, true, None),
+        (true, true, Some(("policy_sha256", json!("f".repeat(64))))),
+        (true, true, Some(("independent_checks", json!(0)))),
+        (true, true, Some(("debt_findings", json!(1)))),
+    ] {
+        let f = Fixture::new()?;
+        let config = if config_v2 {
+            f.release_config(1, 5_000)
+        } else {
+            f.config(1, 5_000)
+        };
+        let mut sample = if sample_v2 {
+            f.release_sample()
+        } else {
+            f.sample()
+        };
+        if let Some((field, invalid)) = invalid_field {
+            sample[field] = invalid;
+        }
+        f.write_sample(&sample)?;
+        let config = f.write_config("t2-audit", &config)?;
+        let mut daemon = Daemon::spawn(&f, Some(&config))?;
+        daemon.wait_audit(
+            &f,
+            &json!({"status":"unavailable", "attempts":1, "exhausted":true}),
+        )?;
         assert_eq!(f.calls()?, "begin\nend\n");
         f.check_state(&f.reviewed)?;
     }

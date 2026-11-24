@@ -18,7 +18,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const SCHEMA: &str = "ai4math.t2.resident-sample.v1";
+const SCHEMA_V1: &str = "ai4math.t2.resident-sample.v1";
+const SCHEMA_V2: &str = "ai4math.t2.resident-sample.v2";
 
 // Struct derives can also accept positional arrays; this protocol is object-only.
 // Delegate the map to the derived decoder so duplicate and unknown keys still fail.
@@ -40,6 +41,14 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for ObjectOnly<T> {
     }
 }
 
+// These fields may be absent, but a present value must have the declared type.
+// In particular, an explicit null cannot smuggle a v2 key into a v1 object.
+fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    input: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(input).map(Some)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Config {
@@ -52,6 +61,14 @@ pub(super) struct Config {
     interval_ms: u64,
     audit_timeout_ms: u64,
     max_runs: u64,
+    #[serde(default, deserialize_with = "present")]
+    policy_sha256: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    compiler_sha256: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    exporter_sha256: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    checker_sha256: Option<String>,
 }
 
 pub(super) fn verified_root(project: &Path) -> Result<PathBuf> {
@@ -77,13 +94,29 @@ impl Config {
     }
 
     fn check_fields(&self) -> Result<()> {
+        let timeout_max = match (
+            self.version,
+            self.policy_sha256.as_deref(),
+            self.compiler_sha256.as_deref(),
+            self.exporter_sha256.as_deref(),
+            self.checker_sha256.as_deref(),
+        ) {
+            (1, None, None, None, None) => 180_000,
+            (2, Some(policy), Some(compiler), Some(exporter), Some(checker))
+                if [policy, compiler, exporter, checker]
+                    .into_iter()
+                    .all(valid_sha256) =>
+            {
+                270_000
+            }
+            _ => anyhow::bail!("invalid resident audit version or pins"),
+        };
         ensure!(
-            self.version == 1
-                && valid_anchor(&self.anchor_module)
+            valid_anchor(&self.anchor_module)
                 && valid_oid(&self.reviewed_main)
                 && self.cli_executable != self.native_executable
                 && (1000..=3_600_000).contains(&self.interval_ms)
-                && (100..=180_000).contains(&self.audit_timeout_ms)
+                && (100..=timeout_max).contains(&self.audit_timeout_ms)
                 && (1..=64).contains(&self.max_runs),
             "invalid resident audit fields"
         );
@@ -157,7 +190,15 @@ impl Config {
             Ok(None) => Status::Waiting,
             Ok(Some(after)) if after == before => bytes
                 .ok()
-                .and_then(|bytes| Summary::parse(&bytes, &self.reviewed_main, after).ok())
+                .and_then(|bytes| {
+                    Summary::parse(
+                        &bytes,
+                        &self.reviewed_main,
+                        after,
+                        self.policy_sha256.as_deref(),
+                    )
+                    .ok()
+                })
                 .map_or(Status::Unavailable, |observation| Status::Observation {
                     observation,
                 }),
@@ -198,12 +239,26 @@ impl Config {
         let mut command = Command::new(&self.cli_executable);
         command
             .current_dir(root)
-            .arg("t2-audit")
+            .arg(if self.version == 2 {
+                "t2-release-check"
+            } else {
+                "t2-audit"
+            })
             .arg(root)
             .arg(&self.bare_repo)
             .arg(&self.anchor_module)
             .arg(&self.reviewed_main)
             .arg(&self.native_executable)
+            .args(
+                [
+                    &self.policy_sha256,
+                    &self.compiler_sha256,
+                    &self.exporter_sha256,
+                    &self.checker_sha256,
+                ]
+                .into_iter()
+                .flatten(),
+            )
             .arg("--daemon-parent")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -258,8 +313,24 @@ enum Status {
     HeadChanged,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WorkerSummary {
+    schema: String,
+    advisory_only: bool,
+    reviewed_commit: String,
+    ledger_event_seq: i64,
+    compile_ms: u64,
+    module_count: u64,
+    debt_findings: u64,
+    #[serde(default, deserialize_with = "present")]
+    independent_checks: Option<u8>,
+    #[serde(default, deserialize_with = "present")]
+    policy_sha256: Option<String>,
+}
+
+// The public type cannot retain the worker policy pin.
+#[derive(Debug, Serialize)]
 struct Summary {
     schema: String,
     advisory_only: bool,
@@ -268,31 +339,66 @@ struct Summary {
     compile_ms: u64,
     module_count: u64,
     debt_findings: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    independent_checks: Option<u8>,
 }
 
 impl Summary {
-    fn parse(bytes: &[u8], reviewed_main: &str, expected_seq: i64) -> Result<Self> {
-        let ObjectOnly(summary): ObjectOnly<Self> = serde_json::from_slice(bytes)?;
+    fn parse(
+        bytes: &[u8],
+        reviewed_main: &str,
+        expected_seq: i64,
+        expected_policy: Option<&str>,
+    ) -> Result<Self> {
+        let ObjectOnly(summary): ObjectOnly<WorkerSummary> = serde_json::from_slice(bytes)?;
+        let audited = match (
+            summary.schema.as_str(),
+            expected_policy,
+            summary.policy_sha256.as_deref(),
+            summary.independent_checks,
+        ) {
+            (SCHEMA_V1, None, None, None) => summary.debt_findings <= 3072,
+            (SCHEMA_V2, Some(expected), Some(policy), Some(1..=8)) => {
+                policy == expected && summary.debt_findings == 0
+            }
+            _ => false,
+        };
         ensure!(
-            summary.schema == SCHEMA
+            audited
                 && summary.advisory_only
                 && valid_oid(&summary.reviewed_commit)
                 && summary.reviewed_commit == reviewed_main
                 && summary.ledger_event_seq >= 0
                 && summary.ledger_event_seq == expected_seq
                 && summary.compile_ms <= 120_000
-                && (1..=128).contains(&summary.module_count)
-                && summary.debt_findings <= 3072,
+                && (1..=128).contains(&summary.module_count),
             "invalid resident audit summary"
         );
-        Ok(summary)
+        Ok(Self {
+            schema: summary.schema,
+            advisory_only: summary.advisory_only,
+            reviewed_commit: summary.reviewed_commit,
+            ledger_event_seq: summary.ledger_event_seq,
+            compile_ms: summary.compile_ms,
+            module_count: summary.module_count,
+            debt_findings: summary.debt_findings,
+            independent_checks: summary.independent_checks,
+        })
     }
 }
 
 fn valid_oid(oid: &str) -> bool {
-    matches!(oid.len(), 40 | 64)
-        && oid.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-        && oid.bytes().any(|b| b != b'0')
+    matches!(oid.len(), 40 | 64) && lowercase_hex(oid) && oid.bytes().any(|b| b != b'0')
+}
+
+fn valid_sha256(pin: &str) -> bool {
+    pin.len() == 64 && lowercase_hex(pin)
+}
+
+fn lowercase_hex(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 fn valid_anchor(module: &str) -> bool {
@@ -313,7 +419,7 @@ mod tests {
 
     fn summary() -> Value {
         json!({
-            "schema": SCHEMA,
+            "schema": SCHEMA_V1,
             "advisory_only": true,
             "reviewed_commit": HEAD,
             "ledger_event_seq": 13,
@@ -326,7 +432,7 @@ mod tests {
     #[test]
     fn exact_status_and_observation_shapes() -> Result<()> {
         let sample = summary();
-        let observation = Summary::parse(&serde_json::to_vec(&sample)?, HEAD, 13)?;
+        let observation = Summary::parse(&serde_json::to_vec(&sample)?, HEAD, 13, None)?;
         assert_eq!(
             serde_json::to_value(AuditState::new(
                 Status::Observation { observation },
@@ -370,28 +476,90 @@ mod tests {
             let mut bad_sample = summary();
             bad_sample[field] = bad;
             assert!(
-                Summary::parse(&serde_json::to_vec(&bad_sample)?, HEAD, 13).is_err(),
+                Summary::parse(&serde_json::to_vec(&bad_sample)?, HEAD, 13, None).is_err(),
                 "accepted {field}"
             );
         }
-        let positional = serde_json::to_vec(&json!([SCHEMA, true, HEAD, 13, 42, 1, 0]))?;
-        assert!(Summary::parse(&positional, HEAD, 13).is_err());
+        let positional = serde_json::to_vec(&json!([SCHEMA_V1, true, HEAD, 13, 42, 1, 0]))?;
+        assert!(Summary::parse(&positional, HEAD, 13, None).is_err());
         let mut missing = summary();
         missing.as_object_mut().unwrap().remove("debt_findings");
-        assert!(Summary::parse(&serde_json::to_vec(&missing)?, HEAD, 13).is_err());
+        assert!(Summary::parse(&serde_json::to_vec(&missing)?, HEAD, 13, None).is_err());
         let mut trailing = serde_json::to_vec(&summary())?;
         trailing.extend_from_slice(b"\n{}\n");
-        assert!(Summary::parse(&trailing, HEAD, 13).is_err());
+        assert!(Summary::parse(&trailing, HEAD, 13, None).is_err());
         let mut duplicate = serde_json::to_vec(&summary())?;
         duplicate.pop();
         duplicate.extend_from_slice(b",\"module_count\":1}");
-        assert!(Summary::parse(&duplicate, HEAD, 13).is_err());
+        assert!(Summary::parse(&duplicate, HEAD, 13, None).is_err());
         Ok(())
     }
 
+    fn release_summary() -> Value {
+        let mut sample = summary();
+        sample["schema"] = json!(SCHEMA_V2);
+        sample["independent_checks"] = json!(8);
+        sample["policy_sha256"] = json!("a".repeat(64));
+        sample["debt_findings"] = json!(0);
+        sample
+    }
+
     #[test]
-    fn strict_config_fields_and_child_command() -> Result<()> {
-        let document = json!({
+    fn release_protocol_is_exact_and_version_bound() -> Result<()> {
+        let sample = release_summary();
+        let policy = "a".repeat(64);
+        let parse =
+            |value: &Value| Summary::parse(&serde_json::to_vec(value)?, HEAD, 13, Some(&policy));
+        let observation = parse(&sample)?;
+        let mut public = sample.clone();
+        public.as_object_mut().unwrap().remove("policy_sha256");
+        assert_eq!(serde_json::to_value(observation)?, public);
+
+        assert!(parse(&summary()).is_err());
+        assert!(Summary::parse(&serde_json::to_vec(&sample)?, HEAD, 13, None).is_err());
+        for field in ["policy_sha256", "independent_checks"] {
+            let mut v1 = summary();
+            for value in [Value::Null, sample[field].clone()] {
+                v1[field] = value;
+                assert!(Summary::parse(&serde_json::to_vec(&v1)?, HEAD, 13, None).is_err());
+            }
+            let mut missing = sample.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(parse(&missing).is_err());
+        }
+        for (field, bad) in [
+            ("schema", json!(SCHEMA_V1)),
+            ("policy_sha256", json!("b".repeat(64))),
+            ("policy_sha256", Value::Null),
+            ("independent_checks", Value::Null),
+            ("independent_checks", json!(0)),
+            ("independent_checks", json!(9)),
+            ("independent_checks", json!(1.0)),
+            ("independent_checks", json!("1")),
+            ("debt_findings", json!(1)),
+            ("advisory_only", json!(false)),
+            ("compiler_sha256", json!("b".repeat(64))),
+        ] {
+            let mut invalid = sample.clone();
+            invalid[field] = bad;
+            assert!(
+                parse(&invalid).is_err(),
+                "accepted {field}: {}",
+                invalid[field]
+            );
+        }
+        let mut duplicate = serde_json::to_vec(&sample)?;
+        duplicate.pop();
+        duplicate.extend_from_slice(b",\"independent_checks\":1}");
+        assert!(Summary::parse(&duplicate, HEAD, 13, Some(&policy)).is_err());
+        let mut lower_bound = sample;
+        lower_bound["independent_checks"] = json!(1);
+        assert!(parse(&lower_bound).is_ok());
+        Ok(())
+    }
+
+    fn config_v1() -> Value {
+        json!({
             "version": 1,
             "cli_executable": "/cli",
             "bare_repo": "/repo",
@@ -401,12 +569,18 @@ mod tests {
             "interval_ms": 1000,
             "audit_timeout_ms": 180_000,
             "max_runs": 64
-        });
-        let validate = |value: Value| -> Result<Config> {
-            let ObjectOnly(config): ObjectOnly<Config> = serde_json::from_value(value)?;
-            config.check_fields()?;
-            Ok(config)
-        };
+        })
+    }
+
+    fn validate(value: Value) -> Result<Config> {
+        let ObjectOnly(config): ObjectOnly<Config> = serde_json::from_value(value)?;
+        config.check_fields()?;
+        Ok(config)
+    }
+
+    #[test]
+    fn strict_config_fields_and_child_command() -> Result<()> {
+        let document = config_v1();
         assert!(
             validate(json!([
                 1,
@@ -464,6 +638,84 @@ mod tests {
             invalid[field] = bad;
             assert!(validate(invalid).is_err(), "accepted {field}");
         }
+        Ok(())
+    }
+
+    #[test]
+    fn strict_release_config_and_child_command() -> Result<()> {
+        let pins = [
+            "a".repeat(64),
+            "b".repeat(64),
+            "c".repeat(64),
+            "d".repeat(64),
+        ];
+        let fields = [
+            "policy_sha256",
+            "compiler_sha256",
+            "exporter_sha256",
+            "checker_sha256",
+        ];
+        let mut document = config_v1();
+        document["version"] = json!(2);
+        document["audit_timeout_ms"] = json!(270_000);
+        for (field, value) in fields.into_iter().zip(&pins) {
+            document[field] = json!(value);
+        }
+        let command = validate(document.clone())?.command(Path::new("/root"));
+        assert_eq!(command.get_program(), "/cli");
+        assert_eq!(command.get_current_dir(), Some(Path::new("/root")));
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "t2-release-check",
+                "/root",
+                "/repo",
+                "Anchor.lean",
+                HEAD,
+                "/native",
+                &pins[0],
+                &pins[1],
+                &pins[2],
+                &pins[3],
+                "--daemon-parent"
+            ]
+        );
+
+        for field in fields {
+            let mut missing = document.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(validate(missing).is_err(), "accepted missing {field}");
+            for bad in [
+                Value::Null,
+                json!(1),
+                json!("a".repeat(63)),
+                json!("A".repeat(64)),
+                json!("g".repeat(64)),
+            ] {
+                let mut invalid = document.clone();
+                invalid[field] = bad;
+                assert!(validate(invalid).is_err(), "accepted malformed {field}");
+            }
+            for extra in [Value::Null, json!(&pins[0])] {
+                let mut v1 = config_v1();
+                v1[field] = extra;
+                assert!(validate(v1).is_err(), "accepted {field} in v1");
+            }
+        }
+        let mut duplicate = serde_json::to_vec(&document)?;
+        duplicate.pop();
+        duplicate.extend_from_slice(b",\"policy_sha256\":\"another pin\"}");
+        assert!(serde_json::from_slice::<ObjectOnly<Config>>(&duplicate).is_err());
+        let mut with_extra = document.clone();
+        with_extra["release_policy"] = json!({});
+        assert!(validate(with_extra).is_err());
+        for timeout in [99, 270_001] {
+            let mut invalid = document.clone();
+            invalid["audit_timeout_ms"] = json!(timeout);
+            assert!(validate(invalid).is_err());
+        }
+        document["audit_timeout_ms"] = json!(100);
+        assert!(validate(document).is_ok());
         Ok(())
     }
 }

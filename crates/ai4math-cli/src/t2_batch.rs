@@ -1,4 +1,4 @@
-//! Operator-only manifest for a selected, independently checked Lean batch.
+//! Independent Lean batch checks and the reviewed T2 release gate.
 use crate::{
     t2_build::{at_generation, at_snapshot_generation},
     trusted_toolchain,
@@ -201,6 +201,35 @@ fn release_debt(state: &ai4math_store::StateStore, seq: i64) -> Result<usize> {
 }
 
 pub(crate) fn release(request: ReleaseRequest<'_>) -> Result<ReleaseReport> {
+    release_mode(request, ReleaseMode::Operator)
+}
+
+#[cfg(unix)]
+pub(crate) fn release_for_daemon(request: ReleaseRequest<'_>) -> Result<()> {
+    crate::t3::arm_daemon_lifeline("T2")?;
+    let report = release_mode(request, ReleaseMode::Daemon)?;
+    // Keep proof identities, project paths, build hashes and native diagnostics
+    // out of the private worker protocol. The daemon checks the policy pin.
+    crate::print_json(serde_json::json!({
+        "schema": "ai4math.t2.resident-sample.v2",
+        "advisory_only": true,
+        "reviewed_commit": report.reviewed_commit,
+        "ledger_event_seq": report.ledger_event_seq,
+        "compile_ms": report.result.build.compile_ms,
+        "module_count": report.result.build.modules.len(),
+        "debt_findings": report.trust_debt_findings,
+        "independent_checks": report.result.checks.len(),
+        "policy_sha256": report.policy_sha256,
+    }))
+}
+
+enum ReleaseMode {
+    Operator,
+    #[cfg(unix)]
+    Daemon,
+}
+
+fn release_mode(request: ReleaseRequest<'_>, mode: ReleaseMode) -> Result<ReleaseReport> {
     for (value, label) in [
         (request.policy_sha256, "T2 release policy"),
         (request.compiler_sha256, "Lean compiler"),
@@ -229,6 +258,11 @@ pub(crate) fn release(request: ReleaseRequest<'_>) -> Result<ReleaseReport> {
                 toolchain.compiler_sha256() == request.compiler_sha256,
                 "Lean compiler SHA-256 mismatch"
             );
+            let toolchain = match mode {
+                ReleaseMode::Operator => toolchain,
+                #[cfg(unix)]
+                ReleaseMode::Daemon => toolchain.with_supervised_process_group()?,
+            };
             Broker::new()
                 .audit_lean_theorems(
                     &toolchain,

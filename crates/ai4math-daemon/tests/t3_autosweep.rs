@@ -187,6 +187,7 @@ mod native {
     };
     use anyhow::Context;
     use rusqlite::{Connection, OpenFlags};
+    use sha2::{Digest, Sha256};
     use std::{
         env,
         io::{BufRead, BufReader},
@@ -233,6 +234,12 @@ mod native {
         );
         path.canonicalize()
             .with_context(|| format!("resolve {name}"))
+    }
+
+    fn file_sha256(path: &Path) -> Result<String> {
+        let mut digest = Sha256::new();
+        std::io::copy(&mut fs::File::open(path)?, &mut digest)?;
+        Ok(format!("{:x}", digest.finalize()))
     }
 
     fn utf8(path: &Path) -> &str {
@@ -439,7 +446,7 @@ mod native {
             .context("preview did not return a digest")
     }
 
-    fn rpc(root: &Path, method: &str, params: Value) -> Result<Value> {
+    fn request(root: &Path, method: &str, params: Value) -> Result<BufReader<UnixStream>> {
         let mut stream = UnixStream::connect(root.join(SOCKET))?;
         stream.set_read_timeout(Some(STARTUP))?;
         stream.set_write_timeout(Some(STARTUP))?;
@@ -448,12 +455,17 @@ mod native {
             "{}",
             json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})
         )?;
+        Ok(BufReader::new(stream))
+    }
+
+    fn frame(stream: &mut BufReader<UnixStream>) -> Result<Value> {
         let mut line = String::new();
-        ensure!(
-            BufReader::new(stream).read_line(&mut line)? > 0,
-            "daemon closed {method} RPC"
-        );
-        let reply: Value = serde_json::from_str(&line)?;
+        ensure!(stream.read_line(&mut line)? > 0, "daemon closed RPC stream");
+        Ok(serde_json::from_str(&line)?)
+    }
+
+    fn rpc(root: &Path, method: &str, params: Value) -> Result<Value> {
+        let reply = frame(&mut request(root, method, params)?)?;
         assert_eq!(reply["id"], 1);
         Ok(reply)
     }
@@ -665,6 +677,167 @@ mod native {
         assert_eq!(f.receipt_count()?, receipts);
         assert_eq!(f.claim("C")?.local_trust, Trust::L5);
         f.stop(daemon)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires outer-unsandboxed macOS Seatbelt, absolute AI4MATH_TEST_CLI, and absolute AI4MATH_TEST_LEAN with bundled leanexport and nanoda_bin"]
+    fn native_resident_t2_independent_audit_is_pinned_and_non_authoritative() -> Result<()> {
+        const POLICY: &str = "ai4math-t2-release.json";
+        const MODULE: &str = "ResidentAudit.lean";
+        const THEOREM: &str = "ResidentAuditFixture.identity";
+        const CLAIM: &str = "resident-unverified-identity";
+        let tmp = short_tempdir()?;
+        let f = Fixture::new(
+            tmp.path().canonicalize()?,
+            &native_binary("AI4MATH_TEST_CLI")?,
+            native_binary("AI4MATH_TEST_LEAN")?,
+        )?;
+        // Keep the exported theorem free of standard library dependencies. The
+        // ordinary managed T1 proof still builds and its Claim must not change.
+        fs::write(
+            f.review.join(MODULE),
+            "prelude\nnamespace ResidentAuditFixture\n\
+             theorem identity {p : Prop} : p → p := fun privateProof => privateProof\n\
+             end ResidentAuditFixture\n",
+        )?;
+        const MANIFEST: &str = "ai4math-modules.txt";
+        fs::write(
+            f.review.join(MANIFEST),
+            format!("Defs.lean\n{ANCHOR}\n{MODULE}\n"),
+        )?;
+        let policy = f.review.join(POLICY);
+        let mut bytes =
+            serde_json::to_vec(&json!([{"target_module": MODULE, "declaration": THEOREM}]))?;
+        bytes.push(b'\n');
+        fs::write(&policy, &bytes)?;
+        git(&f.review, &["add", "--", MODULE, MANIFEST, POLICY])?;
+        git(
+            &f.review,
+            &["commit", "-m", "review resident T2 release policy"],
+        )?;
+        git(&f.review, &["push", "origin", "HEAD:refs/heads/main"])?;
+        let reviewed = f.main()?;
+
+        let bin = f.lean.parent().context("bundled Lean bin directory")?;
+        let mut config = json!({
+            "version": 2,
+            "cli_executable": f.cli,
+            "bare_repo": f.bare,
+            "anchor_module": ANCHOR,
+            "reviewed_main": reviewed,
+            "native_executable": f.lean,
+            "interval_ms": 1000,
+            "audit_timeout_ms": 90_000,
+            "max_runs": 1,
+            "policy_sha256": file_sha256(&policy)?,
+            "compiler_sha256": file_sha256(&f.lean)?,
+            "exporter_sha256": file_sha256(&bin.join("leanexport"))?,
+            "checker_sha256": file_sha256(&bin.join("nanoda_bin"))?,
+        });
+        // Keep a connection open so the WAL can be compared across daemon shutdown.
+        let mut store = StateStore::open(f.database())?;
+        store.create_claim(
+            NewClaim {
+                id: CLAIM,
+                title: "Unverified resident fixture identity",
+                informal_statement: "The independent audit is not a promotion.",
+                engine: "lean4",
+                formal_target: Some(THEOREM),
+                module_path: Some(MODULE),
+                critical: true,
+            },
+            Change {
+                actor: "native-resident-release-fixture",
+                git_commit: Some(&reviewed),
+            },
+        )?;
+        let seq = store.status()?.last_event_seq;
+        let eligible = f.claim(CLAIM)?;
+        assert_eq!(eligible.local_trust, Trust::L0);
+        assert!(eligible.receipt_id.is_none());
+        let claims = [
+            serde_json::to_value(eligible)?,
+            serde_json::to_value(f.claim("C")?)?,
+        ];
+        let receipts = f.receipt_count()?;
+        let wal = f.root.join(".runtime/state.sqlite-wal");
+        let before = (fs::read(f.database())?, fs::read(&wal)?);
+        let refs = git(&f.bare, &["show-ref"])?;
+        let assert_unchanged = || -> Result<()> {
+            assert_eq!(store.status()?.last_event_seq, seq);
+            assert_eq!(f.receipt_count()?, receipts);
+            assert_eq!(serde_json::to_value(f.claim(CLAIM)?)?, claims[0]);
+            assert_eq!(serde_json::to_value(f.claim("C")?)?, claims[1]);
+            assert_eq!((fs::read(f.database())?, fs::read(&wal)?), before);
+            assert_eq!(git(&f.bare, &["show-ref"])?, refs);
+            Ok(())
+        };
+        let run = |filename: &str, body: &Value| -> Result<(Daemon, Value)> {
+            let path = f.root.join(filename);
+            write_new(&path, 0o600, &serde_json::to_vec(body)?)?;
+            let mut daemon = Daemon::spawn_with_flag(&f.root, Some(&path), "--t2-audit")?;
+            ready(&mut daemon, &f.root)?;
+            let live = daemon.poll(Duration::from_secs(95), "resident T2 attempt", || {
+                let live = status(&f.root)?;
+                Ok((live["t2_audit"]["exhausted"] == true).then_some(live))
+            })?;
+            assert_eq!(live["event_seq"], seq);
+            Ok((daemon, live["t2_audit"].clone()))
+        };
+
+        let (daemon, sample) = run("resident-release.json", &config)?;
+        let compile_ms = sample["observation"]["compile_ms"]
+            .as_u64()
+            .with_context(|| {
+                format!(
+                    "missing native independent observation: {sample}; {}",
+                    daemon.logs()
+                )
+            })?;
+        assert!(compile_ms <= 120_000);
+        // Exact public allowlist: neither subprocess pin/digests nor target,
+        // proof, or diagnostic strings may escape into daemon status.
+        assert_eq!(
+            sample,
+            json!({
+                "status": "observation", "attempts": 1, "exhausted": true,
+                "observation": {
+                    "schema": "ai4math.t2.resident-sample.v2", "advisory_only": true,
+                    "reviewed_commit": reviewed, "ledger_event_seq": seq,
+                    "compile_ms": compile_ms, "module_count": 3,
+                    "debt_findings": 0, "independent_checks": 1,
+                }
+            })
+        );
+        let mut stream = request(
+            &f.root,
+            "subscribe",
+            json!({"topics": ["vital_signs.tick"]}),
+        )?;
+        let reply = frame(&mut stream)?;
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["result"]["topics"], json!(["vital_signs.tick"]));
+        let tick = frame(&mut stream)?;
+        assert_eq!(tick["method"], "vital_signs.tick");
+        assert_eq!(tick["params"]["event_seq"], seq);
+        assert_eq!(tick["params"]["t2_audit"], sample);
+        drop(stream);
+        f.stop(daemon)?;
+        assert_unchanged()?;
+
+        let pin = config["policy_sha256"]
+            .as_str()
+            .context("fixture policy pin")?;
+        let replacement = if pin.starts_with('0') { '1' } else { '0' };
+        config["policy_sha256"] = json!(format!("{replacement}{}", &pin[1..]));
+        let (daemon, unavailable) = run("resident-release-wrong-pin.json", &config)?;
+        assert_eq!(
+            unavailable,
+            json!({"status":"unavailable", "attempts":1, "exhausted":true})
+        );
+        f.stop(daemon)?;
+        assert_unchanged()?;
         Ok(())
     }
 

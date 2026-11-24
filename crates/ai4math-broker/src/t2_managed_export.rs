@@ -393,6 +393,7 @@ impl<'a> ManagedNative<'a> {
             &digest(&bytes),
             &self.checker,
             self.checker_pin,
+            self.tool.sandbox_group,
             || phase_timeout(deadline),
         )
     }

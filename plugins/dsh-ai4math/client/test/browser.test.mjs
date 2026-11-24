@@ -73,7 +73,19 @@ test('HUD renders only admissible resident T2 observations and forgets them on r
   });
   const prefix = 'T2 Audit · advisory only · ';
   const exact = '123 ms compile · 2 modules · 0 debt findings · 1 attempt';
+  const v2 = (seq, fields = {}) => sample(seq, { schema: 'ai4math.t2.resident-sample.v2', independent_checks: 2, ...fields });
   const cases = [
+    ['v2 exact observation', seq => v2(seq), '123 ms compile · 2 modules · 0 debt findings · 2 independent theorem checks · 1 attempt'],
+    ['v2 single check', seq => v2(seq, { independent_checks: 1 }), '123 ms compile · 2 modules · 0 debt findings · 1 independent theorem check · 1 attempt'],
+    ['v2 older observation', seq => v2(seq - 1), 'older ledger sample'],
+    ['v2 future observation', seq => v2(seq + 1), 'awaiting matching ledger'],
+    ['v2 missing independent counts', seq => sample(seq, { schema: 'ai4math.t2.resident-sample.v2' })],
+    ['v2 zero independent checks', seq => v2(seq, { independent_checks: 0 })],
+    ['v2 too many independent checks', seq => v2(seq, { independent_checks: 9 })],
+    ['v2 invalid check count', seq => v2(seq, { independent_checks: '2' })],
+    ['v2 nonzero debt', seq => v2(seq, { debt_findings: 1 })],
+    ['v2 private policy key', seq => v2(seq, { policy_sha256: 'a'.repeat(64) })],
+    ['v1 disallows v2-only key', seq => sample(seq, { independent_checks: 1 })],
     ['exact observation', seq => sample(seq), exact],
     ['older observation', seq => sample(seq - 1), 'older ledger sample'],
     ['future observation', seq => sample(seq + 1), 'awaiting matching ledger'],

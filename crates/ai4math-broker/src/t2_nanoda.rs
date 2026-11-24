@@ -240,17 +240,20 @@ pub fn check_lean_export(
         expected_export_sha256,
         native_nanoda,
         expected_checker_sha256,
+        sandbox::ProcessGroup::OwnSession,
         || Ok(TIMEOUT),
     )
 }
 
 /// Query the remaining managed time at invocation, after validation, staging,
-/// and the pin check, rather than giving Nanoda a stale timeout.
+/// and the pin check, rather than giving Nanoda a stale timeout. Managed
+/// verification also shares the compiler's process-group ownership.
 pub(super) fn check_lean_export_timed(
     bytes: &[u8],
     expected_export_sha256: &str,
     native_nanoda: &Path,
     expected_checker_sha256: &str,
+    group: sandbox::ProcessGroup,
     timeout: impl FnOnce() -> Result<Duration>,
 ) -> Result<LeanExportCheck> {
     ensure!(
@@ -282,15 +285,20 @@ pub(super) fn check_lean_export_timed(
     fs::write(room.join(CONFIG_FILE), serde_json::to_vec(&config)?)
         .context("write broker-owned Nanoda configuration")?;
     verify_checker_pin(native_nanoda, expected_checker_sha256)?;
-    let result = sandbox::run(sandbox::Invocation {
-        executable: native_nanoda,
-        args: &[CONFIG_FILE.to_owned()],
-        room: &room,
-        writable: &output,
-        reads: &[],
-        env: &[],
-        timeout: TIMEOUT.min(timeout()?),
-    });
+    let result = sandbox::run_grouped(
+        sandbox::Invocation {
+            executable: native_nanoda,
+            args: &[CONFIG_FILE.to_owned()],
+            room: &room,
+            writable: &output,
+            reads: &[],
+            env: &[],
+            timeout: TIMEOUT.min(timeout()?),
+        },
+        &[],
+        &[],
+        group,
+    );
     verify_checker_pin(native_nanoda, expected_checker_sha256)
         .context("recheck Nanoda checker after sandbox invocation")?;
     ensure!(
