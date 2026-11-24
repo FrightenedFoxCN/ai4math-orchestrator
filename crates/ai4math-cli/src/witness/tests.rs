@@ -64,6 +64,23 @@ fn native_witness_is_archived_before_refutation_and_p0() -> Result<()> {
         git_commit: Some(&base),
     };
     db.set_local_trust("C", Trust::L2a, change)?;
+    // Keep a viable alternate route so only the directly refuted critical Claim raises P0.
+    for (id, dependencies) in [
+        ("dependent", &[("C", "lemma")][..]),
+        ("alternative", &[][..]),
+    ] {
+        db.create_plan(
+            ai4math_store::NewPlan {
+                id,
+                name: id,
+                target: "T",
+                track: "infrastructure",
+                status: ai4math_store::PlanStatus::Active,
+                dependencies,
+            },
+            change,
+        )?;
+    }
     assert!(
         db.append_event(change, "CRITICAL_CLAIM_REFUTED", "claim", "C", json!({}))
             .is_err()
@@ -127,6 +144,49 @@ fn native_witness_is_archived_before_refutation_and_p0() -> Result<()> {
     assert_eq!(db.claim("C")?.unwrap().local_trust, Trust::L2b);
     assert_eq!(db.claim("T")?.unwrap().local_trust, Trust::L0);
     let mark = db.status()?.last_event_seq;
+    let earlier = db
+        .replay_plan("dependent", Some(seq))?
+        .plan
+        .context("missing historical plan")?;
+    let current = db
+        .replay_plan("dependent", None)?
+        .plan
+        .context("missing invalidated plan")?;
+    assert_eq!(
+        (
+            earlier.durable_status,
+            earlier.status,
+            earlier.refuted_claim_id
+        ),
+        ("ACTIVE", "ACTIVE", None)
+    );
+    assert_eq!(
+        (
+            current.durable_status,
+            current.status,
+            current.refuted_claim_id.as_deref()
+        ),
+        (
+            "INVALIDATED_BY_REFUTATION",
+            "INVALIDATED_BY_REFUTATION",
+            Some("C")
+        )
+    );
+    assert_eq!(current.blocking_claim_id, None);
+    assert_eq!(current.effective_trust, Trust::L0);
+    assert!((seq + 1..=mark).contains(&current.last_event_seq));
+    assert_eq!(
+        db.plan_state("dependent")?,
+        Some((current.status.into(), current.effective_trust))
+    );
+    assert_eq!(
+        db.replay_plan("alternative", None)?
+            .plan
+            .context("missing alternate plan")?
+            .status,
+        "ACTIVE"
+    );
+    assert_eq!(db.status()?.last_event_seq, mark);
     let retry = verify_and_record(
         root,
         &repo,

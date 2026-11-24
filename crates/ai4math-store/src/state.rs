@@ -14,9 +14,11 @@ use std::{
 };
 
 mod claim_replay;
+mod ledger_replay;
 mod migrations;
 mod oracle;
 mod pivot;
+mod plan_replay;
 mod probes;
 pub(crate) mod regression;
 mod reviewed_lean;
@@ -29,6 +31,7 @@ mod tasks;
 pub use claim_replay::{ClaimReplay, ReplayedClaim};
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{BreakerTripReport, PivotIntent, PivotPlan, PivotResult};
+pub use plan_replay::{PlanReplay, ReplayedPlan, ReplayedPlanDependency};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
 pub use reviewed_lean::{LeanSpecComparison, LeanSpecRecheck, ReviewedLeanSpec};
 pub use sediment_adaptation::{SedimentAdaptationApproval, SedimentAdaptationPlan};

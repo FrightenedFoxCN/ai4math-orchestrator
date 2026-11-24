@@ -1,12 +1,9 @@
-use super::{StateStore, Trust, last_seq};
+#[cfg(test)]
+use super::ledger_replay::MAX_SOURCE_ROWS;
+use super::{StateStore, Trust, ledger_replay::replay_entity};
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-
-const MAX_SOURCE_ROWS: u32 = 8192;
-const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
-const MAX_TOTAL_PAYLOAD_BYTES: usize = 8 * MAX_PAYLOAD_BYTES;
 
 /// Historical Claim projection from one consistent ledger snapshot, not verified proof evidence.
 #[derive(Debug, Serialize)]
@@ -54,72 +51,21 @@ impl StateStore {
         claim_id: &str,
         through_event_seq: Option<i64>,
     ) -> Result<ClaimReplay> {
-        let snapshot = self.db.unchecked_transaction()?;
-        let ledger_head_event_seq = last_seq(&snapshot)?;
-        let through_event_seq = through_event_seq.unwrap_or(ledger_head_event_seq);
-        ensure!(
-            (0..=ledger_head_event_seq).contains(&through_event_seq),
-            "Claim replay cursor {through_event_seq} is outside [0, {ledger_head_event_seq}]"
-        );
         let mut claim = None;
-        let mut applied_events = 0;
-        let mut total_payload_bytes = 0;
-        let mut source_rows = 0;
-        {
-            let mut stmt = snapshot.prepare(
-                "SELECT event_seq,event_type,
-                   CASE WHEN event_type='CLAIM_TAINTED' AND length(CAST(git_commit AS BLOB))<=?4
-                        THEN git_commit END,
-                   CASE WHEN event_type GLOB 'CLAIM_*' AND event_type<>'CLAIM_REPROOF_REQUESTED'
-                             AND length(CAST(payload_json AS BLOB))<=?4 THEN payload_json END
-                 FROM events INDEXED BY idx_events_entity
-                 WHERE entity_type='claim' AND entity_id=?1 AND event_seq<=?2
-                 ORDER BY event_seq LIMIT ?3",
-            )?;
-            let mut rows = stmt.query(params![
-                claim_id,
-                through_event_seq,
-                MAX_SOURCE_ROWS + 1,
-                MAX_PAYLOAD_BYTES,
-            ])?;
-            while let Some(row) = rows.next()? {
-                source_rows += 1;
-                ensure!(
-                    source_rows <= MAX_SOURCE_ROWS,
-                    "Claim replay exceeds the {MAX_SOURCE_ROWS}-event cap on Claim source rows"
-                );
-                let seq: i64 = row.get(0)?;
-                let kind = row.get_ref(1)?.as_str()?;
-                if !kind.starts_with("CLAIM_") || kind == "CLAIM_REPROOF_REQUESTED" {
-                    continue;
-                }
-                let payload = row.get_ref(3)?;
-                ensure!(
-                    !matches!(payload, rusqlite::types::ValueRef::Null),
-                    "Claim replay payload exceeds {MAX_PAYLOAD_BYTES} bytes at event {seq}"
-                );
-                let payload = payload.as_str()?;
-                let commit = if kind == "CLAIM_TAINTED" {
-                    row.get_ref(2)?.as_str_or_null()?
-                } else {
-                    None
-                };
-                total_payload_bytes += payload.len() + commit.map_or(0, str::len);
-                ensure!(
-                    total_payload_bytes <= MAX_TOTAL_PAYLOAD_BYTES,
-                    "Claim replay exceeds {MAX_TOTAL_PAYLOAD_BYTES} total payload bytes"
-                );
-                apply(&mut claim, claim_id, seq, kind, commit, payload)
-                    .with_context(|| format!("invalid Claim replay event {seq} ({kind})"))?;
-                applied_events += 1;
-            }
-        }
-        snapshot.commit()?;
+        let window = replay_entity(
+            &self.db,
+            "claim",
+            claim_id,
+            through_event_seq,
+            "CLAIM_",
+            Some("CLAIM_REPROOF_REQUESTED"),
+            |seq, kind, commit, payload| apply(&mut claim, claim_id, seq, kind, commit, payload),
+        )?;
         Ok(ClaimReplay {
             claim_id: claim_id.to_owned(),
-            through_event_seq,
-            ledger_head_event_seq,
-            applied_events,
+            through_event_seq: window.through_event_seq,
+            ledger_head_event_seq: window.ledger_head_event_seq,
+            applied_events: window.applied_events,
             claim,
         })
     }

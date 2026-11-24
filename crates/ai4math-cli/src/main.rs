@@ -25,7 +25,7 @@ use anyhow::{Context, Result, bail, ensure};
 use promotion::{PendingRef, Promotion, PromotionRepo};
 use std::{env, fs, io::Read, path::Path};
 
-const HELP: &str = "ai4math init ROOT [lean4|agda|rocq]\nai4math status ROOT\nai4math claim-replay ROOT CLAIM [THROUGH_EVENT_SEQ]\nai4math wiki-rebuild ROOT\nai4math wiki-core-rebuild ROOT BARE_REPO REVIEWED_MAIN\nai4math wiki-core-search ROOT BARE_REPO REVIEWED_MAIN TEXT\nai4math wiki-core-provenance ROOT BARE_REPO REVIEWED_MAIN ENTRY_ID\nai4math wiki-sediment-preview ROOT BARE_REPO CLAIM REVIEWED_MAIN\nai4math wiki-sediment-archive ROOT BARE_REPO CLAIM REVIEWED_MAIN APPROVAL_SHA256\nai4math wiki-sediment-wake-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN\nai4math wiki-sediment-wake-recheck ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-retain ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-result ROOT OBSERVATION_SHA256\nai4math wiki-sediment-adapt-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM\nai4math wiki-sediment-adapt-approve ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM APPROVAL_SHA256\nai4math wiki-sediment-adapt-result ROOT APPROVAL_SHA256\nai4math wiki-sediment-adapt-run ROOT BARE_REPO APPROVAL_SHA256 WORKER_EXE WORKER_SHA256 WALL_SECONDS\nai4math wiki-sediment-adapt-lineage-retain ROOT BARE_REPO APPROVAL_SHA256 PROMOTED_HEAD\nai4math wiki-sediment-adapt-lineage-result ROOT APPROVAL_SHA256\nai4math self-test\nai4math hammer-reconstruct ROOT BARE_REPO CLAIM REVIEWED_COMMIT PREMISES_JSON NATIVE_LEAN\nai4math oracle-probe QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-preview ROOT BARE_REPO CLAIM QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-retain ROOT BARE_REPO CLAIM APPROVAL_SHA256 QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-result ROOT RECORD_SHA256\nai4math oracle-hold ROOT BARE_REPO TASK RECORD_SHA256 SECONDS\nai4math oracle-release ROOT TASK HOLD_SHA256\nai4math oracle-hold-status ROOT TASK\nai4math promote BARE_REPO MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math declare-claim ROOT CLAIM MODULE TARGET TITLE STATEMENT [--critical]\nai4math bind-lean-spec ROOT BARE_REPO CLAIM SPEC_MODULE SPEC_DECL APPROVED_COMMIT\nai4math lean-spec-comparison ROOT PROMOTED_COMMIT\nai4math lean-spec-recheck ROOT CLAIM PLAN_SHA256\nai4math bind-witness-spec ROOT BARE_REPO CLAIM MODULE PROPOSITION APPROVED_COMMIT\nai4math refute-managed ROOT BARE_REPO CLAIM MODULE PROPOSITION NATIVE_LEAN PROOF_BODY_FILE\nai4math promote-reviewed-body ROOT BARE_REPO CLAIM MODULE TARGET REVIEWED_COMMIT NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math promote-managed ROOT BARE_REPO CLAIM MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math recover-promotion ROOT BARE_REPO NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-discover ROOT BARE_REPO ANCHOR_MODULE BASELINE_COMMIT\nai4math t3-discover-claim ROOT BARE_REPO CLAIM_ID\nai4math t3-preview ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT\nai4math t3-apply ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT PLAN_SHA256\nai4math t3-recheck ROOT BARE_REPO PLAN_SHA256 NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-worklist ROOT BARE_REPO PLAN_SHA256 LIMIT [AFTER_CLAIM]\nai4math t3-recheck-one ROOT BARE_REPO PLAN_SHA256 CLAIM NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-recheck-batch ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--after CLAIM EVENT_SEQ]\nai4math t3-sweep-status ROOT BARE_REPO PLAN_SHA256\nai4math t3-sweep-step ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--restart]\nai4math trip-breaker ROOT BARE_REPO BREAKER MODULE DEFINITION REASON [--critical]
+const HELP: &str = "ai4math init ROOT [lean4|agda|rocq]\nai4math status ROOT\nai4math claim-replay ROOT CLAIM [THROUGH_EVENT_SEQ]\nai4math plan-replay ROOT PLAN [THROUGH_EVENT_SEQ]\nai4math wiki-rebuild ROOT\nai4math wiki-core-rebuild ROOT BARE_REPO REVIEWED_MAIN\nai4math wiki-core-search ROOT BARE_REPO REVIEWED_MAIN TEXT\nai4math wiki-core-provenance ROOT BARE_REPO REVIEWED_MAIN ENTRY_ID\nai4math wiki-sediment-preview ROOT BARE_REPO CLAIM REVIEWED_MAIN\nai4math wiki-sediment-archive ROOT BARE_REPO CLAIM REVIEWED_MAIN APPROVAL_SHA256\nai4math wiki-sediment-wake-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN\nai4math wiki-sediment-wake-recheck ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-retain ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-result ROOT OBSERVATION_SHA256\nai4math wiki-sediment-adapt-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM\nai4math wiki-sediment-adapt-approve ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM APPROVAL_SHA256\nai4math wiki-sediment-adapt-result ROOT APPROVAL_SHA256\nai4math wiki-sediment-adapt-run ROOT BARE_REPO APPROVAL_SHA256 WORKER_EXE WORKER_SHA256 WALL_SECONDS\nai4math wiki-sediment-adapt-lineage-retain ROOT BARE_REPO APPROVAL_SHA256 PROMOTED_HEAD\nai4math wiki-sediment-adapt-lineage-result ROOT APPROVAL_SHA256\nai4math self-test\nai4math hammer-reconstruct ROOT BARE_REPO CLAIM REVIEWED_COMMIT PREMISES_JSON NATIVE_LEAN\nai4math oracle-probe QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-preview ROOT BARE_REPO CLAIM QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-retain ROOT BARE_REPO CLAIM APPROVAL_SHA256 QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-result ROOT RECORD_SHA256\nai4math oracle-hold ROOT BARE_REPO TASK RECORD_SHA256 SECONDS\nai4math oracle-release ROOT TASK HOLD_SHA256\nai4math oracle-hold-status ROOT TASK\nai4math promote BARE_REPO MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math declare-claim ROOT CLAIM MODULE TARGET TITLE STATEMENT [--critical]\nai4math bind-lean-spec ROOT BARE_REPO CLAIM SPEC_MODULE SPEC_DECL APPROVED_COMMIT\nai4math lean-spec-comparison ROOT PROMOTED_COMMIT\nai4math lean-spec-recheck ROOT CLAIM PLAN_SHA256\nai4math bind-witness-spec ROOT BARE_REPO CLAIM MODULE PROPOSITION APPROVED_COMMIT\nai4math refute-managed ROOT BARE_REPO CLAIM MODULE PROPOSITION NATIVE_LEAN PROOF_BODY_FILE\nai4math promote-reviewed-body ROOT BARE_REPO CLAIM MODULE TARGET REVIEWED_COMMIT NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math promote-managed ROOT BARE_REPO CLAIM MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math recover-promotion ROOT BARE_REPO NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-discover ROOT BARE_REPO ANCHOR_MODULE BASELINE_COMMIT\nai4math t3-discover-claim ROOT BARE_REPO CLAIM_ID\nai4math t3-preview ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT\nai4math t3-apply ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT PLAN_SHA256\nai4math t3-recheck ROOT BARE_REPO PLAN_SHA256 NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-worklist ROOT BARE_REPO PLAN_SHA256 LIMIT [AFTER_CLAIM]\nai4math t3-recheck-one ROOT BARE_REPO PLAN_SHA256 CLAIM NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-recheck-batch ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--after CLAIM EVENT_SEQ]\nai4math t3-sweep-status ROOT BARE_REPO PLAN_SHA256\nai4math t3-sweep-step ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--restart]\nai4math trip-breaker ROOT BARE_REPO BREAKER MODULE DEFINITION REASON [--critical]
 ai4math pivot-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
 ai4math pivot-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID
 ai4math pivot-recover ROOT BARE_REPO
@@ -48,11 +48,25 @@ fn print_json(value: impl serde::Serialize) -> Result<()> {
     Ok(())
 }
 
-fn replay_claim(root: &Path, claim: &str, through: Option<i64>) -> Result<()> {
+fn replay_audit(command: &str, root: &Path, id: &str, cursor: Option<&str>) -> Result<()> {
+    let through = cursor
+        .map(|text| -> Result<i64> {
+            ensure!(
+                text == "0" || (!text.starts_with('0') && text.bytes().all(|b| b.is_ascii_digit())),
+                "event cursor must be a canonical nonnegative integer"
+            );
+            text.parse()
+                .context("event cursor must be a canonical nonnegative integer")
+        })
+        .transpose()?;
     let path = worker_dispatch::private_state_path(root)
-        .context("claim-replay requires an initialized, owner-controlled project")?;
+        .context("replay requires an initialized, owner-controlled project")?;
     let state = StateStore::open_readonly(path)?;
-    print_json(state.replay_claim(claim, through)?)
+    match command {
+        "claim-replay" => print_json(state.replay_claim(id, through)?),
+        "plan-replay" => print_json(state.replay_plan(id, through)?),
+        _ => unreachable!("replay command is constrained by the CLI grammar"),
+    }
 }
 
 /// Always acquire before the coordinator Git lock and any state mutation.
@@ -618,18 +632,15 @@ fn run() -> Result<()> {
             let state = StateStore::open(root.join(".runtime/state.sqlite"))?.status()?;
             print_json(serde_json::json!({"primary_engine": primary_engine.trim(), "state": state}))
         }
-        ["claim-replay", root, claim] => replay_claim(Path::new(root), claim, None),
-        ["claim-replay", root, claim, through] => {
-            ensure!(
-                through == &"0"
-                    || (!through.starts_with('0') && through.bytes().all(|b| b.is_ascii_digit())),
-                "event cursor must be a canonical nonnegative integer"
-            );
-            let through = through
-                .parse::<i64>()
-                .context("event cursor must be a canonical nonnegative integer")?;
-            replay_claim(Path::new(root), claim, Some(through))
+        [command @ ("claim-replay" | "plan-replay"), root, id] => {
+            replay_audit(command, Path::new(root), id, None)
         }
+        [
+            command @ ("claim-replay" | "plan-replay"),
+            root,
+            id,
+            through,
+        ] => replay_audit(command, Path::new(root), id, Some(through)),
         ["wiki-rebuild", root] => {
             let wiki = Path::new(root).join(".mathwiki");
             ensure!(wiki.is_dir(), "initialize the project first");

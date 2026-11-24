@@ -102,3 +102,58 @@ fn claim_replay_does_not_follow_an_aliased_runtime() {
     assert!(refused.stdout.is_empty());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("owner-controlled project"));
 }
+
+#[test]
+fn plan_replay_uses_event_sequence_without_graph_or_repo_lookup() {
+    use ai4math_store::{Change, NewPlan, PlanStatus, StateStore};
+    let temp = tempfile::tempdir().unwrap();
+    let root = temp.path();
+    ok(ai(root, "init", &["lean4"]));
+    for (id, module) in [("target", "Target.lean"), ("lemma", "Lemma.lean")] {
+        ok(ai(
+            root,
+            "declare-claim",
+            &[id, module, "result", id, "An informal claim"],
+        ));
+    }
+    let path = root.join(".runtime/state.sqlite");
+    let seq = {
+        let mut store = StateStore::open(&path).unwrap();
+        store
+            .create_plan(
+                NewPlan {
+                    id: "route",
+                    target: "target",
+                    name: "Recorded route",
+                    track: "infrastructure",
+                    status: PlanStatus::Active,
+                    dependencies: &[("lemma", "lemma")],
+                },
+                Change {
+                    actor: "test:operator",
+                    git_commit: None,
+                },
+            )
+            .unwrap();
+        store.status().unwrap().last_event_seq
+    };
+    let before = fs::read(&path).unwrap();
+    let found = json(ai(root, "plan-replay", &["route"]));
+    assert_eq!(
+        found,
+        serde_json::json!({"plan_id":"route","through_event_seq":seq,"ledger_head_event_seq":seq,
+        "applied_events":1,"plan":{"plan_id":"route","target_claim_id":"target","name":"Recorded route","track":"infrastructure",
+        "dependencies":[{"claim_id":"lemma","kind":"lemma"}],"durable_status":"ACTIVE","status":"ACTIVE",
+        "effective_trust":"L0","blocking_claim_id":null,"refuted_claim_id":null,"last_event_seq":seq}})
+    );
+    let earlier = (seq - 1).to_string();
+    assert!(json(ai(root, "plan-replay", &["route", &earlier]))["plan"].is_null());
+    assert!(json(ai(root, "plan-replay", &["unknown"]))["plan"].is_null());
+    let future = (seq + 1).to_string();
+    for cursor in ["-1", "01", &future] {
+        let bad = ai(root, "plan-replay", &["route", cursor]);
+        assert!(!bad.status.success());
+        assert!(bad.stdout.is_empty());
+    }
+    assert_eq!(fs::read(path).unwrap(), before);
+}

@@ -996,6 +996,7 @@ fn operator_oracle_and_hammer_are_not_available_over_daemon_rpc() -> Result<()> 
         "t3.discover",
         "t3.discoverClaim",
         "claim.replay",
+        "plan.replay",
         "t3.worklist",
         "t3.recheckOne",
         "t3.recheckBatch",
