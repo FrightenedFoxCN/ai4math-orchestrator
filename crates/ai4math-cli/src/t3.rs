@@ -1,4 +1,6 @@
 //! Operator T3 coordination. Resolves reviewed Git objects, never treats a ledger row as proof.
+#[cfg(unix)]
+mod parent;
 #[cfg(test)]
 mod tests;
 use super::{
@@ -176,6 +178,7 @@ enum Replay<'a> {
     Sweep {
         limit: usize,
         restart: bool,
+        daemon_parent: bool,
     },
 }
 
@@ -252,12 +255,25 @@ pub(crate) fn sweep_step(
     args: &[&str],
 ) -> Result<()> {
     ensure!((1..=8).contains(&limit), "T3 sweep limit must be 1..=8");
-    let (data, restart) = sweep_options(args)?;
+    let daemon_parent = args == ["--daemon-parent"];
+    let (data, restart) = if daemon_parent {
+        #[cfg(unix)]
+        parent::arm()?;
+        #[cfg(not(unix))]
+        anyhow::bail!("daemon T3 supervision requires Unix");
+        (None, false)
+    } else {
+        sweep_options(args)?
+    };
     recheck_selected(
         root,
         repo,
         hash,
-        Replay::Sweep { limit, restart },
+        Replay::Sweep {
+            limit,
+            restart,
+            daemon_parent,
+        },
         exec,
         data,
     )
@@ -326,6 +342,18 @@ fn recheck_selected(
     }
     let engine = bound_engine(root, &approval.anchor_module)?;
     let tool = trusted_toolchain(engine, exec, data)?;
+    #[cfg(unix)]
+    let tool = if matches!(
+        replay,
+        Replay::Sweep {
+            daemon_parent: true,
+            ..
+        }
+    ) {
+        tool.with_supervised_process_group()?
+    } else {
+        tool
+    };
     let repo_snapshot = locked.snapshot(&approval.anchor_module, Some(at))?;
     let files = repo_snapshot.project()?;
     let provenance = StateStore::open_readonly(&path)?;
@@ -439,7 +467,7 @@ fn recheck_selected(
             );
             print_json(batch)
         }
-        Replay::Sweep { limit, restart } => {
+        Replay::Sweep { limit, restart, .. } => {
             let step = state.t3_sweep_step(hash, limit, restart, "broker:t3", check)?;
             ensure!(
                 locked.main_head()? == *at,

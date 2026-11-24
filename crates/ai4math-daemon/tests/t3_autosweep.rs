@@ -1,0 +1,613 @@
+#![cfg(unix)]
+
+use anyhow::{Result, ensure};
+use serde_json::{Value, json};
+use std::{
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
+
+const SOCKET: &str = ".runtime/ai4mathd.sock";
+const STARTUP: Duration = Duration::from_secs(5);
+
+fn short_tempdir() -> Result<tempfile::TempDir> {
+    // Keep the canonical socket path below the Unix sun_path limit on macOS.
+    Ok(tempfile::Builder::new()
+        .prefix("a4")
+        .rand_bytes(4)
+        .tempdir()?)
+}
+
+struct Daemon {
+    child: Child,
+    log: tempfile::NamedTempFile,
+}
+
+impl Daemon {
+    fn spawn(root: &Path, config: Option<&Path>) -> Result<Self> {
+        let log = tempfile::NamedTempFile::new_in(root)?;
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai4mathd"));
+        cmd.arg("--project").arg(root).args(["--tick-ms", "100"]);
+        if let Some(config) = config {
+            cmd.arg("--t3-autosweep").arg(config);
+        }
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(log.reopen()?)
+            .spawn()?;
+        Ok(Self { child, log })
+    }
+
+    fn logs(&self) -> String {
+        fs::read_to_string(self.log.path()).unwrap_or_default()
+    }
+
+    #[cfg(target_os = "macos")]
+    fn poll<T>(
+        &mut self,
+        timeout: Duration,
+        what: &str,
+        mut observe: impl FnMut() -> Result<Option<T>>,
+    ) -> Result<T> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if let Some(value) = observe()? {
+                return Ok(value);
+            }
+            if let Some(status) = self.child.try_wait()? {
+                anyhow::bail!(
+                    "daemon exited ({status}) while waiting for {what}: {}",
+                    self.logs()
+                );
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "waiting for {what}: {}",
+                self.logs()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    fn startup_error(&mut self) -> Result<ExitStatus> {
+        let deadline = Instant::now() + STARTUP;
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                return Ok(status);
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "invalid config did not fail startup: {}",
+                self.logs()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for Daemon {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn catalog(cli: &Path, bare: &Path, native: &Path, hash: &str, interval_ms: u64) -> Value {
+    json!({
+        "version": 1,
+        "cli_executable": cli,
+        "bare_repo": bare,
+        "plan_sha256": hash,
+        "native_executable": native,
+        "page_limit": 1,
+        "interval_ms": interval_ms,
+    })
+}
+
+fn write_new(path: &Path, mode: u32, bytes: &[u8]) -> Result<()> {
+    OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(path)?
+        .write_all(bytes)?;
+    Ok(())
+}
+
+#[test]
+fn invalid_autosweep_catalog_fails_before_publishing_socket() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = short_tempdir()?;
+    let root = tmp.path().canonicalize()?;
+    let cli = root.join("fixture-cli");
+    let native = root.join("fixture-native");
+    for tool in [&cli, &native] {
+        write_new(tool, 0o700, b"#!/bin/sh\nexit 1\n")?;
+        fs::set_permissions(tool, fs::Permissions::from_mode(0o700))?;
+    }
+    let bare = root.join("repo.git");
+    fs::create_dir(&bare)?;
+    let valid = catalog(&cli, &bare, &native, &"b".repeat(64), 3_000);
+    for (name, body, mode) in [
+        ("malformed", b"{not JSON".to_vec(), 0o600),
+        ("nonprivate", serde_json::to_vec(&valid)?, 0o644),
+        (
+            "extra-authority",
+            {
+                let mut extra = valid.clone();
+                extra["restart"] = json!(true);
+                serde_json::to_vec(&extra)?
+            },
+            0o600,
+        ),
+        (
+            "oversized-page",
+            {
+                let mut extra = valid.clone();
+                extra["page_limit"] = json!(9);
+                serde_json::to_vec(&extra)?
+            },
+            0o600,
+        ),
+    ] {
+        let path = root.join(name);
+        write_new(&path, mode, &body)?;
+        // Test the requested mode even when the caller has a stricter umask.
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode))?;
+        let mut daemon = Daemon::spawn(&root, Some(&path))?;
+        assert!(!daemon.startup_error()?.success(), "accepted {name}");
+        assert!(
+            daemon
+                .logs()
+                .contains("invalid --t3-autosweep configuration"),
+            "{name}: {}",
+            daemon.logs()
+        );
+        assert!(!root.join(SOCKET).exists(), "published socket for {name}");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+mod native {
+    use super::*;
+    use ai4math_store::{ClaimState, StateStore, T3SweepState, T3SweepStatus, Trust};
+    use anyhow::Context;
+    use rusqlite::{Connection, OpenFlags};
+    use std::{
+        env,
+        io::{BufRead, BufReader},
+        os::unix::{fs::FileTypeExt, net::UnixStream},
+        path::PathBuf,
+        process::Output,
+    };
+
+    const ANCHOR: &str = "Proof.lean";
+    const INTERVAL_MS: u64 = 3_000;
+
+    fn success(output: Output, description: &str) -> Result<String> {
+        ensure!(
+            output.status.success(),
+            "{description}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(String::from_utf8(output.stdout)?)
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> Result<String> {
+        let output = Command::new("/usr/bin/git")
+            .current_dir(dir)
+            .args([
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@localhost",
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .output()?;
+        Ok(success(output, &format!("Git {args:?}"))?.trim().into())
+    }
+
+    fn native_binary(name: &str) -> Result<PathBuf> {
+        let path = PathBuf::from(env::var_os(name).with_context(|| format!("set {name}"))?);
+        ensure!(
+            path.is_absolute(),
+            "{name} must name an absolute native executable"
+        );
+        path.canonicalize()
+            .with_context(|| format!("resolve {name}"))
+    }
+
+    fn utf8(path: &Path) -> &str {
+        path.to_str().expect("UTF-8 fixture path")
+    }
+
+    struct Fixture {
+        root: PathBuf,
+        bare: PathBuf,
+        cli: PathBuf,
+        lean: PathBuf,
+        review: PathBuf,
+    }
+
+    impl Fixture {
+        fn new(root: PathBuf, original_cli: &Path, lean: PathBuf) -> Result<Self> {
+            // Cargo binaries can be hard links. The daemon catalog requires a private,
+            // ordinary executable, so use an independent copy of the actual CLI.
+            let cli = root.join("ai4math");
+            fs::copy(original_cli, &cli)?;
+            let bare = root.join("repo.git");
+            let review = root.join("review");
+            let source = root.join("source");
+            fs::create_dir(&source)?;
+            git(&source, &["init", "--initial-branch=main", "--quiet"])?;
+            fs::write(
+                source.join("Defs.lean"),
+                "def x : Nat := 2\ndef marker : Nat := 0\n",
+            )?;
+            fs::write(
+                source.join(ANCHOR),
+                "import Defs\ntheorem target : x = 2 := {{PROOF_BODY}}\n",
+            )?;
+            fs::write(
+                source.join("ai4math-modules.txt"),
+                "Defs.lean\nProof.lean\n",
+            )?;
+            git(&source, &["add", "."])?;
+            git(&source, &["commit", "-m", "freeze proof input"])?;
+            git(&root, &["clone", "--bare", "source", "repo.git"])?;
+            let f = Self {
+                root,
+                bare,
+                cli,
+                lean,
+                review,
+            };
+            f.run("init", &["lean4"])?;
+            f.declare("A", "Defs.lean", "x")?;
+            f.declare("C", ANCHOR, "target")?;
+            let body = f.root.join("proof-body.txt");
+            fs::write(&body, "by\n  rfl")?;
+            f.run(
+                "promote-managed",
+                &[
+                    utf8(&f.bare),
+                    "C",
+                    ANCHOR,
+                    "target",
+                    utf8(&f.lean),
+                    utf8(&body),
+                ],
+            )?;
+            git(&f.root, &["clone", "repo.git", "review"])?;
+            Ok(f)
+        }
+
+        fn run(&self, command: &str, args: &[&str]) -> Result<String> {
+            let output = Command::new(&self.cli)
+                .arg(command)
+                .arg(&self.root)
+                .args(args)
+                .output()?;
+            success(output, command)
+        }
+
+        fn declare(&self, id: &str, module: &str, target: &str) -> Result<()> {
+            self.run(
+                "declare-claim",
+                &[id, module, target, id, "Fixture statement"],
+            )?;
+            Ok(())
+        }
+
+        fn main(&self) -> Result<String> {
+            git(&self.bare, &["rev-parse", "refs/heads/main"])
+        }
+
+        fn review_defs(&self, rhs: &str) -> Result<String> {
+            fs::write(
+                self.review.join("Defs.lean"),
+                format!("def x : Nat := {rhs}\ndef marker : Nat := 0\n"),
+            )?;
+            git(&self.review, &["add", "Defs.lean"])?;
+            git(
+                &self.review,
+                &["commit", "-m", "operator-reviewed definitional change"],
+            )?;
+            git(&self.review, &["push", "origin", "HEAD:refs/heads/main"])?;
+            self.main()
+        }
+
+        fn preview(&self, base: &str, head: &str) -> Result<Value> {
+            let preview = self.run("t3-preview", &[utf8(&self.bare), ANCHOR, base, head])?;
+            Ok(serde_json::from_str(&preview)?)
+        }
+
+        fn apply(&self, base: &str, head: &str, hash: &str) -> Result<()> {
+            self.run("t3-apply", &[utf8(&self.bare), ANCHOR, base, head, hash])?;
+            Ok(())
+        }
+
+        fn config(&self, filename: &str, hash: &str) -> Result<PathBuf> {
+            let path = self.root.join(filename);
+            let mut body = catalog(&self.cli, &self.bare, &self.lean, hash, INTERVAL_MS);
+            body["step_timeout_ms"] = json!(60_000);
+            write_new(&path, 0o600, &serde_json::to_vec(&body)?)?;
+            Ok(path)
+        }
+
+        fn stop(&self, mut daemon: Daemon) -> Result<()> {
+            daemon.child.kill()?;
+            daemon.child.wait()?;
+            // SIGKILL cannot run socket cleanup. Remove only the known fixture socket
+            // after reaping its daemon, and refuse to follow a replaced directory.
+            let socket = self.root.join(SOCKET);
+            let parent = socket.parent().context("fixture socket has no parent")?;
+            ensure!(
+                parent.canonicalize()? == parent,
+                "fixture runtime path changed"
+            );
+            ensure!(
+                fs::symlink_metadata(&socket)?.file_type().is_socket(),
+                "fixture endpoint is not a Unix socket"
+            );
+            fs::remove_file(socket)?;
+            Ok(())
+        }
+
+        fn database(&self) -> PathBuf {
+            self.root.join(".runtime/state.sqlite")
+        }
+
+        fn state(&self) -> Result<StateStore> {
+            StateStore::open_readonly(self.database())
+        }
+
+        fn claim(&self, id: &str) -> Result<ClaimState> {
+            self.state()?
+                .claim(id)?
+                .with_context(|| format!("missing claim {id}"))
+        }
+
+        fn checkpoint(&self, hash: &str) -> Result<T3SweepStatus> {
+            self.state()?.t3_sweep_status(hash)
+        }
+
+        fn receipt_count(&self) -> Result<i64> {
+            let db =
+                Connection::open_with_flags(self.database(), OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+            db.busy_timeout(STARTUP)?;
+            Ok(
+                db.query_row("SELECT count(*) FROM verification_receipts", [], |row| {
+                    row.get(0)
+                })?,
+            )
+        }
+    }
+
+    fn digest(preview: &Value) -> Result<&str> {
+        preview["plan_sha256"]
+            .as_str()
+            .context("preview did not return a digest")
+    }
+
+    fn rpc(root: &Path, method: &str, params: Value) -> Result<Value> {
+        let mut stream = UnixStream::connect(root.join(SOCKET))?;
+        stream.set_read_timeout(Some(STARTUP))?;
+        stream.set_write_timeout(Some(STARTUP))?;
+        writeln!(
+            stream,
+            "{}",
+            json!({"jsonrpc":"2.0","id":1,"method":method,"params":params})
+        )?;
+        let mut line = String::new();
+        ensure!(
+            BufReader::new(stream).read_line(&mut line)? > 0,
+            "daemon closed {method} RPC"
+        );
+        let reply: Value = serde_json::from_str(&line)?;
+        assert_eq!(reply["id"], 1);
+        Ok(reply)
+    }
+
+    fn status(root: &Path) -> Result<Value> {
+        let reply = rpc(root, "status", json!({}))?;
+        ensure!(
+            reply["result"]["event_seq"].is_i64(),
+            "unexpected status reply: {reply}"
+        );
+        Ok(reply["result"].clone())
+    }
+
+    fn ready(daemon: &mut Daemon, root: &Path) -> Result<()> {
+        daemon.poll(STARTUP, "Unix socket", || {
+            Ok(UnixStream::connect(root.join(SOCKET)).ok())
+        })?;
+        status(root)?;
+        Ok(())
+    }
+
+    fn latched(daemon: &mut Daemon, reason: &str) -> Result<()> {
+        let line = format!("ai4mathd t3 autosweep stopped: {reason}");
+        let path = daemon.log.path().to_owned();
+        daemon.poll(Duration::from_secs(70), &line, || {
+            let log = fs::read_to_string(&path)?;
+            if let Some(actual) = log
+                .lines()
+                .find(|line| line.starts_with("ai4mathd t3 autosweep stopped:"))
+            {
+                ensure!(actual == line, "expected {line:?}, got {actual:?}\n{log}");
+                return Ok(Some(()));
+            }
+            Ok(None)
+        })
+    }
+
+    #[test]
+    #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
+    fn native_autosweep_is_opt_in_resumes_and_latches_only_approved_work() -> Result<()> {
+        let tmp = short_tempdir()?;
+        let f = Fixture::new(
+            tmp.path().canonicalize()?,
+            &native_binary("AI4MATH_TEST_CLI")?,
+            native_binary("AI4MATH_TEST_LEAN")?,
+        )?;
+        let promoted = f.main()?;
+        let original_source = git(&f.bare, &["show", "refs/heads/main:Proof.lean"])?;
+        assert!(original_source.contains("theorem target : x = 2"));
+        assert!(original_source.contains("rfl"));
+        let original = f.claim("C")?;
+        assert_eq!(original.local_trust, Trust::L5);
+        assert!(original.receipt_id.is_some());
+        assert_eq!(f.receipt_count()?, 1);
+        let reviewed = f.review_defs("Nat.succ 1")?;
+        let preview = f.preview(&promoted, &reviewed)?;
+        let hash = digest(&preview)?;
+        assert_eq!(preview["changed_modules"], json!(["Defs.lean"]));
+        assert_eq!(preview["claims"][0]["claim_id"], "A");
+        assert_eq!(preview["claims"][1]["claim_id"], "C");
+        assert_eq!(
+            preview["claims"][1]["old_proof"]["ready"]["promoted_commit"],
+            promoted
+        );
+        let config = f.config("autosweep.json", hash)?;
+
+        // A valid catalog and matching Git snapshot are not operator approval. Once
+        // the worker stops, applying that very digest must not re-arm the old process.
+        let mut unapproved = Daemon::spawn(&f.root, Some(&config))?;
+        ready(&mut unapproved, &f.root)?;
+        latched(&mut unapproved, "authorization or state unavailable")?;
+        assert!(f.state()?.applied_t3_plan(hash)?.is_none());
+        assert_eq!(f.receipt_count()?, 1);
+        assert_eq!(f.claim("C")?.receipt_id, original.receipt_id);
+        f.apply(&promoted, &reviewed, hash)?;
+        thread::sleep(Duration::from_millis(2 * INTERVAL_MS));
+        assert_eq!(f.checkpoint(hash)?.status, T3SweepState::NotStarted);
+        assert!(f.claim("C")?.stale);
+        status(&f.root)?;
+        f.stop(unapproved)?;
+
+        // A claim declared in the affected module after approval is not in the plan.
+        f.declare("Z", "Defs.lean", "marker")?;
+        let late_claim = serde_json::to_value(f.claim("Z")?)?;
+        let seq = f.state()?.status()?.last_event_seq;
+        let mut disabled = Daemon::spawn(&f.root, None)?;
+        ready(&mut disabled, &f.root)?;
+        assert_eq!(
+            rpc(
+                &f.root,
+                "t3.sweep_step",
+                json!({"plan_sha256":hash,"restart":true})
+            )?["error"]["code"],
+            -32601
+        );
+        thread::sleep(Duration::from_millis(400));
+        assert_eq!(status(&f.root)?["event_seq"], seq);
+        assert_eq!(f.checkpoint(hash)?.status, T3SweepState::NotStarted);
+        assert_eq!(f.receipt_count()?, 1);
+        f.stop(disabled)?;
+
+        // Page one crosses only the non-L5 Claim A. Stop between pages at an
+        // observed durable checkpoint, not while guessing where a child is running.
+        let mut enabled = Daemon::spawn(&f.root, Some(&config))?;
+        ready(&mut enabled, &f.root)?;
+        let partial = enabled.poll(STARTUP, "first T3 page checkpoint", || {
+            let progress = f.checkpoint(hash)?;
+            Ok(progress.revision.is_some().then_some(progress))
+        })?;
+        // Let the finished page's CLI reap and release its locks, comfortably
+        // before the 3-second inter-page delay expires.
+        thread::sleep(Duration::from_millis(150));
+        f.stop(enabled)?;
+        assert_eq!(partial.revision, Some(1));
+        assert_eq!(partial.status, T3SweepState::Running);
+        assert_eq!(partial.next_after_claim.as_deref(), Some("A"));
+        assert_eq!(partial.checkpoint_event_seq, Some(seq));
+        assert_eq!(f.checkpoint(hash)?, partial);
+        assert!(f.claim("C")?.stale);
+        assert_eq!(f.receipt_count()?, 1);
+
+        let mut resumed = Daemon::spawn(&f.root, Some(&config))?;
+        ready(&mut resumed, &f.root)?;
+        latched(&mut resumed, "complete")?;
+        let complete = f.checkpoint(hash)?;
+        assert_eq!(complete.revision, Some(2));
+        assert_eq!(complete.status, T3SweepState::Complete);
+        assert_eq!(complete.reviewed_commit, reviewed);
+        assert!(complete.next_after_claim.is_none());
+        let restored = f.claim("C")?;
+        assert_eq!(restored.local_trust, Trust::L5);
+        assert_eq!(restored.effective_trust, Trust::L5);
+        assert!(!restored.stale);
+        assert_ne!(restored.receipt_id, original.receipt_id);
+        let after = status(&f.root)?;
+        assert_eq!(after["trust"]["L5"], 1);
+        assert_eq!(after["event_seq"].as_i64(), complete.checkpoint_event_seq);
+        assert_eq!(f.receipt_count()?, 2);
+        let events = f.state()?.events_after(seq, 32)?;
+        let receipts: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "RECEIPT_RECORDED")
+            .collect();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(
+            Some(receipts[0].entity_id.as_str()),
+            restored.receipt_id.as_deref()
+        );
+        assert_eq!(receipts[0].git_commit.as_deref(), Some(reviewed.as_str()));
+        assert_eq!(
+            receipts[0].payload,
+            json!({"claim_id":"C","tier":"T3_TAINT_REBUILD"})
+        );
+        assert_eq!(serde_json::to_value(f.claim("Z")?)?, late_claim);
+        assert_eq!(f.main()?, reviewed);
+        let source = git(&f.bare, &["show", "refs/heads/main:Proof.lean"])?;
+        assert_eq!(source, original_source);
+        f.stop(resumed)?;
+
+        let mut completed_restart = Daemon::spawn(&f.root, Some(&config))?;
+        ready(&mut completed_restart, &f.root)?;
+        latched(&mut completed_restart, "complete")?;
+        assert_eq!(status(&f.root)?["event_seq"], after["event_seq"]);
+        assert_eq!(f.checkpoint(hash)?, complete);
+        assert_eq!(f.receipt_count()?, 2);
+        f.stop(completed_restart)?;
+
+        // The stale-input case uses a *pending* approval, so completion cannot
+        // hide an accidental replay after main moves to an unapproved Git commit.
+        let reviewed_two = f.review_defs("1 + 1")?;
+        let second = f.preview(&reviewed, &reviewed_two)?;
+        let old_hash = digest(&second)?;
+        f.apply(&reviewed, &reviewed_two, old_hash)?;
+        let moved = f.review_defs("Nat.succ (Nat.succ 0)")?;
+        let stale_config = f.config("stale.json", old_hash)?;
+        let seq = f.state()?.status()?.last_event_seq;
+        let mut stale = Daemon::spawn(&f.root, Some(&stale_config))?;
+        ready(&mut stale, &f.root)?;
+        // This digest is applied, so the CLI rejects the obsolete main under the
+        // Git/native gates rather than the worker rejecting it during SQLite readback.
+        latched(&mut stale, "step failed")?;
+        assert_eq!(status(&f.root)?["event_seq"], seq);
+        assert_eq!(f.main()?, moved);
+        assert_eq!(f.checkpoint(old_hash)?.status, T3SweepState::NotStarted);
+        let claim = f.claim("C")?;
+        assert!(claim.stale);
+        assert_eq!(
+            claim.taint_root_commit.as_deref(),
+            Some(reviewed_two.as_str())
+        );
+        assert_eq!(f.receipt_count()?, 2);
+        Ok(())
+    }
+}

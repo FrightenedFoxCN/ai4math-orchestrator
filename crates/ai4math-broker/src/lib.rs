@@ -61,6 +61,7 @@ pub struct Toolchain {
     agda_data: Option<PathBuf>,
     rocq_install: Option<rocq::Install>,
     binary_sha256: String,
+    sandbox_group: sandbox::ProcessGroup,
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -103,6 +104,7 @@ impl Toolchain {
             agda_data: None,
             rocq_install: None,
             binary_sha256,
+            sandbox_group: sandbox::ProcessGroup::OwnSession,
         })
     }
 
@@ -120,6 +122,22 @@ impl Toolchain {
             }
         }
         Ok(tool)
+    }
+
+    /// Keep Lean and its sealed comparator in the process group of a guarded
+    /// operator coordinator. Their Seatbelt and per-invocation limits are unchanged.
+    #[cfg(unix)]
+    pub fn with_supervised_process_group(mut self) -> Result<Self> {
+        ensure!(
+            self.engine == Engine::Lean4,
+            "daemon-supervised verification supports Lean only"
+        );
+        ensure!(
+            unsafe { libc::getpgrp() == libc::getpid() },
+            "supervised verification requires a dedicated coordinator process group"
+        );
+        self.sandbox_group = sandbox::ProcessGroup::Supervisor;
+        Ok(self)
     }
 
     pub fn agda(executable: impl AsRef<Path>, mode: AgdaMode) -> Result<Self> {
@@ -519,15 +537,20 @@ impl Broker {
             }
             Engine::Rocq => return rocq::compile(tool, room, &output, relative, save_object),
         }
-        sandbox::run(sandbox::Invocation {
-            executable: &tool.executable,
-            args: &args,
-            room,
-            writable: &output,
-            reads: &reads,
-            env: &env,
-            timeout: TIMEOUT,
-        })
+        sandbox::run_grouped(
+            sandbox::Invocation {
+                executable: &tool.executable,
+                args: &args,
+                room,
+                writable: &output,
+                reads: &reads,
+                env: &env,
+                timeout: TIMEOUT,
+            },
+            &[],
+            &[],
+            tool.sandbox_group,
+        )
     }
 
     pub fn load(&self) -> Result<BrokerLoad> {

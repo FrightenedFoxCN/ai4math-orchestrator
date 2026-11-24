@@ -198,7 +198,7 @@ impl Broker {
         // newly compiled artifacts as data, under a separate data-only grant.
         // Only this run may supply the exact seal (including no extra stderr);
         // build-stage output cannot authorize a comparison.
-        let log = sandbox::run_with_data(
+        let log = sandbox::run_grouped(
             sandbox::Invocation {
                 executable: &tool.executable,
                 args: &[
@@ -225,6 +225,7 @@ impl Broker {
             },
             &[prefix_objects, objects],
             &[],
+            tool.sandbox_group,
         )
         .context("kernel-check sealed Lean spec comparison")?;
         command_timeout(deadline)?;

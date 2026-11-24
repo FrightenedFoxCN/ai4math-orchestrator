@@ -18,6 +18,13 @@ impl std::fmt::Display for ChildExit {
 }
 impl std::error::Error for ChildExit {}
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ProcessGroup {
+    #[default]
+    OwnSession,
+    Supervisor,
+}
+
 pub(crate) struct Invocation<'a> {
     pub executable: &'a Path,
     pub args: &'a [String],
@@ -113,11 +120,25 @@ pub(crate) fn run(spec: Invocation<'_>) -> Result<String> {
 }
 
 /// Unlike native runtime grants, these trusted data paths cannot be mapped as executable.
-#[cfg(target_os = "macos")]
 pub(crate) fn run_with_data(
     spec: Invocation<'_>,
     data_reads: &[PathBuf],
     literal_data_reads: &[PathBuf],
+) -> Result<String> {
+    run_grouped(
+        spec,
+        data_reads,
+        literal_data_reads,
+        ProcessGroup::OwnSession,
+    )
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn run_grouped(
+    spec: Invocation<'_>,
+    data_reads: &[PathBuf],
+    literal_data_reads: &[PathBuf],
+    group: ProcessGroup,
 ) -> Result<String> {
     use anyhow::Context;
     use std::{
@@ -188,10 +209,15 @@ pub(crate) fn run_with_data(
         .stdout(log.try_clone()?)
         .stderr(log.try_clone()?);
     let cpu = spec.timeout.as_secs().saturating_add(1);
+    let own_session = group == ProcessGroup::OwnSession;
+    ensure!(
+        own_session || unsafe { libc::getpgrp() == libc::getpid() },
+        "supervised verification requires the coordinator's dedicated process group"
+    );
     // Only async-signal-safe libc functions in the post-fork child.
     unsafe {
         command.pre_exec(move || {
-            if libc::setsid() == -1 {
+            if own_session && libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
             for (resource, requested) in [
@@ -216,25 +242,32 @@ pub(crate) fn run_with_data(
             Ok(())
         });
     }
-    struct Running(Option<Child>);
+    struct Running(Option<Child>, bool);
     impl Drop for Running {
         fn drop(&mut self) {
             if let Some(child) = &mut self.0 {
                 // PID belongs to the unreaped session leader, so it cannot be reused here.
-                unsafe {
-                    libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                if self.1 {
+                    unsafe {
+                        libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL);
+                    }
                 }
+                // In supervisor mode the child shares the CLI group; do not kill
+                // that group for an individual timeout. Seatbelt denies child forks.
                 let _ = child.kill();
                 let _ = child.wait();
             }
         }
     }
     let start = Instant::now();
-    let mut running = Running(Some(
-        command
-            .spawn()
-            .context("starting Seatbelt; no unsandboxed fallback")?,
-    ));
+    let mut running = Running(
+        Some(
+            command
+                .spawn()
+                .context("starting Seatbelt; no unsandboxed fallback")?,
+        ),
+        own_session,
+    );
     let status = loop {
         if let Some(status) = running.0.as_mut().unwrap().try_wait()? {
             break status;
@@ -271,10 +304,11 @@ pub(crate) fn run_with_data(
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn run_with_data(
+pub(crate) fn run_grouped(
     spec: Invocation<'_>,
     _data_reads: &[PathBuf],
     _literal_data_reads: &[PathBuf],
+    _group: ProcessGroup,
 ) -> Result<String> {
     let Invocation {
         executable,

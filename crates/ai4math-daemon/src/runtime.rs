@@ -1,6 +1,7 @@
 use crate::{
     facts::{self, FactPack},
     proofs::{self, Probes},
+    t3_worker,
     transport::{self, Connection, Hub, RpcError},
 };
 use ai4math_store::{StateStore, Wiki, WikiQuery};
@@ -529,8 +530,17 @@ fn ordinary_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub fn run(project: &Path, tick: Duration, catalog: Option<&Path>) -> Result<()> {
-    let root = project.canonicalize()?;
+pub fn run(
+    project: &Path,
+    tick: Duration,
+    catalog: Option<&Path>,
+    worker: Option<t3_worker::Config>,
+) -> Result<()> {
+    let root = if worker.is_some() {
+        t3_worker::verified_root(project)?
+    } else {
+        project.canonicalize()?
+    };
     ensure!(root.is_dir(), "project root must be a directory");
     let runtime = root.join(".runtime");
     let wiki = root.join(".mathwiki");
@@ -581,8 +591,12 @@ pub fn run(project: &Path, tick: Duration, catalog: Option<&Path>) -> Result<()>
                         }
                         thread::sleep(tick);
                     }
-                })
-                .map(|_| ())
+                })?;
+            if let Some(worker) = worker {
+                // The listener is bound now. A worker failure must not take RPC down.
+                worker.start(root);
+            }
+            Ok(())
         },
         move |connection, method, params| service.method(connection, method, params),
     )?;
