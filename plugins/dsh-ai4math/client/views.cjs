@@ -74,6 +74,54 @@ function DiscoveryBadge({ value, currentSeq }) {
       + (isCount(currentSeq) && value.ledger_event_seq < currentSeq ? ' · older ledger sample' : '')))
 }
 
+const T2_AUDIT_STATUS_TEXT = {
+  starting: 'Starting',
+  running: 'Running',
+  unavailable: 'Unavailable',
+  waiting: 'Waiting',
+  head_changed: 'Reviewed head changed',
+}
+
+function hasExactOwnKeys(value, ...keys) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    && Reflect.ownKeys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
+}
+
+function T2AuditBadge({ value, currentSeq }) {
+  if (!isCount(currentSeq)) return null
+  const hasObservation = hasExactOwnKeys(value, 'status', 'attempts', 'exhausted', 'observation')
+  if (!hasObservation && !hasExactOwnKeys(value, 'status', 'attempts', 'exhausted')) return null
+  const { status, attempts, exhausted } = value
+  if (hasObservation !== (status === 'observation') || !isCount(attempts) || attempts > 64
+    || typeof exhausted !== 'boolean' || (exhausted && attempts === 0)
+    || (status === 'starting' && attempts !== 0)
+    || (status === 'running' && (attempts === 0 || exhausted))) return null
+
+  const attemptsText = attempts + (attempts === 1 ? ' attempt' : ' attempts')
+  let summary, title
+  if (hasObservation) {
+    const sample = value.observation
+    if (attempts === 0 || !hasExactOwnKeys(sample, 'schema', 'advisory_only', 'reviewed_commit', 'ledger_event_seq',
+      'compile_ms', 'module_count', 'debt_findings')) return null
+    const { reviewed_commit: oid, ledger_event_seq: sampleSeq, compile_ms: ms, module_count: modules, debt_findings: debt } = sample
+    if (sample.schema !== 'ai4math.t2.resident-sample.v1' || sample.advisory_only !== true
+      || typeof oid !== 'string' || (oid.length !== 40 && oid.length !== 64) || /[^0-9a-f]/.test(oid) || !/[1-9a-f]/.test(oid)
+      || !isCount(sampleSeq) || !isCount(ms) || ms > 120000
+      || !isCount(modules) || modules < 1 || modules > 128 || !isCount(debt) || debt > 3072) return null
+
+    title = 'Reviewed Git commit: ' + oid + '. This sample carries no proof authority.'
+    if (sampleSeq < currentSeq) summary = 'older ledger sample'
+    else if (sampleSeq > currentSeq) summary = 'awaiting matching ledger'
+    else summary = ms + ' ms compile · ' + modules + (modules === 1 ? ' module' : ' modules')
+      + ' · ' + debt + (debt === 1 ? ' debt finding' : ' debt findings') + ' · ' + attemptsText
+  } else {
+    if (typeof status !== 'string' || !Object.hasOwn(T2_AUDIT_STATUS_TEXT, status)) return null
+    summary = T2_AUDIT_STATUS_TEXT[status] + ' · ' + attemptsText
+  }
+  return h('span', { className: 'ai4m-badge', title },
+    'T2 Audit · advisory only · ' + summary + (exhausted ? ' · exhausted' : ''))
+}
+
 function LiveHud({ live, open }) {
   const [navigationError, setNavigationError] = useState(false)
   const state = useSyncExternalStore(live.subscribe, live.getSnapshot)
@@ -100,6 +148,7 @@ function LiveHud({ live, open }) {
       labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active)),
       trustTape(snapshot?.trust),
       labelValue('Stale', count(snapshot?.stale_claims)),
+      phase === 'live' && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
       phase === 'live' && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
       h(BreakerTotals, { snapshot }),
       phase === 'live' && isCount(oracleHeld) && oracleHeld > 0 && h('span', {

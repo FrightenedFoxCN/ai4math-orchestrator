@@ -53,12 +53,12 @@ try {
   assert.equal(wire.ok,true);
   assert.equal(wire.value.event_seq,0);
   assert.equal(ctx.typert.local.get('ai4math/proofSubmit'),undefined);
-  for (const [method, params, key] of [
-    ['wikiProvenance', {id:'COR-A'}, 'edges'],
-    ['wikiCheckGraveyard', {informal_statement:'example'}, 'warnings'],
+  for (const [method, params, expected] of [
+    ['wikiProvenance', {id:'COR-A'}, {edges:[], truncated:false, managed_core:false}],
+    ['wikiCheckGraveyard', {informal_statement:'example'}, {warnings:[], truncated:false}],
   ]) {
     assert.ok(ctx.typert.local.get('ai4math/' + method));
-    assert.deepEqual(await gateway.invoke(request(method, params)), {[key]:[], truncated:false});
+    assert.deepEqual(await gateway.invoke(request(method, params)), expected);
     await assert.rejects(gateway.invoke(request(method, {...params, role:'owner'})));
     await assert.rejects(gateway.invoke(request(method, params, {kind:'guest'})), {code:'ai4math/denied'});
   }

@@ -63,6 +63,102 @@ test('HUD shows resident T3 as a read-only last sample and clears it when unavai
   assert.doesNotMatch(hud.text(), /Structure changed|older ledger sample|Claim T[13] baseline/);
 });
 
+test('HUD renders only admissible resident T2 observations and forgets them on reconnect', async t => {
+  const commit = 'e'.repeat(40);
+  const sample = (ledger_event_seq, observation = {}, state = {}) => ({
+    status: 'observation', attempts: 1, exhausted: false,
+    observation: { schema: 'ai4math.t2.resident-sample.v1', advisory_only: true,
+      reviewed_commit: commit, ledger_event_seq, compile_ms: 123, module_count: 2, debt_findings: 0, ...observation },
+    ...state,
+  });
+  const prefix = 'T2 Audit · advisory only · ';
+  const exact = '123 ms compile · 2 modules · 0 debt findings · 1 attempt';
+  const cases = [
+    ['exact observation', seq => sample(seq), exact],
+    ['older observation', seq => sample(seq - 1), 'older ledger sample'],
+    ['future observation', seq => sample(seq + 1), 'awaiting matching ledger'],
+    ['missing observation', seq => sample(seq, {}, { observation: null })],
+    ['array observation', seq => sample(seq, {}, { observation: [] })],
+    ['unknown schema', seq => sample(seq, { schema: 'unknown-sample-version' })],
+    ['non-advisory observation', seq => sample(seq, { advisory_only: false })],
+    ['malformed reviewed commit', seq => sample(seq, { reviewed_commit: commit.toUpperCase() })],
+    ['non-numeric ledger cursor', seq => sample(seq, { ledger_event_seq: String(seq) })],
+    ['out-of-range compile time', seq => sample(seq, { compile_ms: 120001 })],
+    ['malformed module count', seq => sample(seq, { module_count: '2' })],
+    ['out-of-range debt count', seq => sample(seq, { debt_findings: 3073 })],
+    ['unknown nested field', seq => sample(seq, { source_path: '/private/audit.lean' })],
+    ['unknown status', () => ({ status: 'unexpected-worker-state', attempts: 1, exhausted: false })],
+    ['inherited status name', () => ({ status: 'constructor', attempts: 1, exhausted: false })],
+    ['invalid attempts', seq => sample(seq, {}, { attempts: '1' })],
+    ['unexpected observation in status', seq => sample(seq, {}, { status: 'running' })],
+    ['starting', () => ({ status: 'starting', attempts: 0, exhausted: false }), 'Starting · 0 attempts'],
+    ['running', () => ({ status: 'running', attempts: 1, exhausted: false }), 'Running · 1 attempt'],
+    ['unavailable', () => ({ status: 'unavailable', attempts: 2, exhausted: true }), 'Unavailable · 2 attempts · exhausted'],
+    ['waiting', () => ({ status: 'waiting', attempts: 0, exhausted: false }), 'Waiting · 0 attempts'],
+    ['head changed', () => ({ status: 'head_changed', attempts: 1, exhausted: false }), 'Reviewed head changed · 1 attempt'],
+    ['exact observation before disconnect', seq => sample(seq, {}, { exhausted: true }), exact + ' · exhausted'],
+  ].map(([name, makeAudit, label], i) => ({ name, eventSeq: 41 + i, makeAudit, label, gate: Promise.withResolvers() }));
+  const disconnect = Promise.withResolvers();
+  const reconnect = Promise.withResolvers();
+  let statusReads = 0;
+  const app = await browser(t, {
+    async *subscribe(params, signal) {
+      assert.deepEqual(fromWire(params), { topics });
+      if (signal.aborted) return;
+      const aborted = once(signal, 'abort');
+      yield transition('connected');
+      for (const { eventSeq, makeAudit, gate } of cases) {
+        await Promise.race([gate.promise, aborted]);
+        if (signal.aborted) return;
+        yield { topic: 'vital_signs.tick', data: snapshot(eventSeq, { t2_audit: makeAudit(eventSeq) }) };
+      }
+      await Promise.race([disconnect.promise, aborted]);
+      if (signal.aborted) return;
+      yield transition('reconnecting');
+      await Promise.race([reconnect.promise, aborted]);
+      if (signal.aborted) return;
+      yield transition('connected');
+      await aborted;
+    },
+    async status() { return ok(snapshot(++statusReads === 1 ? 40 : 3)); },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+  });
+  const hud = app.mount('shell.bottom');
+  const details = /123 ms compile|2 modules|0 debt findings|1 attempt|exhausted/;
+  const noAudit = /T2 Audit|advisory only|unexpected-worker-state|private\/audit\.lean/;
+  await expectText(hud, /Live .*Seq 40\b/);
+  assert.doesNotMatch(hud.text(), noAudit, 'status without opt-in has no audit badge');
+
+  for (const { name, eventSeq, label, gate } of cases) {
+    gate.resolve();
+    await expectText(hud, new RegExp('Seq ' + eventSeq + '\\b'));
+    const text = hud.text();
+    if (label === undefined) {
+      assert.doesNotMatch(text, noAudit, name);
+      assert.doesNotMatch(text, details, name);
+    } else {
+      const badge = hud.find('span', prefix + label);
+      assert.equal(badge.props.onClick, undefined, 'the audit badge is not actionable');
+      if (label.startsWith(exact)) {
+        assert.equal(badge.props.title, 'Reviewed Git commit: ' + commit + '. This sample carries no proof authority.');
+        assert.ok(!text.includes(commit), 'the commit is not in the badge text');
+      } else if (name === 'older observation' || name === 'future observation') {
+        assert.doesNotMatch(text, details, name);
+      }
+    }
+  }
+
+  disconnect.resolve();
+  await expectText(hud, /Reconnecting · stale/);
+  assert.doesNotMatch(hud.text(), noAudit, 'reconnecting hides the prior observation');
+  assert.doesNotMatch(hud.text(), details);
+  reconnect.resolve();
+  await expectText(hud, /Live .*Seq 3\b/);
+  assert.doesNotMatch(hud.text(), noAudit, 'fresh no-opt-in status does not restore the previous badge');
+  assert.doesNotMatch(hud.text(), details);
+  assert.equal(statusReads, 2);
+});
+
 test('lazy browser bundle mounts shell.bottom and four sidebar tabs with owned cleanup', async t => {
   const calls = [];
   const remote = Object.fromEntries(Object.entries({

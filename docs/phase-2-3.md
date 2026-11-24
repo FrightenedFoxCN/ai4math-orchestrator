@@ -32,6 +32,20 @@ ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/DeepSeek Harness" \
 
 最后一个 `ai4math` 参数可选；传入后临时项目会用正式 CLI 登记探索任务及其基建依赖、触发非关键熔断，并断言 Gateway 收到全轨停摆 P0，且能读取相同的留存 Fact Pack。
 
+### 驻留 T2 经安装版 DSH 网关验收
+
+在允许项目自身 Seatbelt 的 macOS 宿主上运行。测试只使用其临时 Git/SQLite 项目，不启动或更改当前 GUI：
+
+```sh
+APP='/Applications/DeepSeek Harness.app'
+LEAN="$(lean --print-prefix)/bin/lean"
+cargo build --locked -p ai4math-daemon -p ai4math-cli
+env -i PATH=/usr/bin:/bin ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/DeepSeek Harness" \
+  plugins/dsh-ai4math/host/test/installed-t2-audit.mjs \
+  "$APP/Contents/Resources/app.asar/dsh" "$PWD/target/debug/ai4mathd" "$PWD/target/debug/ai4math" "$LEAN"
+```
+
+
 ## 尚未覆盖的完整产品设计
 
 当前 GUI 插件未安装；真实 Web/Electron 界面的认证、布局冲突及生产 preset 生命周期仍需部署验收。标准 Unix UID 是 daemon 的信任边界，不隔离同 UID 的其他本机进程；如给模型启用其他 shell/文件工具，部署者还需禁止其直接访问 UDS/状态库。角色授权是 preset 级别，不是完整任务租约。
