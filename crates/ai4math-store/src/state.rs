@@ -14,6 +14,7 @@ use std::{
 };
 
 mod claim_replay;
+mod graph_audit;
 mod graph_replay;
 mod ledger_replay;
 mod migrations;
@@ -30,6 +31,7 @@ mod sweep;
 mod t3_baseline;
 mod tasks;
 pub use claim_replay::{ClaimReplay, ReplayedClaim};
+pub use graph_audit::{GraphAudit, GraphMismatch, GraphMismatchKind};
 pub use graph_replay::GraphReplay;
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{BreakerTripReport, PivotIntent, PivotPlan, PivotResult};

@@ -1,6 +1,6 @@
 use super::last_seq;
 use anyhow::{Context, Result, bail, ensure};
-use rusqlite::{Connection, named_params, types::ValueRef};
+use rusqlite::{Connection, Transaction, named_params, types::ValueRef};
 
 pub(super) const MAX_SOURCE_ROWS: u32 = 8192;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
@@ -100,15 +100,14 @@ pub(super) fn replay_entity(
     })
 }
 
-/// Scan the global ledger prefix in sequence order, without reading live graph tables.
+/// Scan the global ledger prefix in sequence order within the caller's read snapshot.
 /// The cap counts every source row; only graph state events reach the reducer.
-pub(super) fn replay_graph_rows(
-    db: &Connection,
+pub(super) fn replay_graph_rows_in_snapshot(
+    snapshot: &Transaction<'_>,
     through_event_seq: Option<i64>,
     mut apply: impl FnMut(i64, &str, &str, &str, Option<&str>, &str) -> Result<()>,
 ) -> Result<ReplayWindow> {
-    let snapshot = db.unchecked_transaction()?;
-    let ledger_head_event_seq = last_seq(&snapshot)?;
+    let ledger_head_event_seq = last_seq(snapshot)?;
     let through_event_seq = through_event_seq.unwrap_or(ledger_head_event_seq);
     ensure!(
         (0..=ledger_head_event_seq).contains(&through_event_seq),
@@ -215,7 +214,6 @@ pub(super) fn replay_graph_rows(
             applied_events += 1;
         }
     }
-    snapshot.commit()?;
     Ok(ReplayWindow {
         through_event_seq,
         ledger_head_event_seq,
@@ -228,6 +226,17 @@ mod tests {
     use super::*;
     use crate::StateStore;
     use rusqlite::params;
+
+    fn replay_graph_rows(
+        db: &Connection,
+        through_event_seq: Option<i64>,
+        apply: impl FnMut(i64, &str, &str, &str, Option<&str>, &str) -> Result<()>,
+    ) -> Result<ReplayWindow> {
+        let snapshot = db.unchecked_transaction()?;
+        let window = replay_graph_rows_in_snapshot(&snapshot, through_event_seq, apply)?;
+        snapshot.commit()?;
+        Ok(window)
+    }
 
     fn insert_graph_row(
         db: &Connection,

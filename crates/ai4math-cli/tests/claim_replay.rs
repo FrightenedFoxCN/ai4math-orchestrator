@@ -236,3 +236,65 @@ fn graph_replay_exports_a_single_event_cut_and_never_initializes_state() {
     }
     assert_eq!(fs::read(path).unwrap(), before_bytes);
 }
+
+#[test]
+fn graph_audit_exits_nonzero_with_complete_redacted_report_only_for_comparable_drift() {
+    use ai4math_store::{Change, StateStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let missing = ai(root, "graph-audit", &[]);
+    assert!(!missing.status.success() && missing.stdout.is_empty());
+    assert!(!root.join(".runtime").exists());
+    ok(ai(root, "init", &["lean4"]));
+    ok(ai(
+        root,
+        "declare-claim",
+        &["goal", "Goal.lean", "result", "Goal", "private statement"],
+    ));
+    let path = root.join(".runtime/state.sqlite");
+    let clean = json(ai(root, "graph-audit", &[]));
+    assert_eq!(clean["consistent"], true);
+    assert_eq!(clean["mismatch_count"], 0);
+    assert_eq!(clean["truncated"], false);
+    assert_eq!(clean["mismatches"], serde_json::json!([]));
+
+    let mut state = StateStore::open(&path).unwrap();
+    let change = Change {
+        actor: "fixture",
+        git_commit: None,
+    };
+    let seq=state.append_event(change,"PLAN_CREATED","proof_plan","ledger-only-route",serde_json::json!({
+        "target":"goal","name":"private synthetic plan description","track":"infrastructure","status":"ACTIVE","dependencies":[]
+    })).unwrap();
+    drop(state);
+    let before = fs::read(&path).unwrap();
+    let drift = ai(root, "graph-audit", &[]);
+    assert!(!drift.status.success());
+    let report: Value = serde_json::from_slice(&drift.stdout).unwrap();
+    assert_eq!(report["ledger_event_seq"], seq);
+    assert_eq!(report["consistent"], false);
+    assert_eq!(report["mismatch_count"], 1);
+    assert_eq!(report["truncated"], false);
+    assert_eq!(report["mismatches"][0]["kind"], "missing_projection");
+    assert_eq!(report["mismatches"][0]["entity_id"], "ledger-only-route");
+    assert!(!String::from_utf8_lossy(&drift.stdout).contains("private"));
+    assert!(!String::from_utf8_lossy(&drift.stderr).contains("private"));
+    assert_eq!(fs::read(&path).unwrap(), before);
+
+    StateStore::open(&path)
+        .unwrap()
+        .append_event(
+            change,
+            "PLAN_UNKNOWN_MUTATION",
+            "proof_plan",
+            "ledger-only-route",
+            serde_json::json!({}),
+        )
+        .unwrap();
+    let invalid = ai(root, "graph-audit", &[]);
+    assert!(!invalid.status.success());
+    assert!(
+        invalid.stdout.is_empty(),
+        "invalid replay must not produce a partial audit report"
+    );
+}

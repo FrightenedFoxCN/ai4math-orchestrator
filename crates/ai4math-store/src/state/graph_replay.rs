@@ -3,8 +3,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
-const MAX_NODES: usize = 1024;
-const MAX_DEPENDENCY_EDGES: usize = 8192;
+pub(super) const MAX_NODES: usize = 1024;
+pub(super) const MAX_DEPENDENCY_EDGES: usize = 8192;
 
 /// Ledger-only historical Claim and ProofPlan graph. Not a source of proof authority.
 #[derive(Debug, Serialize)]
@@ -35,27 +35,38 @@ impl StateStore {
     /// of status. In addition to the ledger reader's limits, at most 1024 Claims and ProofPlans
     /// combined and 8192 plan dependencies are allowed.
     pub fn replay_graph(&self, through_event_seq: Option<i64>) -> Result<GraphReplay> {
-        let mut graph = Projection::default();
-        let window = ledger_replay::replay_graph_rows(
-            &self.db,
-            through_event_seq,
-            |seq, entity_type, id, kind, commit, payload| match entity_type {
-                "claim" => graph.apply_claim(id, seq, kind, commit, payload),
-                "proof_plan" => graph.apply_plan(id, seq, kind, payload),
-                _ => bail!("unsupported graph replay entity type {entity_type}"),
-            },
-        )?;
-        graph.ensure_dag()?;
-        Ok(GraphReplay {
-            through_event_seq: window.through_event_seq,
-            ledger_head_event_seq: window.ledger_head_event_seq,
-            applied_claim_events: graph.applied_claim_events,
-            applied_plan_events: graph.applied_plan_events,
-            dependency_edge_count: graph.dependency_edge_count,
-            claims: graph.claims.into_values().collect(),
-            plans: graph.plans.into_values().collect(),
-        })
+        let snapshot = self.db.unchecked_transaction()?;
+        let graph = replay_graph_in_snapshot(&snapshot, through_event_seq)?;
+        snapshot.commit()?;
+        Ok(graph)
     }
+}
+
+/// Replay the ledger in the caller's transaction without ending the snapshot.
+pub(super) fn replay_graph_in_snapshot(
+    snapshot: &rusqlite::Transaction<'_>,
+    through: Option<i64>,
+) -> Result<GraphReplay> {
+    let mut graph = Projection::default();
+    let window = ledger_replay::replay_graph_rows_in_snapshot(
+        snapshot,
+        through,
+        |seq, entity_type, id, kind, commit, payload| match entity_type {
+            "claim" => graph.apply_claim(id, seq, kind, commit, payload),
+            "proof_plan" => graph.apply_plan(id, seq, kind, payload),
+            _ => bail!("unsupported graph replay entity type {entity_type}"),
+        },
+    )?;
+    graph.ensure_dag()?;
+    Ok(GraphReplay {
+        through_event_seq: window.through_event_seq,
+        ledger_head_event_seq: window.ledger_head_event_seq,
+        applied_claim_events: graph.applied_claim_events,
+        applied_plan_events: graph.applied_plan_events,
+        dependency_edge_count: graph.dependency_edge_count,
+        claims: graph.claims.into_values().collect(),
+        plans: graph.plans.into_values().collect(),
+    })
 }
 
 #[derive(Default)]
@@ -205,5 +216,73 @@ fn take_state<T>(states: &mut BTreeMap<String, T>, id: &str) -> (String, Option<
     match states.remove_entry(id) {
         Some((key, state)) => (key, Some(state)),
         None => (id.to_owned(), None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Change, NewClaim};
+
+    fn create_claim(store: &mut StateStore, id: &str) -> Result<()> {
+        store.create_claim(
+            NewClaim {
+                id,
+                title: id,
+                informal_statement: "Snapshot test claim",
+                engine: "lean4",
+                formal_target: None,
+                module_path: None,
+                critical: false,
+            },
+            Change {
+                actor: "snapshot-test",
+                git_commit: None,
+            },
+        )
+    }
+
+    #[test]
+    fn borrowed_graph_replay_keeps_the_snapshot_for_live_reads() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("state.sqlite");
+        let mut writer = StateStore::open(&path)?;
+        create_claim(&mut writer, "first")?;
+        let reader = StateStore::open_readonly(&path)?;
+        let changes_before = reader.db.total_changes();
+        let snapshot = reader.db.unchecked_transaction()?;
+        let before = replay_graph_in_snapshot(&snapshot, None)?;
+        assert_eq!(before.claims.len(), 1);
+        assert_eq!(before.claims[0].claim_id, "first");
+        assert!(!snapshot.is_autocommit());
+
+        create_claim(&mut writer, "second")?;
+        writer.db.execute(
+            "INSERT INTO events(occurred_at,event_type,entity_type,entity_id,actor)
+             VALUES ('timestamp','TASK_CREATED','task','task','test')",
+            [],
+        )?;
+        let newer_head = writer.db.last_insert_rowid();
+
+        let still_pinned = replay_graph_in_snapshot(&snapshot, None)?;
+        assert_eq!(
+            still_pinned.ledger_head_event_seq,
+            before.ledger_head_event_seq
+        );
+        assert_eq!(still_pinned.through_event_seq, before.ledger_head_event_seq);
+        assert_eq!(still_pinned.claims.len(), 1);
+        let live_claims: i64 =
+            snapshot.query_row("SELECT COUNT(*) FROM claims", [], |r| r.get(0))?;
+        assert_eq!(live_claims, 1);
+        snapshot.commit()?;
+
+        let fresh = reader.replay_graph(None)?;
+        assert_eq!(fresh.ledger_head_event_seq, newer_head);
+        assert_eq!(fresh.through_event_seq, newer_head);
+        assert_eq!(fresh.applied_claim_events, 2);
+        assert_eq!(fresh.claims.len(), 2);
+        assert!(reader.db.is_autocommit());
+        assert_eq!(reader.db.total_changes(), changes_before);
+        Ok(())
     }
 }
