@@ -890,6 +890,224 @@ fn t3_batch_keeps_prior_receipt_durable_after_mid_page_error() -> Result<()> {
     Ok(())
 }
 
+fn sweep_fixture(store: &mut StateStore) -> Result<T3PlanApproval> {
+    for (id, nonce) in [("A", 1), ("B", 2), ("C", 3)] {
+        claim(store, id, None, false)?;
+        store.record_verified(id, &receipt(id, BASE, nonce), change(BASE))?;
+    }
+    apply_reviewed_fixture_plan(store, "Spec.lean")
+}
+
+fn defer_sweep(_: &ClaimState) -> Result<RecheckOutcome> {
+    Ok(RecheckOutcome::Deferred {
+        reason: "fixture".into(),
+    })
+}
+
+#[test]
+fn t3_sweep_status_on_older_applied_database_is_read_only() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("state.sqlite");
+    let mut store = StateStore::open(&db)?;
+    let approval = sweep_fixture(&mut store)?;
+    let hash = &approval.plan_sha256;
+    let seq = store.status()?.last_event_seq;
+    store.db.execute("DROP TABLE t3_sweep_progress", [])?;
+    drop(store);
+
+    let reader = StateStore::open_readonly(&db)?;
+    let status = reader.t3_sweep_status(hash)?;
+    assert_eq!(status.plan_sha256, *hash);
+    assert_eq!(status.reviewed_commit, T3_HEAD);
+    assert_eq!(status.status, T3SweepState::NotStarted);
+    assert!(status.next_after_claim.is_none());
+    assert!(status.checkpoint_event_seq.is_none());
+    assert!(status.revision.is_none());
+    assert!(reader.t3_sweep_status(&"b".repeat(64)).is_err());
+    assert_eq!(reader.status()?.last_event_seq, seq);
+    assert!(!reader.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE name='t3_sweep_progress')",
+        [],
+        |r| r.get::<_, bool>(0),
+    )?);
+
+    let mut writer = StateStore::open(&db)?;
+    let first = writer.t3_sweep_step(hash, 1, false, "test", defer_sweep)?;
+    assert_eq!(first.progress.status, T3SweepState::Running);
+    assert_eq!(first.progress.checkpoint_event_seq, Some(seq));
+    assert_eq!(first.progress.revision, Some(1));
+    assert_eq!(writer.status()?.last_event_seq, seq);
+    Ok(())
+}
+
+#[test]
+fn t3_sweep_reopens_resumes_latches_and_explicitly_restarts() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("state.sqlite");
+    let mut store = StateStore::open(&db)?;
+    let approval = sweep_fixture(&mut store)?;
+    let hash = &approval.plan_sha256;
+    let seq = store.status()?.last_event_seq;
+    let first = store.t3_sweep_step(hash, 1, false, "test", |c| {
+        assert_eq!(c.id, "A");
+        Ok(RecheckOutcome::Verified(Box::new(receipt(
+            &c.id, T3_HEAD, 4,
+        ))))
+    })?;
+    let first_seq = first.batch.as_ref().unwrap().last_event_seq;
+    assert!(first_seq > seq);
+    assert!(!first.rewound);
+    assert_eq!(first.progress.next_after_claim.as_deref(), Some("A"));
+    assert_eq!(first.progress.checkpoint_event_seq, Some(first_seq));
+    drop(store);
+
+    let mut reopened = StateStore::open(&db)?;
+    assert_eq!(reopened.t3_sweep_status(hash)?, first.progress);
+    let second = reopened.t3_sweep_step(hash, 1, false, "test", |c| {
+        assert_eq!(c.id, "B");
+        Ok(RecheckOutcome::Verified(Box::new(receipt(
+            &c.id, T3_HEAD, 5,
+        ))))
+    })?;
+    assert_eq!(second.batch.unwrap().examined_claims, ["B"]);
+    assert!(!second.rewound);
+    assert_eq!(second.progress.revision, Some(2));
+    let second_seq = reopened.status()?.last_event_seq;
+    let last = reopened.t3_sweep_step(hash, 1, false, "test", |c| {
+        assert_eq!(c.id, "C");
+        defer_sweep(c)
+    })?;
+    assert_eq!(last.progress.status, T3SweepState::Complete);
+    assert_eq!(last.progress.next_after_claim, None);
+    assert_eq!(last.progress.checkpoint_event_seq, Some(second_seq));
+    assert_eq!(last.progress.revision, Some(3));
+    assert_eq!(reopened.status()?.last_event_seq, second_seq);
+    // Completion does not confer proof authority; a deferred claim remains stale.
+    let deferred = reopened.claim("C")?.unwrap();
+    assert!(deferred.stale);
+    assert_eq!(deferred.receipt_id.as_deref(), Some("receipt-3"));
+    claim(&mut reopened, "unrelated", Some("Other.lean"), false)?;
+    let later_seq = reopened.status()?.last_event_seq;
+    assert!(later_seq > second_seq);
+
+    // Even a read-only connection can take the no-write completed path.
+    let mut reader = StateStore::open_readonly(&db)?;
+    for invalid_limit in [0, 9] {
+        let err = reader
+            .t3_sweep_step(hash, invalid_limit, false, "test", |_| {
+                panic!("invalid limit")
+            })
+            .unwrap_err();
+        assert!(err.to_string().contains("limit must be 1..=8"));
+    }
+    let no_op = reader.t3_sweep_step(hash, 1, false, "test", |_| panic!("complete is latched"))?;
+    assert_eq!(no_op.progress, last.progress);
+    assert!(!no_op.rewound);
+    assert!(no_op.batch.is_none());
+    assert_eq!(reader.status()?.last_event_seq, later_seq);
+
+    let restart = reopened.t3_sweep_step(hash, 2, true, "test", |_| panic!("no proof replay"))?;
+    assert!(restart.rewound);
+    assert_eq!(restart.batch.unwrap().examined_claims, ["A", "B"]);
+    assert_eq!(restart.progress.status, T3SweepState::Running);
+    assert_eq!(restart.progress.next_after_claim.as_deref(), Some("B"));
+    assert_eq!(restart.progress.checkpoint_event_seq, Some(later_seq));
+    assert_eq!(restart.progress.revision, Some(4));
+    assert_eq!(reopened.status()?.last_event_seq, later_seq);
+    Ok(())
+}
+
+#[test]
+fn t3_sweep_rewinds_stale_checkpoint_after_partial_page_without_replaying_proofs() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("state.sqlite");
+    let mut store = StateStore::open(&db)?;
+    let approval = sweep_fixture(&mut store)?;
+    let hash = &approval.plan_sha256;
+    let first = store.t3_sweep_step(hash, 1, false, "test", |c| {
+        assert_eq!(c.id, "A");
+        Ok(RecheckOutcome::Verified(Box::new(receipt(
+            &c.id, T3_HEAD, 4,
+        ))))
+    })?;
+    let interrupted = store
+        .t3_sweep_step(hash, 2, false, "test", |c| match c.id.as_str() {
+            "B" => Ok(RecheckOutcome::Verified(Box::new(receipt(
+                &c.id, T3_HEAD, 5,
+            )))),
+            "C" => anyhow::bail!("checker interrupted"),
+            _ => panic!("wrong page"),
+        })
+        .unwrap_err();
+    assert!(format!("{interrupted:#}").contains("checker interrupted"));
+    drop(store);
+
+    let mut reopened = StateStore::open(&db)?;
+    assert_eq!(reopened.t3_sweep_status(hash)?, first.progress);
+    let seq = reopened.status()?.last_event_seq;
+    assert!(seq > first.progress.checkpoint_event_seq.unwrap());
+    let b = reopened.claim("B")?.unwrap();
+    assert!(!b.stale);
+    assert_eq!(b.receipt_id.as_deref(), Some("receipt-5"));
+    let rewind = reopened.t3_sweep_step(hash, 2, false, "test", |_| panic!("no proof replay"))?;
+    assert!(rewind.rewound);
+    assert_eq!(rewind.batch.unwrap().examined_claims, ["A", "B"]);
+    assert_eq!(rewind.progress.next_after_claim.as_deref(), Some("B"));
+    assert_eq!(rewind.progress.checkpoint_event_seq, Some(seq));
+    assert_eq!(rewind.progress.revision, Some(2));
+    assert_eq!(reopened.status()?.last_event_seq, seq);
+    let last = reopened.t3_sweep_step(hash, 1, false, "test", |c| {
+        assert_eq!(c.id, "C");
+        Ok(RecheckOutcome::Verified(Box::new(receipt(
+            &c.id, T3_HEAD, 6,
+        ))))
+    })?;
+    assert_eq!(last.progress.status, T3SweepState::Complete);
+    assert_eq!(last.batch.unwrap().report.verified, ["C"]);
+    Ok(())
+}
+
+#[test]
+fn t3_sweep_stale_writer_cannot_overwrite_concurrent_restart_or_first_checkpoint() -> Result<()> {
+    for initially_started in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let db = dir.path().join("state.sqlite");
+        let mut store = StateStore::open(&db)?;
+        let approval = sweep_fixture(&mut store)?;
+        let hash = &approval.plan_sha256;
+        let mut other = StateStore::open(&db)?;
+        let seq = store.status()?.last_event_seq;
+        if initially_started {
+            store.t3_sweep_step(hash, 1, false, "test", defer_sweep)?;
+        }
+        let mut winner = None;
+        let error = store
+            .t3_sweep_step(hash, 1, false, "test", |c| {
+                assert_eq!(c.id, if initially_started { "B" } else { "A" });
+                // When initially started, the winner re-writes exactly the old cursor
+                // and sequence. Only the revision distinguishes the two checkpoints.
+                let limit = if initially_started { 1 } else { 8 };
+                winner = Some(
+                    other
+                        .t3_sweep_step(hash, limit, true, "test", defer_sweep)?
+                        .progress,
+                );
+                defer_sweep(c)
+            })
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint changed concurrently")
+        );
+        assert_eq!(store.t3_sweep_status(hash)?, winner.unwrap());
+        assert_eq!(store.status()?.last_event_seq, seq);
+        assert!(store.claim("A")?.unwrap().stale);
+        assert!(store.claim("B")?.unwrap().stale);
+    }
+    Ok(())
+}
+
 const REVIEWED_REPO: &str = "/reviewed/project";
 const PROOF_DECL: &str = "Candidate.proof";
 

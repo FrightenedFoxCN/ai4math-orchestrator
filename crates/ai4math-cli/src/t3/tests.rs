@@ -103,6 +103,39 @@ fn batch_options_require_a_complete_generation_cursor() -> Result<()> {
 }
 
 #[test]
+fn sweep_options_allow_only_explicit_restart_and_optional_engine_data() -> Result<()> {
+    assert_eq!(sweep_options(&[])?, (None, false));
+    assert_eq!(sweep_options(&["--restart"])?, (None, true));
+    assert_eq!(sweep_options(&["/tool/data"])?, (Some("/tool/data"), false));
+    assert_eq!(
+        sweep_options(&["/tool/data", "--restart"])?,
+        (Some("/tool/data"), true)
+    );
+    for args in [
+        &["--restart", "--restart"][..],
+        &["--unknown"],
+        &["--restart", "/tool/data"],
+        &["--after", "A", "1"],
+    ] {
+        assert!(sweep_options(args).is_err(), "accepted {args:?}");
+    }
+    assert!(
+        sweep_step(
+            Path::new("/unused"),
+            Path::new("/unused"),
+            "unused",
+            0,
+            Path::new("/unused"),
+            &[]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("1..=8")
+    );
+    Ok(())
+}
+
+#[test]
 fn t3_worklist_requires_applied_digest_and_current_main_without_state_writes() -> Result<()> {
     let root = tempfile::tempdir()?;
     let (repo, base) = project(root.path())?;
@@ -115,6 +148,7 @@ fn t3_worklist_requires_applied_digest_and_current_main_without_state_writes() -
     )?;
     let p = inspect(root.path(), &repo, &base, &first)?;
     assert!(worklist(root.path(), &repo, &p.plan_sha256, 1, None).is_err());
+    assert!(sweep_status(root.path(), &repo, &p.plan_sha256).is_err());
     apply(
         root.path(),
         &repo,
@@ -127,12 +161,23 @@ fn t3_worklist_requires_applied_digest_and_current_main_without_state_writes() -
     let state = StateStore::open_readonly(&path)?;
     let seq = state.status()?.last_event_seq;
     worklist(root.path(), &repo, &p.plan_sha256, 1, None)?;
+    sweep_status(root.path(), &repo, &p.plan_sha256)?;
+    assert_eq!(
+        state.t3_sweep_status(&p.plan_sha256)?.status,
+        ai4math_store::T3SweepState::NotStarted
+    );
     assert!(worklist(root.path(), &repo, &p.plan_sha256, 0, None).is_err());
     assert!(worklist(root.path(), &repo, &p.plan_sha256, 1, Some("not-approved")).is_err());
     assert_eq!(state.status()?.last_event_seq, seq);
     edit_defs(root.path(), &repo, "def x : Nat := 3\n", "move-main")?;
     assert!(
         worklist(root.path(), &repo, &p.plan_sha256, 1, None)
+            .unwrap_err()
+            .to_string()
+            .contains("no longer matches main")
+    );
+    assert!(
+        sweep_status(root.path(), &repo, &p.plan_sha256)
             .unwrap_err()
             .to_string()
             .contains("no longer matches main")
@@ -305,7 +350,31 @@ fn native_t3_uses_committed_sources_and_resumes_without_repeat_downgrades() -> R
         &second,
         &next.plan_sha256,
     )?;
-    recheck(root.path(), &repo, &next.plan_sha256, &exe, None)?;
+    let seq = state.status()?.last_event_seq;
+    sweep_step(root.path(), &repo, &next.plan_sha256, 1, &exe, &[])?;
+    let first_step = state.t3_sweep_status(&next.plan_sha256)?;
+    assert_eq!(first_step.status, ai4math_store::T3SweepState::Running);
+    assert_eq!(first_step.next_after_claim.as_deref(), Some("A"));
+    assert_eq!(first_step.checkpoint_event_seq, Some(seq));
+    assert!(state.claim("C")?.unwrap().stale);
+    drop(state);
+
+    let state = StateStore::open_readonly(root.path().join(".runtime/state.sqlite"))?;
+    assert_eq!(
+        state
+            .t3_sweep_status(&next.plan_sha256)?
+            .next_after_claim
+            .as_deref(),
+        Some("A")
+    );
+    sweep_step(root.path(), &repo, &next.plan_sha256, 1, &exe, &[])?;
+    let completed = state.t3_sweep_status(&next.plan_sha256)?;
+    assert_eq!(completed.status, ai4math_store::T3SweepState::Complete);
+    assert_eq!(
+        completed.checkpoint_event_seq,
+        Some(state.status()?.last_event_seq)
+    );
+    assert!(completed.next_after_claim.is_none());
     let c = state.claim("C")?.unwrap();
     assert_eq!(c.local_trust, Trust::L3);
     assert!(!c.stale);
@@ -318,7 +387,38 @@ fn native_t3_uses_committed_sources_and_resumes_without_repeat_downgrades() -> R
         &second,
         &next.plan_sha256,
     )?;
+    // Complete means no verifier, even if the original executable disappeared.
+    sweep_step(
+        root.path(),
+        &repo,
+        &next.plan_sha256,
+        1,
+        Path::new("/not-an-engine"),
+        &[],
+    )?;
+    assert_eq!(
+        state.t3_sweep_status(&next.plan_sha256)?.revision,
+        completed.revision
+    );
     recheck(root.path(), &repo, &next.plan_sha256, &exe, None)?;
+    assert_eq!(state.status()?.last_event_seq, seq);
+    sweep_step(
+        root.path(),
+        &repo,
+        &next.plan_sha256,
+        1,
+        &exe,
+        &["--restart"],
+    )?;
+    assert_eq!(
+        state.t3_sweep_status(&next.plan_sha256)?.status,
+        ai4math_store::T3SweepState::Running
+    );
+    sweep_step(root.path(), &repo, &next.plan_sha256, 1, &exe, &[])?;
+    assert_eq!(
+        state.t3_sweep_status(&next.plan_sha256)?.status,
+        ai4math_store::T3SweepState::Complete
+    );
     assert_eq!(state.status()?.last_event_seq, seq);
     Ok(())
 }

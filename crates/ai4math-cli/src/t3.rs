@@ -173,6 +173,10 @@ enum Replay<'a> {
         limit: usize,
         after: Option<(&'a str, i64)>,
     },
+    Sweep {
+        limit: usize,
+        restart: bool,
+    },
 }
 
 type BatchOptions<'a> = (Option<&'a str>, Option<(&'a str, i64)>);
@@ -216,6 +220,49 @@ pub(crate) fn recheck_batch(
     recheck_selected(root, repo, hash, Replay::Batch { limit, after }, exec, data)
 }
 
+fn sweep_options<'a>(args: &[&'a str]) -> Result<(Option<&'a str>, bool)> {
+    match args {
+        [] => Ok((None, false)),
+        ["--restart"] => Ok((None, true)),
+        [data] if !data.starts_with("--") => Ok((Some(*data), false)),
+        [data, "--restart"] if !data.starts_with("--") => Ok((Some(*data), true)),
+        _ => anyhow::bail!("expected [ENGINE_DATA] [--restart] for T3 sweep"),
+    }
+}
+
+/// Administrative readback; never advances a checkpoint or opens a verifier.
+pub(crate) fn sweep_status(root: &Path, repo: &Path, hash: &str) -> Result<()> {
+    let locked = PromotionRepo::try_lock(repo)?;
+    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let approval = current_approval(&state, &locked, hash)?;
+    let progress = state.t3_sweep_status(hash)?;
+    ensure!(
+        locked.main_head()? == approval.reviewed_commit,
+        "approved T3 plan no longer matches main"
+    );
+    print_json(progress)
+}
+
+pub(crate) fn sweep_step(
+    root: &Path,
+    repo: &Path,
+    hash: &str,
+    limit: usize,
+    exec: &Path,
+    args: &[&str],
+) -> Result<()> {
+    ensure!((1..=8).contains(&limit), "T3 sweep limit must be 1..=8");
+    let (data, restart) = sweep_options(args)?;
+    recheck_selected(
+        root,
+        repo,
+        hash,
+        Replay::Sweep { limit, restart },
+        exec,
+        data,
+    )
+}
+
 fn current_approval(
     state: &StateStore,
     locked: &PromotionRepo,
@@ -253,7 +300,7 @@ fn recheck_selected(
     data: Option<&str>,
 ) -> Result<()> {
     let _native = crate::managed_native(root)?;
-    let locked = if matches!(replay, Replay::Batch { .. }) {
+    let locked = if matches!(replay, Replay::Batch { .. } | Replay::Sweep { .. }) {
         PromotionRepo::try_lock(repo)?
     } else {
         PromotionRepo::lock(repo)?
@@ -262,6 +309,21 @@ fn recheck_selected(
     let mut state = StateStore::open(&path)?;
     let approval = current_approval(&state, &locked, hash)?;
     let at = &approval.reviewed_commit;
+    if matches!(replay, Replay::Sweep { restart: false, .. }) {
+        let progress = state.t3_sweep_status(hash)?;
+        if progress.status == ai4math_store::T3SweepState::Complete {
+            // A completed checkpoint does not need a toolchain or a proof run.
+            ensure!(
+                locked.main_head()? == *at,
+                "approved T3 plan no longer matches main"
+            );
+            return print_json(ai4math_store::T3SweepStep {
+                progress,
+                rewound: false,
+                batch: None,
+            });
+        }
+    }
     let engine = bound_engine(root, &approval.anchor_module)?;
     let tool = trusted_toolchain(engine, exec, data)?;
     let repo_snapshot = locked.snapshot(&approval.anchor_module, Some(at))?;
@@ -376,6 +438,14 @@ fn recheck_selected(
                 "main changed during T3 batch; do not reuse its cursor"
             );
             print_json(batch)
+        }
+        Replay::Sweep { limit, restart } => {
+            let step = state.t3_sweep_step(hash, limit, restart, "broker:t3", check)?;
+            ensure!(
+                locked.main_head()? == *at,
+                "main changed during T3 sweep; plan is no longer current"
+            );
+            print_json(step)
         }
     }
 }

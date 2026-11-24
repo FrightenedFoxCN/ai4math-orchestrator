@@ -333,6 +333,15 @@ CREATE TABLE IF NOT EXISTS applied_t3_plans (
   preview_event_seq INTEGER NOT NULL
 );
 
+-- Operator sweep navigation only, never evidence or an event. A missing row is
+-- not started; a NULL continuation in an existing row latches completion.
+CREATE TABLE IF NOT EXISTS t3_sweep_progress (
+  plan_sha256 TEXT PRIMARY KEY NOT NULL REFERENCES applied_t3_plans(plan_sha256),
+  next_after_claim TEXT,
+  checkpoint_event_seq INTEGER NOT NULL REFERENCES events(event_seq),
+  revision INTEGER NOT NULL CHECK(revision > 0)
+) STRICT;
+
 -- Sealed reviewed Lean T3 evidence, written atomically with the new proof receipt and trust restoration.
 CREATE TABLE IF NOT EXISTS lean_spec_rechecks (
   claim_id TEXT NOT NULL REFERENCES reviewed_lean_specs(claim_id),

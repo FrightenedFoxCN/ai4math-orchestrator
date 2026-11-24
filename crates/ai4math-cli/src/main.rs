@@ -24,7 +24,7 @@ use anyhow::{Context, Result, bail, ensure};
 use promotion::{PendingRef, Promotion, PromotionRepo};
 use std::{env, fs, io::Read, path::Path};
 
-const HELP: &str = "ai4math init ROOT [lean4|agda|rocq]\nai4math status ROOT\nai4math wiki-rebuild ROOT\nai4math self-test\nai4math hammer-reconstruct ROOT BARE_REPO CLAIM REVIEWED_COMMIT PREMISES_JSON NATIVE_LEAN\nai4math oracle-probe QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-preview ROOT BARE_REPO CLAIM QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-retain ROOT BARE_REPO CLAIM APPROVAL_SHA256 QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-result ROOT RECORD_SHA256\nai4math oracle-hold ROOT BARE_REPO TASK RECORD_SHA256 SECONDS\nai4math oracle-release ROOT TASK HOLD_SHA256\nai4math oracle-hold-status ROOT TASK\nai4math promote BARE_REPO MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math declare-claim ROOT CLAIM MODULE TARGET TITLE STATEMENT [--critical]\nai4math bind-lean-spec ROOT BARE_REPO CLAIM SPEC_MODULE SPEC_DECL APPROVED_COMMIT\nai4math lean-spec-comparison ROOT PROMOTED_COMMIT\nai4math lean-spec-recheck ROOT CLAIM PLAN_SHA256\nai4math bind-witness-spec ROOT BARE_REPO CLAIM MODULE PROPOSITION APPROVED_COMMIT\nai4math refute-managed ROOT BARE_REPO CLAIM MODULE PROPOSITION NATIVE_LEAN PROOF_BODY_FILE\nai4math promote-reviewed-body ROOT BARE_REPO CLAIM MODULE TARGET REVIEWED_COMMIT NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math promote-managed ROOT BARE_REPO CLAIM MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math recover-promotion ROOT BARE_REPO NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-preview ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT\nai4math t3-apply ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT PLAN_SHA256\nai4math t3-recheck ROOT BARE_REPO PLAN_SHA256 NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-worklist ROOT BARE_REPO PLAN_SHA256 LIMIT [AFTER_CLAIM]\nai4math t3-recheck-one ROOT BARE_REPO PLAN_SHA256 CLAIM NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-recheck-batch ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--after CLAIM EVENT_SEQ]\nai4math trip-breaker ROOT BARE_REPO BREAKER MODULE DEFINITION REASON [--critical]
+const HELP: &str = "ai4math init ROOT [lean4|agda|rocq]\nai4math status ROOT\nai4math wiki-rebuild ROOT\nai4math self-test\nai4math hammer-reconstruct ROOT BARE_REPO CLAIM REVIEWED_COMMIT PREMISES_JSON NATIVE_LEAN\nai4math oracle-probe QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-preview ROOT BARE_REPO CLAIM QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-retain ROOT BARE_REPO CLAIM APPROVAL_SHA256 QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-result ROOT RECORD_SHA256\nai4math oracle-hold ROOT BARE_REPO TASK RECORD_SHA256 SECONDS\nai4math oracle-release ROOT TASK HOLD_SHA256\nai4math oracle-hold-status ROOT TASK\nai4math promote BARE_REPO MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math declare-claim ROOT CLAIM MODULE TARGET TITLE STATEMENT [--critical]\nai4math bind-lean-spec ROOT BARE_REPO CLAIM SPEC_MODULE SPEC_DECL APPROVED_COMMIT\nai4math lean-spec-comparison ROOT PROMOTED_COMMIT\nai4math lean-spec-recheck ROOT CLAIM PLAN_SHA256\nai4math bind-witness-spec ROOT BARE_REPO CLAIM MODULE PROPOSITION APPROVED_COMMIT\nai4math refute-managed ROOT BARE_REPO CLAIM MODULE PROPOSITION NATIVE_LEAN PROOF_BODY_FILE\nai4math promote-reviewed-body ROOT BARE_REPO CLAIM MODULE TARGET REVIEWED_COMMIT NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math promote-managed ROOT BARE_REPO CLAIM MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math recover-promotion ROOT BARE_REPO NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-preview ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT\nai4math t3-apply ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT PLAN_SHA256\nai4math t3-recheck ROOT BARE_REPO PLAN_SHA256 NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-worklist ROOT BARE_REPO PLAN_SHA256 LIMIT [AFTER_CLAIM]\nai4math t3-recheck-one ROOT BARE_REPO PLAN_SHA256 CLAIM NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-recheck-batch ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--after CLAIM EVENT_SEQ]\nai4math t3-sweep-status ROOT BARE_REPO PLAN_SHA256\nai4math t3-sweep-step ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--restart]\nai4math trip-breaker ROOT BARE_REPO BREAKER MODULE DEFINITION REASON [--critical]
 ai4math pivot-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
 ai4math pivot-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID
 ai4math pivot-recover ROOT BARE_REPO
@@ -970,6 +970,17 @@ fn run() -> Result<()> {
             claim,
             Path::new(exec),
             Some(data),
+        ),
+        ["t3-sweep-status", root, repo, hash] => {
+            t3::sweep_status(Path::new(root), Path::new(repo), hash)
+        }
+        ["t3-sweep-step", root, repo, hash, limit, exec, args @ ..] => t3::sweep_step(
+            Path::new(root),
+            Path::new(repo),
+            hash,
+            limit.parse()?,
+            Path::new(exec),
+            args,
         ),
         ["t3-recheck-batch", root, repo, hash, limit, exec, args @ ..] => t3::recheck_batch(
             Path::new(root),
