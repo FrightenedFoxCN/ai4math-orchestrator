@@ -19,6 +19,8 @@ mod resources;
 mod rocq;
 pub use golden::{RegressionArtifacts, clone_golden};
 mod sandbox;
+mod t2_build;
+pub use t2_build::{LeanBuildAudit, LeanBuildModuleAudit};
 mod t3;
 mod task_process;
 mod witness;
@@ -324,6 +326,17 @@ enum DiagnosticOutput {
     LeanJson,
 }
 
+enum CheckMode<'a> {
+    Default {
+        save_object: bool,
+        diagnostic_output: DiagnosticOutput,
+    },
+    IsolatedLean {
+        predecessors: &'a PathBuf,
+        timeout: Duration,
+    },
+}
+
 #[derive(Clone, Copy, Debug)]
 enum VerificationMode {
     Legacy(ReceiptTier),
@@ -494,6 +507,47 @@ impl Broker {
         save_object: bool,
         diagnostic_output: DiagnosticOutput,
     ) -> Result<String> {
+        self.check_with_output_timeout(
+            tool,
+            room,
+            output,
+            relative,
+            CheckMode::Default {
+                save_object,
+                diagnostic_output,
+            },
+        )
+    }
+
+    fn check_with_output_timeout(
+        &self,
+        tool: &Toolchain,
+        room: &Path,
+        output: &Path,
+        relative: &str,
+        mode: CheckMode<'_>,
+    ) -> Result<String> {
+        let (save_object, diagnostic_output, timeout, predecessors) = match mode {
+            CheckMode::Default {
+                save_object,
+                diagnostic_output,
+            } => (save_object, diagnostic_output, TIMEOUT, &[][..]),
+            CheckMode::IsolatedLean {
+                predecessors,
+                timeout,
+            } => {
+                ensure!(
+                    tool.engine == Engine::Lean4,
+                    "isolated build requires native Lean"
+                );
+                (
+                    true,
+                    DiagnosticOutput::Text,
+                    timeout,
+                    std::slice::from_ref(predecessors),
+                )
+            }
+        };
         let module = path_for(tool.engine, relative)?;
         let mut reads = tool.reads.clone();
         let output = output.canonicalize()?;
@@ -501,7 +555,16 @@ impl Broker {
         let mut args = Vec::<String>::new();
         match tool.engine {
             Engine::Lean4 => {
-                env.push(("LEAN_PATH", &output));
+                let imports = predecessors
+                    .first()
+                    .map_or(output.as_path(), PathBuf::as_path);
+                env.push(("LEAN_PATH", imports));
+                if !predecessors.is_empty() {
+                    args.extend([
+                        "-Ddebug.skipKernelTC=false".into(),
+                        "-DElab.async=false".into(),
+                    ]);
+                }
                 if matches!(diagnostic_output, DiagnosticOutput::LeanJson) {
                     args.push("--json".into());
                 }
@@ -550,9 +613,9 @@ impl Broker {
                 writable: &output,
                 reads: &reads,
                 env: &env,
-                timeout: TIMEOUT,
+                timeout,
             },
-            &[],
+            predecessors,
             &[],
             tool.sandbox_group,
         )

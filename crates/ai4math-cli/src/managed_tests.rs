@@ -320,3 +320,171 @@ fn managed_promotion_respects_primary_engine_before_git() -> Result<()> {
     assert!(error.to_string().contains("primary engine"));
     Ok(())
 }
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires native host without outer Seatbelt and AI4MATH_TEST_LEAN"]
+fn native_t2_clean_build_is_advisory_and_fail_closed() -> Result<()> {
+    use serde_json::Value;
+    use sha2::{Digest, Sha256};
+
+    const ANCHOR: &str = "Support.lean";
+    const MANIFEST: &str = "ai4math-modules.txt";
+    const ORDERED: &str = "Support.lean\nProof.lean\n";
+    const REVERSED: &str = "Proof.lean\nSupport.lean\n";
+    const SUPPORT: &str = "theorem helper : True := True.intro\n";
+    const PROOF: &str = "import Support\ntheorem target : True := helper\n";
+    const INVALID_PROOF: &str = "import Support\ntheorem target : False := helper\n";
+
+    let exec = PathBuf::from(env::var_os("AI4MATH_TEST_LEAN").context("set native Lean binary")?);
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let source = root.join("source");
+    let repo = root.join("repo.git");
+    init(root, Engine::Lean4)?;
+    fs::create_dir(&source)?;
+    git(&source, &["init", "--initial-branch=main"]);
+    for (path, content) in [(MANIFEST, ORDERED), (ANCHOR, SUPPORT), (MODULE, PROOF)] {
+        fs::write(source.join(path), content)?;
+    }
+    git(&source, &["add", MANIFEST, ANCHOR, MODULE]);
+    git(
+        &source,
+        &["commit", "-m", "review both modules in dependency order"],
+    );
+    git(root, &["clone", "--bare", "source", "repo.git"]);
+    let reviewed = git(&repo, &["rev-parse", MAIN]);
+    declare_claim(root, "C", MODULE, "target", "Target", "True")?;
+    let mut store = StateStore::open(root.join(STATE))?;
+    {
+        let locked = PromotionRepo::try_lock(&repo)?;
+        store.bind_task_repository(
+            locked.path().to_str().context("UTF-8 repo path")?,
+            &reviewed,
+        )?;
+    }
+    let seq = store.status()?.last_event_seq;
+    let claim = serde_json::to_value(store.claim("C")?.context("missing fixture claim")?)?;
+
+    // Inspect the durable SQLite bytes (including the WAL, not its transient
+    // index) and the full Git object/ref inventories, not just main.
+    let sqlite = || -> Result<_> {
+        let db = fs::read(root.join(STATE))?;
+        let wal = match fs::read(root.join(".runtime/state.sqlite-wal")) {
+            Ok(wal) => Some(wal),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(err.into()),
+        };
+        Ok((db, wal))
+    };
+    let git_state = || -> Result<_> {
+        Ok((
+            fs::read(repo.join("HEAD"))?,
+            git(
+                &repo,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname) %(objectname) %(symref)",
+                ],
+            ),
+            git(&repo, &["cat-file", "--batch-all-objects", "--batch-check"]),
+        ))
+    };
+    let assert_no_authority_change = || -> Result<()> {
+        assert_eq!(store.status()?.last_event_seq, seq);
+        assert_eq!(
+            serde_json::to_value(store.claim("C")?.context("missing fixture claim")?)?,
+            claim
+        );
+        assert_unpromoted(&store, None)?;
+        assert!(store.pivot_intent()?.is_none());
+        Ok(())
+    };
+
+    let db_before = sqlite()?;
+    let git_before = git_state()?;
+    let report = serde_json::to_value(crate::t2_build::audit(
+        root, &repo, ANCHOR, &reviewed, &exec,
+    )?)?;
+    assert_eq!(report["schema"], "ai4math.t2.clean-build.v1");
+    assert_eq!(report["advisory_only"], true);
+    assert_eq!(report["reviewed_commit"], reviewed);
+    assert_eq!(report["engine"], "lean4");
+    assert_eq!(report.get("external_checker_passed"), Some(&Value::Null));
+    assert_eq!(report["ledger_event_seq"].as_i64(), Some(seq));
+    let source_set = report["source_set_sha256"]
+        .as_str()
+        .context("missing source-set digest")?;
+    assert_eq!(source_set.len(), 64);
+    assert!(
+        source_set
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    );
+    let mut compiler_hash = Sha256::new();
+    std::io::copy(&mut fs::File::open(&exec)?, &mut compiler_hash)?;
+    assert_eq!(
+        report["compiler_sha256"],
+        format!("{:x}", compiler_hash.finalize())
+    );
+    assert!(report["compile_ms"].as_u64().is_some());
+    let modules = report["modules"]
+        .as_array()
+        .context("missing ordered module reports")?;
+    assert_eq!(modules.len(), 2);
+    for (module, (path, content)) in modules.iter().zip([(ANCHOR, SUPPORT), (MODULE, PROOF)]) {
+        assert_eq!(module["path"], path);
+        assert_eq!(
+            module["source_sha256"],
+            format!("{:x}", Sha256::digest(content.as_bytes()))
+        );
+        assert!(module["compile_ms"].as_u64().is_some());
+    }
+    assert!(sqlite()? == db_before, "a successful audit wrote SQLite");
+    assert!(git_state()? == git_before, "a successful audit wrote Git");
+    assert_no_authority_change()?;
+
+    let assert_rejected = |oid: &str, exe: &Path, expected: &[&str]| -> Result<()> {
+        let git_before = git_state()?;
+        let Err(error) = crate::t2_build::audit(root, &repo, ANCHOR, oid, exe) else {
+            panic!("an audit expected to fail ({expected:?}) produced a report");
+        };
+        let diagnostic = format!("{error:#}");
+        assert!(
+            expected
+                .iter()
+                .all(|&fragment| diagnostic.contains(fragment)),
+            "unexpected refusal: {diagnostic}"
+        );
+        assert!(sqlite()? == db_before, "a rejected audit wrote SQLite");
+        assert!(git_state()? == git_before, "a rejected audit wrote Git");
+        assert_no_authority_change()
+    };
+    let commit_to_main = |manifest: &str, proof: &str, message: &str| -> Result<String> {
+        fs::write(source.join(MANIFEST), manifest)?;
+        fs::write(source.join(MODULE), proof)?;
+        git(&source, &["add", MANIFEST, MODULE]);
+        git(&source, &["commit", "-m", message]);
+        git(&source, &["push", "../repo.git", "main"]);
+        Ok(git(&repo, &["rev-parse", MAIN]))
+    };
+
+    let wrong_order = commit_to_main(REVERSED, PROOF, "move importer before its dependency")?;
+    assert_rejected(
+        &wrong_order,
+        &exec,
+        &["tracked Lean clean build failed", MODULE, "Support"],
+    )?;
+    let broken = commit_to_main(ORDERED, INVALID_PROOF, "break only the downstream proof")?;
+    assert_rejected(
+        &broken,
+        &exec,
+        &["tracked Lean clean build failed", MODULE, "False"],
+    )?;
+    // Reject a stale but previously successful commit before resolving the compiler.
+    assert_rejected(
+        &reviewed,
+        &root.join("missing-compiler"),
+        &["reviewed T2 commit is not current main"],
+    )
+}

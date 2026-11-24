@@ -993,6 +993,7 @@ fn operator_oracle_and_hammer_are_not_available_over_daemon_rpc() -> Result<()> 
         "hammer.promote",
         "tasks.runModel",
         "tasks.finishModel",
+        "t2.build",
         "t3.discover",
         "t3.discoverClaim",
         "claim.replay",
