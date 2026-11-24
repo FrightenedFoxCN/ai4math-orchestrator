@@ -21,11 +21,13 @@
 | [docs/05-multi-engine-and-hammers.md](docs/05-multi-engine-and-hammers.md) | 多引擎协同、对称 Trust Ledger（`L2a/L2b`, `L4a/L4b`）、项目级可配置主引擎、按需 Hammer 工具子代理与 Oracle 剪枝前补充验证防线 |
 | [docs/06-verification-broker.md](docs/06-verification-broker.md) | Local Verification Broker：四层纵深防御（静态禁入、OS 混合沙箱、洁净室形式化准入与 `VerificationReceipt`）、双车道调度、内存水位线与黄金 `.olean` 快照复用 |
 | [docs/07-claim-graph-state-machine.md](docs/07-claim-graph-state-machine.md) | AND-OR Claim Graph 状态机、双信任度（`local` vs. `effective`）、T3 标脏传播与机会主义快速洗白、`L2b` 证伪传播与单文件 SQLite Event Log |
+| [docs/08-engineering-architecture.md](docs/08-engineering-architecture.md) | 工程实现架构：Rust 原生 Workspace（`rusqlite` + Seatbelt 规范化探针结论）、UDS + DSH `dsh-api-gateway` 两跳通信与 `shell.bottom` Live HUD 集成 |
 | [docs/adr/ADR-0001-core-workflow-decisions.md](docs/adr/ADR-0001-core-workflow-decisions.md) | 架构决策记录 #0001：首轮核心编排、权限与知识库策略拍板（D1–D6） |
 | [docs/adr/ADR-0002-review-briefing-and-telemetry.md](docs/adr/ADR-0002-review-briefing-and-telemetry.md) | 架构决策记录 #0002：生命体征解耦、Push Alert、双语呈现与可恢复熔断器决策（D7–D11） |
 | [docs/adr/ADR-0003-multi-engine-oracles-and-hammers.md](docs/adr/ADR-0003-multi-engine-oracles-and-hammers.md) | 架构决策记录 #0003：对称 Trust Ledger、主引擎可配置、默认禁用跨 ITP 桥接、动态 Hammer 与 Oracle 防线（D12–D15，修订 D4） |
 | [docs/adr/ADR-0004-verification-broker-and-sandboxing.md](docs/adr/ADR-0004-verification-broker-and-sandboxing.md) | 架构决策记录 #0004：Broker 四层防御、`L5` 禁入 `native_decide`、混合 OS 沙箱与 T2 外部内核校验（D16–D19） |
 | [docs/adr/ADR-0005-claim-graph-and-artifact-cache.md](docs/adr/ADR-0005-claim-graph-and-artifact-cache.md) | 架构决策记录 #0005：AND-OR Claim Graph、机会主义洗白、黄金 `.olean` 快照池与 SQLite 状态底座（D20–D23） |
+| [docs/adr/ADR-0006-implementation-stack-and-dsh-integration.md](docs/adr/ADR-0006-implementation-stack-and-dsh-integration.md) | 架构决策记录 #0006：Rust + `rusqlite` 原生核心、非嵌套守护进程与路径规范化、UDS + DSH 官方网关两跳通信与 Live HUD 席位（D24–D27） |
 | [schemas/contracts.schema.json](schemas/contracts.schema.json) | 编排契约、信任账本与决策收件箱的 JSON Schema 定义 |
 | [schemas/briefing-telemetry.schema.json](schemas/briefing-telemetry.schema.json) | 常驻生命体征、复盘 Fact Pack、Push Alert、可恢复熔断器与 Pivot 计划的 JSON Schema |
 | [schemas/multi-engine.schema.json](schemas/multi-engine.schema.json) | 项目主引擎配置、Oracle 交叉印证记录、Hammer 探测结果与适配器能力的 JSON Schema |
@@ -35,7 +37,7 @@
 
 ## 阶段状态（Roadmap）
 
-- [x] **架构设计阶段完成（Docs 01–07、ADR-0001–0005、全部 JSON Schema 与 SQLite DDL）**
-- [ ] **Phase 1 MVP 实现**：SQLite 状态底座 + 本地 Math Wiki 索引器 + Local Verification Broker（macOS Seatbelt / Linux bwrap + Clean-Room Receipt）
-- [ ] **Phase 2 实现**：双轨 Orchestrator、常驻生命体征 HUD、双语复盘 Fact Pack 编译器与可恢复熔断器
-- [ ] **Phase 3 实现**：多引擎统一 Adapter（Lean 4 / Agda / Rocq）与 `tool_automation` Hammer / Oracle 交叉印证管线
+- [x] **架构与工程选型设计完成（Docs 01–08、ADR-0001–0006、4 份 JSON Schema 与 2 份 SQLite DDL）**
+- [ ] **Phase 1（Rust 核心底座 + Red-Team 闭环）**：`ai4math-core` + `ai4math-store`（`rusqlite`）+ `ai4math-broker`（Seatbelt 规范化 + APFS 黄金快照 + Lean 4/Agda 洁净室 `VerificationReceipt`）+ `ai4math-cli`
+- [ ] **Phase 2（常驻守护进程）**：`ai4math-daemon`（UDS NDJSON JSON-RPC 2.0 + 实时生命体征推流 + 确定性 Fact Pack 编译器）
+- [ ] **Phase 3（DSH 原生插件）**：`plugins/dsh-ai4math`（Host Cordis 角色工具面 + `TypertRemoteService` 桥接 + Client `shell.bottom` Live HUD 与 `sidebarRightTabs` 面板）
