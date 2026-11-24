@@ -98,14 +98,14 @@ fn repo_name(git: &PromotionRepo) -> Result<&str> {
 /// The owner-only runtime path protects private suggestions from other OS
 /// accounts. The worker has a separate Seatbelt boundary, not this UID check.
 #[cfg(unix)]
-fn private_state_path(root: &Path) -> Result<std::path::PathBuf> {
+pub(crate) fn private_state_path(root: &Path) -> Result<std::path::PathBuf> {
     use std::{fs, os::unix::fs::MetadataExt};
     let runtime = root.join(".runtime");
     let owner = unsafe { libc::geteuid() };
     let info = fs::symlink_metadata(&runtime)?;
     ensure!(
         info.is_dir() && info.uid() == owner && info.mode() & 0o077 == 0,
-        "task dispatch requires an owner-only .runtime directory (mode 0700), not a symlink"
+        "managed task operations require an owner-only .runtime directory (mode 0700), not a symlink"
     );
     for name in ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm"] {
         let path = runtime.join(name);
@@ -115,7 +115,7 @@ fn private_state_path(root: &Path) -> Result<std::path::PathBuf> {
                     && info.uid() == owner
                     && info.nlink() == 1
                     && info.mode() & 0o022 == 0,
-                "task dispatch requires private owner-controlled SQLite files"
+                "managed task operations require private owner-controlled SQLite files"
             ),
             Err(e) if name != "state.sqlite" && e.kind() == std::io::ErrorKind::NotFound => (),
             Err(e) => return Err(e.into()),
@@ -125,8 +125,8 @@ fn private_state_path(root: &Path) -> Result<std::path::PathBuf> {
 }
 
 #[cfg(not(unix))]
-fn private_state_path(_: &Path) -> Result<std::path::PathBuf> {
-    bail!("task dispatch requires an owner-only Unix runtime")
+pub(crate) fn private_state_path(_: &Path) -> Result<std::path::PathBuf> {
+    bail!("managed task operations require an owner-only Unix runtime")
 }
 
 fn require_available(git: &PromotionRepo, store: &StateStore) -> Result<()> {

@@ -422,6 +422,39 @@ CREATE TRIGGER IF NOT EXISTS sediment_replays_no_replace BEFORE INSERT ON sedime
 WHEN EXISTS (SELECT 1 FROM sediment_replays WHERE id=NEW.id OR event_seq=NEW.event_seq)
 BEGIN SELECT RAISE(ABORT, 'sediment replay evidence is immutable'); END;
 
+-- Explicit operator approval of a historical adaptation input. This record is
+-- advisory only; it does not authorize dispatch or create a proof receipt.
+CREATE TABLE IF NOT EXISTS sediment_adaptation_approvals (
+  approval_sha256 TEXT PRIMARY KEY NOT NULL CHECK(length(approval_sha256)=64 AND approval_sha256 NOT GLOB '*[^0-9a-f]*'),
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq),
+  archive_id TEXT NOT NULL CHECK(length(archive_id)=68 AND substr(archive_id,1,4)='SED-'
+    AND substr(archive_id,5) NOT GLOB '*[^0-9a-f]*'),
+  origin_claim TEXT NOT NULL REFERENCES reviewed_lean_specs(claim_id)
+    CHECK(length(CAST(origin_claim AS BLOB)) BETWEEN 1 AND 256),
+  promoted_commit TEXT NOT NULL REFERENCES lean_spec_comparisons(git_commit)
+    CHECK(length(promoted_commit) IN (40,64) AND promoted_commit NOT GLOB '*[^0-9a-f]*'),
+  target_claim TEXT NOT NULL REFERENCES reviewed_lean_specs(claim_id)
+    CHECK(length(CAST(target_claim AS BLOB)) BETWEEN 1 AND 256 AND target_claim<>origin_claim),
+  reviewed_commit TEXT NOT NULL
+    CHECK(length(reviewed_commit)=length(promoted_commit) AND reviewed_commit NOT GLOB '*[^0-9a-f]*'),
+  repo TEXT NOT NULL CHECK(length(CAST(repo AS BLOB)) BETWEEN 1 AND 4096),
+  target_module TEXT NOT NULL CHECK(length(CAST(target_module AS BLOB)) BETWEEN 1 AND 256),
+  target_decl TEXT NOT NULL CHECK(length(CAST(target_decl AS BLOB)) BETWEEN 1 AND 256),
+  frozen_source_sha256 TEXT NOT NULL CHECK(length(frozen_source_sha256)=64 AND frozen_source_sha256 NOT GLOB '*[^0-9a-f]*'),
+  spec_file TEXT NOT NULL CHECK(length(CAST(spec_file AS BLOB)) BETWEEN 1 AND 256),
+  spec_decl TEXT NOT NULL CHECK(length(CAST(spec_decl AS BLOB)) BETWEEN 1 AND 256),
+  spec_prefix_sha256 TEXT NOT NULL CHECK(length(spec_prefix_sha256)=64 AND spec_prefix_sha256 NOT GLOB '*[^0-9a-f]*'),
+  expected_event_seq INTEGER NOT NULL CHECK(expected_event_seq>=0 AND expected_event_seq<event_seq)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS sediment_adaptation_approvals_no_update BEFORE UPDATE ON sediment_adaptation_approvals
+BEGIN SELECT RAISE(ABORT, 'sediment adaptation approvals are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sediment_adaptation_approvals_no_delete BEFORE DELETE ON sediment_adaptation_approvals
+BEGIN SELECT RAISE(ABORT, 'sediment adaptation approvals are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sediment_adaptation_approvals_no_replace BEFORE INSERT ON sediment_adaptation_approvals
+WHEN EXISTS (SELECT 1 FROM sediment_adaptation_approvals
+             WHERE approval_sha256=NEW.approval_sha256 OR event_seq=NEW.event_seq)
+BEGIN SELECT RAISE(ABORT, 'sediment adaptation approvals are immutable'); END;
+
 -- Immutable advisory observations tied to the reviewed Claim snapshot, not to
 -- its current row. No trigger may turn this evidence into a trust transition.
 CREATE TABLE IF NOT EXISTS oracle_observations (

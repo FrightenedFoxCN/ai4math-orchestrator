@@ -18,6 +18,7 @@ mod pivot;
 mod probes;
 pub(crate) mod regression;
 mod reviewed_lean;
+mod sediment_adaptation;
 mod sediment_recheck;
 mod sweep;
 mod tasks;
@@ -25,6 +26,7 @@ pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{BreakerTripReport, PivotIntent, PivotPlan, PivotResult};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
 pub use reviewed_lean::{LeanSpecComparison, LeanSpecRecheck, ReviewedLeanSpec};
+pub use sediment_adaptation::{SedimentAdaptationApproval, SedimentAdaptationPlan};
 pub use sediment_recheck::{RetainedSedimentReplay, SedimentReplayScope};
 pub use sweep::{T3SweepState, T3SweepStatus, T3SweepStep};
 pub(crate) use tasks::scheduler_snapshot;
@@ -643,6 +645,10 @@ impl StateStore {
         ensure!(
             kind != sediment_recheck::RETAINED,
             "sediment replay events require sealed broker evidence"
+        );
+        ensure!(
+            kind != sediment_adaptation::APPROVED,
+            "sediment adaptation events require the typed approval API"
         );
         self.write(|tx| event(tx, change, kind, entity, id, payload))
     }
