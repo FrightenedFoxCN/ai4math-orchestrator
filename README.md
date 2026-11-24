@@ -17,12 +17,15 @@
 | [docs/01-architecture-overview.md](docs/01-architecture-overview.md) | 总体架构蓝图：四大本质张力、双轨编排模型、多引擎信任账本（L0–L5）、单机验证调度与四级回归节奏、异步人机共驾协议及分阶段路线图 |
 | [docs/02-roles-permissions-contracts.md](docs/02-roles-permissions-contracts.md) | 5 角色拓扑、物理工具权限矩阵与四道防火墙、结构化交接契约（Dispatch / Result / InfraRFC / Escalation） |
 | [docs/03-local-math-wiki.md](docs/03-local-math-wiki.md) | 本地数学 Wiki 索引设计：三层沉降库（CORE / SEDIMENT / GRAVEYARD）、惰性重验、三级渐进唤醒（含 Shadow Hint）、四维混合检索与双层存储 |
-| [docs/adr/ADR-0001-core-workflow-decisions.md](docs/adr/ADR-0001-core-workflow-decisions.md) | 架构决策记录 #0001：首轮核心编排、权限与知识库策略拍板 |
+| [docs/04-review-briefing-and-hitl.md](docs/04-review-briefing-and-hitl.md) | 常驻生命体征监控（Live HUD）、按需+P0推送双语复盘简报、可恢复 Definition Smell 局部熔断器与 Pivot Dry-Run 闭环 |
+| [docs/adr/ADR-0001-core-workflow-decisions.md](docs/adr/ADR-0001-core-workflow-decisions.md) | 架构决策记录 #0001：首轮核心编排、权限与知识库策略拍板（D1–D6） |
+| [docs/adr/ADR-0002-review-briefing-and-telemetry.md](docs/adr/ADR-0002-review-briefing-and-telemetry.md) | 架构决策记录 #0002：生命体征解耦、Push Alert、双语呈现与可恢复熔断器决策（D7–D11） |
 | [schemas/contracts.schema.json](schemas/contracts.schema.json) | 编排契约、信任账本与决策收件箱的 JSON Schema 定义 |
+| [schemas/briefing-telemetry.schema.json](schemas/briefing-telemetry.schema.json) | 常驻生命体征、复盘 Fact Pack、Push Alert、可恢复熔断器与 Pivot 计划的 JSON Schema |
 | [schemas/wiki-index.sql](schemas/wiki-index.sql) | 本地 Wiki SQLite 索引库 DDL（关系表、符号倒排、图谱边表、FTS5 与可选向量表） |
 
 ## 后续待细化模块（Roadmap）
 
-- [ ] `docs/04-verification-broker.md`：单机多核 Local Verification Broker（热池 REPL、Fast/Heavy 双车道、APFS/Btrfs CoW Worktree、内存准入控制）
-- [ ] `docs/05-claim-graph-and-hitl.md`：Claim Graph 状态机、自动标脏传播（Taint Propagation）与 5 分钟复盘简报协议
-- [ ] `docs/06-multi-engine-adapters.md`：Lean 4 / Rocq / Agda / SMT 统一适配器接口与 `L4` Bridge Contract 审计规范
+- [ ] `docs/05-verification-broker.md`：单机多核 Local Verification Broker（热池 REPL、Fast/Heavy 双车道、APFS/Btrfs CoW Worktree、内存准入控制）
+- [ ] `docs/06-claim-graph-state-machine.md`：Claim Graph 状态机与上游变更自动标脏传播（Taint Propagation）
+- [ ] `docs/07-multi-engine-adapters.md`：Lean 4 / Rocq / Agda / SMT 统一适配器接口与 `L4` Bridge Contract 审计规范

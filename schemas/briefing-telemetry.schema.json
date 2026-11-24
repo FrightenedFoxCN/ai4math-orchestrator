@@ -1,0 +1,748 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.ai4math-orchestrator/schemas/briefing-telemetry.schema.json",
+  "title": "AI4Math Live Telemetry, Review Briefing, Circuit Breaker & HITL Schemas",
+  "$defs": {
+    "HumanCheckpointCursor": {
+      "type": "object",
+      "required": [
+        "cursor_id",
+        "updated_at",
+        "event_seq",
+        "git_commit"
+      ],
+      "properties": {
+        "cursor_id": {
+          "type": "string"
+        },
+        "updated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "event_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "git_commit": {
+          "type": "string",
+          "minLength": 7
+        },
+        "last_adr_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "LiveVitalSigns": {
+      "type": "object",
+      "description": "Continuously updated deterministic telemetry surface (always-on HUD; zero LLM calls).",
+      "required": [
+        "sampled_at",
+        "resources",
+        "tracks",
+        "trust_ledger_totals",
+        "delta_since_cursor",
+        "alerts"
+      ],
+      "properties": {
+        "sampled_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "resources": {
+          "type": "object",
+          "required": [
+            "ram_used_pct",
+            "active_subagents",
+            "broker_fast_busy",
+            "broker_fast_capacity",
+            "broker_heavy_running",
+            "broker_heavy_queued"
+          ],
+          "properties": {
+            "ram_used_pct": {
+              "type": "number",
+              "minimum": 0,
+              "maximum": 100
+            },
+            "active_subagents": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "broker_fast_busy": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "broker_fast_capacity": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "broker_heavy_running": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "broker_heavy_queued": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "tracks": {
+          "type": "object",
+          "required": [
+            "exploration_active",
+            "exploration_paused",
+            "infra_rfcs_active"
+          ],
+          "properties": {
+            "exploration_active": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "exploration_paused": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "infra_rfcs_active": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "rfc_id",
+                  "phase",
+                  "proved_count",
+                  "total_count"
+                ],
+                "properties": {
+                  "rfc_id": {
+                    "type": "string"
+                  },
+                  "phase": {
+                    "type": "string"
+                  },
+                  "proved_count": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "total_count": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "trust_ledger_totals": {
+          "type": "object",
+          "required": [
+            "L0",
+            "L1",
+            "L2",
+            "L3",
+            "L4",
+            "L5",
+            "stale"
+          ],
+          "properties": {
+            "L0": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "L1": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "L2": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "L3": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "L4": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "L5": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "stale": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          "additionalProperties": false
+        },
+        "delta_since_cursor": {
+          "type": "object",
+          "required": [
+            "L5_net",
+            "L4_net",
+            "L2_new",
+            "stale_net"
+          ],
+          "properties": {
+            "L5_net": {
+              "type": "integer"
+            },
+            "L4_net": {
+              "type": "integer"
+            },
+            "L2_new": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "stale_net": {
+              "type": "integer"
+            }
+          },
+          "additionalProperties": false
+        },
+        "alerts": {
+          "type": "object",
+          "required": [
+            "tripped_breakers",
+            "inbox_pending_total",
+            "inbox_p0_count"
+          ],
+          "properties": {
+            "tripped_breakers": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "inbox_pending_total": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "inbox_p0_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "last_push_alert_id": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "BilingualMathRef": {
+      "type": "object",
+      "description": "Paired informal math statement and exact formal signature (never proof body).",
+      "required": [
+        "entity_id",
+        "engine",
+        "informal_math",
+        "formal_signature"
+      ],
+      "properties": {
+        "entity_id": {
+          "type": "string"
+        },
+        "engine": {
+          "type": "string",
+          "enum": [
+            "lean4",
+            "rocq",
+            "agda",
+            "smt",
+            "informal"
+          ]
+        },
+        "informal_math": {
+          "type": "string"
+        },
+        "formal_signature": {
+          "type": "string"
+        },
+        "file_anchor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CircuitBreakerState": {
+      "type": "object",
+      "description": "Resumable local circuit breaker for definition smell protection.",
+      "required": [
+        "breaker_id",
+        "target_definition",
+        "engine",
+        "state",
+        "trigger_signals",
+        "paused_task_ids",
+        "retained_worktree_path"
+      ],
+      "properties": {
+        "breaker_id": {
+          "type": "string"
+        },
+        "target_definition": {
+          "$ref": "#/$defs/BilingualMathRef"
+        },
+        "engine": {
+          "type": "string",
+          "enum": [
+            "lean4",
+            "rocq",
+            "agda",
+            "smt"
+          ]
+        },
+        "state": {
+          "type": "string",
+          "enum": [
+            "CLOSED",
+            "TRIPPED",
+            "HALF_OPEN",
+            "ARCHIVED"
+          ]
+        },
+        "tripped_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "trigger_signals": {
+          "type": "object",
+          "required": [
+            "independent_spec_defects",
+            "isomorphic_error_count",
+            "heartbeat_ratio"
+          ],
+          "properties": {
+            "independent_spec_defects": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "isomorphic_error_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "heartbeat_ratio": {
+              "type": "number",
+              "minimum": 0
+            },
+            "sample_error": {
+              "type": "string"
+            }
+          },
+          "additionalProperties": false
+        },
+        "paused_task_ids": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "retained_worktree_path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "linked_inbox_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "recovery_mode": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "RESUME_AS_IS",
+            "PATCH_DEFINITION",
+            "ARCHIVE_AND_PIVOT",
+            null
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "PushAlert": {
+      "type": "object",
+      "required": [
+        "alert_id",
+        "created_at",
+        "severity",
+        "reason_code",
+        "dedupe_key",
+        "headline",
+        "briefing_id"
+      ],
+      "properties": {
+        "alert_id": {
+          "type": "string"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "severity": {
+          "type": "string",
+          "enum": [
+            "P0"
+          ]
+        },
+        "reason_code": {
+          "type": "string",
+          "enum": [
+            "CRITICAL_CLAIM_REFUTED",
+            "ALL_TRACKS_BLOCKED",
+            "CRITICAL_BREAKER_TRIPPED",
+            "BROKER_REGRESSION_MELTDOWN"
+          ]
+        },
+        "dedupe_key": {
+          "type": "string"
+        },
+        "headline": {
+          "type": "string"
+        },
+        "related_entities": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "briefing_id": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "BriefingFactPack": {
+      "type": "object",
+      "description": "Immutable deterministic fact base compiled before narrative synthesis. Retained only on push_alert or human_pull.",
+      "required": [
+        "briefing_id",
+        "trigger",
+        "generated_at",
+        "from_cursor",
+        "to_event_seq",
+        "to_git_commit",
+        "milestones",
+        "high_impact_refutations",
+        "frontier_bottlenecks",
+        "risk_radar",
+        "top_inbox_ids",
+        "wiki_digest"
+      ],
+      "properties": {
+        "briefing_id": {
+          "type": "string"
+        },
+        "trigger": {
+          "type": "string",
+          "enum": [
+            "human_pull",
+            "push_alert"
+          ]
+        },
+        "peek_only": {
+          "type": "boolean",
+          "default": false
+        },
+        "generated_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "from_cursor": {
+          "$ref": "#/$defs/HumanCheckpointCursor"
+        },
+        "to_event_seq": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "to_git_commit": {
+          "type": "string",
+          "minLength": 7
+        },
+        "fact_pack_sha256": {
+          "type": "string"
+        },
+        "milestones": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "ref",
+              "new_trust_level",
+              "is_critical_path"
+            ],
+            "properties": {
+              "ref": {
+                "$ref": "#/$defs/BilingualMathRef"
+              },
+              "new_trust_level": {
+                "type": "string",
+                "enum": [
+                  "L4",
+                  "L5"
+                ]
+              },
+              "is_critical_path": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "high_impact_refutations": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "ref",
+              "graveyard_id",
+              "witness_summary"
+            ],
+            "properties": {
+              "ref": {
+                "$ref": "#/$defs/BilingualMathRef"
+              },
+              "graveyard_id": {
+                "type": "string"
+              },
+              "witness_summary": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "frontier_bottlenecks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "ref",
+              "bottleneck_type",
+              "downstream_blocked_count"
+            ],
+            "properties": {
+              "ref": {
+                "$ref": "#/$defs/BilingualMathRef"
+              },
+              "bottleneck_type": {
+                "type": "string",
+                "enum": [
+                  "MATH_IDEA",
+                  "MISSING_INFRA",
+                  "DEF_FRICTION",
+                  "ENGINE_WALL"
+                ]
+              },
+              "downstream_blocked_count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "risk_radar": {
+          "type": "object",
+          "required": [
+            "tripped_breakers",
+            "unaudited_l4_bridges",
+            "stale_claim_count",
+            "regression_anomalies"
+          ],
+          "properties": {
+            "tripped_breakers": {
+              "type": "array",
+              "items": {
+                "$ref": "#/$defs/CircuitBreakerState"
+              }
+            },
+            "unaudited_l4_bridges": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "stale_claim_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "regression_anomalies": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "target",
+                  "metric",
+                  "ratio_vs_baseline"
+                ],
+                "properties": {
+                  "target": {
+                    "type": "string"
+                  },
+                  "metric": {
+                    "type": "string",
+                    "enum": [
+                      "max_heartbeats",
+                      "compile_seconds",
+                      "zero_yield_burn"
+                    ]
+                  },
+                  "ratio_vs_baseline": {
+                    "type": "number"
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "top_inbox_ids": {
+          "type": "array",
+          "maxItems": 3,
+          "items": {
+            "type": "string"
+          }
+        },
+        "wiki_digest": {
+          "type": "object",
+          "required": [
+            "sediment_harvested_count",
+            "graveyard_new_count",
+            "shadow_hints_surfaced"
+          ],
+          "properties": {
+            "sediment_harvested_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "sediment_highlights": {
+              "type": "array",
+              "maxItems": 2,
+              "items": {
+                "type": "string"
+              }
+            },
+            "graveyard_new_count": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "shadow_hints_surfaced": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "PivotActionPlan": {
+      "type": "object",
+      "description": "Dry-run preview confirmed by the human before atomic execution and cursor advancement.",
+      "required": [
+        "plan_id",
+        "source_briefing_id",
+        "adr_to_create",
+        "breaker_actions",
+        "tasks_to_cancel",
+        "claims_to_taint",
+        "rfcs_to_issue"
+      ],
+      "properties": {
+        "plan_id": {
+          "type": "string"
+        },
+        "source_briefing_id": {
+          "type": "string"
+        },
+        "adr_to_create": {
+          "type": "string"
+        },
+        "breaker_actions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "breaker_id",
+              "action"
+            ],
+            "properties": {
+              "breaker_id": {
+                "type": "string"
+              },
+              "action": {
+                "type": "string",
+                "enum": [
+                  "RESUME_AS_IS",
+                  "PATCH_DEFINITION",
+                  "ARCHIVE_AND_PIVOT"
+                ]
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "tasks_to_cancel": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "task_id",
+              "harvest_before_stop"
+            ],
+            "properties": {
+              "task_id": {
+                "type": "string"
+              },
+              "harvest_before_stop": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "claims_to_taint": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "rfcs_to_issue": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "advance_cursor": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}
