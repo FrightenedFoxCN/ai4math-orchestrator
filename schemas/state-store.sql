@@ -472,6 +472,32 @@ WHEN EXISTS (SELECT 1 FROM scheduler_sediment_adaptations
                OR registered_event_seq=NEW.registered_event_seq)
 BEGIN SELECT RAISE(ABORT, 'sediment adaptation scheduler links are immutable'); END;
 
+-- Historical edge only: this does not create a proof, Wiki entry, or new scheduler state.
+CREATE TABLE IF NOT EXISTS sediment_adaptation_lineage (
+  approval_sha256 TEXT PRIMARY KEY NOT NULL REFERENCES sediment_adaptation_approvals(approval_sha256),
+  task_seq INTEGER NOT NULL REFERENCES scheduler_sediment_adaptations(task_seq)
+    REFERENCES scheduler_task_candidates(task_seq),
+  promoted_commit TEXT NOT NULL UNIQUE REFERENCES lean_spec_comparisons(git_commit)
+    CHECK(length(promoted_commit) IN (40,64) AND promoted_commit NOT GLOB '*[^0-9a-f]*'),
+  origin_t1_receipt_sha256 TEXT NOT NULL REFERENCES verification_receipts(receipt_sha256),
+  origin_comparison_receipt_sha256 TEXT NOT NULL
+    CHECK(length(origin_comparison_receipt_sha256)=64 AND origin_comparison_receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+  candidate_receipt_sha256 TEXT NOT NULL REFERENCES verification_receipts(receipt_sha256),
+  comparison_receipt_sha256 TEXT NOT NULL
+    CHECK(length(comparison_receipt_sha256)=64 AND comparison_receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+  expected_event_seq INTEGER NOT NULL CHECK(expected_event_seq>=0 AND expected_event_seq<event_seq),
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS sediment_adaptation_lineage_no_update BEFORE UPDATE ON sediment_adaptation_lineage
+BEGIN SELECT RAISE(ABORT, 'sediment adaptation lineage is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sediment_adaptation_lineage_no_delete BEFORE DELETE ON sediment_adaptation_lineage
+BEGIN SELECT RAISE(ABORT, 'sediment adaptation lineage is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sediment_adaptation_lineage_no_replace BEFORE INSERT ON sediment_adaptation_lineage
+WHEN EXISTS (SELECT 1 FROM sediment_adaptation_lineage
+             WHERE approval_sha256=NEW.approval_sha256 OR event_seq=NEW.event_seq
+                OR promoted_commit=NEW.promoted_commit)
+BEGIN SELECT RAISE(ABORT, 'sediment adaptation lineage is immutable'); END;
+
 -- Immutable advisory observations tied to the reviewed Claim snapshot, not to
 -- its current row. No trigger may turn this evidence into a trust transition.
 CREATE TABLE IF NOT EXISTS oracle_observations (

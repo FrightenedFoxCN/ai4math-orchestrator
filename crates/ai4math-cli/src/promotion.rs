@@ -287,6 +287,51 @@ impl PromotionRepo {
         Ok(tree.files.contains_key(module))
     }
 
+    /// Check an already-published single-module promotion using only existing objects.
+    /// Unlike candidate-tree construction, this does not create a Git object or index.
+    pub(crate) fn assert_exact_proof_commit(
+        &self,
+        base: &str,
+        commit: &str,
+        module: &str,
+        source: &[u8],
+    ) -> Result<()> {
+        module_extension(module).context("invalid managed proof module")?;
+        let mut before = self.project_tree(base)?;
+        self.require_commit(commit)?;
+        let raw = read_object(self.path(), "commit", commit, MAX_TREE_BYTES)?;
+        let mut headers = raw
+            .split(|&b| b == b'\n')
+            .take_while(|line| !line.is_empty());
+        let tree = headers
+            .next()
+            .and_then(|line| line.strip_prefix(b"tree "))
+            .context("missing promoted proof tree")?;
+        ensure!(
+            headers.next() == Some(format!("parent {base}").as_bytes())
+                && !headers.any(|line| line.starts_with(b"parent ") || line.starts_with(b"tree ")),
+            "managed proof must have the exact approved base as its only parent"
+        );
+        let mut after = ProjectTree::read(self.path(), std::str::from_utf8(tree)?)?;
+        let old = before
+            .files
+            .remove(module)
+            .context("frozen module is missing from the approved proof base")?;
+        let new = after
+            .files
+            .remove(module)
+            .context("promoted proof module is missing from Git")?;
+        ensure!(
+            old != new && before.files == after.files && before.adrs == after.adrs,
+            "managed proof commit must change only the promoted module"
+        );
+        ensure!(
+            read_object(self.path(), "blob", &new, 2 * 1024 * 1024)? == source,
+            "managed proof module does not match the retained recipe bytes"
+        );
+        Ok(())
+    }
+
     fn project_tree(&self, commit: &str) -> Result<ProjectTree> {
         self.require_commit(commit)?;
         let spec = format!("{commit}^{{tree}}");
@@ -843,6 +888,37 @@ mod tests {
 
     fn id(digit: char) -> String {
         format!("ADR-PIVOT-{}", digit.to_string().repeat(64))
+    }
+
+    #[test]
+    fn read_only_proof_commit_validation_rejects_an_extra_edit_and_wrong_parent() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let base = branch(&repo)?;
+        let source = b"import B\n-- promoted module\n";
+        let tree = tree_with_blob(repo.path(), &base, "A.lean", source)?;
+        let proof = commit_tree(&repo, &tree, &base)?;
+        repo.assert_exact_proof_commit(&base, &proof, "A.lean", source)?;
+        assert!(
+            repo.assert_exact_proof_commit(&base, &proof, "A.lean", b"not those bytes")
+                .is_err()
+        );
+        assert!(
+            repo.assert_exact_proof_commit(&base, &proof, "B.lean", source)
+                .is_err()
+        );
+        let extra = tree_with_blob(repo.path(), &proof, "B.lean", b"-- unwanted edit")?;
+        let extra = commit_tree(&repo, &extra, &base)?;
+        assert!(
+            repo.assert_exact_proof_commit(&base, &extra, "A.lean", source)
+                .is_err()
+        );
+        let sidelined = commit_tree(&repo, &tree, &proof)?;
+        assert!(
+            repo.assert_exact_proof_commit(&base, &sidelined, "A.lean", source)
+                .is_err()
+        );
+        assert_eq!(repo.main_head()?, base);
+        Ok(())
     }
 
     #[test]

@@ -454,6 +454,21 @@ fn native_sediment_adaptation_approves_only_a_fresh_target_without_granting_auth
     assert_eq!(state.task_candidate(&task_id)?.as_ref(), Some(&candidate));
     after.assert_unchanged(root, &repo, &state)?;
 
+    // An approved head and retained worker candidate still provide no proof.
+    let retain_lineage = |approval: &str, reviewed: &str| {
+        wiki_archive::lineage::retain(root, &repo, approval, reviewed)
+    };
+    assert!(state.sediment_lineage(&digest)?.is_none());
+    let err = retain_lineage(&digest, &head).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("no exact managed promotion for the adaptation target"),
+        "{err:#}"
+    );
+    assert!(state.sediment_lineage(&digest)?.is_none());
+    assert_eq!(state.status()?.last_event_seq, complete_seq);
+    assert_eq!(state.task_candidate(&task_id)?.as_ref(), Some(&candidate));
+    after.assert_unchanged(root, &repo, &state)?;
+
     // A distinct operator step must now run the real Lean comparator against
     // the destination's reviewed spec, not replay the historical comparison.
     let origin_blob = git(&repo, &["show", &format!("{MAIN}:{OLD_MODULE}")]);
@@ -502,5 +517,71 @@ fn native_sediment_adaptation_approves_only_a_fresh_target_without_granting_auth
         state.lean_spec_comparison(&promoted)?.as_ref(),
         Some(&original_comparison)
     );
+
+    // Only the exact newly promoted main may anchor this ledger-only link.
+    let retain_before = Authority::read(root, &repo, &state)?;
+    let retain_seq = state.status()?.last_event_seq;
+    assert!(state.sediment_lineage(&digest)?.is_none());
+    let lineage = retain_lineage(&digest, &adapted)?;
+    assert_eq!(lineage.approval_sha256, digest);
+    assert_eq!(lineage.archive_id, archive.id);
+    assert_eq!(lineage.target_claim, TARGET);
+    assert_eq!(lineage.promoted_commit, adapted);
+    assert_eq!(lineage.core_entry_id, format!("CORE-ADAPT-{digest}"));
+    assert!(lineage.core_entry_prospective);
+    assert_eq!(lineage.task_id, task_id);
+    assert_eq!(
+        lineage.origin_t1_receipt_sha256,
+        original_comparison.candidate_receipt_sha256
+    );
+    assert_eq!(
+        lineage.origin_comparison_receipt_sha256,
+        original_comparison.receipt_sha256
+    );
+    assert_eq!(
+        lineage.candidate_receipt_sha256,
+        comparison.candidate_receipt_sha256
+    );
+    assert_eq!(lineage.comparison_receipt_sha256, comparison.receipt_sha256);
+    assert_eq!(lineage.event_seq, retain_seq + 1);
+    assert_eq!(state.status()?.last_event_seq, retain_seq + 1);
+    assert_eq!(state.sediment_lineage(&digest)?.as_ref(), Some(&lineage));
+    retain_before.assert_unchanged(root, &repo, &state)?;
+
+    // A previously retained digest must not bypass the reviewed-head guard.
+    let err = retain_lineage(&digest, &head).unwrap_err();
+    assert!(format!("{err:#}").contains("not current main"), "{err:#}");
+    let unknown = "0".repeat(64);
+    let err = retain_lineage(&unknown, &adapted).unwrap_err();
+    assert!(
+        format!("{err:#}").contains("no retained sediment adaptation approval"),
+        "{err:#}"
+    );
+    assert!(state.sediment_lineage(&unknown)?.is_none());
+    assert_eq!(retain_lineage(&digest, &adapted)?, lineage);
+    assert_eq!(state.sediment_lineage(&digest)?.as_ref(), Some(&lineage));
+    assert_eq!(state.status()?.last_event_seq, retain_seq + 1);
+    let events = state.events_after(retain_seq, 2)?;
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.event_type, "SEDIMENT_ADAPTATION_LINEAGE_RETAINED");
+    assert_eq!(event.event_seq, lineage.event_seq);
+    assert_eq!(event.entity_type, "claim");
+    assert_eq!(event.entity_id, TARGET);
+    assert_eq!(event.git_commit.as_deref(), Some(adapted.as_str()));
+    assert_eq!(event.payload["approval_sha256"], digest);
+    assert_eq!(event.payload["archive_id"], archive.id);
+    assert_eq!(event.payload["core_entry_id"], lineage.core_entry_id);
+    assert_eq!(state.task_candidate(&task_id)?.as_ref(), Some(&candidate));
+    assert!(state.task_candidate("existing")?.is_none());
+    assert_eq!(
+        state.sediment_adaptation(&digest)?.as_ref(),
+        Some(&approval)
+    );
+    assert_eq!(
+        state.lean_spec_comparison(&adapted)?.as_ref(),
+        Some(&comparison)
+    );
+    retain_before.assert_unchanged(root, &repo, &state)?;
     Ok(())
 }
