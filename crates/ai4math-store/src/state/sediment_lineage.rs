@@ -161,8 +161,14 @@ fn current_recheck_commit(
     let plan_hash: Option<String> = db
         .query_row(
             "SELECT q.plan_sha256 FROM verification_receipts r
-             JOIN applied_t3_plans p ON p.reviewed_commit=r.base_commit
-             JOIN lean_spec_rechecks q ON q.plan_sha256=p.plan_sha256 AND q.claim_id=?1
+             JOIN lean_spec_rechecks q ON q.candidate_receipt_sha256=r.receipt_sha256 AND q.claim_id=?1
+             JOIN applied_t3_plans p ON p.plan_sha256=q.plan_sha256 AND p.reviewed_commit=q.reviewed_commit
+             JOIN events e ON e.event_seq=(SELECT event_seq FROM events
+                 WHERE entity_type='claim' AND entity_id=?1
+                 AND event_type IN ('CLAIM_TRUST_CHANGED','CLAIM_TAINTED')
+                 ORDER BY event_seq DESC LIMIT 1)
+             AND e.event_type='CLAIM_TRUST_CHANGED'
+             AND json_extract(e.payload_json,'$.detail.lean_spec_recheck.plan_sha256')=q.plan_sha256
              WHERE r.receipt_id=?2 AND q.promoted_commit=?3
              AND r.tier='T3_TAINT_REBUILD' AND r.engine='lean4'
              AND r.allowlist_passed=1 AND r.external_checker_passed IS NOT 0

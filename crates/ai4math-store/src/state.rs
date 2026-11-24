@@ -13,6 +13,7 @@ use std::{
     path::Path,
 };
 
+mod migrations;
 mod oracle;
 mod pivot;
 mod probes;
@@ -377,6 +378,7 @@ impl StateStore {
             BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;",
         )?;
         let mut store = Self { db };
+        migrations::permit_distinct_same_head_t3_plans(&mut store.db)?;
         store.initialize_route_projection()?;
         Ok(store)
     }

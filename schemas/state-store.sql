@@ -328,10 +328,11 @@ BEGIN SELECT RAISE(ABORT, 'Lean comparison evidence is immutable'); END;
 CREATE TABLE IF NOT EXISTS applied_t3_plans (
   plan_sha256 TEXT PRIMARY KEY,
   base_commit TEXT NOT NULL,
-  reviewed_commit TEXT NOT NULL UNIQUE,
+  reviewed_commit TEXT NOT NULL,
   anchor_module TEXT NOT NULL,
   preview_event_seq INTEGER NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_applied_t3_reviewed_commit ON applied_t3_plans(reviewed_commit);
 
 -- Operator sweep navigation only, never evidence or an event. A missing row is
 -- not started; a NULL continuation in an existing row latches completion.

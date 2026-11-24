@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 
-mod managed_wiki;
+pub(crate) mod managed_wiki;
 
 const TOPICS: [&str; 3] = ["vital_signs.tick", "alert.p0", "breaker.state_changed"];
 

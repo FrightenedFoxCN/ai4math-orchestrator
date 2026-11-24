@@ -456,6 +456,84 @@ mod native {
 
     #[test]
     #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
+    fn native_multi_autosweep_does_not_duplicate_proof_evidence() -> Result<()> {
+        let tmp = short_tempdir()?;
+        let f = Fixture::new(
+            tmp.path().canonicalize()?,
+            &native_binary("AI4MATH_TEST_CLI")?,
+            native_binary("AI4MATH_TEST_LEAN")?,
+        )?;
+        let promoted = f.main()?;
+        let reviewed = f.review_defs("Nat.succ 1")?;
+        let before = f.claim("C")?;
+        let main = f.preview(&promoted, &reviewed)?;
+        let first = digest(&main)?;
+        f.apply(&promoted, &reviewed, first)?;
+        // The second approval uses a different validated anchor but the same
+        // reviewed main. Both worklists include the original proof Claim.
+        let other: Value = serde_json::from_str(&f.run(
+            "t3-preview",
+            &[utf8(&f.bare), "Defs.lean", &promoted, &reviewed],
+        )?)?;
+        let second = digest(&other)?;
+        assert_ne!(first, second);
+        f.run(
+            "t3-apply",
+            &[utf8(&f.bare), "Defs.lean", &promoted, &reviewed, second],
+        )?;
+        assert!(f.claim("C")?.stale);
+        assert_eq!(f.receipt_count()?, 1);
+        let seq = f.state()?.status()?.last_event_seq;
+        let unapproved = "e".repeat(64);
+        let config = f.root.join("multi.json");
+        let mut body = catalog(&f.cli, &f.bare, &f.lean, first, 100);
+        body.as_object_mut()
+            .expect("catalog is an object")
+            .remove("plan_sha256");
+        body["version"] = json!(2);
+        body["plan_sha256s"] = json!([first, unapproved, second]);
+        body["step_timeout_ms"] = json!(60_000);
+        write_new(&config, 0o600, &serde_json::to_vec(&body)?)?;
+        let mut daemon = Daemon::spawn(&f.root, Some(&config))?;
+        ready(&mut daemon, &f.root)?;
+        let checkpoints = daemon.poll(
+            Duration::from_secs(70),
+            "both approved v2 checkpoints",
+            || {
+                let first = f.checkpoint(first)?;
+                let second = f.checkpoint(second)?;
+                Ok((first.status == T3SweepState::Complete
+                    && second.status == T3SweepState::Complete)
+                    .then_some([first, second]))
+            },
+        )?;
+        assert!(
+            checkpoints
+                .iter()
+                .all(|c| c.revision.is_some_and(|r| r >= 2))
+        );
+        let claim = f.claim("C")?;
+        assert!(!claim.stale);
+        assert_eq!(claim.effective_trust, Trust::L5);
+        assert_ne!(before.receipt_id, claim.receipt_id);
+        assert_eq!(f.receipt_count()?, 2);
+        let state = f.state()?;
+        assert_eq!(
+            state
+                .events_after(seq, 32)?
+                .iter()
+                .filter(|event| event.event_type == "RECEIPT_RECORDED")
+                .count(),
+            1
+        );
+        assert!(state.applied_t3_plan(&unapproved)?.is_none());
+        assert_eq!(f.main()?, reviewed);
+        f.stop(daemon)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
     fn native_autosweep_is_opt_in_resumes_and_latches_only_approved_work() -> Result<()> {
         let tmp = short_tempdir()?;
         let f = Fixture::new(

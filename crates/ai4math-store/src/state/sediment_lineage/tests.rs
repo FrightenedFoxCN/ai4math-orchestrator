@@ -359,6 +359,71 @@ fn retained_core_fixture(
 }
 
 #[test]
+fn legacy_t3_head_uniqueness_migrates_without_touching_receipts_events_or_checkpoints() -> Result<()>
+{
+    let temp = tempfile::tempdir()?;
+    let path = temp.path().join("legacy.sqlite");
+    let mut legacy = StateStore::open(&path)?;
+    let (adaptation, record) = retained_core_fixture(&mut legacy)?;
+    let first = apply_core_t3_plan(&mut legacy, &adaptation.plan, NEW, LATER, 1)?;
+    restore_core_t3(&mut legacy, &adaptation.plan, &first, 1)?;
+    let step = legacy.t3_sweep_step(&first.plan_sha256, 1, false, "fixture:migration", |_| {
+        anyhow::bail!("already restored Claim")
+    })?;
+    let checkpoint = step.progress;
+    let receipt = legacy
+        .lean_spec_recheck(&adaptation.plan.target_claim, &first.plan_sha256)?
+        .unwrap();
+    let seq = last_seq(&legacy.db)?;
+    legacy.db.execute_batch(
+        "CREATE UNIQUE INDEX legacy_t3_one_head ON applied_t3_plans(reviewed_commit);
+                              DELETE FROM state_migrations WHERE version=2;",
+    )?;
+    drop(legacy);
+
+    let readonly = StateStore::open_readonly(&path)?;
+    assert_eq!(readonly.t3_sweep_status(&first.plan_sha256)?, checkpoint);
+    assert_core_evidence(&readonly, &record, LATER)?;
+    assert_eq!(last_seq(&readonly.db)?, seq);
+    assert!(super::super::migrations::pending(&readonly.db)?);
+    drop(readonly);
+
+    let mut migrated = StateStore::open(&path)?;
+    assert!(!super::super::migrations::pending(&migrated.db)?);
+    assert_eq!(last_seq(&migrated.db)?, seq);
+    assert_eq!(migrated.t3_sweep_status(&first.plan_sha256)?, checkpoint);
+    assert_eq!(
+        migrated.applied_t3_plan(&first.plan_sha256)?,
+        Some(first.clone())
+    );
+    assert_eq!(
+        migrated
+            .lean_spec_recheck(&adaptation.plan.target_claim, &first.plan_sha256)?
+            .as_ref(),
+        Some(&receipt)
+    );
+    assert_core_evidence(&migrated, &record, LATER)?;
+    assert!(
+        migrated
+            .db
+            .query_row("PRAGMA foreign_keys", [], |r| r.get::<_, bool>(0))?
+    );
+
+    let second = apply_core_t3_plan(&mut migrated, &adaptation.plan, NEW, LATER, 2)?;
+    assert!(migrated.current_sediment_lineages()?.is_empty());
+    restore_core_t3(&mut migrated, &adaptation.plan, &second, 2)?;
+    assert_core_evidence(&migrated, &record, LATER)?;
+    assert_eq!(migrated.t3_sweep_status(&first.plan_sha256)?, checkpoint);
+    assert_eq!(
+        migrated
+            .lean_spec_recheck(&adaptation.plan.target_claim, &first.plan_sha256)?
+            .as_ref(),
+        Some(&receipt)
+    );
+    Ok(())
+}
+
+#[test]
 fn core_selector_tracks_exact_current_recheck_across_repeated_taint() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let db = temp.path().join("state.sqlite");
