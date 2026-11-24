@@ -676,6 +676,10 @@ impl Promotion<'_> {
         &self.base
     }
 
+    pub(crate) fn module(&self) -> &str {
+        &self.module
+    }
+
     pub fn repo(&self) -> &Path {
         self.repo
     }

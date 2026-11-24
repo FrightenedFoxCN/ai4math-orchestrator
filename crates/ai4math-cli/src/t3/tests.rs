@@ -3,6 +3,32 @@ use crate::{declare_claim, init, managed_tests::git, promote_managed};
 use ai4math_store::{Change, Trust};
 use std::{env, fs, path::PathBuf};
 
+#[test]
+fn project_delta_sorts_module_add_remove_and_keeps_unchanged_bytes_out() {
+    let baseline = [
+        ("Gone.lean", "old".into()),
+        ("Keep.lean", "same".into()),
+        ("Revise.lean", "old".into()),
+    ];
+    let current = [
+        ("Revise.lean", "new".into()),
+        ("Keep.lean", "same".into()),
+        ("Added.lean", "new".into()),
+    ];
+    let change = ProjectDelta::between(&baseline, &current);
+    assert!(change.changed());
+    assert!(change.module_order_changed);
+    assert_eq!(
+        change.changed_modules,
+        ["Added.lean", "Gone.lean", "Revise.lean"]
+    );
+    assert_eq!(
+        change.all_modules.into_iter().collect::<Vec<_>>(),
+        ["Added.lean", "Gone.lean", "Keep.lean", "Revise.lean"]
+    );
+    assert!(!ProjectDelta::between(&baseline, &baseline).changed());
+}
+
 fn project(root: &Path) -> Result<(PathBuf, String)> {
     init(root, Engine::Lean4)?;
     let working = root.join("work");

@@ -1,6 +1,8 @@
 //! Operator T3 coordination. Resolves reviewed Git objects, never treats a ledger row as proof.
+mod discovery;
 #[cfg(unix)]
 mod parent;
+pub(crate) use discovery::discover;
 #[cfg(test)]
 mod tests;
 use super::{
@@ -492,102 +494,140 @@ pub(crate) fn plan(
     );
     let before = locked.snapshot(anchor, Some(old))?;
     let after_snapshot = locked.snapshot(anchor, Some(reviewed))?;
-    let before_rows = before.project()?;
     let after_rows = after_snapshot.project()?;
-    let before = before_rows
-        .iter()
-        .map(|(p, s)| (*p, s.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    let after = after_rows
-        .iter()
-        .map(|(p, s)| (*p, s.as_str()))
-        .collect::<BTreeMap<_, _>>();
-    let all_modules = before
-        .keys()
-        .chain(after.keys())
-        .copied()
-        .collect::<BTreeSet<_>>();
-    let changed_modules = all_modules
-        .iter()
-        .copied()
-        .filter(|p| before.get(p) != after.get(p))
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let order_changed = before_rows
-        .iter()
-        .map(|(p, _)| p)
-        .ne(after_rows.iter().map(|(p, _)| p));
+    let delta = ProjectDelta::between(&before.project()?, &after_rows);
     ensure!(
-        !changed_modules.is_empty() || order_changed,
+        delta.changed(),
         "the review contains no source or module-order change"
     );
-    // The DDL does not record whether dependency discovery is complete. Mark the
-    // bounded whole snapshot, not just graph edges that happen to be registered.
-    let preview = state.preview_t3(&[], &all_modules.iter().copied().collect::<Vec<_>>())?;
-    let mut claims = Vec::new();
-    for id in preview.impact.claims {
-        let current = state
-            .claim(&id)?
-            .context("T3 claim disappeared while planning")?;
-        let prior_trust = current.prior_trust.unwrap_or(current.local_trust);
-        let old_proof = if prior_trust != Trust::L5 {
-            ProofDisposition::NotL5
-        } else if let Some(recipe) = state.managed_proof_recipe(&id)? {
-            let spec = state.lean_spec(&id)?;
-            if spec.is_some()
-                && state
-                    .lean_spec_comparison(&recipe.promoted_commit)?
-                    .as_ref()
-                    .is_none_or(|c| c.claim_id != id)
-            {
-                ProofDisposition::InvalidProvenance
-            } else {
-                diagnose_recipe(
-                    locked,
-                    engine,
-                    &recipe,
-                    old,
-                    &after_rows,
-                    &after_snapshot,
-                    spec.as_ref(),
-                )
-            }
-        } else {
-            ProofDisposition::MissingManagedRecipe
-        };
-        claims.push(ClaimPlan {
-            claim_id: id,
-            prior_trust,
-            old_proof,
-        });
+    delta.build_plan(state, locked, old, engine, &after_snapshot, &after_rows)
+}
+
+struct ProjectDelta<'a> {
+    all_modules: BTreeSet<&'a str>,
+    changed_modules: Vec<String>,
+    module_order_changed: bool,
+}
+
+impl<'a> ProjectDelta<'a> {
+    fn between(before_rows: &[(&'a str, String)], after_rows: &[(&'a str, String)]) -> Self {
+        let before = before_rows
+            .iter()
+            .map(|(p, s)| (*p, s.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let after = after_rows
+            .iter()
+            .map(|(p, s)| (*p, s.as_str()))
+            .collect::<BTreeMap<_, _>>();
+        let all_modules = before
+            .keys()
+            .chain(after.keys())
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let changed_modules = all_modules
+            .iter()
+            .copied()
+            .filter(|p| before.get(p) != after.get(p))
+            .map(str::to_owned)
+            .collect();
+        let module_order_changed = before_rows
+            .iter()
+            .map(|(p, _)| p)
+            .ne(after_rows.iter().map(|(p, _)| p));
+        Self {
+            all_modules,
+            changed_modules,
+            module_order_changed,
+        }
     }
-    // If any claim, provenance, or graph changed between snapshots the digest
-    // could mix generations. Re-run the dry-run instead of guessing.
-    ensure!(
-        state.status()?.last_event_seq == preview.event_seq,
-        "ledger changed while computing T3 plan; rerun preview"
-    );
-    let affected_modules = preview.impact.modules;
-    let plan_sha256 = sha(&serde_json::to_vec(&(
-        "ai4math-t3-plan-v1",
-        anchor,
-        engine.as_str(),
-        old,
-        reviewed,
-        preview.event_seq,
-        &changed_modules,
-        &affected_modules,
-        &claims,
-    ))?);
-    Ok(Plan {
-        base_commit: old.into(),
-        reviewed_commit: reviewed.into(),
-        ledger_event_seq: preview.event_seq,
-        changed_modules,
-        affected_modules,
-        claims,
-        plan_sha256,
-    })
+
+    fn changed(&self) -> bool {
+        !self.changed_modules.is_empty() || self.module_order_changed
+    }
+
+    fn build_plan(
+        self,
+        state: &mut StateStore,
+        locked: &PromotionRepo,
+        old: &str,
+        engine: Engine,
+        after_snapshot: &Promotion<'_>,
+        after_rows: &[(&str, String)],
+    ) -> Result<Plan> {
+        let reviewed = after_snapshot.base();
+        let Self {
+            all_modules,
+            changed_modules,
+            ..
+        } = self;
+        // The DDL does not record whether dependency discovery is complete. Mark the
+        // bounded whole snapshot, not just graph edges that happen to be registered.
+        let preview = state.preview_t3(&[], &all_modules.iter().copied().collect::<Vec<_>>())?;
+        let mut claims = Vec::new();
+        for id in preview.impact.claims {
+            let current = state
+                .claim(&id)?
+                .context("T3 claim disappeared while planning")?;
+            let prior_trust = current.prior_trust.unwrap_or(current.local_trust);
+            let old_proof = if prior_trust != Trust::L5 {
+                ProofDisposition::NotL5
+            } else if let Some(recipe) = state.managed_proof_recipe(&id)? {
+                let spec = state.lean_spec(&id)?;
+                if spec.is_some()
+                    && state
+                        .lean_spec_comparison(&recipe.promoted_commit)?
+                        .as_ref()
+                        .is_none_or(|c| c.claim_id != id)
+                {
+                    ProofDisposition::InvalidProvenance
+                } else {
+                    diagnose_recipe(
+                        locked,
+                        engine,
+                        &recipe,
+                        old,
+                        after_rows,
+                        after_snapshot,
+                        spec.as_ref(),
+                    )
+                }
+            } else {
+                ProofDisposition::MissingManagedRecipe
+            };
+            claims.push(ClaimPlan {
+                claim_id: id,
+                prior_trust,
+                old_proof,
+            });
+        }
+        // If any claim, provenance, or graph changed between snapshots the digest
+        // could mix generations. Re-run the dry-run instead of guessing.
+        ensure!(
+            state.status()?.last_event_seq == preview.event_seq,
+            "ledger changed while computing T3 plan; rerun preview"
+        );
+        let affected_modules = preview.impact.modules;
+        let plan_sha256 = sha(&serde_json::to_vec(&(
+            "ai4math-t3-plan-v1",
+            after_snapshot.module(),
+            engine.as_str(),
+            old,
+            reviewed,
+            preview.event_seq,
+            &changed_modules,
+            &affected_modules,
+            &claims,
+        ))?);
+        Ok(Plan {
+            base_commit: old.into(),
+            reviewed_commit: reviewed.into(),
+            ledger_event_seq: preview.event_seq,
+            changed_modules,
+            affected_modules,
+            claims,
+            plan_sha256,
+        })
+    }
 }
 
 fn predecessors<'a>(sources: &'a [(&str, String)], index: usize) -> Vec<(&'a str, &'a str)> {
