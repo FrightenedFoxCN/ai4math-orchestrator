@@ -5,7 +5,7 @@ use crate::{
     trusted_toolchain,
     worker_dispatch::private_state_path,
 };
-use ai4math_broker::{Broker, LeanBuildAudit, ManagedLeanTheoremAudit};
+use ai4math_broker::{Broker, LeanBuildAudit, LeanHeartbeatAudit, ManagedLeanTheoremAudit};
 use ai4math_core::Engine;
 use ai4math_store::{StateStore, TrustDebtScan};
 use anyhow::{Context, Result, ensure};
@@ -174,6 +174,46 @@ pub(crate) fn audit_managed_theorem(
         target_module: request.module.into(),
         declaration: request.declaration.into(),
         result,
+    })
+}
+
+#[derive(Serialize)]
+pub(crate) struct HeartbeatReport {
+    schema: &'static str,
+    advisory_only: bool,
+    reviewed_commit: String,
+    ledger_event_seq: i64,
+    #[serde(flatten)]
+    observation: LeanHeartbeatAudit,
+}
+
+pub(crate) fn audit_heartbeats(
+    root: &Path,
+    repo: &Path,
+    module: &str,
+    reviewed: &str,
+    executable: &Path,
+    compiler_sha256: &str,
+) -> Result<HeartbeatReport> {
+    let (observation, (), ledger_event_seq, _) = at_generation(
+        root,
+        repo,
+        module,
+        reviewed,
+        |_, _| Ok(()),
+        |engine, modules| {
+            let toolchain = trusted_toolchain(engine, executable, None)?;
+            Broker::new()
+                .audit_lean_heartbeats(&toolchain, modules, module, compiler_sha256)
+                .context("managed Lean heartbeat observation failed")
+        },
+    )?;
+    Ok(HeartbeatReport {
+        schema: "ai4math.t2.lean-heartbeats.v1",
+        advisory_only: true,
+        reviewed_commit: reviewed.into(),
+        ledger_event_seq,
+        observation,
     })
 }
 

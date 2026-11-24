@@ -84,6 +84,14 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
         )
     };
     let pin = "a".repeat(64);
+    let heartbeats = |repo: &str, reviewed: &str| {
+        ai(
+            &root,
+            "t2-heartbeats",
+            &[repo, "Audit.lean", reviewed, nonexistent, &pin],
+        )
+    };
+    rejects(heartbeats(repo_str, &head), "initialized private project");
     let managed_theorem = |repo: &str, reviewed: &str| {
         ai(
             &root,
@@ -219,6 +227,14 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
         publish(&old, "launch-v1"),
         "reviewed T2 commit is not current main",
     );
+    rejects(
+        heartbeats(other_str, &head),
+        "not bound to the supplied managed repository",
+    );
+    rejects(
+        heartbeats(repo_str, &old),
+        "reviewed T2 commit is not current main",
+    );
     let lease = ProjectNativeGate::new(&root).try_heavy().unwrap();
     rejects(audit(repo_str, &head), "project native execution is busy");
     rejects(
@@ -235,6 +251,10 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
     );
     rejects(
         publish(&head, "launch-v1"),
+        "project native execution is busy",
+    );
+    rejects(
+        heartbeats(repo_str, &head),
         "project native execution is busy",
     );
     drop(lease);

@@ -21,6 +21,8 @@ pub use golden::{RegressionArtifacts, clone_golden};
 mod sandbox;
 mod t2_build;
 pub use t2_build::{LeanBuildAudit, LeanBuildModuleAudit};
+mod t2_heartbeats;
+pub use t2_heartbeats::{LeanHeartbeatAudit, LeanHeartbeatProfile};
 mod t2_managed_export;
 pub use t2_managed_export::{
     MAX_MANAGED_T2_THEOREMS, ManagedLeanBatchAudit, ManagedLeanBatchCheck, ManagedLeanTheoremAudit,
