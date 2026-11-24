@@ -65,17 +65,17 @@ L0 (Conjecture)
 
 1. **分类判定**：
    * **叶证明更新（Proof-body-only Promotion / Golfing）**：未改动定义、签名、`@[simp]` 或 `instance` → **零下游标脏**，Fast Lane 热池零重启，仅触发父节点 `effective_trust_level` 重新聚合；
-   * **结构性变更（Definition / Signature / Global Attribute / Instance 变更，触发 T3）**：沿 Claim Graph 向下游 BFS 传播，将全部传递依赖节点置为 `stale = true`，同时保留 `prior_trust_level` 与 `taint_root_commit`。
+   * **结构性变更（Definition / Signature / Global Attribute / Instance 变更，触发 T3）**：沿 Claim Graph 的未失效路线向下游 BFS 传播，并合并物理模块的影响范围，将受影响的传递依赖节点置为 `stale = true`，同时保留 `prior_trust_level` 与 `taint_root_commit`。
 2. **拓扑序机会主义快速洗白（Opportunistic Clean Re-check）**：
    * Heavy Lane 先按拓扑序重建受影响模块切片的新 Golden `.olean`/`.agdai`/`.vo` 快照；
    * 对标脏前本就为 `L5` 的节点，**绝不立刻派 LLM 重写**——先由 Broker 拿旧证明代码在新 Golden 快照上执行一次零 Token 的洁净室复检：
-     * 复检通过（签发新 `VerificationReceipt`）→ 直接清除 `stale = false`，保留 `L5`；
-     * 复检失败 → 降级为 `L3`，提取精确编译器错误摘要并重新排入 Prover / Infra 队列。
+     * 复检通过（签发新 `VerificationReceipt`）→ 清除 `stale`，保留 `L5`。带已审 Lean 规格的 Claim 还必须用此候选对原规格重新做内核定义等价比较，将比较证据和恢复信任原子入账；单独 T3 回执不能清除标脏。
+     * 可归因于目标的确定复检失败（无已审规格绑定）→ 降级为 `L3`，提取精确编译器错误摘要；重排 Prover / Infra 队列属于调度层。若证据不可用，或已审规格的原字节、来源或定义等价无法确认，则保留 `stale`，不把缺失证据当成反例。
 
 ### 4.3 硬证伪传播（`L2b` Refutation Propagation）
 当某节点 $v$ 经主引擎确认升格为 `L2b`：
 1. 永久归档反例 witness 至本地 Wiki `GRAVEYARD`；
-2. 遍历所有依赖 $v$ 的 `ProofPlan`，将其状态置为 `INVALIDATED_BY_REFUTATION`；
+2. 直接依赖 $v$ 的 `ProofPlan` 置为 `INVALIDATED_BY_REFUTATION`。若某个上游命题仅仅是路线耗尽（没有被内核证伪），依赖它的方案显示为派生状态 `BLOCKED_BY_REFUTATION`；新增可行替代路线可解除这个阻塞，不改写直接证伪记录或历史告警。
 3. 检查每个受影响父 `Claim` $u$：
    * 若 $u$ 仍有其他活跃 `ProofPlan` → 记入普通事件，不中断无人值守；
    * 若 $v$ 本身是主关键路径顶层猜想，或导致顶层猜想的**全部已知方案均失效** → 立刻触发 P0 Push Alert（`CRITICAL_CLAIM_REFUTED`）并写入 `DecisionInbox`。

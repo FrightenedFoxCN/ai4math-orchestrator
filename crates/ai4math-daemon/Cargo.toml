@@ -1,0 +1,22 @@
+[package]
+name = "ai4math-daemon"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ai4mathd"
+path = "src/main.rs"
+
+[dependencies]
+ai4math-store.workspace = true
+ai4math-core.workspace = true
+ai4math-broker.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+libc.workspace = true
+tempfile.workspace = true
+
+[dev-dependencies]
+rusqlite.workspace = true

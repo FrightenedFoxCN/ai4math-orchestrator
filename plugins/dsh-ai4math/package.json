@@ -1,0 +1,31 @@
+{
+  "name": "dsh-ai4math",
+  "version": "0.1.0",
+  "description": "AI4Math local daemon bridge and mathematical workspace for DeepSeek Harness",
+  "type": "module",
+  "exports": {
+    ".": "./host/index.mjs",
+    "./client": "./client/client.js",
+    "./package.json": "./package.json"
+  },
+  "scripts": {
+    "build": "node client/build.mjs",
+    "test": "node --test host/test/*.test.mjs client/test/*.test.mjs"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-scope": "0.2.2-rc.5",
+    "@deepseek-ai/schemastery": "~3.19.0",
+    "zod": "^4.6.6"
+  },
+  "dsh": {
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-api-gateway",
+        "@deepseek-ai/dsh-client-ui-layout",
+        "@deepseek-ai/dsh-client-ui-sidebar-right"
+      ]
+    }
+  }
+}

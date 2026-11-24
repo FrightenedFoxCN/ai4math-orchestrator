@@ -1,0 +1,11 @@
+[package]
+name = "ai4math-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

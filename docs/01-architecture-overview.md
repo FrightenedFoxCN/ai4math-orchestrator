@@ -116,9 +116,8 @@
 4. **ADR 转向语义**：人类决策固化为 ADR 后，系统自动优雅取消废弃分支在跑子任务、将可用中间引理沉降入 Wiki、对受影响节点触发 T3 标脏并下发新 RFC。
 
 ---
+## 7. 工程交付路线图
 
-## 7. 分阶段落地路线图
+工程阶段以 [08. 工程实现架构 §5](08-engineering-architecture.md#5-分阶段实现顺序) 为准：**Phase 1：Rust 核心 + CLI 验证闭环 → Phase 2：常驻守护进程 → Phase 3：DSH 插件与 Live HUD**。阶段状态见 [README](../README.md)，首阶段验收见 [Phase 1 清单](phase-1.md)。
 
-* **Phase 1（最小闭环底座）**：选定主引擎（默认 Lean 4）+ SMT（Z3/cvc5）主线；落地 Local Verification Broker（沙箱 + 洁净室 `VerificationReceipt`）、基础 AND-OR Claim Graph（`L0`–`L5`）及核心角色物理权限隔离。
-* **Phase 2（双轨协作 + 分层 Wiki + 异步共驾）**：落地 Exploration/Infra 双轨（RFC + Smoke Test + Freeze Window）、三层本地 Wiki 索引（CORE/SEDIMENT/GRAVEYARD）、Decision Inbox 与 5 分钟复盘简报。
-* **Phase 3（多引擎扩展）**：通过统一 Proof-Assistant Adapter 支持项目级可配置主引擎（Lean 4 / Agda / Rocq）、`tool_automation` Hammer 子代理及剪枝前 Oracle 交叉印证门禁。
+探索/基建双轨、异步共驾与多引擎是产品能力，不另设同名阶段。Phase 1 先用 Lean 4 / Agda 建立可信验证与状态底座；常驻协作、人工交互和其余引擎适配随工程交付逐步接入。

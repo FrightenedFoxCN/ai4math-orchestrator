@@ -406,6 +406,25 @@
       },
       "additionalProperties": false
     },
+    "CriticalBreakerTrippedPayload": {
+      "type": "object",
+      "description": "Cause of an escalated trip. New events carry an exact positive critical_claim_count. Historical events can lack route evidence.",
+      "required": ["state", "inbox_id", "trip_event_seq"],
+      "properties": {
+        "state": { "const": "TRIPPED" },
+        "inbox_id": { "type": "string", "minLength": 1, "maxLength": 104 },
+        "trip_event_seq": { "type": "integer", "minimum": 1 },
+        "critical_claim_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "Lexicographically first newly blocked critical Claim ID. Omitted rather than shortened if the exact ID exceeds the 256-byte public bound or contains control characters."
+        },
+        "critical_claim_count": { "type": "integer", "minimum": 1 }
+      },
+      "dependentRequired": { "critical_claim_id": ["critical_claim_count"] },
+      "additionalProperties": false
+    },
     "PushAlert": {
       "type": "object",
       "required": [

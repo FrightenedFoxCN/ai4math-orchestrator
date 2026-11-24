@@ -1,0 +1,17 @@
+[package]
+name = "ai4math-store"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ai4math-broker.workspace = true
+ai4math-core.workspace = true
+anyhow.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+serde.workspace = true
+# Reparse retained JSON scores exactly before recomputing their canonical digest.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+serde_yaml.workspace = true
+sha2.workspace = true
+tempfile.workspace = true

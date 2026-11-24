@@ -3,7 +3,7 @@
 
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
+PRAGMA synchronous = FULL;
 
 -- 1. Append-Only Event Log (monotonic timeline for Live HUD & Briefing Fact Pack diffs)
 CREATE TABLE IF NOT EXISTS events (
@@ -188,3 +188,235 @@ CREATE TABLE IF NOT EXISTS decision_inbox (
 
 CREATE INDEX IF NOT EXISTS idx_inbox_pending_rank
   ON decision_inbox (status, priority, leverage_score DESC);
+
+-- 9. Daemon P0 scan/deduplication. Internal, not an agent-writable interface.
+CREATE TABLE IF NOT EXISTS daemon_alert_cursor (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  event_seq INTEGER NOT NULL CHECK (event_seq >= 0)
+);
+INSERT OR IGNORE INTO daemon_alert_cursor(singleton,event_seq) VALUES(1,0);
+
+CREATE TABLE IF NOT EXISTS daemon_alerts (
+  alert_id TEXT PRIMARY KEY,
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq),
+  created_at TEXT NOT NULL,
+  reason_code TEXT NOT NULL,
+  dedupe_key TEXT NOT NULL,
+  headline TEXT NOT NULL,
+  entity_id TEXT NOT NULL,
+  briefing_id TEXT NOT NULL,
+  dispatched_unix INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_daemon_alerts_dedupe ON daemon_alerts(dedupe_key, dispatched_unix);
+
+-- Derived refutation state does not change the kernel trust of a claim.
+CREATE TABLE IF NOT EXISTS proof_plan_route_blocks (
+  plan_id TEXT PRIMARY KEY REFERENCES proof_plans(plan_id),
+  refuted_claim_id TEXT NOT NULL REFERENCES claims(claim_id)
+);
+CREATE TABLE IF NOT EXISTS claim_route_exhaustion (
+  claim_id TEXT PRIMARY KEY REFERENCES claims(claim_id),
+  refuted_claim_id TEXT NOT NULL REFERENCES claims(claim_id)
+);
+CREATE TABLE IF NOT EXISTS state_migrations (version INTEGER PRIMARY KEY);
+
+-- Cooperating CLI uses a durable prepare record before updating Git. The
+-- recovery process re-verifies source rather than treating the record as evidence.
+CREATE TABLE IF NOT EXISTS managed_repo (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), repo TEXT NOT NULL);
+
+-- Internal regression episode state, never projected or used as trust evidence.
+-- Holds only the last observed base; a newer observed base or final promotion
+-- clears all pending and latched contexts. At most 4096 context rows per base
+-- (enforced by the typed writer), each with up to two pending candidate hashes.
+CREATE TABLE IF NOT EXISTS managed_regression_base (
+  singleton INTEGER PRIMARY KEY CHECK(singleton=1) REFERENCES managed_repo(singleton),
+  base_commit TEXT NOT NULL CHECK(length(base_commit) IN (40,64) AND base_commit NOT GLOB '*[^0-9a-f]*')
+);
+CREATE TABLE IF NOT EXISTS managed_regression_incidents (
+  context_sha256 TEXT PRIMARY KEY NOT NULL CHECK(length(context_sha256)=64 AND context_sha256 NOT GLOB '*[^0-9a-f]*'),
+  opened_at_ms INTEGER CHECK(opened_at_ms>=0),
+  first_sha256 TEXT CHECK(length(first_sha256)=64 AND first_sha256 NOT GLOB '*[^0-9a-f]*'),
+  second_sha256 TEXT CHECK(length(second_sha256)=64 AND second_sha256 NOT GLOB '*[^0-9a-f]*' AND second_sha256<>first_sha256),
+  emitted_event_seq INTEGER UNIQUE REFERENCES events(event_seq),
+  CHECK (
+    (emitted_event_seq IS NULL AND opened_at_ms IS NOT NULL AND first_sha256 IS NOT NULL) OR
+    (emitted_event_seq IS NOT NULL AND opened_at_ms IS NULL AND first_sha256 IS NULL AND second_sha256 IS NULL)
+  )
+);
+CREATE TABLE IF NOT EXISTS promotion_intent (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  repo TEXT NOT NULL,
+  claim_id TEXT NOT NULL REFERENCES claims(claim_id),
+  base_commit TEXT NOT NULL,
+  new_commit TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  target_decl TEXT NOT NULL,
+  proof_body TEXT NOT NULL
+);
+-- Single in-flight cross-resource ADR transaction; not an event and not an approval by itself.
+CREATE TABLE IF NOT EXISTS pivot_resume_intent (
+  singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+  adr_id TEXT NOT NULL,
+  plan_json TEXT NOT NULL,
+  new_commit TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS recorded_pivots (
+  adr_id TEXT PRIMARY KEY,
+  plan_json TEXT NOT NULL,
+  git_commit TEXT NOT NULL UNIQUE,
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq),
+  reviewed_through INTEGER NOT NULL REFERENCES events(event_seq)
+);
+-- One approved whole-batch native probe plan at a time per breaker. Old
+-- plans remain audit history; a fresh approval supersedes them by event order.
+CREATE TABLE IF NOT EXISTS breaker_probe_batches (
+  approval_id TEXT PRIMARY KEY,
+  breaker_id TEXT NOT NULL REFERENCES circuit_breakers(breaker_id),
+  adr_id TEXT NOT NULL REFERENCES recorded_pivots(adr_id),
+  plan_json TEXT NOT NULL,
+  arm_event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq),
+  required INTEGER NOT NULL CHECK (required BETWEEN 1 AND 2),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts BETWEEN 0 AND 8),
+  status TEXT NOT NULL CHECK(status IN ('READY','RUNNING','NEEDS_PROBE','PASSED')),
+  receipt_sha256 TEXT,
+  CHECK ((status = 'PASSED') = (receipt_sha256 IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_breaker_probe_latest ON breaker_probe_batches(breaker_id,arm_event_seq DESC);
+CREATE TABLE IF NOT EXISTS recorded_promotions (
+  git_commit TEXT PRIMARY KEY,
+  base_commit TEXT NOT NULL,
+  claim_id TEXT NOT NULL REFERENCES claims(claim_id),
+  receipt_id TEXT NOT NULL UNIQUE REFERENCES verification_receipts(receipt_id),
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq)
+);
+
+-- Human-reviewed Lean spec prefixes are immutable per Claim. A binding adds no trust.
+CREATE TABLE IF NOT EXISTS reviewed_lean_specs (
+  claim_id TEXT PRIMARY KEY NOT NULL REFERENCES claims(claim_id),
+  repo TEXT NOT NULL,
+  approved_git_commit TEXT NOT NULL CHECK(length(approved_git_commit) IN (40,64) AND approved_git_commit NOT GLOB '*[^0-9a-f]*'),
+  spec_file TEXT NOT NULL,
+  spec_decl TEXT NOT NULL,
+  spec_prefix_sha256 TEXT NOT NULL CHECK(length(spec_prefix_sha256)=64 AND spec_prefix_sha256 NOT GLOB '*[^0-9a-f]*')
+);
+CREATE TRIGGER IF NOT EXISTS reviewed_lean_specs_no_update BEFORE UPDATE ON reviewed_lean_specs
+BEGIN SELECT RAISE(ABORT, 'reviewed Lean specs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS reviewed_lean_specs_no_delete BEFORE DELETE ON reviewed_lean_specs
+BEGIN SELECT RAISE(ABORT, 'reviewed Lean specs are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS reviewed_lean_specs_no_replace BEFORE INSERT ON reviewed_lean_specs
+WHEN EXISTS (SELECT 1 FROM reviewed_lean_specs WHERE claim_id = NEW.claim_id)
+BEGIN SELECT RAISE(ABORT, 'reviewed Lean specs are immutable'); END;
+
+-- Recorded in the same transaction as its promotion. A journal is not comparison evidence.
+CREATE TABLE IF NOT EXISTS lean_spec_comparisons (
+  git_commit TEXT PRIMARY KEY NOT NULL REFERENCES recorded_promotions(git_commit),
+  spec_file TEXT NOT NULL,
+  spec_decl TEXT NOT NULL,
+  spec_prefix_sha256 TEXT NOT NULL CHECK(length(spec_prefix_sha256)=64 AND spec_prefix_sha256 NOT GLOB '*[^0-9a-f]*'),
+  candidate_receipt_sha256 TEXT NOT NULL REFERENCES verification_receipts(receipt_sha256),
+  receipt_sha256 TEXT NOT NULL CHECK(length(receipt_sha256)=64 AND receipt_sha256 NOT GLOB '*[^0-9a-f]*')
+);
+CREATE TRIGGER IF NOT EXISTS lean_spec_comparisons_no_update BEFORE UPDATE ON lean_spec_comparisons
+BEGIN SELECT RAISE(ABORT, 'Lean comparison evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS lean_spec_comparisons_no_delete BEFORE DELETE ON lean_spec_comparisons
+BEGIN SELECT RAISE(ABORT, 'Lean comparison evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS lean_spec_comparisons_no_replace BEFORE INSERT ON lean_spec_comparisons
+WHEN EXISTS (SELECT 1 FROM lean_spec_comparisons WHERE git_commit = NEW.git_commit)
+BEGIN SELECT RAISE(ABORT, 'Lean comparison evidence is immutable'); END;
+
+-- Applied operator plans pin taint to an observed Git snapshot and ledger generation.
+CREATE TABLE IF NOT EXISTS applied_t3_plans (
+  plan_sha256 TEXT PRIMARY KEY,
+  base_commit TEXT NOT NULL,
+  reviewed_commit TEXT NOT NULL UNIQUE,
+  anchor_module TEXT NOT NULL,
+  preview_event_seq INTEGER NOT NULL
+);
+
+-- Sealed reviewed Lean T3 evidence, written atomically with the new proof receipt and trust restoration.
+CREATE TABLE IF NOT EXISTS lean_spec_rechecks (
+  claim_id TEXT NOT NULL REFERENCES reviewed_lean_specs(claim_id),
+  plan_sha256 TEXT NOT NULL REFERENCES applied_t3_plans(plan_sha256),
+  reviewed_commit TEXT NOT NULL,
+  promoted_commit TEXT NOT NULL REFERENCES lean_spec_comparisons(git_commit),
+  spec_file TEXT NOT NULL,
+  spec_decl TEXT NOT NULL,
+  spec_prefix_sha256 TEXT NOT NULL CHECK(length(spec_prefix_sha256)=64 AND spec_prefix_sha256 NOT GLOB '*[^0-9a-f]*'),
+  candidate_file TEXT NOT NULL,
+  candidate_decl TEXT NOT NULL,
+  candidate_source_sha256 TEXT NOT NULL CHECK(length(candidate_source_sha256)=64 AND candidate_source_sha256 NOT GLOB '*[^0-9a-f]*'),
+  candidate_receipt_sha256 TEXT NOT NULL REFERENCES verification_receipts(receipt_sha256),
+  comparison_receipt_sha256 TEXT NOT NULL CHECK(length(comparison_receipt_sha256)=64 AND comparison_receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+  PRIMARY KEY (claim_id, plan_sha256)
+);
+CREATE TRIGGER IF NOT EXISTS lean_spec_rechecks_no_update BEFORE UPDATE ON lean_spec_rechecks
+BEGIN SELECT RAISE(ABORT, 'Lean recheck evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS lean_spec_rechecks_no_delete BEFORE DELETE ON lean_spec_rechecks
+BEGIN SELECT RAISE(ABORT, 'Lean recheck evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS lean_spec_rechecks_no_replace BEFORE INSERT ON lean_spec_rechecks
+WHEN EXISTS (SELECT 1 FROM lean_spec_rechecks WHERE claim_id=NEW.claim_id AND plan_sha256=NEW.plan_sha256)
+BEGIN SELECT RAISE(ABORT, 'Lean recheck evidence is immutable'); END;
+
+-- Refutable claims bind to a human-reviewed Git context; names alone are not statement identity.
+CREATE TABLE IF NOT EXISTS witness_spec_bindings (
+  claim_id TEXT PRIMARY KEY REFERENCES claims(claim_id),
+  repo TEXT NOT NULL,
+  commit_id TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  proposition_name TEXT NOT NULL
+);
+
+-- Kernel-verified exact counterexamples; the matching Markdown archive is written before this transaction commits.
+CREATE TABLE IF NOT EXISTS verified_refutations (
+  claim_id TEXT PRIMARY KEY REFERENCES claims(claim_id),
+  wiki_id TEXT NOT NULL UNIQUE,
+  witness_sha256 TEXT NOT NULL,
+  commit_id TEXT NOT NULL,
+  file_path TEXT NOT NULL,
+  proposition_name TEXT NOT NULL,
+  source_sha256 TEXT NOT NULL,
+  proof_body TEXT NOT NULL CHECK(length(CAST(proof_body AS BLOB))<=262144),
+  receipt_json TEXT NOT NULL,
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq)
+);
+
+-- Immutable replay material for managed promotions. It is never exposed via the daemon.
+CREATE TABLE IF NOT EXISTS managed_proof_recipes (
+  git_commit TEXT PRIMARY KEY REFERENCES recorded_promotions(git_commit),
+  file_path TEXT NOT NULL,
+  target_decl TEXT NOT NULL,
+  proof_body TEXT NOT NULL CHECK(length(CAST(proof_body AS BLOB))<=262144)
+);
+
+-- Immutable advisory observations tied to the reviewed Claim snapshot, not to
+-- its current row. No trigger may turn this evidence into a trust transition.
+CREATE TABLE IF NOT EXISTS oracle_observations (
+  id TEXT PRIMARY KEY NOT NULL CHECK(length(id)=64 AND id NOT GLOB '*[^0-9a-f]*'),
+  approval_sha256 TEXT NOT NULL CHECK(length(approval_sha256)=64 AND approval_sha256 NOT GLOB '*[^0-9a-f]*'),
+  claim_id TEXT NOT NULL CHECK(length(CAST(claim_id AS BLOB)) BETWEEN 1 AND 256),
+  git_commit TEXT NOT NULL CHECK(length(git_commit) IN (40,64) AND git_commit NOT GLOB '*[^0-9a-f]*'),
+  repo TEXT NOT NULL CHECK(length(CAST(repo AS BLOB)) BETWEEN 1 AND 4096),
+  engine TEXT NOT NULL CHECK(engine IN ('lean4','agda','rocq')),
+  formal_target TEXT NOT NULL CHECK(length(CAST(formal_target AS BLOB)) BETWEEN 1 AND 513),
+  informal_statement TEXT NOT NULL CHECK(length(CAST(informal_statement AS BLOB)) BETWEEN 1 AND 16384),
+  query_sha256 TEXT NOT NULL CHECK(length(query_sha256)=64 AND query_sha256 NOT GLOB '*[^0-9a-f]*'),
+  z3_sha256 TEXT NOT NULL CHECK(length(z3_sha256)=64 AND z3_sha256 NOT GLOB '*[^0-9a-f]*'),
+  cvc5_sha256 TEXT NOT NULL CHECK(length(cvc5_sha256)=64 AND cvc5_sha256 NOT GLOB '*[^0-9a-f]*'),
+  observation_sha256 TEXT NOT NULL CHECK(length(observation_sha256)=64 AND observation_sha256 NOT GLOB '*[^0-9a-f]*'),
+  observation_json TEXT NOT NULL CHECK(length(CAST(observation_json AS BLOB)) BETWEEN 1 AND 131072 AND json_valid(observation_json)),
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq),
+  UNIQUE (approval_sha256, observation_sha256)
+);
+CREATE TRIGGER IF NOT EXISTS oracle_observations_no_update BEFORE UPDATE ON oracle_observations
+BEGIN SELECT RAISE(ABORT, 'Oracle observations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS oracle_observations_no_delete BEFORE DELETE ON oracle_observations
+BEGIN SELECT RAISE(ABORT, 'Oracle observations are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS oracle_observations_no_replace BEFORE INSERT ON oracle_observations
+WHEN EXISTS (SELECT 1 FROM oracle_observations
+  WHERE id=NEW.id OR event_seq=NEW.event_seq
+    OR (approval_sha256=NEW.approval_sha256 AND observation_sha256=NEW.observation_sha256))
+BEGIN SELECT RAISE(ABORT, 'Oracle observations are immutable'); END;
+
+CREATE TRIGGER IF NOT EXISTS events_no_replace BEFORE INSERT ON events
+WHEN EXISTS (SELECT 1 FROM events WHERE event_seq = NEW.event_seq)
+BEGIN SELECT RAISE(ABORT, 'events are append-only'); END;

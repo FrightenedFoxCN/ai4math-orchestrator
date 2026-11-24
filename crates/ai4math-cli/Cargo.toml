@@ -1,0 +1,20 @@
+[package]
+name = "ai4math-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "ai4math"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+ai4math-core.workspace = true
+ai4math-store.workspace = true
+ai4math-broker.workspace = true
+fs2.workspace = true
+libc.workspace = true
+tempfile.workspace = true

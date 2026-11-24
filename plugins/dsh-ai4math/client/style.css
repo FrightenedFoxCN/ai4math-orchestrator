@@ -1,0 +1,66 @@
+.ai4m {
+  --a4-muted: var(--dsw-alias-text-secondary, currentColor);
+  --a4-border: var(--dsw-alias-border-base, color-mix(in srgb, currentColor 20%, transparent));
+  --a4-bg: var(--dsw-alias-bg-base, Canvas);
+  --a4-subtle: color-mix(in srgb, currentColor 6%, transparent);
+  box-sizing: border-box;
+  font: inherit;
+  overflow-wrap: anywhere;
+}
+.ai4m *, .ai4m *::before, .ai4m *::after { box-sizing: inherit; }
+.ai4m-hud {
+  border-block-start: 1px solid var(--a4-border);
+  background: var(--a4-bg);
+  padding: 3px 10px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.ai4m-hud-line { display: flex; align-items: center; gap: 4px 10px; overflow-x: auto; padding: 2px; }
+.ai4m-hud-line > * { flex: 0 0 auto; white-space: nowrap; }
+.ai4m-hud-alert { padding: 2px 2px 4px; max-height: 4.5em; overflow: auto; }
+.ai4m-tape, .ai4m-meta, .ai4m-actions { display: inline-flex; gap: 4px 7px; align-items: center; flex-wrap: wrap; }
+.ai4m-hud-line .ai4m-actions { margin-inline-start: auto; flex-wrap: nowrap; }
+.ai4m-muted { color: var(--a4-muted); }
+.ai4m-badge {
+  display: inline-block;
+  border: 1px solid var(--a4-border);
+  background: var(--a4-subtle);
+  border-radius: 5px;
+  padding: 1px 4px;
+  line-height: 1.2;
+  font-size: .92em;
+}
+.ai4m-badge[data-tone="good"] { border-color: #358860; }
+.ai4m-badge[data-tone="warn"] { border-color: #ab7116; }
+.ai4m-badge[data-tone="danger"] { border-color: #c74748; font-weight: 650; }
+.ai4m-button, .ai4m input, .ai4m select {
+  border: 1px solid var(--a4-border);
+  background: var(--a4-subtle);
+  color: inherit;
+  font: inherit;
+  border-radius: 5px;
+  padding: .22em .55em;
+}
+.ai4m input { max-width: min(60vw, 15em); }
+.ai4m select option { background: var(--a4-bg); }
+.ai4m-button:not(:disabled), .ai4m details > summary { cursor: pointer; }
+.ai4m-button:not(:disabled):hover { background: color-mix(in srgb, currentColor 12%, transparent); }
+.ai4m-button:disabled { opacity: .55; }
+.ai4m :focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
+.ai4m-panel {
+  height: 100%; min-height: 0; min-width: 0; overflow: auto;
+  padding: 12px; display: flex; flex-direction: column; gap: 12px;
+  font-size: 13px; line-height: 1.45;
+}
+.ai4m h2, .ai4m h3, .ai4m h4, .ai4m p, .ai4m pre { margin: 0; }
+.ai4m h2 { font-size: 16px; }
+.ai4m h3 { font-size: 14px; }
+.ai4m h4 { font-size: 13px; }
+.ai4m-panel header .ai4m-actions { margin-block-start: 6px; }
+.ai4m-stack, .ai4m-section, .ai4m-card { display: flex; flex-direction: column; gap: 7px; }
+.ai4m-card, .ai4m details { border: 1px solid var(--a4-border); border-radius: 8px; padding: 8px; }
+.ai4m-math { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }
+.ai4m-math > div { background: var(--a4-subtle); border-radius: 5px; padding: 6px; }
+.ai4m pre { margin-block-start: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.ai4m-evidence { max-height: 16rem; overflow: auto; }
+.ai4m-edges { display: grid; gap: 5px; margin: 0; padding-inline-start: 1.4em; }
