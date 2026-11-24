@@ -102,4 +102,4 @@ L0 (Conjecture)
 | `circuit_breakers` | 可恢复 `Definition Smell` 局部熔断器状态与冻结队列快照 |
 | `decision_inbox` & `human_checkpoints` | 非阻塞决策收件箱与人类检查点游标（`cursor_id`, `event_seq`, `git_commit`） |
 
-当前已提供 [单 Claim 历史事件重放](architecture-acceptance.md#L458)和 [单 ProofPlan 历史事件重放](architecture-acceptance.md#L466)；也支持 [同一事件截点的 AND-OR 整图重放](architecture-acceptance.md#L474) 与拓扑校验。这些视图不依赖当前的图表数据，也不等同于从事件恢复整库。 另有 [当前图投影对账](architecture-acceptance.md#L482)，在同一 SQLite 读事务内核对账本与物化行，不修复数据。
+当前已提供 [单 Claim 历史事件重放](architecture-acceptance.md#L458)和 [单 ProofPlan 历史事件重放](architecture-acceptance.md#L466)；也支持 [同一事件截点的 AND-OR 整图重放](architecture-acceptance.md#L474) 与拓扑校验。这些视图不依赖当前的图表数据，也不等同于从事件恢复整库。 另有 [当前图投影对账](architecture-acceptance.md#L482)，在同一 SQLite 读事务内核对账本与物化行，不修复数据。 [账本头 AND-OR 语义检查](architecture-acceptance.md#L490) 另行重算图的派生状态，不将账本/物化表相符等同于推导正确。

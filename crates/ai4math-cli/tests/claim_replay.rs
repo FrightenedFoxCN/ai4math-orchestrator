@@ -298,3 +298,52 @@ fn graph_audit_exits_nonzero_with_complete_redacted_report_only_for_comparable_d
         "invalid replay must not produce a partial audit report"
     );
 }
+
+#[test]
+fn graph_check_reports_impossible_derived_state_without_reading_or_repairing_it() {
+    use ai4math_store::{Change, StateStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let uninitialized = ai(root, "graph-check", &[]);
+    assert!(!uninitialized.status.success() && uninitialized.stdout.is_empty());
+    assert!(!root.join(".runtime").exists());
+    ok(ai(root, "init", &["lean4"]));
+    ok(ai(
+        root,
+        "declare-claim",
+        &["goal", "Goal.lean", "result", "Goal", "private text"],
+    ));
+    let path = root.join(".runtime/state.sqlite");
+    let clean = json(ai(root, "graph-check", &[]));
+    assert_eq!(clean["consistent"], true);
+    assert_eq!(clean["mismatches"], serde_json::json!([]));
+    let mut store = StateStore::open(&path).unwrap();
+    let seq = store
+        .append_event(
+            Change {
+                actor: "fixture",
+                git_commit: None,
+            },
+            "CLAIM_EFFECTIVE_CHANGED",
+            "claim",
+            "goal",
+            serde_json::json!({"previous":"L0","effective":"L5","effective_stale":false}),
+        )
+        .unwrap();
+    drop(store);
+    let bytes = fs::read(&path).unwrap();
+    let bad = ai(root, "graph-check", &[]);
+    assert!(!bad.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&bad.stdout).unwrap(),
+        serde_json::json!({
+        "ledger_event_seq":seq,"consistent":false,"mismatch_count":1,"truncated":false,
+        "mismatches":[{"entity_type":"claim","entity_id":"goal","field":"effective_trust"}]})
+    );
+    assert!(!String::from_utf8_lossy(&bad.stdout).contains("private text"));
+    assert_eq!(
+        json(ai(root, "graph-replay", &[]))["claims"][0]["effective_trust"],
+        "L5"
+    );
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}

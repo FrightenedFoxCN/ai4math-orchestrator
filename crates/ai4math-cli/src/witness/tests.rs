@@ -86,6 +86,9 @@ fn native_witness_is_archived_before_refutation_and_p0() -> Result<()> {
             .is_err()
     );
     let seq = db.status()?.last_event_seq;
+    let before_check = db.check_graph()?;
+    assert!(before_check.consistent, "{before_check:?}");
+    assert_eq!(before_check.ledger_event_seq, seq);
     assert!(
         verify_and_record(
             root,
@@ -186,6 +189,9 @@ fn native_witness_is_archived_before_refutation_and_p0() -> Result<()> {
             .status,
         "ACTIVE"
     );
+    let after_check = db.check_graph()?;
+    assert!(after_check.consistent, "{after_check:?}");
+    assert_eq!(after_check.ledger_event_seq, mark);
     assert_eq!(db.status()?.last_event_seq, mark);
     let retry = verify_and_record(
         root,
