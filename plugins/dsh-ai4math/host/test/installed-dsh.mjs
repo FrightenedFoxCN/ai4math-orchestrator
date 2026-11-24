@@ -47,6 +47,9 @@ try {
     }
   }
   assert.equal(result.event_seq,0);
+  assert.equal(result.archived_breakers,0);
+  assert.equal(ctx.typert.local.get('ai4math/pivotArchivePreview'),undefined);
+  assert.equal(ctx.typert.local.get('ai4math/pivotArchiveApply'),undefined);
   await assert.rejects(gateway.invoke(request('status',{role:'chief'})));
   await assert.rejects(gateway.invoke(request('status',{}, {kind:'guest'})), {code:'ai4math/denied'});
   const wire = await gateway.dispatchRpc('ai4math/status', { args: { params: {} } }, signal, {principal:{kind:'owner'},signal});
@@ -111,6 +114,43 @@ try {
       console.log('Installed Typert: real scheduler P0 push and retained Fact Pack passed');
     } finally {
       await alerts.return();
+    }
+    const selected=await gateway.invoke(request('briefingPull'));
+    const reason='retain this archived queue gate';
+    const args=[dir,repo,selected.retained_id,'fixture-breaker',reason];
+    const plan=JSON.parse(run(cli,['pivot-archive-preview',...args]));
+    assert.equal(plan.action,'ARCHIVE_BREAKER');
+    assert.equal(plan.to_state,'ARCHIVED');
+    assert.equal(git('--git-dir='+repo,'rev-parse','refs/heads/main'),head);
+    const reqArchive=request('subscribe',{topics:['breaker.state_changed','vital_signs.tick']});
+    const deadlineArchive=AbortSignal.timeout(10_000);
+    const archiveStream=await gateway.stream({...reqArchive,signal:deadlineArchive,
+      peer:{...reqArchive.peer,signal:deadlineArchive}});
+    const observations=archiveStream[Symbol.asyncIterator]();
+    try {
+      assert.equal((await observations.next()).value.topic,'ai4math.connection');
+      const applied=JSON.parse(run(cli,['pivot-archive-apply',...args,plan.adr_id]));
+      assert.equal(applied.breaker_state,'ARCHIVED');
+      assert.equal(applied.probes_started,false);
+      let transition, tick;
+      while (!transition || !tick) {
+        const next=await observations.next();
+        assert.ok(!next.done,'archive event and tick must arrive before deadline');
+        const {topic,data}=next.value;
+        if (topic==='breaker.state_changed' && data.event_type==='BREAKER_ARCHIVED') transition=data;
+        if (topic==='vital_signs.tick' && data.archived_breakers===1) tick=data;
+      }
+      assert.equal(transition.payload.adr_id,plan.adr_id);
+      assert.equal(transition.payload.state,'ARCHIVED');
+      assert.equal(transition.git_commit,applied.git_commit);
+      assert.equal(tick.half_open_breakers,0);
+      assert.equal(tick.task_scheduler.exploration.breaker_blocked,1);
+      const status=await gateway.invoke(request('status'));
+      assert.equal(status.archived_breakers,1);
+      assert.equal(status.event_seq,transition.event_seq);
+      console.log('Installed Typert: exact approved archive event and retained queue gate passed');
+    } finally {
+      await observations.return();
     }
   }
 } finally {

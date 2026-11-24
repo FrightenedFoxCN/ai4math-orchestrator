@@ -30,7 +30,7 @@ ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/DeepSeek Harness" \
   "$APP/Contents/Resources/app.asar/dsh" "$PWD/target/debug/ai4mathd" "$PWD/target/debug/ai4math"
 ```
 
-最后一个 `ai4math` 参数可选；传入后临时项目会用正式 CLI 登记探索任务及其基建依赖、触发非关键熔断，并断言 Gateway 收到全轨停摆 P0，且能读取相同的留存 Fact Pack。
+最后一个 `ai4math` 参数可选；传入后临时项目会用正式 CLI 登记双轨任务、触发非关键熔断并经 Gateway 验证全轨停摆 P0 与留存 Fact Pack。之后用正式 CLI 预览和批准仅归档熔断，经 Gateway 核对精确归档事件、持续队列门禁与计数，并确认没有远程审批入口。
 
 ### 驻留 T2 经安装版 DSH 网关验收
 

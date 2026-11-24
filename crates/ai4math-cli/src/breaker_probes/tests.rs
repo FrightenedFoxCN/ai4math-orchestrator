@@ -89,7 +89,15 @@ fn setup(root: &Path) -> Result<(PathBuf, StateStore)> {
             )?
             .adr_id()?
     };
-    pivot::apply(root, &repo, &fact, ID, REASON, &approved)?;
+    pivot::apply(
+        root,
+        &repo,
+        &fact,
+        ID,
+        REASON,
+        &approved,
+        ai4math_store::PivotAction::ResumeAsIs,
+    )?;
     assert!(
         store
             .claim_task(None, Duration::from_secs(60), change())?

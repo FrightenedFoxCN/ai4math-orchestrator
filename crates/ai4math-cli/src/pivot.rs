@@ -1,10 +1,10 @@
-//! Operator CLI only. Do not expose through daemon RPC or agent tools.
+//! Operator CLI only. Do not expose Pivot mutations through daemon RPC or agent tools.
 use crate::{
     bound_engine, print_json,
     promotion::{PendingRef, PromotionRepo},
 };
 use ai4math_store::{
-    PivotIntent, PivotPlan, PivotResult, StateStore, retained::read_retained_review,
+    PivotAction, PivotIntent, PivotPlan, PivotResult, StateStore, retained::read_retained_review,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
@@ -56,11 +56,20 @@ fn plan(
     fact: &str,
     breaker: &str,
     reason: &str,
+    action: PivotAction,
 ) -> Result<PivotPlan> {
     let base = git.main_head()?;
     let review = read_retained_review(&root.join(".runtime/briefings"), fact)?
         .context("retained Fact Pack not found; pull a human briefing first")?;
-    let plan = store.preview_resume(repo_name(git)?, &base, fact, &review, breaker, reason)?;
+    let plan = store.preview_pivot(
+        repo_name(git)?,
+        &base,
+        fact,
+        &review,
+        breaker,
+        reason,
+        action,
+    )?;
     if let Some(c) = plan.checkpoint.as_ref() {
         ensure!(
             git.is_ancestor(&c.git_commit, &base)?,
@@ -72,8 +81,18 @@ fn plan(
 
 fn markdown(p: &PivotPlan) -> Result<String> {
     let id = p.adr_id()?;
+    let action = p.action.as_str();
+    // Existing recovery validates the precise historical ADR blob.
+    let effect = match p.action {
+        PivotAction::ResumeAsIs => {
+            "The approved breaker moves from TRIPPED to HALF_OPEN. No worker tasks are released, no probes are started and no mathematical definitions change."
+        }
+        PivotAction::ArchiveBreaker => {
+            "The approved breaker moves from TRIPPED to ARCHIVED, and its linked decision is resolved. Its module remains gated. No worktree, task, route, Claim, proof or mathematical definition changes."
+        }
+    };
     let mut s = format!(
-        "# {id}: RESUME_AS_IS\n\n- Base Git commit: {}\n- Retained Fact Pack SHA-256: {}\n- Reviewed event interval: ({}, {}]\n- Pack presentation truncated: {}\n\nThe approved breaker moves from TRIPPED to HALF_OPEN. No worker tasks are released, no probes are started and no mathematical definitions change.\n\n## Approved decision\n\n",
+        "# {id}: {action}\n\n- Base Git commit: {}\n- Retained Fact Pack SHA-256: {}\n- Reviewed event interval: ({}, {}]\n- Pack presentation truncated: {}\n\n{effect}\n\n## Approved decision\n\n",
         p.base_commit,
         p.fact_sha256,
         p.event_from_exclusive,
@@ -97,12 +116,13 @@ pub(crate) fn preview(
     fact: &str,
     breaker: &str,
     reason: &str,
+    action: PivotAction,
 ) -> Result<()> {
     let git = PromotionRepo::lock(repo)?;
     let mut store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
-    let p = plan(root, &git, &mut store, fact, breaker, reason)?;
+    let p = plan(root, &git, &mut store, fact, breaker, reason, action)?;
     print_json(
-        json!({"adr_id":p.adr_id()?,"action":"RESUME_AS_IS","to_state":"HALF_OPEN","probe_tasks":[],"stopped_tasks":[],"tainted_claims":[],"archived_claims":[],"new_tasks":[],"plan":p,"adr_markdown":markdown(&p)?}),
+        json!({"adr_id":p.adr_id()?,"action":action.as_str(),"to_state":action.target_state(),"probe_tasks":[],"stopped_tasks":[],"tainted_claims":[],"archived_claims":[],"new_tasks":[],"plan":p,"adr_markdown":markdown(&p)?}),
     )
 }
 
@@ -186,6 +206,7 @@ pub(crate) fn apply(
     breaker: &str,
     reason: &str,
     approved_id: &str,
+    action: PivotAction,
 ) -> Result<()> {
     let git = PromotionRepo::lock(repo)?;
     let state_path = root.join(".runtime/state.sqlite");
@@ -196,6 +217,7 @@ pub(crate) fn apply(
                 && fact == p.fact_sha256
                 && breaker == p.breaker.breaker_id
                 && reason == p.decision_reason
+                && p.action == action
                 && p.adr_id()? == approved_id,
             "Pivot replay arguments do not match the committed approval"
         );
@@ -206,7 +228,7 @@ pub(crate) fn apply(
         );
         return print_json(r);
     }
-    let p = plan(root, &git, &mut store, fact, breaker, reason)?;
+    let p = plan(root, &git, &mut store, fact, breaker, reason, action)?;
     ensure!(
         p.adr_id()? == approved_id,
         "approval ID does not match current Pivot preview"

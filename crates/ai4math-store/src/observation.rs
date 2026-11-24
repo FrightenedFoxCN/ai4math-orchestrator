@@ -136,6 +136,7 @@ pub struct TelemetrySnapshot {
     pub pending_inbox: BTreeMap<String, i64>,
     pub tripped_breakers: i64,
     pub half_open_breakers: i64,
+    pub archived_breakers: i64,
     pub task_scheduler: crate::TaskSchedulerStatus,
     pub last_alert: Option<PushAlert>,
 }
@@ -601,6 +602,7 @@ impl StateStore {
             pending_inbox:grouped(&tx,&PRIORITIES,"SELECT priority,count(*) FROM decision_inbox WHERE status='PENDING' GROUP BY priority")?,
             tripped_breakers:tx.query_row("SELECT count(*) FROM circuit_breakers WHERE state='TRIPPED'",[],|r|r.get(0))?,
             half_open_breakers:tx.query_row("SELECT count(*) FROM circuit_breakers WHERE state='HALF_OPEN'",[],|r|r.get(0))?,
+            archived_breakers:tx.query_row("SELECT count(*) FROM circuit_breakers WHERE state='ARCHIVED'",[],|r|r.get(0))?,
             task_scheduler:crate::state::scheduler_snapshot(&tx)?,
             last_alert:tx.query_row("SELECT alert_id,event_seq,created_at,reason_code,dedupe_key,headline,entity_id,briefing_id
                 FROM daemon_alerts ORDER BY event_seq DESC LIMIT 1",[],read_alert).optional()?,

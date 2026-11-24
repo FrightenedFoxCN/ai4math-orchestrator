@@ -42,7 +42,7 @@ pub use graph_audit::{GraphAudit, GraphMismatch, GraphMismatchKind};
 pub use graph_check::{GraphSemanticCheck, GraphSemanticMismatch};
 pub use graph_replay::GraphReplay;
 pub use oracle::{OracleApproval, RetainedOracleObservation};
-pub use pivot::{BreakerTripReport, PivotIntent, PivotPlan, PivotResult};
+pub use pivot::{BreakerTripReport, PivotAction, PivotIntent, PivotPlan, PivotResult};
 pub use plan_replay::{PlanReplay, ReplayedPlan, ReplayedPlanDependency};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
 pub use reviewed_lean::{LeanSpecComparison, LeanSpecRecheck, ReviewedLeanSpec};
@@ -674,6 +674,7 @@ impl StateStore {
             !matches!(
                 kind,
                 "PIVOT_APPLIED"
+                    | "BREAKER_ARCHIVED"
                     | "BREAKER_PROBES_ARMED"
                     | "BREAKER_PROBES_STARTED"
                     | "BREAKER_PROBES_FAILED"

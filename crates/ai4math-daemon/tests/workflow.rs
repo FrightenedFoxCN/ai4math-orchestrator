@@ -71,6 +71,11 @@ impl Rpc {
         }
         anyhow::bail!("no RPC response")
     }
+    fn result(&mut self, method: &str, params: Value) -> Result<Value> {
+        let mut response = self.call(method, params)?;
+        ensure!(response.get("result").is_some(), "{method}: {response}");
+        Ok(response["result"].take())
+    }
     fn event(&mut self, kind: &str) -> Result<Value> {
         for _ in 0..50 {
             let m = self.receive()?;
@@ -781,20 +786,70 @@ fn native_managed_regressions_raise_one_real_meltdown_p0() -> Result<()> {
     Ok(())
 }
 
-#[test]
-#[ignore = "requires AI4MATH_TEST_CLI pointing to the built ai4math operator binary"]
-fn operator_pivot_observed_by_real_daemon() -> Result<()> {
-    let cli = std::env::var_os("AI4MATH_TEST_CLI").context("set AI4MATH_TEST_CLI")?;
-    let root = tempfile::Builder::new()
-        .prefix("a4")
-        .rand_bytes(4)
-        .tempdir()?;
-    let project = root.path().to_str().context("UTF-8 project")?;
-    let repo = root.path().join("repo.git");
-    let bare = repo.to_str().context("UTF-8 repo")?;
-    let source = root.path().join("src");
-    fs::create_dir(&source)?;
-    let git = |dir: &Path, args: &[&str]| -> Result<()> {
+struct PivotWorkflow {
+    root: tempfile::TempDir,
+    repo: std::path::PathBuf,
+    source: std::path::PathBuf,
+    cli: std::ffi::OsString,
+}
+
+impl PivotWorkflow {
+    fn new(extra_modules: &[&str]) -> Result<Self> {
+        let cli = std::env::var_os("AI4MATH_TEST_CLI").context("set AI4MATH_TEST_CLI")?;
+        let root = tempfile::Builder::new()
+            .prefix("a4")
+            .rand_bytes(4)
+            .tempdir()?;
+        let repo = root.path().join("repo.git");
+        let source = root.path().join("src");
+        fs::create_dir(&source)?;
+        Self::git(&source, &["init", "--initial-branch=main"])?;
+        let modules = ["Spec.lean"]
+            .into_iter()
+            .chain(extra_modules.iter().copied());
+        for module in modules.clone() {
+            fs::write(source.join(module), "def target : Prop := True\n")?;
+        }
+        if !extra_modules.is_empty() {
+            fs::write(
+                source.join("ai4math-modules.txt"),
+                modules
+                    .map(|module| format!("{module}\n"))
+                    .collect::<String>(),
+            )?;
+        }
+        Self::git(&source, &["add", "."])?;
+        Self::git(&source, &["commit", "-m", "frozen"])?;
+        Self::git(root.path(), &["clone", "--bare", "src", "repo.git"])?;
+        let fixture = Self {
+            root,
+            repo,
+            source,
+            cli,
+        };
+        let (project, _) = fixture.paths()?;
+        fixture.run(&["init", project, "lean4"])?;
+        fixture.run(&[
+            "declare-claim",
+            project,
+            "CriticalDefinition",
+            "Spec.lean",
+            "target",
+            "Reviewed definition",
+            "Recorded critical target",
+            "--critical",
+        ])?;
+        Ok(fixture)
+    }
+
+    fn paths(&self) -> Result<(&str, &str)> {
+        Ok((
+            self.root.path().to_str().context("UTF-8 project")?,
+            self.repo.to_str().context("UTF-8 repo")?,
+        ))
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> Result<String> {
         let r = Command::new("/usr/bin/git")
             .current_dir(dir)
             .args([
@@ -811,13 +866,14 @@ fn operator_pivot_observed_by_real_daemon() -> Result<()> {
             .output()?;
         ensure!(
             r.status.success(),
-            "git fixture: {}",
+            "git {args:?}: {}",
             String::from_utf8_lossy(&r.stderr)
         );
-        Ok(())
-    };
-    let run = |args: &[&str]| -> Result<Value> {
-        let r = Command::new(&cli).args(args).output()?;
+        Ok(String::from_utf8(r.stdout)?)
+    }
+
+    fn run(&self, args: &[&str]) -> Result<Value> {
+        let r = Command::new(&self.cli).args(args).output()?;
         ensure!(
             r.status.success(),
             "ai4math {}: {}",
@@ -829,25 +885,37 @@ fn operator_pivot_observed_by_real_daemon() -> Result<()> {
         } else {
             Ok(serde_json::from_slice(&r.stdout)?)
         }
-    };
-    git(&source, &["init", "--initial-branch=main"])?;
-    fs::write(source.join("Spec.lean"), "def target : Prop := True\n")?;
-    git(&source, &["add", "Spec.lean"])?;
-    git(&source, &["commit", "-m", "frozen"])?;
-    git(root.path(), &["clone", "--bare", "src", "repo.git"])?;
-    run(&["init", project, "lean4"])?;
-    run(&[
-        "declare-claim",
-        project,
-        "CriticalDefinition",
-        "Spec.lean",
-        "target",
-        "Reviewed definition",
-        "Recorded critical target",
-        "--critical",
-    ])?;
-    let mut child = boot(root.path())?;
-    let mut rpc = wait_connection(&root.path().join(".runtime/ai4mathd.sock"), &mut child)?;
+    }
+
+    fn trip_critical(&self) -> Result<()> {
+        let (project, bare) = self.paths()?;
+        let tripped = self.run(&[
+            "trip-breaker",
+            project,
+            bare,
+            "B",
+            "Spec.lean",
+            "target",
+            "Critical smell reported",
+            "--critical",
+        ])?;
+        assert_eq!(tripped["inbox_priority"], "P0");
+        assert_eq!(tripped["critical_claim_count"], 1);
+        Ok(())
+    }
+}
+
+#[test]
+#[ignore = "requires AI4MATH_TEST_CLI pointing to the built ai4math operator binary"]
+fn operator_pivot_observed_by_real_daemon() -> Result<()> {
+    let fixture = PivotWorkflow::new(&[])?;
+    let (project, bare) = fixture.paths()?;
+    let run = |args: &[&str]| fixture.run(args);
+    let mut child = boot(fixture.root.path())?;
+    let mut rpc = wait_connection(
+        &fixture.root.path().join(".runtime/ai4mathd.sock"),
+        &mut child,
+    )?;
     assert!(
         rpc.call(
             "subscribe",
@@ -855,18 +923,7 @@ fn operator_pivot_observed_by_real_daemon() -> Result<()> {
         )?["result"]
             .is_object()
     );
-    let tripped = run(&[
-        "trip-breaker",
-        project,
-        bare,
-        "B",
-        "Spec.lean",
-        "target",
-        "Critical smell reported",
-        "--critical",
-    ])?;
-    assert_eq!(tripped["inbox_priority"], "P0");
-    assert_eq!(tripped["critical_claim_count"], 1);
+    fixture.trip_critical()?;
     let alert = rpc.event("alert.p0")?;
     assert_eq!(alert["reason_code"], "CRITICAL_BREAKER_TRIPPED");
     let alert_id = alert["briefing_id"]
@@ -970,6 +1027,343 @@ fn operator_pivot_observed_by_real_daemon() -> Result<()> {
     for unavailable in ["pivot.apply", "breaker.probes.run", "tasks.claim"] {
         assert!(rpc.call(unavailable, json!({}))?["error"].is_object());
     }
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires AI4MATH_TEST_CLI pointing to the built ai4math operator binary"]
+fn operator_pivot_archive_observed_by_real_daemon() -> Result<()> {
+    let fixture = PivotWorkflow::new(&["Separate.lean", "Unblocked.lean"])?;
+    let (project, bare) = fixture.paths()?;
+    let git = |args: &[&str]| PivotWorkflow::git(&fixture.repo, args);
+    let run = |command, args: &[&str]| fixture.run(&[&[command, project, bare], args].concat());
+    let base = git(&["rev-parse", "refs/heads/main"])?;
+    let base = base.trim();
+    let runtime = fixture.root.path().join(".runtime");
+    let state = runtime.join("state.sqlite");
+    let mut store = StateStore::open(&state)?;
+    let change = Change {
+        actor: "archive-workflow-fixture",
+        git_commit: Some(base),
+    };
+    store.create_plan(
+        NewPlan {
+            id: "route-B",
+            target: "CriticalDefinition",
+            name: "Keep the route",
+            track: "exploration",
+            status: PlanStatus::Active,
+            dependencies: &[],
+        },
+        change,
+    )?;
+
+    let socket = runtime.join("ai4mathd.sock");
+    let mut child = boot(fixture.root.path())?;
+    let mut rpc = wait_connection(&socket, &mut child)?;
+    let mut listener = Rpc::new(UnixStream::connect(&socket)?)?;
+    listener.call(
+        "subscribe",
+        json!({"topics":["alert.p0","breaker.state_changed","vital_signs.tick"]}),
+    )?;
+    listener.event("vital_signs.tick")?;
+    fixture.trip_critical()?;
+    assert_eq!(listener.event("breaker.state_changed")?["entity_id"], "B");
+    let alert = listener.event("alert.p0")?;
+    assert_eq!(alert["reason_code"], "CRITICAL_BREAKER_TRIPPED");
+    run(
+        "trip-breaker",
+        &["B-other", "Separate.lean", "target", "Unrelated report"],
+    )?;
+    assert_eq!(
+        listener.event("breaker.state_changed")?["entity_id"],
+        "B-other"
+    );
+    run(
+        "task-register",
+        &["leased", "exploration", "Unblocked.lean", "target"],
+    )?;
+    // Keep one unrelated live lease so the scheduler does not independently raise
+    // ALL_TRACKS_BLOCKED and so the archive must preserve existing lease state.
+    store
+        .claim_expected_task(
+            Some(TaskTrack::Exploration),
+            "leased",
+            Duration::from_secs(3600),
+            change,
+        )?
+        .context("unrelated fixture lease")?;
+    for (id, track) in [("task-E", "exploration"), ("task-I", "infrastructure")] {
+        run("task-register", &[id, track, "Spec.lean", "target"])?;
+    }
+    // The owner reviews a retained briefing while both breakers are still tripped.
+    let before = rpc.result("briefing.pull", json!({}))?;
+    let before_pack = &before["fact_pack"];
+    let fact = before["retained_id"]
+        .as_str()
+        .context("owner's retained Fact Pack")?;
+    assert_eq!(rpc.result("briefing.get", json!({"id":fact}))?, before);
+    let reviewed = before_pack["event_to_inclusive"]
+        .as_i64()
+        .context("reviewed sequence")?;
+    assert_eq!(before_pack["checkpoint"], Value::Null);
+    assert_eq!(before_pack["breakers"]["items"][0]["state"], "TRIPPED");
+    assert_eq!(before_pack["inbox"]["items"][0]["inbox_id"], "DEF-B");
+    let other_breaker = before_pack["breakers"]["items"][1].clone();
+    assert_eq!(other_breaker["breaker_id"], "B-other");
+    let other_inbox = before_pack["inbox"]["items"][1].clone();
+    assert_eq!(other_inbox["inbox_id"], "DEF-B-other");
+    let retained_file = runtime.join("briefings").join(format!("{fact}.json"));
+    let retained = fs::read(&retained_file)?;
+    let refs = git(&["show-ref"])?;
+    let objects = git(&["count-objects", "-v"])?;
+    let worktrees = git(&["worktree", "list", "--porcelain"])?;
+    let initial_status = rpc.result("status", json!({}))?;
+    let scheduler = &initial_status["task_scheduler"];
+    assert_eq!(initial_status["tripped_breakers"], 2);
+    assert_eq!(initial_status["archived_breakers"], 0);
+    let claim = serde_json::to_value(
+        store
+            .claim("CriticalDefinition")?
+            .context("fixture Claim")?,
+    )?;
+    let plan = store.plan_state("route-B")?.context("fixture route")?;
+    let db =
+        rusqlite::Connection::open_with_flags(&state, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+    db.busy_timeout(Duration::from_secs(5))?;
+    let task_rows = || -> Result<Vec<Vec<rusqlite::types::Value>>> {
+        let mut stmt = db.prepare("SELECT * FROM scheduler_tasks ORDER BY queue_seq")?;
+        let n = stmt.column_count();
+        Ok(stmt
+            .query_map([], |r| (0..n).map(|i| r.get(i)).collect())?
+            .collect::<rusqlite::Result<_>>()?)
+    };
+    let tasks = task_rows()?;
+    assert_eq!(tasks.len(), 3);
+
+    // Preview and rejected approvals must not write Git objects, state or the checkpoint.
+    let reason = "Archive the reported breaker without changing its mathematical route";
+    let preview_args = [fact, "B", reason];
+    let preview = run("pivot-archive-preview", &preview_args)?;
+    assert_eq!(run("pivot-archive-preview", &preview_args)?, preview);
+    assert_eq!(preview["action"], "ARCHIVE_BREAKER");
+    assert_eq!(preview["plan"]["action"], "ARCHIVE_BREAKER");
+    assert_eq!(preview["to_state"], "ARCHIVED");
+    assert_eq!(preview["plan"]["reviewed_through"], reviewed);
+    for field in [
+        "probe_tasks",
+        "stopped_tasks",
+        "tainted_claims",
+        "archived_claims",
+        "new_tasks",
+    ] {
+        assert_eq!(preview[field], json!([]), "{field}");
+    }
+    let archive_id = preview["adr_id"].as_str().context("archive ADR ID")?;
+    let resume = run("pivot-preview", &preview_args)?;
+    assert_eq!(resume["action"], "RESUME_AS_IS");
+    assert!(resume["plan"].get("action").is_none());
+    let resume_id = resume["adr_id"].as_str().context("resume ADR ID")?;
+    assert_ne!(archive_id, resume_id);
+    let reject_apply = |cmd, decision, approval, expected: &str| -> Result<()> {
+        let output = Command::new(&fixture.cli)
+            .args([cmd, project, bare, fact, "B", decision, approval])
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(expected),
+            "{cmd}: {stderr}"
+        );
+        Ok(())
+    };
+    for (command, decision, approval) in [
+        ("pivot-archive-apply", reason, "not-an-approval"),
+        (
+            "pivot-archive-apply",
+            "Different operator decision",
+            archive_id,
+        ),
+        ("pivot-archive-apply", reason, resume_id),
+        ("pivot-apply", reason, archive_id),
+    ] {
+        reject_apply(command, decision, approval, "approval ID does not match")?;
+    }
+    let params =
+        json!({"fact_sha256":fact,"breaker_id":"B","reason":reason,"approved_adr_id":archive_id});
+    for method in [
+        "pivot.apply",
+        "pivot.archive_apply",
+        "pivot-archive-apply",
+        "tasks.claim",
+    ] {
+        assert_eq!(
+            rpc.call(method, params.clone())?["error"]["code"],
+            -32601,
+            "{method}"
+        );
+    }
+    assert_eq!(
+        &rpc.result("briefing.peek", json!({}))?["fact_pack"],
+        before_pack
+    );
+    assert_eq!(git(&["show-ref"])?, refs);
+    assert_eq!(git(&["count-objects", "-v"])?, objects);
+    assert!(store.pivot_intent()?.is_none());
+    assert!(store.recorded_pivot(archive_id)?.is_none());
+
+    let apply_args = [fact, "B", reason, archive_id];
+    let applied = run("pivot-archive-apply", &apply_args)?;
+    let commit = applied["git_commit"]
+        .as_str()
+        .context("landed ADR commit")?;
+    assert_eq!(applied["adr_id"], archive_id);
+    assert_eq!(applied["reviewed_through"], reviewed);
+    assert_eq!(applied["event_seq"], reviewed + 1);
+    assert_eq!(applied["breaker_state"], "ARCHIVED");
+    assert_eq!(applied["probes_started"], false);
+    assert_eq!(run("pivot-archive-apply", &apply_args)?, applied);
+    reject_apply(
+        "pivot-apply",
+        reason,
+        archive_id,
+        "replay arguments do not match",
+    )?;
+
+    let transition = listener.event("breaker.state_changed")?;
+    assert_eq!(transition["entity_id"], "B");
+    assert_eq!(transition["event_type"], "BREAKER_ARCHIVED");
+    assert_eq!(transition["git_commit"], commit);
+    assert_eq!(transition["event_seq"], reviewed + 2);
+    assert_eq!(transition["payload"]["previous_state"], "TRIPPED");
+    assert_eq!(transition["payload"]["state"], "ARCHIVED");
+    assert_eq!(transition["payload"]["adr_id"], archive_id);
+    // The transition follows its own tick; the next tick must still show the archive.
+    let tick = listener.event("vital_signs.tick")?;
+    let status = rpc.result("status", json!({}))?;
+    for observed in [&tick, &status] {
+        assert_eq!(observed["event_seq"], reviewed + 2);
+        assert_eq!(observed["tripped_breakers"], 1);
+        assert_eq!(observed["half_open_breakers"], 0);
+        assert_eq!(observed["archived_breakers"], 1);
+        assert_eq!(observed["last_alert"], alert);
+        assert_eq!(&observed["task_scheduler"], scheduler);
+        for track in ["exploration", "infrastructure"] {
+            assert_eq!(observed["task_scheduler"][track]["breaker_blocked"], 1);
+        }
+    }
+
+    // The next retained briefing includes exactly the two archive events.
+    let later = rpc.result("briefing.pull", json!({}))?;
+    let pack = &later["fact_pack"];
+    assert_eq!(
+        pack["checkpoint"],
+        json!({"cursor_id": archive_id, "event_seq": reviewed,
+        "git_commit": commit, "last_adr_id": archive_id})
+    );
+    assert_eq!(pack["event_from_exclusive"], reviewed);
+    assert_eq!(pack["event_to_inclusive"], reviewed + 2);
+    assert_eq!(pack["breakers"]["items"][0], other_breaker);
+    assert_eq!(pack["breakers"]["items"][1]["breaker_id"], "B");
+    assert_eq!(pack["breakers"]["items"][1]["state"], "ARCHIVED");
+    assert!(pack["breakers"]["items"][1].get("probe_status").is_none());
+    assert_eq!(pack["inbox"]["items"], json!([other_inbox]));
+    assert_eq!(
+        rpc.result("inbox.list", json!({}))?["items"],
+        pack["inbox"]["items"]
+    );
+    let events = pack["events"]["items"]
+        .as_array()
+        .context("archive events")?;
+    assert_eq!(events.len(), 2);
+    assert!(events.contains(&transition));
+    let pivot = events
+        .iter()
+        .find(|e| e["event_type"] == "PIVOT_APPLIED")
+        .context("retained Pivot event")?;
+    assert_eq!(pivot["entity_id"], archive_id);
+    assert_eq!(pivot["git_commit"], commit);
+    assert_eq!(
+        pivot["payload"],
+        json!({"action":"ARCHIVE_BREAKER","fact_sha256":fact,
+        "reviewed_through":reviewed,"breaker_id":"B","inbox_id":"DEF-B","probes_started":false})
+    );
+    assert_eq!(
+        rpc.result("briefing.get", json!({"id":later["retained_id"]}))?,
+        later
+    );
+    assert_eq!(rpc.result("briefing.get", json!({"id":fact}))?, before);
+    assert_eq!(fs::read(&retained_file)?, retained);
+    assert_eq!(
+        rpc.result("alerts.list", json!({}))?["items"],
+        json!([alert])
+    );
+
+    // Publication changed only main's ADR; no worktree, queue, route or trust changed.
+    let adr_path = format!("docs/adr/{archive_id}.md");
+    assert_eq!(git(&["rev-parse", "refs/heads/main"])?.trim(), commit);
+    assert_eq!(git(&["rev-parse", &format!("{commit}^1")])?.trim(), base);
+    let changes = git(&[
+        "diff-tree",
+        "--no-commit-id",
+        "--name-status",
+        "-r",
+        base,
+        commit,
+    ])?;
+    assert_eq!(changes, format!("A\t{adr_path}\n"));
+    assert_eq!(
+        git(&["show", &format!("{commit}:{adr_path}")])?,
+        preview["adr_markdown"]
+    );
+    assert_eq!(
+        git(&["show-ref"])?,
+        refs.replace(
+            &format!("{base} refs/heads/main"),
+            &format!("{commit} refs/heads/main")
+        )
+    );
+    assert_eq!(git(&["worktree", "list", "--porcelain"])?, worktrees);
+    assert_eq!(
+        PivotWorkflow::git(
+            &fixture.source,
+            &["status", "--porcelain", "--untracked-files=all"]
+        )?,
+        ""
+    );
+    let (inbox_state, resolved_by): (String, String) = db.query_row(
+        "SELECT status,resolved_adr FROM decision_inbox WHERE inbox_id='DEF-B'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(
+        (inbox_state.as_str(), resolved_by.as_str()),
+        ("RESOLVED", archive_id)
+    );
+    assert_eq!(task_rows()?, tasks);
+    assert_eq!(
+        serde_json::to_value(
+            store
+                .claim("CriticalDefinition")?
+                .context("retained Claim")?
+        )?,
+        claim
+    );
+    assert_eq!(store.plan_state("route-B")?, Some(plan));
+    assert!(store.pivot_intent()?.is_none());
+    assert!(store.module_breaker_gated("lean4", "Spec.lean")?);
+    // Explorer and both infrastructure worker roles all claim through this gate.
+    for (id, track) in [
+        ("task-E", TaskTrack::Exploration),
+        ("task-I", TaskTrack::Infrastructure),
+    ] {
+        assert!(
+            store
+                .claim_expected_task(Some(track), id, Duration::from_secs(60), change)?
+                .is_none()
+        );
+        assert!(store.task_candidate(id)?.is_none());
+    }
+    assert_eq!(store.status()?.last_event_seq, reviewed + 2);
     Ok(())
 }
 

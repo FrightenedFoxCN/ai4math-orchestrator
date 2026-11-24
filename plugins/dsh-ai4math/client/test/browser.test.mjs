@@ -616,14 +616,21 @@ test('real Host bridge events render, reconnect, handle failure, and cancel', { 
     payload: { state: 'CLOSED', probe_status: 'PASSED', probe_passed: 2, probe_required: 2 } });
   await expectText(hud, /#41 CLOSED Probe verified 2\/2 probes passed/);
 
+  // An archive does not verify a probe, and its queue gate is durable across reconnect.
+  push(first.socket, 'breaker.state_changed', { event_seq: 42, event_type: 'BREAKER_ARCHIVED', entity_id: 'archived-breaker',
+    payload: { state: 'ARCHIVED', previous_state: 'TRIPPED' } });
+  await expectText(hud, /archived-breaker .*#42 ARCHIVED Ordinary queue remains gated/);
+  await expectText(frontier, /BREAKER_ARCHIVED .*archived-breaker .*ARCHIVED Ordinary queue remains gated/);
+  assert.doesNotMatch(hud.text(), /Probe verified/);
+
   first.socket.destroy();
   await expectText(hud, /Reconnecting · stale .*Seq 39/);
   assert.doesNotMatch(hud.text(), /Latest breaker event|Probe verified/);
   const second = await nthSubscription(1);
   assert.equal(handles.length, 1, 'Host reconnect retains the browser stream');
-  status = snapshot(42, { last_alert: { event_seq: 41, headline: 'Latest from status' } });
+  status = snapshot(42, { archived_breakers: 1, last_alert: { event_seq: 41, headline: 'Latest from status' } });
   ack(second);
-  await expectText(hud, /Live .*Seq 42 .*Latest from status/);
+  await expectText(hud, /Live .*ARCHIVED 1 · Affected ordinary queues remain gated .*Seq 42 .*Latest from status/);
   const secondPage = await pageRequest(1, 1);
   reply(secondPage.socket, secondPage.id, { items: [
     { event_seq: 38, headline: 'Duplicate persisted alert' },

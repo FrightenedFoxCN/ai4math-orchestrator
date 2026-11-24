@@ -1,4 +1,4 @@
-//! Trusted operator's durable RESUME_AS_IS decision. A journal row is not a Git receipt.
+//! Trusted operator's durable Pivot decisions. A journal row is not a Git receipt.
 use super::*;
 use crate::{
     BreakerProjection, Checkpoint, InboxProjection,
@@ -19,6 +19,42 @@ pub struct BreakerTripReport {
     pub critical_claim_count: usize,
 }
 
+/// The operator-approved state transition for a selected TRIPPED breaker.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PivotAction {
+    #[default]
+    ResumeAsIs,
+    ArchiveBreaker,
+}
+
+impl PivotAction {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ResumeAsIs => "RESUME_AS_IS",
+            Self::ArchiveBreaker => "ARCHIVE_BREAKER",
+        }
+    }
+
+    pub const fn target_state(self) -> &'static str {
+        match self {
+            Self::ResumeAsIs => "HALF_OPEN",
+            Self::ArchiveBreaker => "ARCHIVED",
+        }
+    }
+
+    fn is_resume(&self) -> bool {
+        *self == Self::ResumeAsIs
+    }
+
+    fn adr_domain(self) -> &'static str {
+        match self {
+            Self::ResumeAsIs => "RESUME_AS_IS/v1",
+            Self::ArchiveBreaker => "ARCHIVE_BREAKER/v1",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct PivotPlan {
@@ -32,12 +68,18 @@ pub struct PivotPlan {
     pub breaker: BreakerProjection,
     pub inbox_id: String,
     pub decision_reason: String,
+    // Resume plans are also the legacy on-disk ADR identity input. Preserve their bytes.
+    #[serde(default, skip_serializing_if = "PivotAction::is_resume")]
+    pub action: PivotAction,
     target_sha256: String,
 }
 
 impl PivotPlan {
     pub fn adr_id(&self) -> Result<String> {
-        Ok(format!("ADR-PIVOT-{}", digest(&("RESUME_AS_IS/v1", self))?))
+        Ok(format!(
+            "ADR-PIVOT-{}",
+            digest(&(self.action.adr_domain(), self))?
+        ))
     }
 }
 
@@ -237,6 +279,27 @@ impl StateStore {
         breaker_id: &str,
         reason: &str,
     ) -> Result<PivotPlan> {
+        self.preview_pivot(
+            repo,
+            base,
+            fact,
+            review,
+            breaker_id,
+            reason,
+            PivotAction::ResumeAsIs,
+        )
+    }
+
+    pub fn preview_pivot(
+        &mut self,
+        repo: &str,
+        base: &str,
+        fact: &str,
+        review: &RetainedReview,
+        breaker_id: &str,
+        reason: &str,
+        action: PivotAction,
+    ) -> Result<PivotPlan> {
         ensure!(
             oid(base) && fact.len() == 64 && oid(fact) && valid_id(breaker_id) && reason_ok(reason),
             "invalid Pivot approval inputs"
@@ -278,6 +341,7 @@ impl StateStore {
             breaker,
             inbox_id: inbox.inbox_id,
             decision_reason: reason.into(),
+            action,
             target_sha256,
         };
         tx.commit()?;
@@ -289,7 +353,26 @@ impl StateStore {
     }
 
     pub fn recorded_pivot(&self, adr_id: &str) -> Result<Option<(PivotPlan, PivotResult)>> {
-        self.db.query_row("SELECT plan_json,git_commit,event_seq,reviewed_through FROM recorded_pivots WHERE adr_id=?1",[adr_id],|r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?,r.get::<_,i64>(3)?))).optional()?.map(|(plan,git_commit,event_seq,reviewed_through)|Ok((serde_json::from_str(&plan)?,PivotResult{adr_id:adr_id.into(),git_commit,event_seq,reviewed_through,breaker_state:"HALF_OPEN",probes_started:false}))).transpose()
+        self.db
+            .query_row(
+                "SELECT plan_json,git_commit,event_seq,reviewed_through FROM recorded_pivots WHERE adr_id=?1",
+                [adr_id],
+                |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?
+            .map(|(plan, git_commit, event_seq, reviewed_through)| {
+                let plan: PivotPlan = serde_json::from_str(&plan)?;
+                let result = PivotResult {
+                    adr_id: adr_id.into(),
+                    git_commit,
+                    event_seq,
+                    reviewed_through,
+                    breaker_state: plan.action.target_state(),
+                    probes_started: false,
+                };
+                Ok((plan, result))
+            })
+            .transpose()
     }
 
     pub fn prepare_pivot(&mut self, intent: &PivotIntent) -> Result<()> {
@@ -318,16 +401,25 @@ impl StateStore {
             adopt()?;
             let change=Change{actor:"operator:pivot",git_commit:Some(&intent.new_commit)};
             let id=&intent.adr_id;
-            let seq=event(tx,change,"PIVOT_APPLIED","adr",id,json!({"action":"RESUME_AS_IS","fact_sha256":p.fact_sha256,"reviewed_through":p.reviewed_through,"breaker_id":p.breaker.breaker_id,"inbox_id":p.inbox_id,"probes_started":false}))?;
-            tx.execute(&format!("UPDATE circuit_breakers SET state='HALF_OPEN',updated_at={NOW} WHERE breaker_id=?1"),[&p.breaker.breaker_id])?;
-            event(tx,change,"BREAKER_STATE_CHANGED","breaker",&p.breaker.breaker_id,json!({"previous_state":"TRIPPED","state":"HALF_OPEN","adr_id":id,"probe_status":"AWAITING_REVIEW"}))?;
+            let breaker_state = p.action.target_state();
+            let seq=event(tx,change,"PIVOT_APPLIED","adr",id,json!({"action":p.action.as_str(),"fact_sha256":p.fact_sha256,"reviewed_through":p.reviewed_through,"breaker_id":p.breaker.breaker_id,"inbox_id":p.inbox_id,"probes_started":false}))?;
+            tx.execute(&format!("UPDATE circuit_breakers SET state=?2,updated_at={NOW} WHERE breaker_id=?1"),params![p.breaker.breaker_id,breaker_state])?;
+            let mut transition = json!({"previous_state":"TRIPPED","state":breaker_state,"adr_id":id});
+            let breaker_event = match p.action {
+                PivotAction::ResumeAsIs => {
+                    transition["probe_status"] = json!("AWAITING_REVIEW");
+                    "BREAKER_STATE_CHANGED"
+                }
+                PivotAction::ArchiveBreaker => "BREAKER_ARCHIVED",
+            };
+            event(tx,change,breaker_event,"breaker",&p.breaker.breaker_id,transition)?;
             tx.execute(&format!("UPDATE decision_inbox SET status='RESOLVED',resolved_adr=?2,resolved_at={NOW} WHERE inbox_id=?1"),params![p.inbox_id,id])?;
             tx.execute("UPDATE human_checkpoints SET is_current=0 WHERE is_current=1",[])?;
             // Never hide events that arrived between a successful CAS and recovery.
             tx.execute(&format!("INSERT INTO human_checkpoints(cursor_id,updated_at,event_seq,git_commit,last_adr_id,is_current) VALUES(?1,{NOW},?2,?3,?1,1)"),params![id,p.reviewed_through,intent.new_commit])?;
             tx.execute("INSERT INTO recorded_pivots(adr_id,plan_json,git_commit,event_seq,reviewed_through) VALUES(?1,?2,?3,?4,?5)",params![id,serde_json::to_string(p)?,intent.new_commit,seq,p.reviewed_through])?;
             tx.execute("DELETE FROM pivot_resume_intent WHERE singleton=1",[])?;
-            Ok(PivotResult{adr_id:id.clone(),git_commit:intent.new_commit.clone(),event_seq:seq,reviewed_through:p.reviewed_through,breaker_state:"HALF_OPEN",probes_started:false})
+            Ok(PivotResult{adr_id:id.clone(),git_commit:intent.new_commit.clone(),event_seq:seq,reviewed_through:p.reviewed_through,breaker_state,probes_started:false})
         })
     }
 
@@ -341,5 +433,213 @@ impl StateStore {
             tx.execute("DELETE FROM pivot_resume_intent WHERE singleton=1", [])?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_resume_plan_keeps_its_exact_bytes_and_adr_id() -> Result<()> {
+        let legacy = concat!(
+            r#"{"repo":"/repo","base_commit":"1111111111111111111111111111111111111111","#,
+            r#""fact_sha256":"2222222222222222222222222222222222222222222222222222222222222222","#,
+            r#""event_from_exclusive":3,"reviewed_through":4,"checkpoint":{"cursor_id":"old-adr","event_seq":3,"#,
+            r#""git_commit":"0000000000000000000000000000000000000000","last_adr_id":"old-adr"},"#,
+            r#""presentation_truncated":false,"breaker":{"breaker_id":"test","target_definition_id":"Defs.name","#,
+            r#""module_path":"Defs","engine":"lean4","state":"TRIPPED","updated_at":"now"},"#,
+            r#""inbox_id":"DEF-test","decision_reason":"reviewed","#,
+            r#""target_sha256":"3333333333333333333333333333333333333333333333333333333333333333"}"#,
+        );
+        let mut plan: PivotPlan = serde_json::from_str(legacy)?;
+        assert_eq!(plan.action, PivotAction::ResumeAsIs);
+        assert_eq!(serde_json::to_string(&plan)?, legacy);
+        let legacy_adr_id = plan.adr_id()?;
+        assert_eq!(
+            legacy_adr_id,
+            "ADR-PIVOT-4329b8b16232396635ec2d54058db8e2244401fbd89b7314232f3d4008e41d4d"
+        );
+        assert_eq!(serde_json::to_value(plan.action)?, "RESUME_AS_IS");
+
+        plan.action = PivotAction::ArchiveBreaker;
+        let archive = serde_json::to_value(&plan)?;
+        assert_eq!(archive["action"], "ARCHIVE_BREAKER");
+        assert_eq!(serde_json::from_value::<PivotPlan>(archive)?, plan);
+        assert_ne!(plan.adr_id()?, legacy_adr_id);
+        assert_ne!(
+            plan.adr_id()?,
+            format!("ADR-PIVOT-{}", digest(&("RESUME_AS_IS/v1", &plan))?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn archive_recovery_finalizes_only_the_reviewed_breaker_and_inbox() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("state.sqlite");
+        let mut store = StateStore::open(&path)?;
+        let repo = "/repo";
+        let base = "1".repeat(40);
+        let fact = "2".repeat(64);
+        let new_commit = "3".repeat(40);
+        store.register_tripped_breaker(
+            repo,
+            &base,
+            "chosen",
+            "Defs.name",
+            "Defs",
+            "lean4",
+            "incident",
+            false,
+        )?;
+        store.register_tripped_breaker(
+            repo,
+            &base,
+            "other",
+            "Other.name",
+            "Other",
+            "lean4",
+            "different incident",
+            false,
+        )?;
+        let untouched = read_target(&store.db, "other")?;
+        let facts = store.briefing_facts()?;
+        let review = RetainedReview {
+            event_from_exclusive: facts.event_from_exclusive,
+            event_to_inclusive: facts.event_to_inclusive,
+            to_git_commit: facts.to_git_commit,
+            checkpoint: facts.checkpoint,
+            presentation_truncated: false,
+            breakers: facts.breakers.items,
+            inbox: facts.inbox.items,
+        };
+        let resume = store.preview_resume(repo, &base, &fact, &review, "chosen", "reviewed")?;
+        assert_eq!(resume.action, PivotAction::ResumeAsIs);
+        let plan = store.preview_pivot(
+            repo,
+            &base,
+            &fact,
+            &review,
+            "chosen",
+            "reviewed",
+            PivotAction::ArchiveBreaker,
+        )?;
+        assert_eq!(
+            plan,
+            PivotPlan {
+                action: PivotAction::ArchiveBreaker,
+                ..resume
+            }
+        );
+        let intent = PivotIntent {
+            adr_id: plan.adr_id()?,
+            plan,
+            new_commit: new_commit.clone(),
+        };
+        store.prepare_pivot(&intent)?;
+
+        // Fail after the adoption callback and just before journaling completes. No
+        // partial SQLite finalization may survive, and the intent must be recoverable.
+        store.db.execute_batch(
+            "CREATE TRIGGER interrupt_pivot BEFORE INSERT ON recorded_pivots
+            BEGIN SELECT RAISE(ABORT, 'simulated interrupted finalization'); END;",
+        )?;
+        let mut adopted = false;
+        let err = store
+            .land_pivot(&intent, false, || {
+                adopted = true;
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(adopted);
+        assert!(
+            err.to_string()
+                .contains("simulated interrupted finalization")
+        );
+        assert_eq!(last_seq(&store.db)?, intent.plan.reviewed_through);
+        assert_eq!(current_checkpoint(&store.db)?, intent.plan.checkpoint);
+        assert_eq!(read_target(&store.db, "chosen")?.0, intent.plan.breaker);
+        assert!(store.recorded_pivot(&intent.adr_id)?.is_none());
+        store.db.execute_batch("DROP TRIGGER interrupt_pivot")?;
+        drop(store);
+
+        let mut store = StateStore::open(&path)?;
+        assert_eq!(store.pivot_intent()?.as_ref(), Some(&intent));
+        let change = Change {
+            actor: "test",
+            git_commit: None,
+        };
+        for (kind, entity, id) in [
+            ("PIVOT_APPLIED", "adr", intent.adr_id.as_str()),
+            ("BREAKER_ARCHIVED", "breaker", "chosen"),
+        ] {
+            let err = store
+                .append_event(change, kind, entity, id, json!({}))
+                .unwrap_err();
+            assert!(err.to_string().contains("finalized ADR transaction"));
+        }
+        let unreviewed =
+            store.append_event(change, "UNREVIEWED_TEST_EVENT", "test", "test", json!({}))?;
+        let result = store.land_pivot(&intent, true, || Ok(()))?;
+        assert_eq!(result.breaker_state, "ARCHIVED");
+        assert!(!result.probes_started);
+        assert_eq!(result.reviewed_through, review.event_to_inclusive);
+        assert!(store.pivot_intent()?.is_none());
+        assert_eq!(
+            store.recorded_pivot(&intent.adr_id)?,
+            Some((intent.plan.clone(), result.clone()))
+        );
+        assert_eq!(read_target(&store.db, "other")?, untouched);
+        assert!(store.module_breaker_gated("lean4", "Defs")?);
+        assert!(store.breaker_probe_scope(repo, "chosen").is_err());
+        assert!(store.current_breaker_probe_batch("chosen")?.is_none());
+
+        let resolved: (String, String, bool) = store.db.query_row(
+            "SELECT status,resolved_adr,resolved_at IS NOT NULL FROM decision_inbox WHERE inbox_id=?1",
+            [&intent.plan.inbox_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )?;
+        assert_eq!(resolved, ("RESOLVED".into(), intent.adr_id.clone(), true));
+        let facts = store.briefing_for_alerts()?;
+        assert_eq!(
+            facts.checkpoint,
+            Some(Checkpoint {
+                cursor_id: intent.adr_id.clone(),
+                event_seq: review.event_to_inclusive,
+                git_commit: new_commit,
+                last_adr_id: Some(intent.adr_id.clone()),
+            })
+        );
+        assert_eq!(
+            facts
+                .events
+                .items
+                .iter()
+                .map(|e| (e.event_type.as_str(), e.event_seq))
+                .collect::<Vec<_>>(),
+            vec![
+                ("UNREVIEWED_TEST_EVENT", unreviewed),
+                ("PIVOT_APPLIED", result.event_seq),
+                ("BREAKER_ARCHIVED", result.event_seq + 1),
+            ]
+        );
+        assert_eq!(
+            facts.events.items[1].payload,
+            json!({
+                "action":"ARCHIVE_BREAKER", "fact_sha256":fact, "reviewed_through":review.event_to_inclusive,
+                "breaker_id":"chosen", "inbox_id":"DEF-chosen", "probes_started":false,
+            })
+        );
+        assert!(facts.alert_sources.is_empty());
+        let changes =
+            store.breaker_events_through(review.event_to_inclusive, facts.event_to_inclusive, 2)?;
+        assert_eq!(changes.items.len(), 1);
+        assert_eq!(changes.items[0].event_type, "BREAKER_ARCHIVED");
+        assert_eq!(
+            changes.items[0].payload,
+            json!({"previous_state":"TRIPPED", "state":"ARCHIVED", "adr_id":intent.adr_id})
+        );
+        Ok(())
     }
 }

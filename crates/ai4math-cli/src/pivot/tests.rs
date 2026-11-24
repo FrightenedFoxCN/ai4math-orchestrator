@@ -88,11 +88,19 @@ fn post_cas_recovery_preserves_unreviewed_events_and_finalizes_once() -> Result<
         "CRITICAL_BREAKER_TRIPPED"
     );
     let id = retain(root, serde_json::to_value(&facts)?)?;
-    preview(root, &repo, &id, B, REASON)?;
+    preview(root, &repo, &id, B, REASON, PivotAction::ResumeAsIs)?;
     let reviewed = store.status()?.last_event_seq;
     let intent = {
         let repo = PromotionRepo::lock(&repo)?;
-        let p = plan(root, &repo, &mut store, &id, B, REASON)?;
+        let p = plan(
+            root,
+            &repo,
+            &mut store,
+            &id,
+            B,
+            REASON,
+            PivotAction::ResumeAsIs,
+        )?;
         let pin = repo.pivot_pending_ref(&state)?;
         let intent = prepare(&mut store, &repo, &pin, p)?;
         git(repo.path(), &["gc", "--prune=now"]);
@@ -157,8 +165,27 @@ fn post_cas_recovery_preserves_unreviewed_events_and_finalizes_once() -> Result<
         ["DEF-B2"]
     );
     let end = store.status()?.last_event_seq;
-    assert!(apply(root, &repo, &id, B, "changed reason", &intent.adr_id).is_err());
-    apply(root, &repo, &id, B, REASON, &intent.adr_id)?;
+    assert!(
+        apply(
+            root,
+            &repo,
+            &id,
+            B,
+            "changed reason",
+            &intent.adr_id,
+            PivotAction::ResumeAsIs
+        )
+        .is_err()
+    );
+    apply(
+        root,
+        &repo,
+        &id,
+        B,
+        REASON,
+        &intent.adr_id,
+        PivotAction::ResumeAsIs,
+    )?;
     recover(root, &repo)?;
     assert_eq!(end, store.status()?.last_event_seq);
     let git = PromotionRepo::lock(&repo)?;
@@ -180,7 +207,7 @@ fn stale_unadopted_plan_cannot_land_and_requires_fresh_human_review() -> Result<
     omitted["inbox"]["truncated"] = json!(true);
     let omitted = retain(root, omitted)?;
     assert!(
-        preview(root, &repo, &omitted, B, REASON)
+        preview(root, &repo, &omitted, B, REASON, PivotAction::ResumeAsIs)
             .unwrap_err()
             .to_string()
             .contains("both appear")
@@ -188,7 +215,15 @@ fn stale_unadopted_plan_cannot_land_and_requires_fresh_human_review() -> Result<
     let facts = retain(root, serde_json::to_value(store.briefing_facts()?)?)?;
     let intent = {
         let git = PromotionRepo::lock(&repo)?;
-        let p = plan(root, &git, &mut store, &facts, B, REASON)?;
+        let p = plan(
+            root,
+            &git,
+            &mut store,
+            &facts,
+            B,
+            REASON,
+            PivotAction::ResumeAsIs,
+        )?;
         let pin = git.pivot_pending_ref(&state)?;
         prepare(&mut store, &git, &pin, p)?
     };
@@ -201,14 +236,42 @@ fn stale_unadopted_plan_cannot_land_and_requires_fresh_human_review() -> Result<
     assert!(store.recorded_pivot(&intent.adr_id)?.is_none());
     abandon(root, &repo, &intent.adr_id)?;
     assert!(store.pivot_intent()?.is_none());
-    assert!(preview(root, &repo, &facts, B, REASON).is_err());
+    assert!(preview(root, &repo, &facts, B, REASON, PivotAction::ResumeAsIs).is_err());
     let fresh = retain(root, serde_json::to_value(store.briefing_facts()?)?)?;
     let approved = {
         let git = PromotionRepo::lock(&repo)?;
-        plan(root, &git, &mut store, &fresh, B, REASON)?.adr_id()?
+        plan(
+            root,
+            &git,
+            &mut store,
+            &fresh,
+            B,
+            REASON,
+            PivotAction::ResumeAsIs,
+        )?
+        .adr_id()?
     };
-    assert!(apply(root, &repo, &fresh, B, REASON, &intent.adr_id).is_err());
-    apply(root, &repo, &fresh, B, REASON, &approved)?;
+    assert!(
+        apply(
+            root,
+            &repo,
+            &fresh,
+            B,
+            REASON,
+            &intent.adr_id,
+            PivotAction::ResumeAsIs
+        )
+        .is_err()
+    );
+    apply(
+        root,
+        &repo,
+        &fresh,
+        B,
+        REASON,
+        &approved,
+        PivotAction::ResumeAsIs,
+    )?;
     assert!(store.recorded_pivot(&approved)?.is_some());
     Ok(())
 }
@@ -224,7 +287,15 @@ fn main_movement_between_prepare_and_recovery_requires_no_state_change() -> Resu
     let before = store.status()?.last_event_seq;
     let intent = {
         let git = PromotionRepo::lock(&repo)?;
-        let p = plan(root, &git, &mut store, &facts, B, REASON)?;
+        let p = plan(
+            root,
+            &git,
+            &mut store,
+            &facts,
+            B,
+            REASON,
+            PivotAction::ResumeAsIs,
+        )?;
         let pin = git.pivot_pending_ref(&state)?;
         prepare(&mut store, &git, &pin, p)?
     };
@@ -252,6 +323,125 @@ fn main_movement_between_prepare_and_recovery_requires_no_state_change() -> Resu
     assert_eq!(store.pivot_intent()?, Some(intent.clone()));
     assert!(store.recorded_pivot(&intent.adr_id)?.is_none());
     abandon(root, &repo, &intent.adr_id)?;
-    assert!(preview(root, &repo, &facts, B, REASON).is_err());
+    assert!(preview(root, &repo, &facts, B, REASON, PivotAction::ResumeAsIs).is_err());
+    Ok(())
+}
+
+#[test]
+fn archive_recovery_validates_adr_and_keeps_scope_gated_after_git_cas() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let repo = setup(root)?;
+    let state = root.join(".runtime/state.sqlite");
+    let sentry = root.join("source/unfinished-work.txt");
+    fs::write(&sentry, b"unfinished work is not ours to move\n")?;
+    let (intent, before, unreviewed) = {
+        let mut store = StateStore::open(&state)?;
+        let fact = retain(root, serde_json::to_value(store.briefing_facts()?)?)?;
+        let git = PromotionRepo::lock(&repo)?;
+        let resume = plan(
+            root,
+            &git,
+            &mut store,
+            &fact,
+            B,
+            REASON,
+            PivotAction::ResumeAsIs,
+        )?;
+        let archive = plan(
+            root,
+            &git,
+            &mut store,
+            &fact,
+            B,
+            REASON,
+            PivotAction::ArchiveBreaker,
+        )?;
+        assert_ne!(resume.adr_id()?, archive.adr_id()?);
+        assert_eq!(git.main_head()?, archive.base_commit);
+        assert!(store.pivot_intent()?.is_none());
+        let before = serde_json::to_value(store.claim("CriticalDefinition")?)?;
+        let pin = git.pivot_pending_ref(&state)?;
+        let intent = prepare(&mut store, &git, &pin, archive)?;
+        git.advance_adr(
+            &intent.plan.base_commit,
+            &intent.new_commit,
+            &intent.adr_id,
+            &markdown(&intent.plan)?,
+        )?;
+        assert_eq!(store.live_telemetry()?.archived_breakers, 0);
+        assert_eq!(store.status()?.last_event_seq, intent.plan.reviewed_through);
+        let unreviewed = fixture_event(&mut store)?;
+        (intent, before, unreviewed)
+    }; // Handles drop here, reproducing startup from a committed Git CAS.
+    assert!(abandon(root, &repo, &intent.adr_id).is_err());
+    recover(root, &repo)?;
+    let mut store = StateStore::open(&state)?;
+    let (_, result) = store
+        .recorded_pivot(&intent.adr_id)?
+        .context("missing archive receipt")?;
+    assert_eq!(result.git_commit, intent.new_commit);
+    assert_eq!(result.breaker_state, "ARCHIVED");
+    assert!(!result.probes_started);
+    assert!(store.module_breaker_gated("lean4", MODULE)?);
+    assert!(
+        store
+            .breaker_probe_scope(repo.to_str().unwrap(), B)
+            .is_err()
+    );
+    assert!(store.pivot_intent()?.is_none());
+    let after = store.briefing_facts()?;
+    assert_eq!(
+        after.checkpoint.as_ref().unwrap().event_seq,
+        intent.plan.reviewed_through
+    );
+    assert!(after.events.items.iter().any(|e| e.event_seq == unreviewed));
+    assert!(
+        after
+            .inbox
+            .items
+            .iter()
+            .all(|i| i.inbox_id != intent.plan.inbox_id)
+    );
+    assert_eq!(
+        serde_json::to_value(store.claim("CriticalDefinition")?)?,
+        before
+    );
+    assert_eq!(fs::read(&sentry)?, b"unfinished work is not ours to move\n");
+    let changes = git(
+        &repo,
+        &[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-only",
+            "-r",
+            &intent.new_commit,
+        ],
+    );
+    assert_eq!(changes, format!("docs/adr/{}.md", intent.adr_id));
+    let latest = store.status()?.last_event_seq;
+    assert!(
+        apply(
+            root,
+            &repo,
+            &intent.plan.fact_sha256,
+            B,
+            REASON,
+            &intent.adr_id,
+            PivotAction::ResumeAsIs
+        )
+        .is_err()
+    );
+    apply(
+        root,
+        &repo,
+        &intent.plan.fact_sha256,
+        B,
+        REASON,
+        &intent.adr_id,
+        PivotAction::ArchiveBreaker,
+    )?;
+    recover(root, &repo)?;
+    assert_eq!(store.status()?.last_event_seq, latest);
     Ok(())
 }

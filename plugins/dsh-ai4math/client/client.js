@@ -393,10 +393,12 @@ function AlertCatchUp({ live, state }) {
 function BreakerTotals({ snapshot }) {
   const tripped = snapshot?.tripped_breakers
   const halfOpen = snapshot?.half_open_breakers
+  const archived = snapshot?.archived_breakers
   return h('span', { className: 'ai4m-meta', role: 'status' },
     badge('Tripped ' + count(tripped), isCount(tripped) && tripped > 0 ? 'danger' : undefined),
     isCount(halfOpen) && badge('HALF_OPEN ' + halfOpen + (halfOpen > 0 ? ' · Affected ordinary queues remain frozen' : ''),
-      halfOpen > 0 ? 'warn' : undefined))
+      halfOpen > 0 ? 'warn' : undefined),
+    isCount(archived) && archived > 0 && badge('ARCHIVED ' + archived + ' · Affected ordinary queues remain gated', 'warn'))
 }
 
 function DiscoveryBadge({ value, currentSeq }) {
@@ -536,7 +538,7 @@ function LiveHud({ live, open }) {
         } }, panel.label)))),
     navigationError && note('Open a DSH session before opening an AI4Math tab.', 'status'),
     h(AlertCatchUp, { live, state }),
-    h('div', { role: 'status', 'aria-atomic': true }, latestBreaker?.probe &&
+    h('div', { role: 'status', 'aria-atomic': true }, (latestBreaker?.probe || latestBreaker?.state === 'ARCHIVED') &&
       h('div', { className: 'ai4m-hud-alert' },
         'Latest breaker event · ', h('code', null, text(breaker.entity_id)), ' · #' + count(breaker.event_seq) + ' ',
         h(BreakerReading, { reading: latestBreaker }))),
@@ -667,7 +669,7 @@ function readBreaker(item) {
     tone = 'good'
   }
   const progress = probe && validCounts ? passed + '/' + required + ' probes passed' : null
-  if (!probe && (halfOpen || status === 'PASSED')) {
+  if (!probe && (halfOpen || (status === 'PASSED' && state !== 'ARCHIVED'))) {
     probe = 'Probe status unavailable'
     tone = 'warn'
   }
@@ -688,7 +690,8 @@ function BreakerReading({ reading }) {
     badge(state, state === 'TRIPPED' ? 'danger' : halfOpen ? 'warn' : undefined),
     probe && badge(probe, tone),
     progress && h('span', null, progress),
-    halfOpen && h('span', null, 'Ordinary queue remains frozen'))
+    halfOpen && h('span', null, 'Ordinary queue remains frozen'),
+    state === 'ARCHIVED' && h('span', null, 'Ordinary queue remains gated'))
 }
 
 function BreakerCard({ item }) {
