@@ -995,6 +995,7 @@ fn operator_oracle_and_hammer_are_not_available_over_daemon_rpc() -> Result<()> 
         "tasks.finishModel",
         "t3.worklist",
         "t3.recheckOne",
+        "t3.recheckBatch",
     ] {
         assert_eq!(rpc.call(method, json!({}))?["error"]["code"], -32601);
     }

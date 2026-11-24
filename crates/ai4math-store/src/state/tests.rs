@@ -641,6 +641,255 @@ fn t3_worklist_bounds_pages_and_keeps_cursors_when_claims_change_status() -> Res
     Ok(())
 }
 
+#[test]
+fn t3_batch_bounds_examined_approved_rows_in_dependency_order() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    for i in 0..10 {
+        let id = format!("scope-{i:02}");
+        claim(&mut store, &id, None, false)?;
+        if i != 1 {
+            store.record_verified(&id, &receipt(&id, BASE, i + 1), change(BASE))?;
+        }
+    }
+    claim(&mut store, "outside", Some("Other.lean"), false)?;
+    let mut outside = receipt("outside", BASE, 20);
+    outside.file_path = "Other.lean".into();
+    store.record_verified("outside", &outside, change(BASE))?;
+    plan(&mut store, "late-dependency", "scope-00", &["scope-09"])?;
+    let approval = apply_reviewed_fixture_plan(&mut store, "Spec.lean")?;
+    let hash = &approval.plan_sha256;
+    store.mark_t3(&["outside"], &[], change(T3_HEAD))?;
+    store.recheck_one_stale_for_plan(hash, "scope-02", "test", |c| {
+        Ok(RecheckOutcome::Verified(Box::new(receipt(
+            &c.id, T3_HEAD, 21,
+        ))))
+    })?;
+    let seq = store.status()?.last_event_seq;
+    let unexpected = |_: &ClaimState| panic!("invalid batch must not invoke checker");
+    for limit in [0, 9] {
+        let err = store
+            .recheck_page_stale_for_plan(hash, limit, None, "test", unexpected)
+            .unwrap_err();
+        assert!(err.to_string().contains("limit must be 1..=8"));
+    }
+    let err = store
+        .recheck_page_stale_for_plan(&"b".repeat(64), 8, None, "test", unexpected)
+        .unwrap_err();
+    assert!(err.to_string().contains("T3 plan has not been applied"));
+    let err = store
+        .recheck_page_stale_for_plan(hash, 8, Some(("outside", seq)), "test", unexpected)
+        .unwrap_err();
+    assert!(err.to_string().contains("invalid T3 worklist cursor"));
+
+    let mut calls = Vec::new();
+    let mut defer = |c: &ClaimState| {
+        calls.push(c.id.clone());
+        Ok(RecheckOutcome::Deferred {
+            reason: "fixture".into(),
+        })
+    };
+    let first = store.recheck_page_stale_for_plan(hash, 8, None, "test", &mut defer)?;
+    assert_eq!(first.plan_sha256, *hash);
+    assert_eq!(first.reviewed_commit, T3_HEAD);
+    assert_eq!(
+        first.examined_claims,
+        [
+            "scope-01", "scope-02", "scope-03", "scope-04", "scope-05", "scope-06", "scope-07",
+            "scope-08",
+        ]
+    );
+    assert_eq!(first.report.deferred.len(), 6);
+    assert!(first.report.verified.is_empty() && first.report.needs_reproof.is_empty());
+    assert_eq!(first.next_after_claim.as_deref(), Some("scope-08"));
+    assert_eq!(first.last_event_seq, seq);
+    let tail = store.recheck_page_stale_for_plan(
+        hash,
+        8,
+        Some((
+            first.next_after_claim.as_deref().unwrap(),
+            first.last_event_seq,
+        )),
+        "test",
+        &mut defer,
+    )?;
+    assert_eq!(tail.examined_claims, ["scope-09", "scope-00"]);
+    assert_eq!(tail.report.deferred.len(), 2);
+    assert!(tail.next_after_claim.is_none());
+    assert_eq!(tail.last_event_seq, seq);
+    assert_eq!(
+        calls,
+        [
+            "scope-03", "scope-04", "scope-05", "scope-06", "scope-07", "scope-08", "scope-09",
+            "scope-00",
+        ]
+    );
+    assert!(store.claim("outside")?.unwrap().stale);
+    assert_eq!(store.status()?.last_event_seq, seq);
+    Ok(())
+}
+
+#[test]
+fn t3_batch_resume_uses_post_commit_seq_and_does_not_replay_receipts() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    for (id, nonce) in [("A", 1), ("B", 2), ("C", 3)] {
+        claim(&mut store, id, None, false)?;
+        store.record_verified(id, &receipt(id, BASE, nonce), change(BASE))?;
+    }
+    let approval = apply_reviewed_fixture_plan(&mut store, "Spec.lean")?;
+    let hash = &approval.plan_sha256;
+    let seq = store.status()?.last_event_seq;
+    let first = store.recheck_page_stale_for_plan(hash, 1, None, "test", |c| {
+        assert_eq!(c.id, "A");
+        Ok(RecheckOutcome::Verified(Box::new(receipt(
+            &c.id, T3_HEAD, 4,
+        ))))
+    })?;
+    assert_eq!(first.examined_claims, ["A"]);
+    assert_eq!(first.report.verified, ["A"]);
+    assert_eq!(first.last_event_seq, store.status()?.last_event_seq);
+    assert!(first.last_event_seq > seq);
+    let cursor = first.next_after_claim.as_deref().unwrap();
+    let err = store
+        .recheck_page_stale_for_plan(hash, 1, Some((cursor, seq)), "test", |_| {
+            panic!("pre-batch sequence must not authorize another check")
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("cursor is stale"));
+    let second = store.recheck_page_stale_for_plan(
+        hash,
+        1,
+        Some((cursor, first.last_event_seq)),
+        "test",
+        |c| {
+            assert_eq!(c.id, "B");
+            Ok(RecheckOutcome::Verified(Box::new(receipt(
+                &c.id, T3_HEAD, 5,
+            ))))
+        },
+    )?;
+    assert_eq!(second.report.verified, ["B"]);
+    assert_eq!(second.last_event_seq, store.status()?.last_event_seq);
+
+    // A new dependency can move an unexamined claim ahead of the old cursor.
+    plan(&mut store, "new-dependency", "B", &["C"])?;
+    let cursor = second.next_after_claim.as_deref().unwrap();
+    let err = store
+        .recheck_page_stale_for_plan(
+            hash,
+            1,
+            Some((cursor, second.last_event_seq)),
+            "test",
+            |_| panic!("cursor from an old graph must not authorize another check"),
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("cursor is stale"));
+    let replay = store.recheck_page_stale_for_plan(hash, 8, None, "test", |c| {
+        assert_eq!(c.id, "C");
+        Ok(RecheckOutcome::Verified(Box::new(receipt(
+            &c.id, T3_HEAD, 6,
+        ))))
+    })?;
+    assert_eq!(replay.examined_claims, ["A", "C", "B"]);
+    assert_eq!(replay.report.verified, ["C"]);
+    assert!(replay.next_after_claim.is_none());
+    assert_eq!(
+        store.claim("A")?.unwrap().receipt_id.as_deref(),
+        Some("receipt-4")
+    );
+    assert_eq!(
+        store.claim("B")?.unwrap().receipt_id.as_deref(),
+        Some("receipt-5")
+    );
+    Ok(())
+}
+
+#[test]
+fn t3_batch_rejects_concurrent_graph_change_during_deferred_check() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("state.sqlite");
+    let mut store = StateStore::open(&db)?;
+    let mut other = StateStore::open(&db)?;
+    for id in ["A", "B"] {
+        claim(&mut store, id, None, false)?;
+    }
+    store.record_verified("A", &receipt("A", BASE, 1), change(BASE))?;
+    let approval = apply_reviewed_fixture_plan(&mut store, "Spec.lean")?;
+    let hash = &approval.plan_sha256;
+    let err = store
+        .recheck_page_stale_for_plan(hash, 1, None, "test", |c| {
+            assert_eq!(c.id, "A");
+            plan(&mut other, "concurrent-dependency", "A", &["B"])?;
+            Ok(RecheckOutcome::Deferred {
+                reason: "fixture".into(),
+            })
+        })
+        .unwrap_err();
+    assert!(err.to_string().contains("state changed during T3 recheck"));
+    assert!(store.claim("A")?.unwrap().stale);
+    let seq = store.status()?.last_event_seq;
+    let retry = store.recheck_page_stale_for_plan(hash, 1, None, "test", |_| {
+        panic!("new first row was never L5")
+    })?;
+    assert_eq!(retry.examined_claims, ["B"]);
+    assert_eq!(retry.next_after_claim.as_deref(), Some("B"));
+    assert_eq!(retry.last_event_seq, seq);
+    Ok(())
+}
+
+#[test]
+fn t3_batch_keeps_prior_receipt_durable_after_mid_page_error() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db = dir.path().join("state.sqlite");
+    let mut store = StateStore::open(&db)?;
+    for (id, nonce) in [("A", 1), ("B", 2), ("C", 3)] {
+        claim(&mut store, id, None, false)?;
+        store.record_verified(id, &receipt(id, BASE, nonce), change(BASE))?;
+    }
+    let approval = apply_reviewed_fixture_plan(&mut store, "Spec.lean")?;
+    let hash = &approval.plan_sha256;
+    let err = store
+        .recheck_page_stale_for_plan(hash, 8, None, "test", |c| match c.id.as_str() {
+            "A" => Ok(RecheckOutcome::Verified(Box::new(receipt(
+                &c.id, T3_HEAD, 4,
+            )))),
+            "B" => Ok(RecheckOutcome::Verified(Box::new(receipt(
+                &c.id, T3_OLD, 5,
+            )))),
+            _ => panic!("must stop after invalid receipt"),
+        })
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("receipt base does not match verification commit")
+    );
+    drop(store);
+
+    let mut reopened = StateStore::open(&db)?;
+    let a = reopened.claim("A")?.unwrap();
+    assert!(!a.stale);
+    assert_eq!(a.receipt_id.as_deref(), Some("receipt-4"));
+    let b = reopened.claim("B")?.unwrap();
+    assert!(b.stale);
+    assert_eq!(b.receipt_id.as_deref(), Some("receipt-2"));
+    assert!(reopened.claim("C")?.unwrap().stale);
+    let replay =
+        reopened.recheck_page_stale_for_plan(hash, 8, None, "test", |c| match c.id.as_str() {
+            "B" => Ok(RecheckOutcome::Verified(Box::new(receipt(
+                &c.id, T3_HEAD, 5,
+            )))),
+            "C" => Ok(RecheckOutcome::Failed {
+                diagnostics: "fixture".into(),
+            }),
+            _ => panic!("committed receipt must not be replayed"),
+        })?;
+    assert_eq!(replay.examined_claims, ["A", "B", "C"]);
+    assert_eq!(replay.report.verified, ["B"]);
+    assert_eq!(replay.report.needs_reproof, ["C"]);
+    assert!(replay.next_after_claim.is_none());
+    assert_eq!(replay.last_event_seq, reopened.status()?.last_event_seq);
+    Ok(())
+}
+
 const REVIEWED_REPO: &str = "/reviewed/project";
 const PROOF_DECL: &str = "Candidate.proof";
 

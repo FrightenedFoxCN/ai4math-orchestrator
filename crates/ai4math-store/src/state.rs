@@ -259,6 +259,11 @@ impl VerifiedReceipt {
     }
 }
 
+struct AppliedT3Plan {
+    approval: T3PlanApproval,
+    claims: BTreeSet<String>,
+}
+
 enum RecheckContext<'a> {
     Commit(&'a str),
     Plan {
@@ -311,6 +316,20 @@ pub struct T3WorklistPage {
     pub entries: Vec<T3WorklistEntry>,
     /// Exclusive cursor for another page, if this snapshot has more entries.
     pub next_after_claim: Option<String>,
+}
+
+/// Outcome of one bounded pass over the approved T3 worklist.
+#[derive(Debug, Serialize)]
+pub struct T3BatchReport {
+    pub plan_sha256: String,
+    pub reviewed_commit: String,
+    /// All examined worklist rows in dependency order, including skips and deferrals.
+    pub examined_claims: Vec<String>,
+    pub report: RecheckReport,
+    /// Exclusive cursor for another page, if any. Pair it with last_event_seq.
+    pub next_after_claim: Option<String>,
+    /// The ledger sequence after this page's independently committed results.
+    pub last_event_seq: i64,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -950,37 +969,19 @@ impl StateStore {
             "T3 worklist limit must be 1..=64"
         );
         let snapshot = self.db.transaction()?;
-        let plan = read_t3_plan(&snapshot, hash)?.context("T3 plan has not been applied")?;
-        let claims = read_applied_t3_claims(&snapshot, &plan)?;
-        let ordered: Vec<_> = graph_order(&snapshot)?
-            .into_iter()
-            .filter(|id| claims.contains(id))
-            .collect();
-        ensure!(
-            ordered.len() == claims.len(),
-            "applied T3 scope references missing claims"
-        );
-        let start = match after {
-            Some(cursor) => {
-                ordered
-                    .iter()
-                    .position(|id| id == cursor)
-                    .with_context(|| {
-                        format!("invalid T3 worklist cursor {cursor}: not in the applied plan")
-                    })?
-                    + 1
-            }
-            None => 0,
-        };
-        let remaining = &ordered[start..];
-        let mut entries = Vec::with_capacity(limit.min(remaining.len()));
-        for id in remaining.iter().take(limit) {
-            let c = require_claim(&snapshot, id)?;
+        let AppliedT3Plan {
+            approval: plan,
+            claims,
+        } = require_applied_t3_plan(&snapshot, hash)?;
+        let (ids, next_after_claim) = applied_t3_page(&snapshot, &claims, limit, after)?;
+        let mut entries = Vec::with_capacity(ids.len());
+        for id in ids {
+            let c = require_claim(&snapshot, &id)?;
             let status = if !c.stale {
                 T3WorklistStatus::Resolved
             } else if !is_t3_recheck_candidate(&c, &plan.reviewed_commit) {
                 T3WorklistStatus::NotEligible
-            } else if reviewed_lean::has_recheck(&snapshot, id, hash)? {
+            } else if reviewed_lean::has_recheck(&snapshot, &id, hash)? {
                 T3WorklistStatus::RetainedComparison
             } else {
                 T3WorklistStatus::Pending
@@ -990,7 +991,6 @@ impl StateStore {
                 status,
             });
         }
-        let next_after_claim = (remaining.len() > limit).then(|| remaining[limit - 1].clone());
         let last_event_seq = last_seq(&snapshot)?;
         snapshot.commit()?;
         Ok(T3WorklistPage {
@@ -1075,29 +1075,80 @@ impl StateStore {
         )
     }
 
+    /// Recheck one contiguous page of an applied plan, counting resolved and deferred
+    /// rows toward the limit. Resume with the returned cursor and ledger sequence;
+    /// if the cursor is stale or the batch fails, restart from the first page.
+    pub fn recheck_page_stale_for_plan(
+        &mut self,
+        hash: &str,
+        limit: usize,
+        after: Option<(&str, i64)>,
+        actor: &str,
+        check: impl FnMut(&ClaimState) -> Result<RecheckOutcome>,
+    ) -> Result<T3BatchReport> {
+        ensure!((1..=8).contains(&limit), "T3 batch limit must be 1..=8");
+        let (applied, examined_claims, next_after_claim, seq) = {
+            let snapshot = self.db.transaction()?;
+            let applied = require_applied_t3_plan(&snapshot, hash)?;
+            let seq = last_seq(&snapshot)?;
+            let cursor = if let Some((cursor, expected)) = after {
+                ensure!(
+                    seq == expected,
+                    "T3 batch cursor is stale: ledger changed since the previous page; restart from the first page"
+                );
+                Some(cursor)
+            } else {
+                None
+            };
+            let (ids, next) = applied_t3_page(&snapshot, &applied.claims, limit, cursor)?;
+            snapshot.commit()?;
+            (applied, ids, next, seq)
+        };
+        let (report, last_event_seq) = self.recheck_claims(
+            examined_claims.iter().cloned(),
+            seq,
+            Some(&applied),
+            &applied.approval.reviewed_commit,
+            actor,
+            check,
+        )?;
+        // This fresh read validates the cursor even for an empty or all-skipped page.
+        // Never return a newer sequence that would silently bless a changed worklist.
+        ensure!(
+            last_event_seq == last_seq(&self.db)?,
+            "state changed during T3 recheck; restart from the first page"
+        );
+        Ok(T3BatchReport {
+            plan_sha256: applied.approval.plan_sha256,
+            reviewed_commit: applied.approval.reviewed_commit,
+            examined_claims,
+            report,
+            next_after_claim,
+            last_event_seq,
+        })
+    }
+
     // Callback errors leave the current claim stale; earlier results are independently
     // durable. A concurrent write invalidates any uncommitted callback result.
     fn recheck_stale_inner(
         &mut self,
         context: RecheckContext<'_>,
         actor: &str,
-        mut check: impl FnMut(&ClaimState) -> Result<RecheckOutcome>,
+        check: impl FnMut(&ClaimState) -> Result<RecheckOutcome>,
     ) -> Result<RecheckReport> {
-        let (ids, mut seq, applied) = {
+        let (ids, seq, applied) = {
             let snapshot = self.db.transaction()?;
             let (applied, only_claim) = match context {
                 RecheckContext::Commit(_) => (None, None),
                 RecheckContext::Plan { hash, only_claim } => {
-                    let plan =
-                        read_t3_plan(&snapshot, hash)?.context("T3 plan has not been applied")?;
-                    let claims = read_applied_t3_claims(&snapshot, &plan)?;
+                    let applied = require_applied_t3_plan(&snapshot, hash)?;
                     if let Some(id) = only_claim {
                         ensure!(
-                            claims.contains(id),
+                            applied.claims.contains(id),
                             "claim {id} is not in the applied T3 plan"
                         );
                     }
-                    (Some((plan, claims)), only_claim)
+                    (Some(applied), only_claim)
                 }
             };
             let ids = match only_claim {
@@ -1114,10 +1165,23 @@ impl StateStore {
                 &applied
                     .as_ref()
                     .context("T3 plan has not been applied")?
-                    .0
+                    .approval
                     .reviewed_commit
             }
         };
+        self.recheck_claims(ids, seq, applied.as_ref(), commit, actor, check)
+            .map(|(report, _)| report)
+    }
+
+    fn recheck_claims(
+        &mut self,
+        ids: impl IntoIterator<Item = String>,
+        mut seq: i64,
+        applied: Option<&AppliedT3Plan>,
+        commit: &str,
+        actor: &str,
+        mut check: impl FnMut(&ClaimState) -> Result<RecheckOutcome>,
+    ) -> Result<(RecheckReport, i64)> {
         let change = Change {
             actor,
             git_commit: Some(commit),
@@ -1133,17 +1197,19 @@ impl StateStore {
                 continue;
             }
             let binding = reviewed_lean::read_binding(&self.db, &id)?;
-            let outside_plan = applied
-                .as_ref()
-                .is_some_and(|(_, claims)| !claims.contains(&id));
+            let outside_plan = applied.is_some_and(|plan| !plan.claims.contains(&id));
             let reason = if binding.is_some() {
-                match &applied {
+                match applied {
                     None => Some("reviewed Lean spec requires a comparator-backed recheck"),
                     Some(_) if outside_plan => {
                         Some("bound claim was not tainted by this applied plan")
                     }
-                    Some((plan, _))
-                        if reviewed_lean::has_recheck(&self.db, &id, &plan.plan_sha256)? =>
+                    Some(plan)
+                        if reviewed_lean::has_recheck(
+                            &self.db,
+                            &id,
+                            &plan.approval.plan_sha256,
+                        )? =>
                     {
                         Some("reviewed Lean recheck already recorded for this claim and plan")
                     }
@@ -1195,9 +1261,11 @@ impl StateStore {
                             "T3 recheck needs a T3 receipt"
                         );
                         let evidence = if let Some(spec) = &binding {
-                            let (plan, _) = applied.as_ref().context(
-                                "T3 cannot restore a bound Lean claim without an applied plan",
-                            )?;
+                            let plan = &applied
+                                .context(
+                                    "T3 cannot restore a bound Lean claim without an applied plan",
+                                )?
+                                .approval;
                             ensure!(
                                 read_t3_plan(tx, &plan.plan_sha256)?.as_ref() == Some(plan),
                                 "applied T3 plan changed during recheck"
@@ -1259,7 +1327,7 @@ impl StateStore {
                 }
             }
         }
-        Ok(report)
+        Ok((report, seq))
     }
 
     fn write<T>(&mut self, f: impl FnOnce(&Transaction<'_>) -> Result<T>) -> Result<T> {
@@ -1285,6 +1353,46 @@ fn read_t3_plan(db: &Connection, hash: &str) -> Result<Option<T3PlanApproval>> {
     Ok(db.query_row("SELECT base_commit,reviewed_commit,anchor_module,preview_event_seq FROM applied_t3_plans WHERE plan_sha256=?1",[hash],|r|Ok(T3PlanApproval {
         plan_sha256:hash.to_owned(),base_commit:r.get(0)?,reviewed_commit:r.get(1)?,anchor_module:r.get(2)?,preview_event_seq:r.get(3)?,
     })).optional()?)
+}
+
+fn require_applied_t3_plan(db: &Connection, hash: &str) -> Result<AppliedT3Plan> {
+    let approval = read_t3_plan(db, hash)?.context("T3 plan has not been applied")?;
+    let claims = read_applied_t3_claims(db, &approval)?;
+    Ok(AppliedT3Plan { approval, claims })
+}
+
+fn applied_t3_page(
+    snapshot: &Connection,
+    claims: &BTreeSet<String>,
+    limit: usize,
+    after: Option<&str>,
+) -> Result<(Vec<String>, Option<String>)> {
+    let ordered: Vec<_> = graph_order(snapshot)?
+        .into_iter()
+        .filter(|id| claims.contains(id))
+        .collect();
+    ensure!(
+        ordered.len() == claims.len(),
+        "applied T3 scope references missing claims"
+    );
+    let start = match after {
+        Some(cursor) => {
+            ordered
+                .iter()
+                .position(|id| id == cursor)
+                .with_context(|| {
+                    format!("invalid T3 worklist cursor {cursor}: not in the applied plan")
+                })?
+                + 1
+        }
+        None => 0,
+    };
+    let remaining = &ordered[start..];
+    let next_after_claim = (remaining.len() > limit).then(|| remaining[limit - 1].clone());
+    Ok((
+        remaining.iter().take(limit).cloned().collect(),
+        next_after_claim,
+    ))
 }
 
 fn is_t3_recheck_candidate(c: &ClaimState, commit: &str) -> bool {

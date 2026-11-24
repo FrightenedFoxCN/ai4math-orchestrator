@@ -152,7 +152,7 @@ pub(crate) fn recheck(
     exec: &Path,
     data: Option<&str>,
 ) -> Result<()> {
-    recheck_selected(root, repo, hash, None, exec, data)
+    recheck_selected(root, repo, hash, Replay::All, exec, data)
 }
 
 pub(crate) fn recheck_one(
@@ -163,7 +163,57 @@ pub(crate) fn recheck_one(
     exec: &Path,
     data: Option<&str>,
 ) -> Result<()> {
-    recheck_selected(root, repo, hash, Some(claim), exec, data)
+    recheck_selected(root, repo, hash, Replay::One(claim), exec, data)
+}
+
+enum Replay<'a> {
+    All,
+    One(&'a str),
+    Batch {
+        limit: usize,
+        after: Option<(&'a str, i64)>,
+    },
+}
+
+type BatchOptions<'a> = (Option<&'a str>, Option<(&'a str, i64)>);
+fn batch_options<'a>(args: &[&'a str]) -> Result<BatchOptions<'a>> {
+    let (data, cursor) = match args {
+        [] => (None, None),
+        [data] if !data.starts_with("--") => (Some(*data), None),
+        ["--after", claim, seq] => (None, Some((*claim, *seq))),
+        [data, "--after", claim, seq] if !data.starts_with("--") => {
+            (Some(*data), Some((*claim, *seq)))
+        }
+        _ => anyhow::bail!("expected [ENGINE_DATA] [--after CLAIM EVENT_SEQ] for T3 batch"),
+    };
+    let after = cursor
+        .map(|(claim, seq)| -> Result<_> {
+            let event_seq: i64 = seq.parse().context("invalid T3 cursor event sequence")?;
+            ensure!(
+                event_seq >= 0 && seq == event_seq.to_string(),
+                "invalid T3 cursor event sequence"
+            );
+            ensure!(
+                !claim.is_empty() && !claim.chars().any(char::is_control),
+                "invalid T3 cursor Claim"
+            );
+            Ok((claim, event_seq))
+        })
+        .transpose()?;
+    Ok((data, after))
+}
+
+pub(crate) fn recheck_batch(
+    root: &Path,
+    repo: &Path,
+    hash: &str,
+    limit: usize,
+    exec: &Path,
+    args: &[&str],
+) -> Result<()> {
+    ensure!((1..=8).contains(&limit), "T3 batch limit must be 1..=8");
+    let (data, after) = batch_options(args)?;
+    recheck_selected(root, repo, hash, Replay::Batch { limit, after }, exec, data)
 }
 
 fn current_approval(
@@ -198,12 +248,16 @@ fn recheck_selected(
     root: &Path,
     repo: &Path,
     hash: &str,
-    only: Option<&str>,
+    replay: Replay<'_>,
     exec: &Path,
     data: Option<&str>,
 ) -> Result<()> {
     let _native = crate::managed_native(root)?;
-    let locked = PromotionRepo::lock(repo)?;
+    let locked = if matches!(replay, Replay::Batch { .. }) {
+        PromotionRepo::try_lock(repo)?
+    } else {
+        PromotionRepo::lock(repo)?
+    };
     let path = root.join(".runtime/state.sqlite");
     let mut state = StateStore::open(&path)?;
     let approval = current_approval(&state, &locked, hash)?;
@@ -309,11 +363,21 @@ fn recheck_selected(
             ),
         }
     };
-    let report = match only {
-        Some(id) => state.recheck_one_stale_for_plan(hash, id, "broker:t3", check)?,
-        None => state.recheck_stale_for_plan(hash, "broker:t3", check)?,
-    };
-    print_json(report)
+    match replay {
+        Replay::All => print_json(state.recheck_stale_for_plan(hash, "broker:t3", check)?),
+        Replay::One(id) => {
+            print_json(state.recheck_one_stale_for_plan(hash, id, "broker:t3", check)?)
+        }
+        Replay::Batch { limit, after } => {
+            let batch =
+                state.recheck_page_stale_for_plan(hash, limit, after, "broker:t3", check)?;
+            ensure!(
+                locked.main_head()? == *at,
+                "main changed during T3 batch; do not reuse its cursor"
+            );
+            print_json(batch)
+        }
+    }
 }
 
 pub(crate) fn plan(

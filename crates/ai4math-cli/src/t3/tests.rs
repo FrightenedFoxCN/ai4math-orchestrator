@@ -63,6 +63,46 @@ fn dry_run_is_deterministic_readonly_and_rejects_unrelated_git_input() -> Result
 }
 
 #[test]
+fn batch_options_require_a_complete_generation_cursor() -> Result<()> {
+    assert_eq!(batch_options(&[])?, (None, None));
+    assert_eq!(batch_options(&["/tool/data"])?, (Some("/tool/data"), None));
+    assert_eq!(
+        batch_options(&["--after", "C", "42"])?,
+        (None, Some(("C", 42)))
+    );
+    assert_eq!(
+        batch_options(&["/tool/data", "--after", "C", "42"])?,
+        (Some("/tool/data"), Some(("C", 42)))
+    );
+    for args in [
+        &["--after"][..],
+        &["--after", "C"],
+        &["--cursor", "C", "42"],
+        &["--after", "C", "-1"],
+        &["--after", "C", "+1"],
+        &["--after", "C", "01"],
+        &["--after", "", "1"],
+        &["--after", "C", "9223372036854775808"],
+    ] {
+        assert!(batch_options(args).is_err(), "accepted {args:?}");
+    }
+    assert!(
+        recheck_batch(
+            Path::new("/unused"),
+            Path::new("/unused"),
+            "unused",
+            9,
+            Path::new("/unused"),
+            &[]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("1..=8")
+    );
+    Ok(())
+}
+
+#[test]
 fn t3_worklist_requires_applied_digest_and_current_main_without_state_writes() -> Result<()> {
     let root = tempfile::tempdir()?;
     let (repo, base) = project(root.path())?;
@@ -107,6 +147,14 @@ fn t3_worklist_requires_applied_digest_and_current_main_without_state_writes() -
 fn native_t3_uses_committed_sources_and_resumes_without_repeat_downgrades() -> Result<()> {
     let root = tempfile::tempdir()?;
     let (repo, _) = project(root.path())?;
+    declare_claim(
+        root.path(),
+        "A",
+        "Defs.lean",
+        "x",
+        "Unproved marker",
+        "x is defined",
+    )?;
     let file = root.path().join("body.txt");
     fs::write(&file, "by\n  rfl")?;
     let exe = PathBuf::from(env::var_os("AI4MATH_TEST_LEAN").context("set Lean executable")?);
@@ -129,7 +177,12 @@ fn native_t3_uses_committed_sources_and_resumes_without_repeat_downgrades() -> R
     )?;
     let preview = inspect(root.path(), &repo, &promoted, &first)?;
     assert!(matches!(
-        preview.claims[0].old_proof,
+        preview
+            .claims
+            .iter()
+            .find(|claim| claim.claim_id == "C")
+            .unwrap()
+            .old_proof,
         ProofDisposition::Ready { .. }
     ));
     let mut state = StateStore::open(root.path().join(".runtime/state.sqlite"))?;
@@ -165,7 +218,9 @@ fn native_t3_uses_committed_sources_and_resumes_without_repeat_downgrades() -> R
     )?;
     assert!(state.claim("C")?.unwrap().stale);
     let seq = state.status()?.last_event_seq;
-    let page = state.t3_worklist(&preview.plan_sha256, 1, None)?;
+    let first_page = state.t3_worklist(&preview.plan_sha256, 1, None)?;
+    assert_eq!(first_page.next_after_claim.as_deref(), Some("A"));
+    let page = state.t3_worklist(&preview.plan_sha256, 1, Some("A"))?;
     assert_eq!(page.entries.len(), 1);
     assert_eq!(page.entries[0].claim_id, "C");
     assert_eq!(
@@ -184,10 +239,46 @@ fn native_t3_uses_committed_sources_and_resumes_without_repeat_downgrades() -> R
         .is_err()
     );
     assert_eq!(state.status()?.last_event_seq, seq);
-    recheck_one(root.path(), &repo, &preview.plan_sha256, "C", &exe, None)?;
+    recheck_batch(root.path(), &repo, &preview.plan_sha256, 1, &exe, &[])?;
+    assert_eq!(state.status()?.last_event_seq, seq);
+    assert!(state.claim("C")?.unwrap().stale);
+    state.append_event(
+        Change {
+            actor: "fixture",
+            git_commit: Some(&first),
+        },
+        "UNRELATED",
+        "claim",
+        "C",
+        serde_json::json!({}),
+    )?;
+    let stale_cursor = seq.to_string();
+    assert!(
+        recheck_batch(
+            root.path(),
+            &repo,
+            &preview.plan_sha256,
+            1,
+            &exe,
+            &["--after", "A", &stale_cursor]
+        )
+        .is_err()
+    );
+    assert!(state.claim("C")?.unwrap().stale);
+    let seq = state.status()?.last_event_seq;
+    recheck_batch(root.path(), &repo, &preview.plan_sha256, 1, &exe, &[])?;
+    assert_eq!(state.status()?.last_event_seq, seq);
+    recheck_batch(
+        root.path(),
+        &repo,
+        &preview.plan_sha256,
+        1,
+        &exe,
+        &["--after", "A", &seq.to_string()],
+    )?;
     assert_eq!(state.claim("C")?.unwrap().local_trust, Trust::L5);
     assert!(!state.claim("C")?.unwrap().stale);
-    let page = state.t3_worklist(&preview.plan_sha256, 1, None)?;
+    let page = state.t3_worklist(&preview.plan_sha256, 1, Some("A"))?;
     assert_eq!(
         page.entries[0].status,
         ai4math_store::T3WorklistStatus::Resolved
