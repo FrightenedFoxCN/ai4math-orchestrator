@@ -280,6 +280,37 @@ impl StateStore {
         })
     }
 
+    /// Includes Claim aliases for the same physical Lean module and declaration.
+    pub fn lean_spec_target_owner(&self, file: &str, decl: &str) -> Result<Option<String>> {
+        read_optional_table(&self.db, "reviewed_lean_specs", |db| {
+            binding_owner(db, file, decl)
+        })
+    }
+
+    /// Confirm that a retained comparator names the very T1 receipt joined to
+    /// the historical recipe, rather than merely another row with the same spec.
+    pub fn managed_lean_t1_matches_comparison(
+        &self,
+        recipe: &ManagedProofRecipe,
+        comparison: &LeanSpecComparison,
+    ) -> Result<bool> {
+        if comparison.claim_id != recipe.claim_id
+            || comparison.promoted_commit != recipe.promoted_commit
+            || comparison.base_commit != recipe.base_commit
+        {
+            return Ok(false);
+        }
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM recorded_promotions p JOIN verification_receipts r USING(receipt_id)
+             WHERE p.git_commit=?1 AND p.claim_id=?2 AND p.base_commit=?3
+             AND r.receipt_sha256=?4 AND r.tier='T1_PROMOTION' AND r.engine='lean4'
+             AND r.base_commit=p.base_commit AND r.target_decl=?5
+             AND json_extract(r.raw_receipt_json, '$.file_path')=?6 AND r.patch_sha256=?7)",
+            params![recipe.promoted_commit,recipe.claim_id,recipe.base_commit,comparison.candidate_receipt_sha256,
+                recipe.target_decl,recipe.file_path,recipe.source_sha256], |r| r.get(0),
+        )?)
+    }
+
     pub fn lean_spec_recheck(
         &self,
         claim_id: &str,

@@ -322,5 +322,6 @@ pub(crate) fn wake_preview(root: &Path, repo: &Path, id: &str, reviewed_main: &s
     print_json(prepare_wake(root, &git, &state, id, reviewed_main)?)
 }
 
+pub(crate) mod recheck;
 #[cfg(test)]
 mod tests;
