@@ -11,6 +11,8 @@ mod proofs;
 #[cfg(unix)]
 mod runtime;
 #[cfg(unix)]
+mod t2_audit;
+#[cfg(unix)]
 mod t3_discovery;
 #[cfg(unix)]
 mod t3_worker;
@@ -20,7 +22,7 @@ mod transport;
 #[cfg(unix)]
 fn main() -> std::process::ExitCode {
     use std::{env, path::PathBuf, process::ExitCode, time::Duration};
-    const USAGE: &str = "ai4mathd --project ROOT [--tick-ms N] [--proof-targets PATH] [--t3-autosweep PATH] [--t3-discovery PATH]";
+    const USAGE: &str = "ai4mathd --project ROOT [--tick-ms N] [--proof-targets PATH] [--t3-autosweep PATH] [--t3-discovery PATH] [--t2-audit PATH]";
     let cmd = || -> anyhow::Result<()> {
         let mut args = env::args_os().skip(1);
         let Some(first) = args.next() else {
@@ -39,6 +41,7 @@ fn main() -> std::process::ExitCode {
         let mut catalog = None;
         let mut t3_config = None;
         let mut discovery_config = None;
+        let mut audit_config = None;
         while let Some(flag) = args.next() {
             if flag == "--tick-ms" && tick.is_none() {
                 let ms: u64 = args
@@ -63,6 +66,11 @@ fn main() -> std::process::ExitCode {
                 discovery_config = Some(PathBuf::from(args.next().ok_or_else(|| {
                     anyhow::anyhow!("missing --t3-discovery configuration path")
                 })?));
+            } else if flag == "--t2-audit" && audit_config.is_none() {
+                audit_config =
+                    Some(PathBuf::from(args.next().ok_or_else(|| {
+                        anyhow::anyhow!("missing --t2-audit configuration path")
+                    })?));
             } else {
                 anyhow::bail!("unknown or repeated argument");
             }
@@ -75,12 +83,17 @@ fn main() -> std::process::ExitCode {
             .as_deref()
             .map(t3_discovery::Config::load)
             .transpose()?;
+        let audit = audit_config
+            .as_deref()
+            .map(t2_audit::Config::load)
+            .transpose()?;
         runtime::run(
             &root,
             tick.unwrap_or(Duration::from_secs(2)),
             catalog.as_deref(),
             worker,
             discovery,
+            audit,
         )
     };
     match cmd() {

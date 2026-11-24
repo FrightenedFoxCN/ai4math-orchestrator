@@ -45,7 +45,7 @@ pub(crate) fn audit(
         anchor,
         reviewed,
         |_, _| Ok(()),
-        |engine, modules| compile(engine, executable, modules),
+        |engine, modules| compile(engine, executable, modules, false),
     )?;
     Ok(build)
 }
@@ -56,6 +56,40 @@ pub(crate) fn audit_with_debt(
     anchor: &str,
     reviewed: &str,
     executable: &Path,
+) -> Result<ManagedT2Audit> {
+    audit_with_debt_mode(root, repo, anchor, reviewed, executable, false)
+}
+
+#[cfg(unix)]
+pub(crate) fn audit_for_daemon(
+    root: &Path,
+    repo: &Path,
+    anchor: &str,
+    reviewed: &str,
+    executable: &Path,
+) -> Result<()> {
+    crate::t3::arm_daemon_lifeline("T2")?;
+    let report = audit_with_debt_mode(root, repo, anchor, reviewed, executable, true)?;
+    // This private subprocess protocol never publishes strings from the proof,
+    // compiler diagnostics, project paths, or raw Claim/debt details.
+    crate::print_json(serde_json::json!({
+        "schema": "ai4math.t2.resident-sample.v1",
+        "advisory_only": true,
+        "reviewed_commit": report.reviewed_commit,
+        "ledger_event_seq": report.ledger_event_seq,
+        "compile_ms": report.clean_build.build.compile_ms,
+        "module_count": report.clean_build.build.modules.len(),
+        "debt_findings": report.trust_debt.finding_count,
+    }))
+}
+
+fn audit_with_debt_mode(
+    root: &Path,
+    repo: &Path,
+    anchor: &str,
+    reviewed: &str,
+    executable: &Path,
+    supervised: bool,
 ) -> Result<ManagedT2Audit> {
     let (clean_build, trust_debt) = audit_inner(
         root,
@@ -72,7 +106,7 @@ pub(crate) fn audit_with_debt(
             );
             Ok(report)
         },
-        |engine, modules| compile(engine, executable, modules),
+        |engine, modules| compile(engine, executable, modules, supervised),
     )?;
     Ok(ManagedT2Audit {
         schema: "ai4math.t2.audit.v1",
@@ -157,8 +191,18 @@ fn audit_inner<T>(
     ))
 }
 
-fn compile(engine: Engine, executable: &Path, modules: &[(&str, &str)]) -> Result<LeanBuildAudit> {
+fn compile(
+    engine: Engine,
+    executable: &Path,
+    modules: &[(&str, &str)],
+    supervised: bool,
+) -> Result<LeanBuildAudit> {
     let toolchain = trusted_toolchain(engine, executable, None)?;
+    let toolchain = if supervised {
+        toolchain.with_supervised_process_group()?
+    } else {
+        toolchain
+    };
     Broker::new()
         .audit_lean_build(&toolchain, modules)
         .context("tracked Lean clean build failed")

@@ -317,7 +317,11 @@ fn valid_claim_id(claim_id: &str) -> bool {
         && !claim_id.chars().any(char::is_control)
 }
 
-fn capture_stdout(child: &mut Child, started: Instant, timeout: Duration) -> Result<Vec<u8>> {
+pub(super) fn capture_stdout(
+    child: &mut Child,
+    started: Instant,
+    timeout: Duration,
+) -> Result<Vec<u8>> {
     // Keep this writer outside Child; wait must not close it before the child exits.
     let lifeline = child.stdin.take();
     let mut may_signal = true;

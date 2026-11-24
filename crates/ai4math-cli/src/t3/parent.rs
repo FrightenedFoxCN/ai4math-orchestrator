@@ -6,21 +6,26 @@ use std::{
 };
 
 pub(super) fn arm() -> Result<()> {
+    arm_for("T3")
+}
+
+pub(crate) fn arm_for(label: &'static str) -> Result<()> {
     // SAFETY: no pointer arguments. Refuse to signal an inherited, shared group.
     let pid = unsafe { libc::getpid() };
     ensure!(
         pid > 1 && unsafe { libc::getpgrp() } == pid,
-        "daemon T3 requires a dedicated process group"
+        "daemon {label} requires a dedicated process group"
     );
     let mut meta = std::mem::MaybeUninit::<libc::stat>::uninit();
     // SAFETY: fstat fully initializes this stack buffer on success.
     if unsafe { libc::fstat(libc::STDIN_FILENO, meta.as_mut_ptr()) } < 0 {
-        return Err(io::Error::last_os_error()).context("inspect daemon T3 lifeline");
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("inspect daemon {label} lifeline"));
     }
     let kind = unsafe { meta.assume_init() }.st_mode & libc::S_IFMT;
     ensure!(
         kind == libc::S_IFIFO || kind == libc::S_IFSOCK,
-        "daemon T3 requires a private stdin lifeline pipe"
+        "daemon {label} requires a private stdin lifeline pipe"
     );
     let mut pfd = libc::pollfd {
         fd: libc::STDIN_FILENO,
@@ -30,10 +35,10 @@ pub(super) fn arm() -> Result<()> {
     // Poll once before any work, refusing an already-closed or non-silent pipe.
     ensure!(
         unsafe { libc::poll(&mut pfd, 1, 0) } == 0,
-        "daemon T3 lifeline is already closed or has unexpected data"
+        "daemon {label} lifeline is already closed or has unexpected data"
     );
     thread::Builder::new()
-        .name("ai4math-t3-lifeline".into())
+        .name("ai4math-daemon-lifeline".into())
         .spawn(move || {
             let mut pipe = io::stdin().lock();
             let mut byte = [0];
@@ -59,7 +64,7 @@ pub(super) fn arm() -> Result<()> {
                 }
             }
         })
-        .context("start daemon T3 lifeline watcher")?;
+        .with_context(|| format!("start daemon {label} lifeline watcher"))?;
     Ok(())
 }
 

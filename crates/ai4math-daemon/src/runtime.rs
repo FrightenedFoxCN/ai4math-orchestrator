@@ -1,6 +1,7 @@
 use crate::{
     facts::{self, FactPack},
     proofs::{self, Probes},
+    t2_audit::{self, AuditState},
     t3_discovery::{self, DiscoveryState},
     t3_worker,
     transport::{self, Connection, Hub, RpcError},
@@ -233,6 +234,7 @@ struct Project {
     retained_dir: PathBuf,
     probes: Probes,
     t3_discovery: Option<Arc<Mutex<DiscoveryState>>>,
+    t2_audit: Option<Arc<Mutex<AuditState>>>,
 }
 
 impl Project {
@@ -295,6 +297,12 @@ impl Project {
             data["t3_discovery"] = match discovery.lock() {
                 Ok(observation) => serde_json::to_value(&*observation)?,
                 Err(_) => serde_json::to_value(DiscoveryState::Unavailable)?,
+            };
+        }
+        if let Some(audit) = &self.t2_audit {
+            data["t2_audit"] = match audit.lock() {
+                Ok(summary) => serde_json::to_value(&*summary)?,
+                Err(_) => serde_json::to_value(AuditState::unavailable())?,
             };
         }
         Ok(data)
@@ -599,11 +607,14 @@ pub fn run(
     catalog: Option<&Path>,
     worker: Option<t3_worker::Config>,
     discovery: Option<t3_discovery::Config>,
+    audit: Option<t2_audit::Config>,
 ) -> Result<()> {
     let root = if worker.is_some() {
         t3_worker::verified_root(project)?
     } else if discovery.is_some() {
         t3_discovery::verified_root(project)?
+    } else if audit.is_some() {
+        t2_audit::verified_root(project)?
     } else {
         project.canonicalize()?
     };
@@ -634,12 +645,16 @@ pub fn run(
     let discovery_state = discovery
         .as_ref()
         .map(|_| Arc::new(Mutex::new(DiscoveryState::Starting)));
+    let audit_state = audit
+        .as_ref()
+        .map(|_| Arc::new(Mutex::new(AuditState::starting())));
     let service = Arc::new(Project {
         store: Mutex::new(StateStore::open(runtime.join("state.sqlite"))?),
         wiki: Mutex::new(Wiki::open(wiki.join(".index.sqlite"))?),
         retained_dir,
         probes: Probes::open(&root, catalog)?,
         t3_discovery: discovery_state.clone(),
+        t2_audit: audit_state.clone(),
     });
     let hub = Hub::new();
     let ticker = hub.clone();
@@ -667,7 +682,10 @@ pub fn run(
                 worker.start(root.clone());
             }
             if let (Some(discovery), Some(state)) = (discovery, discovery_state) {
-                discovery.start(root, state);
+                discovery.start(root.clone(), state);
+            }
+            if let (Some(audit), Some(state)) = (audit, audit_state) {
+                audit.start(root, state);
             }
             Ok(())
         },

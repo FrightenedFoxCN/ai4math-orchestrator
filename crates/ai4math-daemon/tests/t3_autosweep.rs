@@ -182,7 +182,9 @@ fn invalid_autosweep_catalog_fails_before_publishing_socket() -> Result<()> {
 #[cfg(target_os = "macos")]
 mod native {
     use super::*;
-    use ai4math_store::{ClaimState, StateStore, T3SweepState, T3SweepStatus, Trust};
+    use ai4math_store::{
+        Change, ClaimState, NewClaim, StateStore, T3SweepState, T3SweepStatus, Trust,
+    };
     use anyhow::Context;
     use rusqlite::{Connection, OpenFlags};
     use std::{
@@ -585,6 +587,83 @@ mod native {
         );
         assert_eq!(state.status()?.last_event_seq, verified_seq);
         assert_eq!(f.main()?, reviewed);
+        f.stop(daemon)?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
+    fn native_resident_t2_audit_is_pinned_and_non_authoritative() -> Result<()> {
+        let tmp = short_tempdir()?;
+        let f = Fixture::new(
+            tmp.path().canonicalize()?,
+            &native_binary("AI4MATH_TEST_CLI")?,
+            native_binary("AI4MATH_TEST_LEAN")?,
+        )?;
+        let reviewed = f.main()?;
+        let change = Change {
+            actor: "native-resident-t2-fixture",
+            git_commit: Some(&reviewed),
+        };
+        let mut writer = StateStore::open(f.database())?;
+        writer.create_claim(
+            NewClaim {
+                id: "unpublished-debt-id",
+                title: "Fixture debt",
+                informal_statement: "Unpublished fixture statement",
+                engine: "lean4",
+                formal_target: None,
+                module_path: None,
+                critical: false,
+            },
+            change,
+        )?;
+        writer.set_local_trust("unpublished-debt-id", Trust::L4a, change)?;
+        let seq = writer.status()?.last_event_seq;
+        let receipts = f.receipt_count()?;
+        let wal = f.root.join(".runtime/state.sqlite-wal");
+        let before = (fs::read(f.database())?, fs::read(&wal)?);
+        let refs = git(&f.bare, &["show-ref"])?;
+        let config = f.root.join("resident-t2.json");
+        write_new(
+            &config,
+            0o600,
+            &serde_json::to_vec(&json!({
+                "version":1,"cli_executable":f.cli,"bare_repo":f.bare,"anchor_module":ANCHOR,"reviewed_main":reviewed,
+                "native_executable":f.lean,"interval_ms":1000,"audit_timeout_ms":60000,"max_runs":2
+            }))?,
+        )?;
+        let mut daemon = Daemon::spawn_with_flag(&f.root, Some(&config), "--t2-audit")?;
+        ready(&mut daemon, &f.root)?;
+        let sample = daemon.poll(
+            Duration::from_secs(25),
+            "both pinned native T2 samples",
+            || {
+                let live = status(&f.root)?;
+                let audit = &live["t2_audit"];
+                Ok((audit["exhausted"] == true).then_some(audit.clone()))
+            },
+        )?;
+        assert_eq!(sample["status"], "observation", "{}", daemon.logs());
+        assert_eq!(sample["attempts"], 2);
+        let audit = &sample["observation"];
+        assert_eq!(audit["schema"], "ai4math.t2.resident-sample.v1");
+        assert_eq!(audit["advisory_only"], true);
+        assert_eq!(audit["reviewed_commit"], reviewed);
+        assert_eq!(audit["ledger_event_seq"], seq);
+        assert_eq!(audit["module_count"], 2);
+        assert_eq!(audit["debt_findings"], 2);
+        assert!(audit["compile_ms"].as_u64().is_some_and(|ms| ms <= 120000));
+        assert_eq!(
+            audit.as_object().context("sanitized audit object")?.len(),
+            7
+        );
+        assert!(!sample.to_string().contains("unpublished"));
+        assert_eq!((fs::read(f.database())?, fs::read(&wal)?), before);
+        assert_eq!(git(&f.bare, &["show-ref"])?, refs);
+        assert_eq!(f.state()?.status()?.last_event_seq, seq);
+        assert_eq!(f.receipt_count()?, receipts);
+        assert_eq!(f.claim("C")?.local_trust, Trust::L5);
         f.stop(daemon)?;
         Ok(())
     }

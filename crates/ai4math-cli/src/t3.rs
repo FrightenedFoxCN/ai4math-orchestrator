@@ -7,6 +7,8 @@ pub(crate) use discovery::discover_claim_observation;
 pub(crate) use discovery::{discover, discover_claim};
 #[cfg(unix)]
 pub(crate) use discovery::{discover_claim_for_daemon, discover_for_daemon};
+#[cfg(unix)]
+pub(crate) use parent::arm_for as arm_daemon_lifeline;
 #[cfg(test)]
 mod tests;
 use super::{

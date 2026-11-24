@@ -1092,6 +1092,22 @@ fn run() -> Result<()> {
         ["t2-compare", baseline, candidate, delta, percent] => {
             t2_compare_io::run(Path::new(baseline), Path::new(candidate), delta, percent)
         }
+        #[cfg(unix)]
+        [
+            "t2-audit",
+            root,
+            repo,
+            anchor,
+            reviewed,
+            executable,
+            "--daemon-parent",
+        ] => t2_build::audit_for_daemon(
+            Path::new(root),
+            Path::new(repo),
+            anchor,
+            reviewed,
+            Path::new(executable),
+        ),
         ["t2-audit", root, repo, anchor, reviewed, executable] => {
             print_json(t2_build::audit_with_debt(
                 Path::new(root),
