@@ -1,6 +1,6 @@
 use anyhow::{Result, ensure};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[derive(Debug)]
 pub(crate) struct ChildExit {
@@ -139,8 +139,34 @@ pub(crate) fn run_grouped(
     literal_data_reads: &[PathBuf],
     group: ProcessGroup,
 ) -> Result<String> {
-    let bytes = run_inner(spec, data_reads, literal_data_reads, group, None)?;
-    Ok(String::from_utf8_lossy(&bytes).into_owned())
+    run_grouped_until(spec, data_reads, literal_data_reads, group, None)
+}
+
+/// Apply an absolute wall-clock bound in addition to the invocation timeout.
+pub(crate) fn run_grouped_until(
+    spec: Invocation<'_>,
+    data_reads: &[PathBuf],
+    literal_data_reads: &[PathBuf],
+    group: ProcessGroup,
+    deadline: Option<Instant>,
+) -> Result<String> {
+    let bytes = run_inner(spec, data_reads, literal_data_reads, group, None, deadline)?;
+    let log = String::from_utf8_lossy(&bytes).into_owned();
+    deadline_remaining(deadline)?;
+    Ok(log)
+}
+
+fn deadline_remaining(deadline: Option<Instant>) -> Result<Option<Duration>> {
+    deadline
+        .map(|deadline| {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            ensure!(
+                !remaining.is_zero(),
+                "sandbox timeout: absolute wall-clock budget exhausted"
+            );
+            Ok(remaining)
+        })
+        .transpose()
 }
 
 const MAX_CAPTURE_STDOUT: usize = 16 * 1024 * 1024;
@@ -163,6 +189,7 @@ pub(crate) fn run_capture_bytes(
         literal_data_reads,
         group,
         Some(max_stdout),
+        None,
     )
 }
 
@@ -191,6 +218,7 @@ fn run_inner(
     literal_data_reads: &[PathBuf],
     group: ProcessGroup,
     max_stdout: Option<usize>,
+    deadline: Option<Instant>,
 ) -> Result<Vec<u8>> {
     use anyhow::Context;
     use std::{
@@ -198,7 +226,6 @@ fn run_inner(
         os::unix::process::CommandExt,
         process::{Child, Command, Stdio},
         thread,
-        time::Instant,
     };
 
     // Capture through anonymous regular files, not pipes that a stuck process could keep open.
@@ -207,6 +234,7 @@ fn run_inner(
     const LOG_OVERFLOW: &str = "sandbox diagnostic output exceeded limit";
     const STDOUT_OVERFLOW: &str = "sandbox stdout exceeded limit";
     const SEATBELT: &str = "/usr/bin/sandbox-exec";
+    deadline_remaining(deadline)?;
     let executable = fs::canonicalize(spec.executable)?;
     let room = fs::canonicalize(spec.room)?;
     let writable = fs::canonicalize(spec.writable)?;
@@ -237,6 +265,7 @@ fn run_inner(
         .iter()
         .map(fs::canonicalize)
         .collect::<std::io::Result<Vec<_>>>()?;
+    deadline_remaining(deadline)?;
     let policy = profile(
         &executable,
         &room,
@@ -266,7 +295,9 @@ fn run_inner(
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(log.try_clone()?);
-    let cpu = spec.timeout.as_secs().saturating_add(1);
+    let cpu_budget =
+        deadline_remaining(deadline)?.map_or(spec.timeout, |left| left.min(spec.timeout));
+    let cpu = cpu_budget.as_secs().saturating_add(1);
     let own_session = group == ProcessGroup::OwnSession;
     ensure!(
         own_session || unsafe { libc::getpgrp() == libc::getpid() },
@@ -317,6 +348,8 @@ fn run_inner(
             }
         }
     }
+    // An absolute deadline includes policy and command setup, unlike the legacy timeout.
+    deadline_remaining(deadline)?;
     let start = Instant::now();
     let mut running = Running(
         Some(
@@ -330,6 +363,7 @@ fn run_inner(
         if let Some(status) = running.0.as_mut().unwrap().try_wait()? {
             break status;
         }
+        deadline_remaining(deadline)?;
         ensure!(
             start.elapsed() < spec.timeout,
             "sandbox timeout after {:?}",
@@ -339,22 +373,35 @@ fn run_inner(
         if let Some((file, max)) = &stdout {
             check_capture_size(file, *max, STDOUT_OVERFLOW)?;
         }
-        thread::sleep(Duration::from_millis(10));
+        let poll_interval = Duration::from_millis(10);
+        let sleep_for = deadline_remaining(deadline)?.map_or(poll_interval, |left| {
+            left.min(poll_interval)
+                .min(spec.timeout.saturating_sub(start.elapsed()))
+        });
+        thread::sleep(sleep_for);
     };
     // The sandbox denies every fork, so successful leader exit leaves no descendants.
     running.0 = None;
+    deadline_remaining(deadline)?;
     let diagnostics = read_capture(&mut log, LOG_CAP, LOG_OVERFLOW)?;
     if !status.success() {
+        let diagnostics = String::from_utf8_lossy(&diagnostics).into_owned();
+        deadline_remaining(deadline)?;
         return Err(ChildExit {
             status,
-            diagnostics: String::from_utf8_lossy(&diagnostics).into_owned(),
+            diagnostics,
         }
         .into());
     }
-    match &mut stdout {
-        Some((file, max)) => read_capture(file, *max, STDOUT_OVERFLOW),
-        None => Ok(diagnostics),
-    }
+    let bytes = match &mut stdout {
+        Some((file, max)) => {
+            deadline_remaining(deadline)?;
+            read_capture(file, *max, STDOUT_OVERFLOW)?
+        }
+        None => diagnostics,
+    };
+    deadline_remaining(deadline)?;
+    Ok(bytes)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -364,6 +411,7 @@ fn run_inner(
     _literal_data_reads: &[PathBuf],
     _group: ProcessGroup,
     _max_stdout: Option<usize>,
+    _deadline: Option<Instant>,
 ) -> Result<Vec<u8>> {
     let Invocation {
         executable,
@@ -463,6 +511,70 @@ pub fn sandbox_self_test() -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn expired_deadline_does_not_enter_sandbox_prep() {
+        let unused = Path::new("");
+        let spec = Invocation {
+            executable: unused,
+            args: &[],
+            room: unused,
+            writable: unused,
+            reads: &[],
+            env: &[],
+            timeout: Duration::from_secs(1),
+        };
+        let error = run_grouped_until(
+            spec,
+            &[],
+            &[],
+            ProcessGroup::OwnSession,
+            Some(Instant::now()),
+        )
+        .unwrap_err();
+        if cfg!(target_os = "macos") {
+            assert!(
+                error
+                    .to_string()
+                    .contains("absolute wall-clock budget exhausted")
+            );
+        } else {
+            assert!(error.to_string().contains("no unsandboxed fallback"));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    #[ignore = "requires a host that permits native Seatbelt startup"]
+    fn absolute_deadline_caps_a_running_verifier() -> Result<()> {
+        let room = tempfile::tempdir()?;
+        let output = room.path().join("output");
+        std::fs::create_dir(&output)?;
+        let args = ["-c".into(), "while :; do :; done".into()];
+        let error = run_grouped_until(
+            Invocation {
+                executable: Path::new("/bin/bash"),
+                args: &args,
+                room: room.path(),
+                writable: &output,
+                reads: &[],
+                env: &[],
+                timeout: Duration::from_secs(3),
+            },
+            &[],
+            &[],
+            ProcessGroup::OwnSession,
+            Some(Instant::now() + Duration::from_millis(150)),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("absolute wall-clock budget exhausted"),
+            "unexpected sandbox result: {error:#}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn capture_reads_exact_limit_and_preserves_bytes() -> Result<()> {

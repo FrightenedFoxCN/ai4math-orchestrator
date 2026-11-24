@@ -7,15 +7,15 @@ const MODULE: &str = "Audit.lean";
 const SOURCE: &str = "theorem audit : True := True.intro\n";
 const MAIN: &str = "refs/heads/main";
 
-struct Fixture {
+pub(super) struct Fixture {
     _temp: tempfile::TempDir,
-    root: PathBuf,
-    bare: PathBuf,
-    initial: String,
-    next: String,
+    pub(super) root: PathBuf,
+    pub(super) bare: PathBuf,
+    pub(super) initial: String,
+    pub(super) next: String,
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
+pub(super) fn git(dir: &Path, args: &[&str]) -> Result<String> {
     let run = Command::new("/usr/bin/git")
         .current_dir(dir)
         .args([
@@ -37,7 +37,7 @@ fn git(dir: &Path, args: &[&str]) -> Result<String> {
 }
 
 impl Fixture {
-    fn new() -> Result<Self> {
+    pub(super) fn new() -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
         let source = root.join("fixture");
@@ -77,7 +77,7 @@ impl Fixture {
         })
     }
 
-    fn append_from_other_connection(&self) -> Result<i64> {
+    pub(super) fn append_from_other_connection(&self) -> Result<i64> {
         StateStore::open(private_state_path(&self.root)?)?.append_event(
             Change {
                 actor: "audit-concurrent-fixture",

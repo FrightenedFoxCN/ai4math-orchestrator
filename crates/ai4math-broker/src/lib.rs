@@ -348,6 +348,7 @@ enum CheckMode<'a> {
     IsolatedLean {
         predecessors: &'a PathBuf,
         timeout: Duration,
+        deadline: Option<Instant>,
     },
 }
 
@@ -546,14 +547,15 @@ impl Broker {
         relative: &str,
         mode: CheckMode<'_>,
     ) -> Result<String> {
-        let (save_object, diagnostic_output, timeout, predecessors) = match mode {
+        let (save_object, diagnostic_output, timeout, predecessors, deadline) = match mode {
             CheckMode::Default {
                 save_object,
                 diagnostic_output,
-            } => (save_object, diagnostic_output, TIMEOUT, &[][..]),
+            } => (save_object, diagnostic_output, TIMEOUT, &[][..], None),
             CheckMode::IsolatedLean {
                 predecessors,
                 timeout,
+                deadline,
             } => {
                 ensure!(
                     tool.engine == Engine::Lean4,
@@ -564,6 +566,7 @@ impl Broker {
                     DiagnosticOutput::Text,
                     timeout,
                     std::slice::from_ref(predecessors),
+                    deadline,
                 )
             }
         };
@@ -624,7 +627,7 @@ impl Broker {
             }
             Engine::Rocq => return rocq::compile(tool, room, &output, relative, save_object),
         }
-        sandbox::run_grouped(
+        sandbox::run_grouped_until(
             sandbox::Invocation {
                 executable: &tool.executable,
                 args: &args,
@@ -637,6 +640,7 @@ impl Broker {
             predecessors,
             &[],
             tool.sandbox_group,
+            deadline,
         )
     }
 

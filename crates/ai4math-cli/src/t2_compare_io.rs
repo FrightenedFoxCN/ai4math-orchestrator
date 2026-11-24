@@ -42,7 +42,7 @@ fn read_samples(path: &Path) -> Result<Vec<u8>> {
     Ok(data)
 }
 
-fn threshold(value: &str) -> Result<u64> {
+pub(crate) fn threshold(value: &str) -> Result<u64> {
     ensure!(
         !value.is_empty() && !value.starts_with('0') && value.bytes().all(|b| b.is_ascii_digit()),
         "T2 comparison threshold must be a canonical positive integer"

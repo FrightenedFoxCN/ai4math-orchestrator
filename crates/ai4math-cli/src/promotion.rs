@@ -655,6 +655,21 @@ impl PromotionRepo {
         Ok(true)
     }
 
+    pub(crate) fn is_ungrafted_ancestor(&self, old: &str, new: &str) -> Result<bool> {
+        self.require_commit(old)?;
+        self.require_commit(new)?;
+        let args = ["merge-base", "--is-ancestor", old, new];
+        let output = git_command(&self.path, &args, None, false)
+            .env("GIT_GRAFT_FILE", "/dev/null")
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .output()?;
+        if output.status.code() == Some(1) {
+            return Ok(false);
+        }
+        git_success(&args, output)?;
+        Ok(true)
+    }
+
     pub fn pending_ref(&self, state_path: &Path) -> Result<PendingRef<'_>> {
         self.scoped_pending_ref("pending", state_path)
     }
@@ -1210,6 +1225,22 @@ impl Promotion<'_> {
         self.modules
             .iter()
             .map(|path| Ok((path.as_str(), Self::read_blob(self.repo, &self.base, path)?)))
+            .collect()
+    }
+
+    pub(crate) fn project_with_byte_budget(
+        &self,
+        remaining: &mut usize,
+    ) -> Result<Vec<(&str, String)>> {
+        self.modules
+            .iter()
+            .map(|path| {
+                let content = Self::read_blob(self.repo, &self.base, path)?;
+                *remaining = remaining
+                    .checked_sub(content.len())
+                    .context("combined managed heartbeat sources exceed 32 MiB")?;
+                Ok((path.as_str(), content))
+            })
             .collect()
     }
 

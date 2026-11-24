@@ -129,6 +129,24 @@ fn snapshot(fixture: &Path) -> Result<BTreeMap<PathBuf, Option<String>>> {
     Ok(files)
 }
 
+fn comparison_report(output: Output, case: &str, regressed: bool) -> Result<Value> {
+    assert_eq!(
+        output.status.code().map(|code| code != 0),
+        Some(regressed),
+        "{case} exited {}:\nstdout: {}\nstderr: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).with_context(|| {
+        format!(
+            "{case} did not emit JSON:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        )
+    })
+}
+
 fn rejects(output: Output, case: &str, diagnostic: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{case}: unexpectedly accepted");
@@ -277,6 +295,17 @@ fn native_t2_heartbeats_profiles_a_reviewed_snapshot_without_authority() -> Resu
             .output()
     };
 
+    let managed_compare = |baseline: &str, reviewed: &str, compiler_pin: &str, min_delta: u64| {
+        ai(&root, "t2-compare-managed-heartbeats")
+            .arg(&repo)
+            .args([TARGET, baseline, reviewed])
+            .arg(&lean)
+            .arg(compiler_pin)
+            .arg(min_delta.to_string())
+            .arg("100")
+            .output()
+    };
+
     let read_sample =
         |commit: &str, modules: &[(&str, &str)], count: u64| -> Result<HeartbeatSample> {
             let report: Value =
@@ -360,6 +389,16 @@ fn native_t2_heartbeats_profiles_a_reviewed_snapshot_without_authority() -> Resu
          total {baseline_total} -> {candidate_total}"
     );
 
+    // An individual profile can only use current main. The managed comparison
+    // must rebuild the earlier commit even though it is no longer current main.
+    let before = snapshot(&fixture)?;
+    rejects(
+        profile(&head, &pin)?,
+        "individual profile of the historical baseline",
+        "reviewed T2 commit is not current main",
+    );
+    assert_unchanged(&before, "individual profile of the historical baseline")?;
+
     let baseline_json = fixture.join("baseline-heartbeats.json");
     let candidate_json = fixture.join("candidate-heartbeats.json");
     for (path, samples) in [(&baseline_json, &baseline), (&candidate_json, &candidate)] {
@@ -368,8 +407,8 @@ fn native_t2_heartbeats_profiles_a_reviewed_snapshot_without_authority() -> Resu
             &samples.each_ref().map(|sample| &sample.report),
         )?;
     }
-    // Baseline after writing the inputs, so both comparison invocations must
-    // leave the JSON arrays, repository and ledger untouched.
+    // Snapshot after writing the offline inputs. Both comparison commands must
+    // leave the JSON arrays, repository and ledger untouched, even when flagged.
     let before = snapshot(&fixture)?;
     for (min_delta, regressed) in [(1_000, true), (9_000_000_000_000_000u64, false)] {
         let output = Command::new(env!("CARGO_BIN_EXE_ai4math"))
@@ -380,21 +419,8 @@ fn native_t2_heartbeats_profiles_a_reviewed_snapshot_without_authority() -> Resu
             .arg(min_delta.to_string())
             .arg("100")
             .output()?;
-        assert_eq!(
-            output.status.success(),
-            !regressed,
-            "comparison at raw delta {min_delta} exited {}:\nstdout: {}\nstderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
-        let report: Value = serde_json::from_slice(&output.stdout).with_context(|| {
-            format!(
-                "comparison at raw delta {min_delta} did not emit JSON:\nstdout: {}\nstderr: {}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            )
-        })?;
+        let offline_case = format!("offline comparison at raw delta {min_delta}");
+        let report = comparison_report(output, &offline_case, regressed)?;
         assert_eq!(report["schema"], "ai4math.t2.heartbeat-comparison.v1");
         assert_eq!(report["advisory_only"], true);
         assert_eq!(report["regressed"], regressed);
@@ -423,8 +449,45 @@ fn native_t2_heartbeats_profiles_a_reviewed_snapshot_without_authority() -> Resu
             );
             assert_eq!(report[metric]["regressed"], regressed);
         }
-        assert_unchanged(&before, &format!("comparison at raw delta {min_delta}"))?;
+        assert_unchanged(&before, &offline_case)?;
+
+        let managed_case = format!("managed comparison at raw delta {min_delta}");
+        let managed = comparison_report(
+            managed_compare(&head, &heavier_head, &pin, min_delta)?,
+            &managed_case,
+            regressed,
+        )?;
+        assert_eq!(
+            managed,
+            serde_json::json!({
+                "schema": "ai4math.t2.managed-heartbeat-comparison.v1",
+                "advisory_only": true,
+                "ledger_event_seq": seq,
+                "comparison": report,
+            }),
+            "{managed_case} must wrap exactly the offline v1 comparison of native medians"
+        );
+        assert_unchanged(&before, &managed_case)?;
     }
+
+    rejects(
+        managed_compare(&head, &heavier_head, &pin, 0)?,
+        "managed comparison with invalid threshold",
+        "comparison threshold must be a canonical positive integer",
+    );
+    assert_unchanged(&before, "managed comparison with invalid threshold")?;
+    rejects(
+        managed_compare(&heavier_head, &heavier_head, &pin, 1_000)?,
+        "managed comparison with same-commit baseline",
+        "heartbeat baseline must be a distinct ancestor of reviewed main",
+    );
+    assert_unchanged(&before, "managed comparison with same-commit baseline")?;
+    rejects(
+        managed_compare(&head, &heavier_head, &wrong_pin, 1_000)?,
+        "managed comparison with wrong compiler pin",
+        "Lean compiler SHA-256 mismatch",
+    );
+    assert_unchanged(&before, "managed comparison with wrong compiler pin")?;
 
     // Break only the later module. The unchanged target must not yield a
     // partial report even though its predecessors and its own proof are valid.
@@ -438,10 +501,16 @@ fn native_t2_heartbeats_profiles_a_reviewed_snapshot_without_authority() -> Resu
     );
     assert_unchanged(&before, "broken later module")?;
     rejects(
-        profile(&head, &pin)?,
-        "stale review",
+        managed_compare(&head, &broken_head, &pin, 1_000)?,
+        "managed comparison with broken later module",
+        &format!("build isolated Lean module {LATER:?}"),
+    );
+    assert_unchanged(&before, "managed comparison with broken later module")?;
+    rejects(
+        managed_compare(&head, &heavier_head, &pin, 1_000)?,
+        "managed comparison with stale review",
         "reviewed T2 commit is not current main",
     );
-    assert_unchanged(&before, "stale review")?;
+    assert_unchanged(&before, "managed comparison with stale review")?;
     Ok(())
 }

@@ -12,6 +12,9 @@ use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::path::Path;
 
+mod managed_heartbeats;
+pub(crate) use managed_heartbeats::{ManagedHeartbeatRequest, compare_managed_heartbeats};
+
 #[derive(Serialize)]
 pub(crate) struct T2BuildReport {
     schema: &'static str,
@@ -208,13 +211,23 @@ pub(crate) fn audit_heartbeats(
                 .context("managed Lean heartbeat observation failed")
         },
     )?;
-    Ok(HeartbeatReport {
-        schema: "ai4math.t2.lean-heartbeats.v1",
-        advisory_only: true,
-        reviewed_commit: reviewed.into(),
+    Ok(HeartbeatReport::new(
+        reviewed,
         ledger_event_seq,
         observation,
-    })
+    ))
+}
+
+impl HeartbeatReport {
+    fn new(reviewed: &str, ledger_event_seq: i64, observation: LeanHeartbeatAudit) -> Self {
+        Self {
+            schema: "ai4math.t2.lean-heartbeats.v1",
+            advisory_only: true,
+            reviewed_commit: reviewed.into(),
+            ledger_event_seq,
+            observation,
+        }
+    }
 }
 
 fn audit_inner<T>(
@@ -291,6 +304,66 @@ pub(crate) fn at_snapshot_generation_then<T, B, F>(
     build: impl FnOnce(Engine, &Promotion<'_>, &[(&str, &str)]) -> Result<B>,
     finish: impl FnOnce(&PromotionRepo, &Path, i64, &B, &T) -> Result<F>,
 ) -> Result<(B, T, i64, Engine, F)> {
+    with_generation(root, repo, anchor, reviewed, |generation| {
+        let observation = observe(generation.state, generation.seq())?;
+        generation.check_current("managed main or ledger changed before T2 build; retry")?;
+        let pinned = generation.git.snapshot(anchor, Some(reviewed))?;
+        let files = pinned.project()?;
+        let ordered: Vec<_> = files
+            .iter()
+            .map(|(file, source)| (*file, source.as_str()))
+            .collect();
+        let build = build(generation.engine, &pinned, &ordered)?;
+        generation.check_current("managed main or ledger changed during T2 build; retry")?;
+        let finished = finish(
+            generation.git,
+            generation.path,
+            generation.seq(),
+            &build,
+            &observation,
+        )?;
+        Ok((
+            build,
+            observation,
+            generation.seq(),
+            generation.engine,
+            finished,
+        ))
+    })
+}
+
+struct ManagedGeneration<'a> {
+    state: &'a StateStore,
+    git: &'a PromotionRepo,
+    path: &'a Path,
+    reviewed: &'a str,
+    stamp: &'a (String, i64),
+    engine: Engine,
+}
+
+impl ManagedGeneration<'_> {
+    fn seq(&self) -> i64 {
+        self.stamp.1
+    }
+
+    fn check_current(&self, reject: &'static str) -> Result<()> {
+        // External writers need not honor either project lock.
+        ensure!(
+            self.git.main_head()? == self.reviewed
+                && self.state.managed_wiki_stamp()?.as_ref() == Some(self.stamp),
+            "{reject}"
+        );
+        Ok(())
+    }
+}
+
+fn with_generation<R>(
+    root: &Path,
+    repo: &Path,
+    anchor: &str,
+    reviewed: &str,
+    run: impl FnOnce(&ManagedGeneration<'_>) -> Result<R>,
+) -> Result<R> {
     let path =
         private_state_path(root).context("T2 build requires an initialized private project")?;
     let engine = bound_engine(root, anchor)?;
@@ -324,26 +397,14 @@ pub(crate) fn at_snapshot_generation_then<T, B, F>(
         "managed ledger changed before T2 build; retry"
     );
 
-    let observation = observe(&state, stamp.1)?;
-    ensure!(
-        git.main_head()? == reviewed && state.managed_wiki_stamp()?.as_ref() == Some(&stamp),
-        "managed main or ledger changed before T2 build; retry"
-    );
-    let pinned = git.snapshot(anchor, Some(reviewed))?;
-    let files = pinned.project()?;
-    let ordered: Vec<_> = files
-        .iter()
-        .map(|(file, source)| (*file, source.as_str()))
-        .collect();
-    let build = build(engine, &pinned, &ordered)?;
-    // An external Git writer need not honor our lock. Suppress stale telemetry rather
-    // than labeling a changed head or a different ledger generation as the audited state.
-    ensure!(
-        git.main_head()? == reviewed && state.managed_wiki_stamp()?.as_ref() == Some(&stamp),
-        "managed main or ledger changed during T2 build; retry"
-    );
-    let finished = finish(&git, &path, stamp.1, &build, &observation)?;
-    Ok((build, observation, stamp.1, engine, finished))
+    run(&ManagedGeneration {
+        state: &state,
+        git: &git,
+        path: &path,
+        reviewed,
+        stamp: &stamp,
+        engine,
+    })
 }
 
 fn compile(

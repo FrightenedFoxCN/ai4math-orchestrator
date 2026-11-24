@@ -1,4 +1,5 @@
 //! Advisory command heartbeat observations from an isolated native Lean replay.
+use super::t2_build::check_lean_audit_deadline;
 use super::{Broker, Engine, LeanBuildAudit, TIMEOUT, Toolchain, path_for, sandbox, stage_source};
 use anyhow::{Context, Result, anyhow, ensure};
 use serde::Serialize;
@@ -152,8 +153,10 @@ fn profile_target(
     target_module: &str,
     module_name: &str,
     source: &str,
+    audit_deadline: Option<Instant>,
 ) -> Result<LeanHeartbeatProfile> {
-    let deadline = Instant::now() + TIMEOUT;
+    let probe_deadline = Instant::now() + TIMEOUT;
+    check_lean_audit_deadline(audit_deadline)?;
     let temp = tempfile::tempdir().context("create Lean heartbeat probe room")?;
     let room = temp.path().canonicalize()?;
     let output = room.join("output");
@@ -165,7 +168,8 @@ fn profile_target(
     // The wrapper and exact source are in the read-only room. Only output is
     // writable. The broker's object prefix is granted as read-only data, not
     // native executable code, and is the only explicit Lean import path.
-    let log = sandbox::run_grouped(
+    check_lean_audit_deadline(audit_deadline)?;
+    let log = sandbox::run_grouped_until(
         sandbox::Invocation {
             executable: &tool.executable,
             args: &args,
@@ -173,19 +177,22 @@ fn profile_target(
             writable: &output,
             reads: &tool.reads,
             env: &[("LEAN_PATH", objects)],
-            timeout: remaining(deadline)?,
+            timeout: remaining(probe_deadline)?,
         },
         &[objects.to_path_buf()],
         &[],
         tool.sandbox_group,
+        audit_deadline.map(|deadline| deadline.min(probe_deadline)),
     )
     .map_err(without_child_diagnostics)?;
     // run_grouped merges stdout and stderr without trimming. Every byte must
     // belong to the one summary line; do not search past other source output.
-    remaining(deadline)?;
+    check_lean_audit_deadline(audit_deadline)?;
+    remaining(probe_deadline)?;
     let profile = parse_summary(&log, target_module)?;
     temp.close().context("discard Lean heartbeat probe room")?;
-    remaining(deadline)?;
+    check_lean_audit_deadline(audit_deadline)?;
+    remaining(probe_deadline)?;
     Ok(profile)
 }
 
@@ -200,6 +207,44 @@ impl Broker {
         target_module: &str,
         compiler_sha256: &str,
     ) -> Result<LeanHeartbeatAudit> {
+        self.audit_lean_heartbeats_with_deadline(
+            tool,
+            modules,
+            target_module,
+            compiler_sha256,
+            None,
+        )
+    }
+
+    /// Like [Self::audit_lean_heartbeats], with an additional absolute wall-clock
+    /// deadline covering both build and profiling. It can be shared across a
+    /// serial batch; it never resets and does not change compile telemetry.
+    pub fn audit_lean_heartbeats_until(
+        &self,
+        tool: &Toolchain,
+        modules: &[(&str, &str)],
+        target_module: &str,
+        compiler_sha256: &str,
+        deadline: Instant,
+    ) -> Result<LeanHeartbeatAudit> {
+        self.audit_lean_heartbeats_with_deadline(
+            tool,
+            modules,
+            target_module,
+            compiler_sha256,
+            Some(deadline),
+        )
+    }
+
+    fn audit_lean_heartbeats_with_deadline(
+        &self,
+        tool: &Toolchain,
+        modules: &[(&str, &str)],
+        target_module: &str,
+        compiler_sha256: &str,
+        audit_deadline: Option<Instant>,
+    ) -> Result<LeanHeartbeatAudit> {
+        check_lean_audit_deadline(audit_deadline)?;
         ensure!(
             tool.engine == Engine::Lean4,
             "heartbeat audit requires native Lean"
@@ -220,30 +265,43 @@ impl Broker {
             compiler_sha256 == tool.compiler_sha256(),
             "Lean compiler SHA-256 mismatch with the approved toolchain"
         );
+        check_lean_audit_deadline(audit_deadline)?;
         verify_compiler(&tool.executable, compiler_sha256)
             .context("verify Lean heartbeat compiler before audit")?;
+        check_lean_audit_deadline(audit_deadline)?;
 
         let mut observation = None;
         let build = self
-            .audit_lean_build_with(
+            .audit_lean_build_with_until(
                 tool,
                 modules,
                 Some(|module: &str, objects: &Path| {
                     if module == target_name {
                         observation = Some(
-                            profile_target(tool, objects, target_module, module, target_source)
-                                .with_context(|| {
-                                    format!("profile isolated Lean module {target_module:?}")
-                                }),
+                            profile_target(
+                                tool,
+                                objects,
+                                target_module,
+                                module,
+                                target_source,
+                                audit_deadline,
+                            )
+                            .with_context(|| {
+                                format!("profile isolated Lean module {target_module:?}")
+                            }),
                         );
                     }
-                    // Even an unavailable observation must not skip later modules.
+                    // An unavailable observation does not skip later modules
+                    // as long as the enclosing audit still has time.
                     Ok(())
                 }),
+                audit_deadline,
             )
             .map_err(without_child_diagnostics);
+        check_lean_audit_deadline(audit_deadline)?;
         let pinned = verify_compiler(&tool.executable, compiler_sha256)
             .context("recheck Lean heartbeat compiler after audit");
+        check_lean_audit_deadline(audit_deadline)?;
         let build = build?;
         let profile = observation.context("missing Lean heartbeat observation")??;
         pinned?;
@@ -331,6 +389,45 @@ mod tests {
             .set_len(MAX_COMPILER_BYTES + 1)?;
         assert!(verify_compiler(&path, &expected).is_err());
         assert!(remaining(Instant::now()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn expired_audit_deadline_prevents_pin_check_and_profile_launch() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let tool = Toolchain {
+            engine: Engine::Lean4,
+            executable: temp.path().join("missing-lean"),
+            reads: vec![],
+            agda_mode: crate::AgdaMode::default(),
+            agda_data: None,
+            rocq_install: None,
+            binary_sha256: crate::digest(b"fixture compiler"),
+            sandbox_group: sandbox::ProcessGroup::OwnSession,
+        };
+        let target = "Fixture.lean";
+        let source = "def fixture : Nat := 1\n";
+        let deadline = Instant::now();
+        let err = Broker::new()
+            .audit_lean_heartbeats_until(
+                &tool,
+                &[(target, source)],
+                target,
+                tool.compiler_sha256(),
+                deadline,
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("wall-clock deadline exhausted"));
+        let err = profile_target(
+            &tool,
+            temp.path(),
+            target,
+            "Fixture",
+            source,
+            Some(deadline),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("wall-clock deadline exhausted"));
         Ok(())
     }
 

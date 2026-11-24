@@ -62,6 +62,16 @@ fn remaining(deadline: Instant) -> Result<Duration> {
     Ok(time)
 }
 
+/// The caller's wall budget includes every phase, even time that does not count
+/// toward the independent build budget or compile telemetry.
+pub(super) fn check_lean_audit_deadline(deadline: Option<Instant>) -> Result<()> {
+    ensure!(
+        deadline.is_none_or(|deadline| Instant::now() < deadline),
+        "Lean heartbeat audit wall-clock deadline exhausted"
+    );
+    Ok(())
+}
+
 /// Only the current module's expected object parts may reach the read-only
 /// predecessor pool. The sandboxed subprocess has exited and cannot fork;
 /// the containing room is broker-owned and is never writable by the compiler.
@@ -155,12 +165,25 @@ impl Broker {
         &self,
         tool: &Toolchain,
         modules: &[(&str, &str)],
-        mut after_module: Option<impl FnMut(&str, &Path) -> Result<()>>,
+        after_module: Option<impl FnMut(&str, &Path) -> Result<()>>,
     ) -> Result<LeanBuildAudit> {
-        let mut deadline = Instant::now() + TOTAL_TIMEOUT;
+        self.audit_lean_build_with_until(tool, modules, after_module, None)
+    }
+
+    pub(super) fn audit_lean_build_with_until(
+        &self,
+        tool: &Toolchain,
+        modules: &[(&str, &str)],
+        mut after_module: Option<impl FnMut(&str, &Path) -> Result<()>>,
+        audit_deadline: Option<Instant>,
+    ) -> Result<LeanBuildAudit> {
+        let mut build_deadline = Instant::now() + TOTAL_TIMEOUT;
+        check_lean_audit_deadline(audit_deadline)?;
         validate_inputs(tool, modules)?;
+        check_lean_audit_deadline(audit_deadline)?;
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
-        remaining(deadline)?;
+        check_lean_audit_deadline(audit_deadline)?;
+        remaining(build_deadline)?;
         let build_start = Instant::now();
         let room = tempfile::tempdir().context("create Lean build audit room")?;
         let room_path = room.path().canonicalize()?;
@@ -170,14 +193,18 @@ impl Broker {
         let mut remaining_bytes = TOTAL_ARTIFACT_CAP;
         let mut observation_time = Duration::ZERO;
         for &(path, source) in modules {
-            remaining(deadline)?;
+            check_lean_audit_deadline(audit_deadline)?;
+            remaining(build_deadline)?;
             let module = path_for(Engine::Lean4, path)?;
             let scratch = tempfile::tempdir_in(&room_path)?;
             let output = scratch.path().join("output");
             fs::create_dir(&output)?;
             stage_source(Engine::Lean4, scratch.path(), &output, path, source)?;
             let started = Instant::now();
-            let timeout = TIMEOUT.min(remaining(deadline)?);
+            let timeout = TIMEOUT.min(remaining(build_deadline)?);
+            check_lean_audit_deadline(audit_deadline)?;
+            let deadline =
+                audit_deadline.map(|deadline| deadline.min(build_deadline).min(started + TIMEOUT));
             self.check_with_output_timeout(
                 tool,
                 scratch.path(),
@@ -186,10 +213,12 @@ impl Broker {
                 CheckMode::IsolatedLean {
                     predecessors: &predecessors,
                     timeout,
+                    deadline,
                 },
             )
             .with_context(|| format!("build isolated Lean module {path:?}"))?;
             let compile_time = started.elapsed();
+            check_lean_audit_deadline(audit_deadline)?;
             ensure!(
                 compile_time < timeout,
                 "Lean build module {path:?} exceeded its wall-clock budget"
@@ -203,17 +232,20 @@ impl Broker {
                 compile_ms: compile_time.as_millis() as u64,
             });
             if let Some(observe) = &mut after_module {
-                remaining(deadline)?;
+                check_lean_audit_deadline(audit_deadline)?;
+                remaining(build_deadline)?;
                 let check_start = Instant::now();
                 observe(module, &predecessors)?;
                 let elapsed = check_start.elapsed();
                 observation_time += elapsed;
-                deadline += elapsed;
+                build_deadline += elapsed;
+                check_lean_audit_deadline(audit_deadline)?;
             }
         }
         room.close().context("discard Lean build audit room")?;
         let source_set_sha256 = dependencies_digest(modules);
-        remaining(deadline)?;
+        check_lean_audit_deadline(audit_deadline)?;
+        remaining(build_deadline)?;
         Ok(LeanBuildAudit {
             source_set_sha256,
             compiler_sha256: tool.binary_sha256.clone(),
@@ -231,20 +263,24 @@ mod tests {
     use super::*;
     use crate::{AgdaMode, MAX_MODULES, SOURCE_CAP, sandbox};
 
-    #[test]
-    fn rejects_invalid_input_shape_and_installation_shadows() -> Result<()> {
-        let install = tempfile::tempdir()?;
-        fs::write(install.path().join("Installed.olean"), b"fixture")?;
-        let mut tool = Toolchain {
+    fn fixture_tool(install: &Path) -> Toolchain {
+        Toolchain {
             engine: Engine::Lean4,
-            executable: install.path().join("unused"),
-            reads: vec![install.path().to_owned()],
+            executable: install.join("unused"),
+            reads: vec![install.to_owned()],
             agda_mode: AgdaMode::default(),
             agda_data: None,
             rocq_install: None,
             binary_sha256: String::new(),
             sandbox_group: sandbox::ProcessGroup::OwnSession,
-        };
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_input_shape_and_installation_shadows() -> Result<()> {
+        let install = tempfile::tempdir()?;
+        fs::write(install.path().join("Installed.olean"), b"fixture")?;
+        let mut tool = fixture_tool(install.path());
         assert!(validate_inputs(&tool, &[("Valid.lean", "")]).is_ok());
         for modules in [
             &[][..],
@@ -269,6 +305,22 @@ mod tests {
     #[test]
     fn expired_build_budget_fails_closed() {
         assert!(remaining(Instant::now()).is_err());
+    }
+
+    #[test]
+    fn expired_audit_deadline_prevents_build_launch() -> Result<()> {
+        let install = tempfile::tempdir()?;
+        let tool = fixture_tool(install.path());
+        let err = Broker::new()
+            .audit_lean_build_with_until(
+                &tool,
+                &[("Fixture.lean", "def fixture : Nat := 1\n")],
+                Some(|_: &str, _: &Path| panic!("observer must not run")),
+                Some(Instant::now()),
+            )
+            .unwrap_err();
+        assert!(err.to_string().contains("wall-clock deadline exhausted"));
+        Ok(())
     }
 
     #[test]

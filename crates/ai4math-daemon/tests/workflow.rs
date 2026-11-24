@@ -1004,6 +1004,7 @@ fn operator_oracle_and_hammer_are_not_available_over_daemon_rpc() -> Result<()> 
         "t2.heartbeats",
         "t2.compare",
         "t2.compareHeartbeats",
+        "t2.compareManagedHeartbeats",
         "t2.trustDebt",
         "t3.discover",
         "t3.discoverClaim",

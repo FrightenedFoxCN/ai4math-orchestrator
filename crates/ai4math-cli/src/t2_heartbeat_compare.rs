@@ -239,12 +239,7 @@ fn compare_metric(
     )
 }
 
-pub(crate) fn compare(
-    baseline: &[u8],
-    candidate: &[u8],
-    min_delta: u64,
-    min_percent: u64,
-) -> Result<HeartbeatComparison> {
+pub(crate) fn validate_thresholds(min_delta: u64, min_percent: u64) -> Result<()> {
     ensure!(
         (1..=MAX_RAW_HEARTBEATS).contains(&min_delta),
         "min_delta_heartbeats_raw must be in 1..={MAX_RAW_HEARTBEATS}"
@@ -253,6 +248,16 @@ pub(crate) fn compare(
         (1..=MAX_INCREASE_PERCENT).contains(&min_percent),
         "min_increase_percent must be in 1..={MAX_INCREASE_PERCENT}"
     );
+    Ok(())
+}
+
+pub(crate) fn compare(
+    baseline: &[u8],
+    candidate: &[u8],
+    min_delta: u64,
+    min_percent: u64,
+) -> Result<HeartbeatComparison> {
+    validate_thresholds(min_delta, min_percent)?;
     let thresholds = Thresholds {
         min_delta_heartbeats_raw: min_delta,
         min_increase_percent: min_percent,
