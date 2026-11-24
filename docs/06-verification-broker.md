@@ -161,4 +161,4 @@ Broker 每 2 秒采样宿主机可用内存，执行三级背压（并实时输�
 * **T2（周期后台）**：全仓增量构建 + 编译耗时/Heartbeat 基线回归 + 第三方外部内核校验（如 `lean4checker` / `nanoda`）+ `L4a`/`L4b` 债务扫描；
 * **T3（定义/ADR 转向后）**：沿 Claim Graph 标脏受影响下游子树并按拓扑序重检。
 
-现有 T2 切片可手动采集 Lean 冷构建样本并 [离线比较墙钟中位数](architecture-acceptance.md#L514)，也可 [只读扫描经校验的 L4 信任债](architecture-acceptance.md#L522)；这些手动切片不是周期任务、heartbeat 或第三方内核复核。
+现有 T2 切片可手动采集 Lean 冷构建样本并 [离线比较墙钟中位数](architecture-acceptance.md#L514)，也可 [只读扫描经校验的 L4 信任债](architecture-acceptance.md#L522)，并可在 [同代次托管 T2 审计](architecture-acceptance.md#L530) 中合并冷构建和债务结果；这些手动切片不是周期任务、heartbeat 或第三方内核复核。
