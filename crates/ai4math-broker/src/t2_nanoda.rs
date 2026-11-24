@@ -8,6 +8,7 @@ use std::{
     fs,
     io::{self, Read},
     path::Path,
+    time::Duration,
 };
 
 /// Maximum input size, exclusive of the broker-generated configuration.
@@ -234,6 +235,24 @@ pub fn check_lean_export(
     native_nanoda: &Path,
     expected_checker_sha256: &str,
 ) -> Result<LeanExportCheck> {
+    check_lean_export_timed(
+        bytes,
+        expected_export_sha256,
+        native_nanoda,
+        expected_checker_sha256,
+        || Ok(TIMEOUT),
+    )
+}
+
+/// Query the remaining managed time at invocation, after validation, staging,
+/// and the pin check, rather than giving Nanoda a stale timeout.
+pub(super) fn check_lean_export_timed(
+    bytes: &[u8],
+    expected_export_sha256: &str,
+    native_nanoda: &Path,
+    expected_checker_sha256: &str,
+    timeout: impl FnOnce() -> Result<Duration>,
+) -> Result<LeanExportCheck> {
     ensure!(
         lower_hex(expected_checker_sha256, 64),
         "expected Nanoda checker SHA-256 must be 64 lowercase hex digits"
@@ -270,7 +289,7 @@ pub fn check_lean_export(
         writable: &output,
         reads: &[],
         env: &[],
-        timeout: TIMEOUT,
+        timeout: TIMEOUT.min(timeout()?),
     });
     verify_checker_pin(native_nanoda, expected_checker_sha256)
         .context("recheck Nanoda checker after sandbox invocation")?;

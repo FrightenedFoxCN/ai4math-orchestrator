@@ -1,18 +1,23 @@
-//! Advisory export of one exact theorem from a fresh isolated source build.
+//! Advisory export of exact theorems from a fresh isolated source build.
 use super::{
     Broker, Engine, LEAN_EXPORT_MAX_BYTES, LeanBuildAudit, LeanExportCheck, TIMEOUT, Toolchain,
-    breaker_probe::identifier, check_lean_export, digest, path_for, sandbox,
+    breaker_probe::identifier, digest, path_for, sandbox, t2_nanoda::check_lean_export_timed,
 };
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
+    collections::HashSet,
     fs,
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
+/// Maximum number of requested declarations per managed theorem audit.
+pub const MAX_MANAGED_T2_THEOREMS: usize = 8;
+const INDEPENDENT_TIMEOUT: Duration = Duration::from_secs(120);
 const DECLARATION_MAX_BYTES: usize = 256;
 const NATIVE_BINARY_MAX_BYTES: u64 = 64 * 1024 * 1024;
 const EXPORT_LINE_MAX_BYTES: usize = 1024 * 1024;
@@ -56,6 +61,63 @@ pub struct ManagedLeanTheoremAudit {
     pub build: LeanBuildAudit,
     pub independent_check: LeanExportCheck,
     pub exporter_sha256: String,
+}
+
+/// Advisory observations from one isolated build, not promotion receipts.
+#[derive(Debug, Serialize)]
+#[must_use]
+pub struct ManagedLeanBatchAudit {
+    pub build: LeanBuildAudit,
+    pub exporter_sha256: String,
+    /// Checks in the caller's target order, not build order.
+    pub checks: Vec<ManagedLeanBatchCheck>,
+}
+
+/// Independent check of the exact public theorem in its owning module.
+#[derive(Debug, Serialize)]
+pub struct ManagedLeanBatchCheck {
+    /// Source path, such as `Fixture.lean`.
+    pub target_module: String,
+    pub declaration: String,
+    pub independent_check: LeanExportCheck,
+}
+
+#[derive(Clone, Copy)]
+struct ManagedTarget<'a> {
+    path: &'a str,
+    module: &'a str,
+    declaration: &'a str,
+}
+
+fn validate_targets<'a>(
+    modules: &[(&str, &str)],
+    targets: &[(&'a str, &'a str)],
+) -> Result<Vec<ManagedTarget<'a>>> {
+    ensure!(
+        (1..=MAX_MANAGED_T2_THEOREMS).contains(&targets.len()),
+        "expected 1 to {MAX_MANAGED_T2_THEOREMS} managed Lean theorem targets"
+    );
+    let mut declarations = HashSet::with_capacity(targets.len());
+    targets
+        .iter()
+        .map(|&(path, declaration)| {
+            validate_declaration(declaration)?;
+            let module = path_for(Engine::Lean4, path)?;
+            ensure!(
+                modules.iter().any(|&(source_path, _)| source_path == path),
+                "managed theorem target module must be in the supplied source set"
+            );
+            ensure!(
+                declarations.insert(declaration),
+                "duplicate managed Lean theorem declaration {declaration:?}"
+            );
+            Ok(ManagedTarget {
+                path,
+                module,
+                declaration,
+            })
+        })
+        .collect()
 }
 
 fn validate_declaration(declaration: &str) -> Result<()> {
@@ -112,7 +174,36 @@ fn verify_pin(path: &Path, pin: &str, label: &str) -> Result<()> {
     Ok(())
 }
 
-fn confirm_origin(tool: &Toolchain, objects: &Path, module: &str, declaration: &str) -> Result<()> {
+fn phase_timeout(deadline: Instant) -> Result<Duration> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    ensure!(
+        !remaining.is_zero(),
+        "managed Lean independent check wall-clock budget exhausted"
+    );
+    Ok(TIMEOUT.min(remaining))
+}
+
+fn within_check_budget<T>(
+    remaining: &mut Duration,
+    check: impl FnOnce(Instant) -> Result<T>,
+) -> Result<T> {
+    let start = Instant::now();
+    let deadline = start + *remaining;
+    phase_timeout(deadline)?;
+    let checked = check(deadline);
+    *remaining = remaining.saturating_sub(start.elapsed());
+    let checked = checked?;
+    phase_timeout(deadline)?;
+    Ok(checked)
+}
+
+fn confirm_origin(
+    tool: &Toolchain,
+    objects: &Path,
+    module: &str,
+    declaration: &str,
+    deadline: Instant,
+) -> Result<()> {
     let temp = tempfile::tempdir().context("create managed Lean origin room")?;
     let room = temp.path().canonicalize()?;
     let writable = room.join("output");
@@ -136,7 +227,7 @@ fn confirm_origin(tool: &Toolchain, objects: &Path, module: &str, declaration: &
             writable: &writable,
             reads: &tool.reads,
             env: &[],
-            timeout: TIMEOUT,
+            timeout: phase_timeout(deadline)?,
         },
         &[objects.to_owned()],
         &[],
@@ -225,32 +316,19 @@ fn require_exported_theorem(bytes: &[u8], declaration: &str) -> Result<()> {
     Ok(())
 }
 
-impl Broker {
-    /// Build ordered sources, confirm the exact public declaration belongs to
-    /// `target_module` (a source path such as `Fixture.lean`), export it, and
-    /// run the existing independent checker. Pins must come from an operator
-    /// who trusts the native installation, not from the submitted source set.
-    pub fn audit_lean_theorem(
-        &self,
-        tool: &Toolchain,
-        modules: &[(&str, &str)],
-        target_module: &str,
-        declaration: &str,
-        exporter_sha256: &str,
-        checker_sha256: &str,
-    ) -> Result<ManagedLeanTheoremAudit> {
-        ensure!(
-            tool.engine == Engine::Lean4,
-            "managed theorem audit requires native Lean"
-        );
-        validate_declaration(declaration)?;
-        let module = path_for(Engine::Lean4, target_module)?;
-        ensure!(
-            modules.iter().any(|(path, _)| *path == target_module),
-            "managed theorem target module must be in the supplied source set"
-        );
-        validate_pin(exporter_sha256, "Lean exporter")?;
-        validate_pin(checker_sha256, "Nanoda checker")?;
+struct ManagedNative<'a> {
+    tool: &'a Toolchain,
+    sysroot: &'a Path,
+    exporter: PathBuf,
+    exporter_pin: &'a str,
+    checker: PathBuf,
+    checker_pin: &'a str,
+}
+
+impl<'a> ManagedNative<'a> {
+    fn new(tool: &'a Toolchain, exporter_pin: &'a str, checker_pin: &'a str) -> Result<Self> {
+        validate_pin(exporter_pin, "Lean exporter")?;
+        validate_pin(checker_pin, "Nanoda checker")?;
         let bin = tool
             .executable
             .parent()
@@ -260,48 +338,212 @@ impl Broker {
         let exporter = bin.join("leanexport");
         let checker = bin.join("nanoda_bin");
         verify_pin(&tool.executable, &tool.binary_sha256, "Lean compiler")?;
-        verify_pin(&exporter, exporter_sha256, "Lean exporter")?;
-        verify_pin(&checker, checker_sha256, "Nanoda checker")?;
-        let (build, independent_check) = self.audit_lean_build_with(
+        verify_pin(&exporter, exporter_pin, "Lean exporter")?;
+        verify_pin(&checker, checker_pin, "Nanoda checker")?;
+        Ok(Self {
+            tool,
+            sysroot,
+            exporter,
+            exporter_pin,
+            checker,
+            checker_pin,
+        })
+    }
+
+    fn check(
+        &self,
+        objects: &Path,
+        target: ManagedTarget<'_>,
+        deadline: Instant,
+    ) -> Result<LeanExportCheck> {
+        let ManagedTarget {
+            module,
+            declaration,
+            ..
+        } = target;
+        confirm_origin(self.tool, objects, module, declaration, deadline)
+            .context("Lean declaration is not a public theorem owned by target module")?;
+        let temp = tempfile::tempdir().context("create managed Lean export room")?;
+        let room = temp.path().canonicalize()?;
+        let writable = room.join("output");
+        fs::create_dir(&writable)?;
+        verify_pin(&self.exporter, self.exporter_pin, "Lean exporter")?;
+        let result = sandbox::run_capture_bytes(
+            sandbox::Invocation {
+                executable: &self.exporter,
+                args: &[module.to_owned(), "--".to_owned(), declaration.to_owned()],
+                room: &room,
+                writable: &writable,
+                reads: &self.tool.reads,
+                env: &[("LEAN_SYSROOT", self.sysroot), ("LEAN_PATH", objects)],
+                timeout: phase_timeout(deadline)?,
+            },
+            &[objects.to_owned()],
+            &[],
+            self.tool.sandbox_group,
+            LEAN_EXPORT_MAX_BYTES,
+        );
+        verify_pin(&self.exporter, self.exporter_pin, "Lean exporter")
+            .context("recheck Lean exporter after sandbox invocation")?;
+        let bytes = result.context("export managed Lean theorem")?;
+        temp.close().context("discard managed Lean export room")?;
+        require_exported_theorem(&bytes, declaration)?;
+        check_lean_export_timed(
+            &bytes,
+            &digest(&bytes),
+            &self.checker,
+            self.checker_pin,
+            || phase_timeout(deadline),
+        )
+    }
+}
+
+fn observe_module<'a, T>(
+    checks: &mut [(ManagedTarget<'a>, Option<T>)],
+    module: &str,
+    mut observe: impl FnMut(ManagedTarget<'a>) -> Result<T>,
+) -> Result<()> {
+    // Filter without sorting: observations of the same module run in input
+    // order and all results occupy their original target slots.
+    for (target, check) in checks
+        .iter_mut()
+        .filter(|(target, _)| target.module == module)
+    {
+        *check = Some(observe(*target)?);
+    }
+    Ok(())
+}
+
+enum OnCheckFailure {
+    Stop,
+    // The legacy single audit gave downstream build failures precedence over
+    // independent-check errors, even though it checked at the target prefix.
+    FinishBuild,
+}
+
+impl Broker {
+    /// Build ordered sources, confirm the exact public declaration belongs to
+    /// the source path, export it, and run the pinned independent checker.
+    pub fn audit_lean_theorem(
+        &self,
+        tool: &Toolchain,
+        modules: &[(&str, &str)],
+        target_module: &str,
+        declaration: &str,
+        exporter_sha256: &str,
+        checker_sha256: &str,
+    ) -> Result<ManagedLeanTheoremAudit> {
+        let audit = self.audit_managed_lean_theorems(
             tool,
             modules,
-            Some((module, |objects: &Path| {
-                confirm_origin(tool, objects, module, declaration)
-                    .context("Lean declaration is not a public theorem owned by target module")?;
-                let temp = tempfile::tempdir().context("create managed Lean export room")?;
-                let room = temp.path().canonicalize()?;
-                let writable = room.join("output");
-                fs::create_dir(&writable)?;
-                verify_pin(&exporter, exporter_sha256, "Lean exporter")?;
-                let result = sandbox::run_capture_bytes(
-                    sandbox::Invocation {
-                        executable: &exporter,
-                        args: &[module.to_owned(), "--".to_owned(), declaration.to_owned()],
-                        room: &room,
-                        writable: &writable,
-                        reads: &tool.reads,
-                        env: &[("LEAN_SYSROOT", sysroot), ("LEAN_PATH", objects)],
-                        timeout: TIMEOUT,
-                    },
-                    &[objects.to_owned()],
-                    &[],
-                    tool.sandbox_group,
-                    LEAN_EXPORT_MAX_BYTES,
-                );
-                verify_pin(&exporter, exporter_sha256, "Lean exporter")
-                    .context("recheck Lean exporter after sandbox invocation")?;
-                let bytes = result.context("export managed Lean theorem")?;
-                temp.close().context("discard managed Lean export room")?;
-                require_exported_theorem(&bytes, declaration)?;
-                check_lean_export(&bytes, &digest(&bytes), &checker, checker_sha256)
-            })),
+            &[(target_module, declaration)],
+            exporter_sha256,
+            checker_sha256,
+            OnCheckFailure::FinishBuild,
         )?;
+        let check = audit
+            .checks
+            .into_iter()
+            .next()
+            .context("missing managed Lean theorem check")?;
+        Ok(ManagedLeanTheoremAudit {
+            build: audit.build,
+            independent_check: check.independent_check,
+            exporter_sha256: audit.exporter_sha256,
+        })
+    }
+
+    /// Build ordered sources once and check each exact public theorem when its
+    /// owning module arrives. Return the checks in target order only after the
+    /// entire audit succeeds. Pins must come from an operator who trusts the
+    /// native installation, not from the submitted source set.
+    pub fn audit_lean_theorems(
+        &self,
+        tool: &Toolchain,
+        modules: &[(&str, &str)],
+        targets: &[(&str, &str)],
+        exporter_sha256: &str,
+        checker_sha256: &str,
+    ) -> Result<ManagedLeanBatchAudit> {
+        self.audit_managed_lean_theorems(
+            tool,
+            modules,
+            targets,
+            exporter_sha256,
+            checker_sha256,
+            OnCheckFailure::Stop,
+        )
+    }
+
+    fn audit_managed_lean_theorems(
+        &self,
+        tool: &Toolchain,
+        modules: &[(&str, &str)],
+        targets: &[(&str, &str)],
+        exporter_sha256: &str,
+        checker_sha256: &str,
+        on_check_failure: OnCheckFailure,
+    ) -> Result<ManagedLeanBatchAudit> {
+        ensure!(
+            tool.engine == Engine::Lean4,
+            "managed theorem audit requires native Lean"
+        );
+        let mut checks: Vec<_> = validate_targets(modules, targets)?
+            .into_iter()
+            .map(|target| (target, None))
+            .collect();
+        let native = ManagedNative::new(tool, exporter_sha256, checker_sha256)?;
+        let mut remaining = INDEPENDENT_TIMEOUT;
+        let mut deferred_error = None;
+        let build = self.audit_lean_build_with(
+            tool,
+            modules,
+            Some(|module: &str, objects: &Path| {
+                if deferred_error.is_some() {
+                    return Ok(());
+                }
+                let result = observe_module(&mut checks, module, |target| {
+                    let result = within_check_budget(&mut remaining, |deadline| {
+                        native.check(objects, target, deadline)
+                    });
+                    match on_check_failure {
+                        OnCheckFailure::Stop => result.with_context(|| {
+                            format!(
+                                "check managed Lean theorem {:?} in {:?}",
+                                target.declaration, target.path
+                            )
+                        }),
+                        OnCheckFailure::FinishBuild => result,
+                    }
+                });
+                match on_check_failure {
+                    OnCheckFailure::Stop => result,
+                    OnCheckFailure::FinishBuild => {
+                        deferred_error = result.err();
+                        Ok(())
+                    }
+                }
+            }),
+        )?;
+        if let Some(error) = deferred_error {
+            return Err(error);
+        }
         verify_pin(&tool.executable, &tool.binary_sha256, "Lean compiler")
             .context("recheck Lean compiler after managed theorem audit")?;
-        Ok(ManagedLeanTheoremAudit {
+        let checks = checks
+            .into_iter()
+            .map(|(target, check)| {
+                Ok(ManagedLeanBatchCheck {
+                    target_module: target.path.to_owned(),
+                    declaration: target.declaration.to_owned(),
+                    independent_check: check.context("missing managed Lean theorem check")?,
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(ManagedLeanBatchAudit {
             build,
-            independent_check: independent_check.context("missing managed Lean theorem check")?,
             exporter_sha256: exporter_sha256.to_owned(),
+            checks,
         })
     }
 }
@@ -334,6 +576,101 @@ mod tests {
         ] {
             assert!(validate_declaration(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn validates_batch_count_known_paths_and_global_declaration_uniqueness() -> Result<()> {
+        let modules = [("First.lean", ""), ("Second.lean", "")];
+        let first = ("First.lean", "P.one");
+        let second = ("Second.lean", "Q.two");
+        let declarations: Vec<_> = (0..=MAX_MANAGED_T2_THEOREMS)
+            .map(|index| format!("P.target{index}"))
+            .collect();
+        let many: Vec<_> = declarations
+            .iter()
+            .map(|declaration| ("First.lean", declaration.as_str()))
+            .collect();
+        assert!(validate_targets(&modules, &many).is_err());
+        assert_eq!(
+            validate_targets(&modules, &many[..MAX_MANAGED_T2_THEOREMS])?.len(),
+            MAX_MANAGED_T2_THEOREMS
+        );
+        for bad in [
+            &[][..],
+            &[first, first],
+            &[first, (second.0, first.1)],
+            &[first, ("Third.lean", second.1)],
+            &[first, ("SECond.lean", second.1)],
+            &[first, ("../Second.lean", second.1)],
+            &[first, (second.0, "unqualified")],
+        ] {
+            assert!(validate_targets(&modules, bad).is_err(), "{bad:?}");
+        }
+        let targets = validate_targets(&modules, &[second, first])?;
+        assert_eq!(targets[0].module, "Second");
+        assert_eq!(targets[1].declaration, "P.one");
+        Ok(())
+    }
+
+    #[test]
+    fn observes_targets_on_arrival_and_retains_original_slots() -> Result<()> {
+        let modules = [
+            ("First.lean", ""),
+            ("Untargeted.lean", ""),
+            ("Last.lean", ""),
+        ];
+        let selected = [
+            ("Last.lean", "Example.last"),
+            ("First.lean", "Example.first"),
+            ("First.lean", "Example.another"),
+        ];
+        let mut checks: Vec<_> = validate_targets(&modules, &selected)?
+            .into_iter()
+            .map(|target| (target, None))
+            .collect();
+        let mut observed = vec![];
+        for (path, _) in modules {
+            observe_module(&mut checks, path_for(Engine::Lean4, path)?, |target| {
+                observed.push(target.declaration);
+                Ok(observed.len())
+            })?;
+        }
+        assert_eq!(
+            observed,
+            ["Example.first", "Example.another", "Example.last"]
+        );
+        assert_eq!(
+            checks.iter().map(|(_, check)| *check).collect::<Vec<_>>(),
+            [Some(3), Some(1), Some(2)]
+        );
+
+        for (_, check) in &mut checks {
+            *check = None;
+        }
+        let error = observe_module(&mut checks, "First", |target| {
+            anyhow::bail!("failed at {}", target.declaration)
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "failed at Example.first");
+        assert!(checks.iter().all(|(_, check)| check.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn independent_phase_budget_uses_remaining_time_and_fails_closed() -> Result<()> {
+        let start = Instant::now();
+        assert_eq!(phase_timeout(start + INDEPENDENT_TIMEOUT)?, TIMEOUT);
+        let short = Duration::from_secs(10);
+        assert!(phase_timeout(start + short)? <= short);
+        assert!(phase_timeout(start).is_err());
+        let mut exhausted = Duration::ZERO;
+        assert!(
+            within_check_budget(&mut exhausted, |_| -> Result<()> {
+                panic!("must not check after exhaustion");
+            })
+            .is_err()
+        );
+        Ok(())
     }
 
     #[test]

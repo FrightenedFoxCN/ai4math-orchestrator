@@ -99,6 +99,31 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
             ],
         )
     };
+    let manifest = root.join("reviewed-targets.json");
+    fs::write(
+        &manifest,
+        br#"[{"target_module":"Audit.lean","declaration":"Fixture.n"}]"#,
+    )
+    .unwrap();
+    let managed_batch = |repo: &str, reviewed: &str| {
+        ai(
+            &root,
+            "t2-check-batch",
+            &[
+                repo,
+                "Audit.lean",
+                reviewed,
+                nonexistent,
+                &pin,
+                &pin,
+                manifest.to_str().unwrap(),
+            ],
+        )
+    };
+    rejects(
+        managed_batch(repo_str, &head),
+        "initialized private project",
+    );
     rejects(audit(repo_str, &head), "initialized private project");
     rejects(
         managed_theorem(repo_str, &head),
@@ -131,10 +156,22 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
         managed_theorem(repo_str, &old),
         "reviewed T2 commit is not current main",
     );
+    rejects(
+        managed_batch(other_str, &head),
+        "not bound to the supplied managed repository",
+    );
+    rejects(
+        managed_batch(repo_str, &old),
+        "reviewed T2 commit is not current main",
+    );
     let lease = ProjectNativeGate::new(&root).try_heavy().unwrap();
     rejects(audit(repo_str, &head), "project native execution is busy");
     rejects(
         managed_theorem(repo_str, &head),
+        "project native execution is busy",
+    );
+    rejects(
+        managed_batch(repo_str, &head),
         "project native execution is busy",
     );
     drop(lease);

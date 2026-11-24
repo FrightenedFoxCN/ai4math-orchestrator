@@ -15,6 +15,7 @@ use std::{
 const BASIS: &str = "ZManagedExportBasis.lean";
 const TARGET: &str = "AManagedExportTarget.lean";
 const IMPORTED: &str = "ManagedExportFixture.importedIdentity";
+const OTHER_IMPORTED: &str = "ManagedExportFixture.otherIdentity";
 const THEOREM: &str = "ManagedExportFixture.localIdentity";
 const DEFINITION: &str = "ManagedExportFixture.localDefinition";
 const AXIOMATIC: &str = "ManagedExportFixture.axiomaticIdentity";
@@ -22,6 +23,7 @@ const CLAIM: &str = "managed-export-advisory-fixture";
 const BASIS_SOURCE: &str = "prelude
 namespace ManagedExportFixture
 theorem importedIdentity {p : Prop} : p → p := fun h => h
+theorem otherIdentity {p : Prop} : p → p := fun h => h
 end ManagedExportFixture
 ";
 const TARGET_SOURCE: &str = "prelude
@@ -33,6 +35,8 @@ axiom forbiddenIdentity {p : Prop} : p → p
 theorem axiomaticIdentity {p : Prop} : p → p := @forbiddenIdentity p
 end ManagedExportFixture
 ";
+
+const MODULES: [(&str, &str); 2] = [(BASIS, BASIS_SOURCE), (TARGET, TARGET_SOURCE)];
 
 fn checked(output: Output, step: &str) -> Result<Vec<u8>> {
     ensure!(
@@ -133,9 +137,22 @@ fn rejected(output: Output, case: &str, diagnostic: &str) {
     );
 }
 
-#[test]
-#[ignore = "requires native macOS Seatbelt and AI4MATH_TEST_LEAN from the bundled toolchain"]
-fn native_t2_check_managed_checks_the_owned_theorem_without_authority() -> Result<()> {
+struct NativeFixture {
+    fixture: PathBuf,
+    root: PathBuf,
+    source: PathBuf,
+    repo: PathBuf,
+    head: String,
+    stale: String,
+    lean: PathBuf,
+    exporter_pin: String,
+    checker_pin: String,
+    store: StateStore,
+    seq: i64,
+    _temp: tempfile::TempDir,
+}
+
+fn native_fixture() -> Result<NativeFixture> {
     let lean = PathBuf::from(
         std::env::var_os("AI4MATH_TEST_LEAN").context("set AI4MATH_TEST_LEAN to bundled Lean")?,
     );
@@ -232,25 +249,98 @@ fn native_t2_check_managed_checks_the_owned_theorem_without_authority() -> Resul
         },
     )?;
     let seq = store.status()?.last_event_seq;
+    Ok(NativeFixture {
+        _temp: temp,
+        fixture,
+        root,
+        source,
+        repo,
+        head,
+        stale,
+        lean,
+        exporter_pin,
+        checker_pin,
+        store,
+        seq,
+    })
+}
+
+fn assert_fixture_build(lean: &Path, build: &Value) -> Result<()> {
+    let mut sources = Sha256::new();
+    sources.update(b"ai4math:ordered-source-dependencies:v1");
+    sources.update((MODULES.len() as u64).to_be_bytes());
+    let modules = build["modules"].as_array().context("built modules")?;
+    assert_eq!(modules.len(), MODULES.len());
+    for (module, (path, source)) in modules.iter().zip(MODULES) {
+        for part in [path, source] {
+            sources.update((part.len() as u64).to_be_bytes());
+            sources.update(part.as_bytes());
+        }
+        assert_eq!(
+            *module,
+            json!({
+                "path": path,
+                "source_sha256": format!("{:x}", Sha256::digest(source.as_bytes())),
+                "compile_ms": module["compile_ms"].as_u64().context("module timing")?,
+            })
+        );
+    }
+    assert_eq!(
+        *build,
+        json!({
+            "compiler_sha256": file_sha256(lean)?,
+            "source_set_sha256": format!("{:x}", sources.finalize()),
+            "compile_ms": build["compile_ms"].as_u64().context("build timing")?,
+            "modules": modules,
+        })
+    );
+    Ok(())
+}
+
+fn assert_unchanged(
+    fixture: &Path,
+    before: &BTreeMap<PathBuf, Option<String>>,
+    store: &StateStore,
+    seq: i64,
+    case: &str,
+) -> Result<()> {
+    assert_eq!(
+        &snapshot(fixture)?,
+        before,
+        "{case}: wrote durable fixture files"
+    );
+    assert_eq!(
+        store.status()?.last_event_seq,
+        seq,
+        "{case}: changed ledger generation"
+    );
+    let claim = store.claim(CLAIM)?.context("missing fixture Claim")?;
+    assert_eq!(claim.local_trust, Trust::L0);
+    assert_eq!(claim.effective_trust, Trust::L0);
+    assert!(claim.receipt_id.is_none());
+    assert!(store.managed_proof_recipe(CLAIM)?.is_none());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires native macOS Seatbelt and AI4MATH_TEST_LEAN from the bundled toolchain"]
+fn native_t2_check_managed_checks_the_owned_theorem_without_authority() -> Result<()> {
+    let NativeFixture {
+        _temp,
+        fixture,
+        root,
+        source,
+        repo,
+        head,
+        stale,
+        lean,
+        exporter_pin,
+        checker_pin,
+        store,
+        seq,
+    } = native_fixture()?;
     let before = snapshot(&fixture)?;
-    let assert_unchanged = |case: &str| -> Result<()> {
-        assert_eq!(
-            snapshot(&fixture)?,
-            before,
-            "{case}: wrote durable fixture files"
-        );
-        assert_eq!(
-            store.status()?.last_event_seq,
-            seq,
-            "{case}: changed ledger generation"
-        );
-        let claim = store.claim(CLAIM)?.context("missing fixture Claim")?;
-        assert_eq!(claim.local_trust, Trust::L0);
-        assert_eq!(claim.effective_trust, Trust::L0);
-        assert!(claim.receipt_id.is_none());
-        assert!(store.managed_proof_recipe(CLAIM)?.is_none());
-        Ok(())
-    };
+    let assert_unchanged = |case| assert_unchanged(&fixture, &before, &store, seq, case);
     let run = |decl: &str, commit: &str, exporter: &str, checker: &str| {
         ai(&root, "t2-check-managed")
             .arg(&repo)
@@ -280,22 +370,7 @@ fn native_t2_check_managed_checks_the_owned_theorem_without_authority() -> Resul
             "exporter_sha256": exporter_pin,
         })
     );
-    assert_eq!(build["compiler_sha256"], file_sha256(&lean)?);
-    assert!(hex_field(&build["source_set_sha256"], 64));
-    assert!(build["compile_ms"].as_u64().is_some());
-    let modules = build["modules"].as_array().context("built modules")?;
-    assert_eq!(modules.len(), 2);
-    for (module, (path, source)) in modules
-        .iter()
-        .zip([(BASIS, BASIS_SOURCE), (TARGET, TARGET_SOURCE)])
-    {
-        assert_eq!(module["path"], path);
-        assert_eq!(
-            module["source_sha256"],
-            format!("{:x}", Sha256::digest(source.as_bytes()))
-        );
-        assert!(module["compile_ms"].as_u64().is_some());
-    }
+    assert_fixture_build(&lean, build)?;
     assert_eq!(
         *check,
         json!({
@@ -384,5 +459,150 @@ fn native_t2_check_managed_checks_the_owned_theorem_without_authority() -> Resul
             .local_trust,
         Trust::L0
     );
+    Ok(())
+}
+
+// Independently produce the expected export bytes from the fixture's own source,
+// rather than only validating that the report contains hexadecimal strings.
+fn fixture_exports(lean: &Path, targets: &[(&str, &str)]) -> Result<Vec<Vec<u8>>> {
+    let bin = lean.parent().context("bundled Lean bin directory")?;
+    let sysroot = bin.parent().context("bundled Lean sysroot")?;
+    let oracle = tempfile::tempdir()?;
+    let dir = oracle.path().canonicalize()?;
+    for (path, source) in MODULES {
+        fs::write(dir.join(path), source)?;
+        let object = Path::new(path).with_extension("olean");
+        checked(
+            Command::new(lean)
+                .env_clear()
+                .env("PATH", bin)
+                .env("LEAN_PATH", &dir)
+                .current_dir(&dir)
+                .args(["-Ddebug.skipKernelTC=false", "-DElab.async=false", "-o"])
+                .arg(object)
+                .arg(path)
+                .output()?,
+            path,
+        )?;
+    }
+    targets
+        .iter()
+        .map(|&(path, declaration)| {
+            let module = path.strip_suffix(".lean").context("Lean fixture suffix")?;
+            checked(
+                Command::new(bin.join("leanexport"))
+                    .env_clear()
+                    .env("PATH", bin)
+                    .env("LEAN_SYSROOT", sysroot)
+                    .env("LEAN_PATH", &dir)
+                    .current_dir(&dir)
+                    .args([module, "--", declaration])
+                    .output()?,
+                declaration,
+            )
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "requires native macOS Seatbelt and AI4MATH_TEST_LEAN from the bundled toolchain"]
+fn native_t2_check_batch_checks_both_modules_in_input_order() -> Result<()> {
+    let f = native_fixture()?;
+    let write_targets = |filename: &str, targets: &[(&str, &str)]| -> Result<PathBuf> {
+        let path = f.fixture.join(filename);
+        let rows: Vec<_> = targets
+            .iter()
+            .map(|&(module, declaration)| json!({"target_module": module, "declaration": declaration}))
+            .collect();
+        fs::write(&path, serde_json::to_vec(&rows)?)?;
+        Ok(path)
+    };
+    // The dependent theorem goes first in the report, but its basis must build first.
+    let targets = [(TARGET, THEOREM), (BASIS, IMPORTED)];
+    let accepted = write_targets("accepted.json", &targets)?;
+    // These valid first members are checked before the bad members in manifest order.
+    let wrong_module = write_targets(
+        "wrong-module.json",
+        &[(BASIS, IMPORTED), (TARGET, OTHER_IMPORTED)],
+    )?;
+    let axiomatic = write_targets("axiomatic.json", &[(BASIS, IMPORTED), (TARGET, AXIOMATIC)])?;
+    let scratch = f.fixture.join("tmp");
+    fs::create_dir(&scratch)?;
+    let before = snapshot(&f.fixture)?;
+    let run = |path: &Path| {
+        ai(&f.root, "t2-check-batch")
+            .env("TMPDIR", &scratch)
+            .arg(&f.repo)
+            .args([BASIS, &f.head])
+            .arg(&f.lean)
+            .args([&f.exporter_pin, &f.checker_pin])
+            .arg(path)
+            .output()
+    };
+    let assert_unchanged = |case| assert_unchanged(&f.fixture, &before, &f.store, f.seq, case);
+
+    let report: Value = serde_json::from_slice(&checked(run(&accepted)?, "check reversed batch")?)?;
+    assert_unchanged("accepted batch")?;
+    assert_fixture_build(&f.lean, &report["build"])?;
+    let exports = fixture_exports(&f.lean, &targets)?;
+    let rows = targets
+        .into_iter()
+        .zip(exports)
+        .zip([2, 1])
+        .map(
+            |(((module, declaration), export), theorem_count)| -> Result<Value> {
+                let header = export
+                    .split(|&byte| byte == b'\n')
+                    .next()
+                    .context("export header")?;
+                let header: Value = serde_json::from_slice(header)?;
+                let lean_commit = &header["meta"]["lean"]["githash"];
+                assert!(hex_field(lean_commit, 40));
+                Ok(json!({
+                    "target_module": module,
+                    "declaration": declaration,
+                    "independent_check": {
+                        "schema": "ai4math.t2.lean-export-check.v1",
+                        "advisory_only": true,
+                        "checker": "nanoda",
+                        "accepted": true,
+                        "export_sha256": format!("{:x}", Sha256::digest(&export)),
+                        "checker_sha256": f.checker_pin,
+                        "export_format": "3.1.0",
+                        "lean_git_commit": lean_commit,
+                        "theorem_count": theorem_count,
+                    }
+                }))
+            },
+        )
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        report,
+        json!({
+            "schema": "ai4math.t2.managed-batch-check.v1",
+            "advisory_only": true,
+            "reviewed_commit": f.head,
+            "ledger_event_seq": f.seq,
+            "build": report["build"],
+            "exporter_sha256": f.exporter_pin,
+            "checks": rows,
+        })
+    );
+
+    for (path, case, diagnostic) in [
+        (
+            &wrong_module,
+            "wrong module in batch",
+            "Lean declaration is not a public theorem owned by target module",
+        ),
+        (
+            &axiomatic,
+            "axiomatic theorem in batch",
+            "Nanoda rejected the Lean export",
+        ),
+    ] {
+        rejected(run(path)?, case, diagnostic);
+        assert_unchanged(case)?;
+    }
     Ok(())
 }

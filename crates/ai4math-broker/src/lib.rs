@@ -22,7 +22,9 @@ mod sandbox;
 mod t2_build;
 pub use t2_build::{LeanBuildAudit, LeanBuildModuleAudit};
 mod t2_managed_export;
-pub use t2_managed_export::ManagedLeanTheoremAudit;
+pub use t2_managed_export::{
+    MAX_MANAGED_T2_THEOREMS, ManagedLeanBatchAudit, ManagedLeanBatchCheck, ManagedLeanTheoremAudit,
+};
 mod t2_nanoda;
 pub use t2_nanoda::{LEAN_EXPORT_MAX_BYTES, LeanExportCheck, check_lean_export};
 mod t3;

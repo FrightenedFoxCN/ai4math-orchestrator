@@ -199,7 +199,7 @@ fn audit_inner<T>(
     ))
 }
 
-fn at_generation<T, B>(
+pub(crate) fn at_generation<T, B>(
     root: &Path,
     repo: &Path,
     anchor: &str,
