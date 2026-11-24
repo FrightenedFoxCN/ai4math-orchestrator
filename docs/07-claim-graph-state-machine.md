@@ -101,3 +101,5 @@ L0 (Conjecture)
 | `verification_receipts` | Broker 洁净室签发的不可伪造形式化准入凭证存根 |
 | `circuit_breakers` | 可恢复 `Definition Smell` 局部熔断器状态与冻结队列快照 |
 | `decision_inbox` & `human_checkpoints` | 非阻塞决策收件箱与人类检查点游标（`cursor_id`, `event_seq`, `git_commit`） |
+
+当前已提供 [单 Claim 历史事件重放](architecture-acceptance.md#L458)，不依赖当前的 Claim 行，也不等同于从事件恢复整库。

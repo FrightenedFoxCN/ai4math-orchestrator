@@ -13,6 +13,7 @@ use std::{
     path::Path,
 };
 
+mod claim_replay;
 mod migrations;
 mod oracle;
 mod pivot;
@@ -25,6 +26,7 @@ mod sediment_recheck;
 mod sweep;
 mod t3_baseline;
 mod tasks;
+pub use claim_replay::{ClaimReplay, ReplayedClaim};
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{BreakerTripReport, PivotIntent, PivotPlan, PivotResult};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
