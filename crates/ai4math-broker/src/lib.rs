@@ -286,6 +286,11 @@ pub struct VerifiedCandidate {
     mode: VerificationMode,
 }
 impl VerifiedCandidate {
+    /// Distinguish typed native T3 assessment from a caller-selected legacy tier.
+    pub fn is_assessed_t3(&self) -> bool {
+        matches!(self.mode, VerificationMode::AssessT3)
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }
@@ -920,6 +925,17 @@ mod tests {
             source,
             mode: VerificationMode::Legacy(ReceiptTier::T1Promotion),
         }
+    }
+
+    #[test]
+    fn t3_tier_does_not_confer_the_typed_assessment_seal() {
+        let mut candidate = candidate_fixture(&[]);
+        assert!(!candidate.is_assessed_t3());
+        candidate.receipt.tier = ReceiptTier::T3TaintRebuild;
+        candidate.mode = VerificationMode::Legacy(ReceiptTier::T3TaintRebuild);
+        assert!(!candidate.is_assessed_t3());
+        candidate.mode = VerificationMode::AssessT3;
+        assert!(candidate.is_assessed_t3());
     }
 
     #[test]

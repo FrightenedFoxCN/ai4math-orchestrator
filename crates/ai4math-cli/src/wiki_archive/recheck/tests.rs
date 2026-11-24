@@ -89,9 +89,7 @@ impl<'a> Fixture<'a> {
         let result = run(self.root, &self.repo, id, reviewed, lean);
         let after = self.snapshot()?;
         assert_eq!(before.seq, after.seq, "changed ledger event sequence");
-        assert_eq!(before.claim, after.claim, "changed Claim state");
-        assert_eq!(before.refs, after.refs, "changed repository refs");
-        assert!(before.wiki == after.wiki, "changed Wiki tree or bytes");
+        before.assert_same_authority(&after);
         Ok(result)
     }
 
@@ -159,6 +157,14 @@ struct Observation {
     wiki: BTreeMap<PathBuf, Option<Vec<u8>>>,
 }
 
+impl Observation {
+    fn assert_same_authority(&self, after: &Self) {
+        assert_eq!(self.claim, after.claim, "changed Claim state");
+        assert_eq!(self.refs, after.refs, "changed repository refs");
+        assert!(self.wiki == after.wiki, "changed Wiki tree or bytes");
+    }
+}
+
 fn snapshot_tree(root: &Path, tree: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) -> Result<()> {
     for entry in fs::read_dir(root)? {
         let entry = entry?;
@@ -224,6 +230,7 @@ fn assert_report(
     let json = serde_json::to_value(report)?;
     assert_eq!(json["reason"], reason);
     assert_eq!(json["persisted"], false);
+    assert!(report.observation.is_none());
     assert_eq!(json["current_proof_authority"], false);
     assert_eq!(json["preview"]["archive_id"], archive_id);
     assert_eq!(json["preview"]["current_main"], head);
@@ -283,6 +290,23 @@ fn native_ordinary_recheck_verifies_or_defers_without_changing_authority() -> Re
     )?;
     assert_ne!(digest(&verified.candidate_receipt_sha256), original);
     assert!(verified.comparison_receipt_sha256.is_none());
+
+    let before = fixture.snapshot()?;
+    let retained = run_with_retention(fixture.root, &fixture.repo, &id, &reviewed, &lean, true)?;
+    assert_eq!(retained.status, Status::Verified);
+    assert!(retained.persisted && !retained.current_proof_authority);
+    let observation = retained
+        .observation
+        .context("missing ordinary retained observation")?;
+    assert!(observation.comparison_receipt_sha256.is_none());
+    assert_eq!(
+        fixture.store()?.sediment_replay(&observation.id)?,
+        Some(observation.clone())
+    );
+    super::result(fixture.root, &observation.id)?;
+    let after = fixture.snapshot()?;
+    assert_eq!(after.seq, before.seq + 1);
+    before.assert_same_authority(&after);
 
     let changed = fixture.advance_main(&[(DEFS, "def x : Nat := Nat.succ 1\n")])?;
     let deferred = fixture.observe(&id, &changed, &missing)??;
@@ -355,6 +379,93 @@ fn native_reviewed_spec_recheck_compares_against_unchanged_spec_prefix() -> Resu
         &id,
         &spec_edited,
     )?;
+    assert_eq!(store.lean_spec_comparison(&promoted)?, Some(original));
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires native macOS Seatbelt and absolute AI4MATH_TEST_LEAN"]
+fn native_reviewed_spec_recheck_retains_only_verified_observations() -> Result<()> {
+    let lean = native_lean()?;
+    let dir = tempfile::tempdir()?;
+    let fixture = Fixture::new(dir.path(), true)?;
+    let (promoted, id) = fixture.promote_and_archive(&lean)?;
+    let store = fixture.store()?;
+    let original = store
+        .lean_spec_comparison(&promoted)?
+        .context("missing original comparison")?;
+
+    // The proof still checks with x = 3, but it no longer matches the reviewed spec.
+    let different = fixture.advance_main(&[(DEFS, "def x : Nat := 3\n")])?;
+    fixture.mark_claim_stale(&different)?;
+    let before = fixture.snapshot()?;
+    let deferred = run_with_retention(fixture.root, &fixture.repo, &id, &different, &lean, true)?;
+    assert_report(
+        &deferred,
+        Status::Deferred,
+        "reviewed_spec_comparison_not_confirmed",
+        &id,
+        &different,
+    )?;
+    let after = fixture.snapshot()?;
+    assert_eq!(after.seq, before.seq, "retained a failed replay");
+    before.assert_same_authority(&after);
+    assert!(store.lean_spec_comparison(&different)?.is_none());
+
+    let reviewed = fixture.advance_main(&[(DEFS, "def x : Nat := Nat.succ 1\n")])?;
+    let before = fixture.snapshot()?;
+    assert_eq!(before.claim["stale"], true);
+    assert!(before.claim["receipt_id"].is_string());
+    let report = run_with_retention(fixture.root, &fixture.repo, &id, &reviewed, &lean, true)?;
+    assert_eq!(report.status, Status::Verified, "{report:?}");
+    assert!(report.persisted);
+    assert!(!report.current_proof_authority);
+    assert!(!report.preview.current_proof_authority);
+    let observation = report
+        .observation
+        .as_ref()
+        .context("missing retained observation")?;
+    let retained = store
+        .sediment_replay(&observation.id)?
+        .context("missing persisted observation")?;
+    assert_eq!(
+        serde_json::to_value(observation)?,
+        serde_json::to_value(&retained)?
+    );
+    assert_eq!(retained.archive_id, id);
+    assert_eq!(retained.claim_id, CLAIM);
+    assert_eq!(retained.promoted_commit, promoted);
+    assert_eq!(retained.reviewed_commit, reviewed);
+    assert_eq!(
+        retained.candidate_receipt_sha256,
+        digest(&report.candidate_receipt_sha256)
+    );
+    assert_eq!(
+        retained.comparison_receipt_sha256.as_deref(),
+        Some(digest(&report.comparison_receipt_sha256))
+    );
+    assert_ne!(
+        retained.candidate_receipt_sha256,
+        original.candidate_receipt_sha256
+    );
+    assert_ne!(
+        retained.comparison_receipt_sha256.as_deref(),
+        Some(original.receipt_sha256.as_str())
+    );
+
+    let after = fixture.snapshot()?;
+    assert_eq!(after.seq, before.seq + 1);
+    before.assert_same_authority(&after);
+    let events = store.events_after(before.seq, 2)?;
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.event_seq, retained.event_seq);
+    assert_eq!(event.event_type, "SEDIMENT_REPLAY_RETAINED");
+    assert_eq!(event.entity_id, CLAIM);
+    assert_eq!(event.git_commit.as_deref(), Some(reviewed.as_str()));
+    assert_eq!(event.payload["id"], retained.id);
+    assert!(store.lean_spec_comparison(&reviewed)?.is_none());
     assert_eq!(store.lean_spec_comparison(&promoted)?, Some(original));
     Ok(())
 }

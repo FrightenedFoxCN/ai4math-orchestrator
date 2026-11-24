@@ -18,12 +18,14 @@ mod pivot;
 mod probes;
 pub(crate) mod regression;
 mod reviewed_lean;
+mod sediment_recheck;
 mod sweep;
 mod tasks;
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{BreakerTripReport, PivotIntent, PivotPlan, PivotResult};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
 pub use reviewed_lean::{LeanSpecComparison, LeanSpecRecheck, ReviewedLeanSpec};
+pub use sediment_recheck::{RetainedSedimentReplay, SedimentReplayScope};
 pub use sweep::{T3SweepState, T3SweepStatus, T3SweepStep};
 pub(crate) use tasks::scheduler_snapshot;
 pub use tasks::{
@@ -637,6 +639,10 @@ impl StateStore {
         ensure!(
             kind != regression::MELTDOWN,
             "managed regression events require typed broker failure evidence"
+        );
+        ensure!(
+            kind != sediment_recheck::RETAINED,
+            "sediment replay events require sealed broker evidence"
         );
         self.write(|tx| event(tx, change, kind, entity, id, payload))
     }

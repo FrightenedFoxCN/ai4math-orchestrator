@@ -106,7 +106,7 @@ pub(super) fn read_binding(db: &Connection, claim_id: &str) -> Result<Option<Rev
 // Claim IDs may alias one physical target. Compare module spellings with ASCII
 // case folding (the managed filesystem may be case-insensitive), but declaration
 // names must match exactly. Only canonically scoped bindings enter this table.
-fn binding_owner(db: &Connection, file: &str, decl: &str) -> Result<Option<String>> {
+pub(super) fn binding_owner(db: &Connection, file: &str, decl: &str) -> Result<Option<String>> {
     Ok(db
         .query_row(
             "SELECT b.claim_id FROM reviewed_lean_specs b JOIN claims c USING(claim_id)
@@ -187,7 +187,7 @@ pub(super) fn read_recheck(
 
 // A read-only StateStore may be looking at a legacy database whose additive
 // tables have not been installed. Never use this fallback on the write path.
-fn read_optional_table<T>(
+pub(super) fn read_optional_table<T>(
     db: &Connection,
     name: &str,
     read: impl FnOnce(&Connection) -> Result<Option<T>>,
@@ -294,21 +294,7 @@ impl StateStore {
         recipe: &ManagedProofRecipe,
         comparison: &LeanSpecComparison,
     ) -> Result<bool> {
-        if comparison.claim_id != recipe.claim_id
-            || comparison.promoted_commit != recipe.promoted_commit
-            || comparison.base_commit != recipe.base_commit
-        {
-            return Ok(false);
-        }
-        Ok(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM recorded_promotions p JOIN verification_receipts r USING(receipt_id)
-             WHERE p.git_commit=?1 AND p.claim_id=?2 AND p.base_commit=?3
-             AND r.receipt_sha256=?4 AND r.tier='T1_PROMOTION' AND r.engine='lean4'
-             AND r.base_commit=p.base_commit AND r.target_decl=?5
-             AND json_extract(r.raw_receipt_json, '$.file_path')=?6 AND r.patch_sha256=?7)",
-            params![recipe.promoted_commit,recipe.claim_id,recipe.base_commit,comparison.candidate_receipt_sha256,
-                recipe.target_decl,recipe.file_path,recipe.source_sha256], |r| r.get(0),
-        )?)
+        matches_managed_t1(&self.db, recipe, Some(comparison), None)
     }
 
     pub fn lean_spec_recheck(
@@ -320,6 +306,35 @@ impl StateStore {
             read_recheck(db, claim_id, plan_sha256)
         })
     }
+}
+
+/// Check the exact recorded promotion receipt for the historical recipe. If a
+/// retained comparator is required, it must name that same receipt and promotion.
+/// An unbound replay can instead require the exact ordered T1 dependency prefix.
+pub(super) fn matches_managed_t1(
+    db: &Connection,
+    recipe: &ManagedProofRecipe,
+    comparison: Option<&LeanSpecComparison>,
+    expected_dependencies: Option<&str>,
+) -> Result<bool> {
+    if comparison.is_some_and(|c| {
+        c.claim_id != recipe.claim_id
+            || c.promoted_commit != recipe.promoted_commit
+            || c.base_commit != recipe.base_commit
+    }) {
+        return Ok(false);
+    }
+    let expected_receipt = comparison.map(|c| c.candidate_receipt_sha256.as_str());
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM recorded_promotions p JOIN verification_receipts r USING(receipt_id)
+         WHERE p.git_commit=?1 AND p.claim_id=?2 AND p.base_commit=?3
+         AND (?4 IS NULL OR r.receipt_sha256=?4) AND r.tier='T1_PROMOTION' AND r.engine='lean4'
+         AND r.base_commit=p.base_commit AND r.target_decl=?5
+         AND json_extract(r.raw_receipt_json, '$.file_path')=?6 AND r.patch_sha256=?7
+         AND (?8 IS NULL OR json_extract(r.raw_receipt_json, '$.dependencies_sha256')=?8))",
+        params![recipe.promoted_commit,recipe.claim_id,recipe.base_commit,expected_receipt,
+            recipe.target_decl,recipe.file_path,recipe.source_sha256,expected_dependencies], |r| r.get(0),
+    )?)
 }
 
 impl VerifiedReceipt {

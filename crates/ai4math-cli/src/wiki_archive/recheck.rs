@@ -6,7 +6,9 @@ use crate::{
 };
 use ai4math_broker::{Broker, RecheckAssessment};
 use ai4math_core::Engine;
-use ai4math_store::{StateStore, Trust};
+use ai4math_store::{
+    RetainedSedimentReplay, SedimentReplayScope, StateStore, Trust, read_sediment,
+};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::path::Path;
@@ -28,6 +30,8 @@ struct Report {
     candidate_receipt_sha256: Option<String>,
     comparison_receipt_sha256: Option<String>,
     persisted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observation: Option<RetainedSedimentReplay>,
     current_proof_authority: bool,
 }
 
@@ -40,6 +44,7 @@ impl Report {
             candidate_receipt_sha256: None,
             comparison_receipt_sha256: None,
             persisted: false,
+            observation: None,
             current_proof_authority: false,
         }
     }
@@ -57,9 +62,21 @@ fn run(
     reviewed_main: &str,
     executable: &Path,
 ) -> Result<Report> {
+    run_with_retention(root, repo, id, reviewed_main, executable, false)
+}
+
+fn run_with_retention(
+    root: &Path,
+    repo: &Path,
+    id: &str,
+    reviewed_main: &str,
+    executable: &Path,
+    retain: bool,
+) -> Result<Report> {
     let _native = managed_native(root)?;
     let git = PromotionRepo::try_lock(repo)?;
-    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let db_path = root.join(".runtime/state.sqlite");
+    let state = StateStore::open_readonly(&db_path)?;
     let seq = state.status()?.last_event_seq;
     let still_current = || -> Result<()> {
         ensure!(
@@ -182,7 +199,7 @@ fn run(
             ),
         "native replay differs from reviewed source"
     );
-    if let Some(spec) = binding.as_ref() {
+    let comparison = if let Some(spec) = binding.as_ref() {
         let compared = broker.compare_lean_spec(
             &tool,
             &candidate,
@@ -195,14 +212,54 @@ fn run(
             return defer(report, "reviewed_spec_comparison_not_confirmed");
         };
         report.comparison_receipt_sha256 = Some(compared.receipt_sha256().into());
-    }
+        Some(compared)
+    } else {
+        None
+    };
     report.candidate_receipt_sha256 = Some(candidate.receipt().receipt_sha256().into());
     still_current()?;
+    if retain {
+        // A report or a digest is never input to retention. Keep both real broker
+        // values and both project locks alive through the SQLite write CAS.
+        read_sediment(root, id).context("archive changed before observation retention")?;
+        let mut writable = StateStore::open(&db_path)?;
+        still_current()?;
+        report.observation = Some(
+            writable.retain_sediment_replay(
+                SedimentReplayScope {
+                    repo: git
+                        .path()
+                        .to_str()
+                        .context("managed repository path is not UTF-8")?,
+                    archive_id: id,
+                    claim_id: &claim.id,
+                    promoted_commit: &recipe.promoted_commit,
+                    reviewed_commit: reviewed_main,
+                    expected_event_seq: seq,
+                },
+                &candidate,
+                comparison.as_ref(),
+            )?,
+        );
+        report.persisted = true;
+    }
     Ok(report.finish(Status::Verified, "replayed_in_isolation"))
 }
 
 pub(crate) fn command(root: &Path, repo: &Path, id: &str, head: &str, exec: &Path) -> Result<()> {
     print_json(run(root, repo, id, head, exec)?)
+}
+
+pub(crate) fn retain(root: &Path, repo: &Path, id: &str, head: &str, exec: &Path) -> Result<()> {
+    print_json(run_with_retention(root, repo, id, head, exec, true)?)
+}
+
+pub(crate) fn result(root: &Path, id: &str) -> Result<()> {
+    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let observation = state
+        .sediment_replay(id)?
+        .context("no retained sediment replay observation")?;
+    print_json(serde_json::json!({"observation":observation,"current_proof_authority":false}))
 }
 
 #[cfg(test)]

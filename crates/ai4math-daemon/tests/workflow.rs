@@ -1001,6 +1001,8 @@ fn operator_oracle_and_hammer_are_not_available_over_daemon_rpc() -> Result<()> 
         "wiki.sedimentPreview",
         "wiki.sedimentWakePreview",
         "wiki.sedimentWakeRecheck",
+        "wiki.sedimentWakeRetain",
+        "wiki.sedimentWakeResult",
         "wiki.sedimentArchive",
     ] {
         assert_eq!(rpc.call(method, json!({}))?["error"]["code"], -32601);

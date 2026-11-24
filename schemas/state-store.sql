@@ -397,6 +397,31 @@ CREATE TABLE IF NOT EXISTS managed_proof_recipes (
   proof_body TEXT NOT NULL CHECK(length(CAST(proof_body AS BLOB))<=262144)
 );
 
+-- A native Lean sediment replay is advisory readback; digest fields deliberately
+-- do not reference or mint verification receipts and confer no current trust.
+CREATE TABLE IF NOT EXISTS sediment_replays (
+  id TEXT PRIMARY KEY NOT NULL CHECK(length(id)=64 AND id NOT GLOB '*[^0-9a-f]*'),
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq),
+  repo TEXT NOT NULL CHECK(length(repo)>0),
+  archive_id TEXT NOT NULL CHECK(length(archive_id)=68 AND substr(archive_id,1,4)='SED-'
+    AND substr(archive_id,5) NOT GLOB '*[^0-9a-f]*'),
+  claim_id TEXT NOT NULL REFERENCES claims(claim_id),
+  promoted_commit TEXT NOT NULL REFERENCES recorded_promotions(git_commit)
+    CHECK(length(promoted_commit) IN (40,64) AND promoted_commit NOT GLOB '*[^0-9a-f]*'),
+  reviewed_commit TEXT NOT NULL
+    CHECK(length(reviewed_commit)=length(promoted_commit) AND reviewed_commit NOT GLOB '*[^0-9a-f]*'),
+  expected_event_seq INTEGER NOT NULL CHECK(expected_event_seq>=0 AND expected_event_seq<event_seq),
+  candidate_receipt_sha256 TEXT NOT NULL CHECK(length(candidate_receipt_sha256)=64 AND candidate_receipt_sha256 NOT GLOB '*[^0-9a-f]*'),
+  comparison_receipt_sha256 TEXT CHECK(length(comparison_receipt_sha256)=64 AND comparison_receipt_sha256 NOT GLOB '*[^0-9a-f]*')
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS sediment_replays_no_update BEFORE UPDATE ON sediment_replays
+BEGIN SELECT RAISE(ABORT, 'sediment replay evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sediment_replays_no_delete BEFORE DELETE ON sediment_replays
+BEGIN SELECT RAISE(ABORT, 'sediment replay evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS sediment_replays_no_replace BEFORE INSERT ON sediment_replays
+WHEN EXISTS (SELECT 1 FROM sediment_replays WHERE id=NEW.id OR event_seq=NEW.event_seq)
+BEGIN SELECT RAISE(ABORT, 'sediment replay evidence is immutable'); END;
+
 -- Immutable advisory observations tied to the reviewed Claim snapshot, not to
 -- its current row. No trigger may turn this evidence into a trust transition.
 CREATE TABLE IF NOT EXISTS oracle_observations (
