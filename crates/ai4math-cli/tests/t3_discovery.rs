@@ -398,6 +398,26 @@ fn daemon_summary_refuses_a_direct_cli_call_without_lifeline() {
 }
 
 #[test]
+fn claim_discovery_never_guesses_a_baseline_for_unverified_or_missing_claims() {
+    let f = Fixture::new();
+    let seq = f.event_seq();
+    let project = project_tree(&f.root);
+    let repo = file_tree(&f.bare);
+    for id in ["Proof", "UnknownClaim"] {
+        let output = f.ai("t3-discover-claim", &[utf8(&f.bare), id]);
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("no current exact managed Lean T1 baseline")
+        );
+    }
+    assert_eq!(f.event_seq(), seq);
+    assert_same_tree(&f.root, project, project_tree(&f.root));
+    assert_same_tree(&f.bare, repo, file_tree(&f.bare));
+}
+
+#[test]
 fn discovery_rejects_inputs_outside_its_managed_scope_without_writes() {
     let f = Fixture::new();
     let other = f._temp.path().join("unbound.git");

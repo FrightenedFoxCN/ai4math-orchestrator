@@ -521,6 +521,50 @@ fn native_sediment_adaptation_approves_only_a_fresh_target_without_granting_auth
         Some(&original_comparison)
     );
 
+    assert_eq!(
+        target.receipt_id.as_deref(),
+        Some(comparison.candidate_receipt_sha256.as_str())
+    );
+    // Claim discovery uses the current T1 receipt and its promoted commit,
+    // not the parent reviewed for promotion or the archived origin's receipt.
+    let discover = |observed_head: &str, status: &str| -> Result<Value> {
+        let before = Authority::read(root, &repo, &state)?;
+        let seq = state.status()?.last_event_seq;
+        let discovery = serde_json::to_value(t3::discover_claim_observation(root, &repo, TARGET)?)?;
+        assert_eq!(discovery["baseline_claim"], TARGET);
+        assert_eq!(discovery["baseline_scope"], "claim_t1");
+        assert_eq!(
+            discovery["baseline_receipt_sha256"],
+            comparison.candidate_receipt_sha256
+        );
+        assert_eq!(discovery["base_commit"], adapted);
+        assert_eq!(discovery["observed_head"], observed_head);
+        assert_eq!(discovery["status"], status);
+        assert_eq!(discovery["advisory_only"], true);
+        assert_eq!(discovery["ledger_event_seq"], seq);
+        assert_eq!(state.status()?.last_event_seq, seq);
+        before.assert_unchanged(root, &repo, &state)?;
+        Ok(discovery)
+    };
+    let unchanged = discover(&adapted, "unchanged")?;
+    assert_eq!(unchanged.get("plan"), Some(&Value::Null));
+    assert_eq!(unchanged["changed_modules"], json!([]));
+    assert_eq!(unchanged["module_order_changed"], false);
+
+    let assert_discovery_refused = || -> Result<()> {
+        let before = Authority::read(root, &repo, &state)?;
+        let seq = state.status()?.last_event_seq;
+        let err = t3::discover_claim_observation(root, &repo, TARGET)
+            .err()
+            .context("claim discovery should refuse this baseline")?;
+        assert!(
+            format!("{err:#}").contains("no current exact managed Lean T1 baseline for this Claim"),
+            "{err:#}"
+        );
+        assert_eq!(state.status()?.last_event_seq, seq);
+        before.assert_unchanged(root, &repo, &state)
+    };
+
     // Only the exact newly promoted main may anchor this ledger-only link.
     let retain_before = Authority::read(root, &repo, &state)?;
     let retain_seq = state.status()?.last_event_seq;
@@ -680,6 +724,25 @@ fn native_sediment_adaptation_approves_only_a_fresh_target_without_granting_auth
             .context("missing destination Claim")?
             .stale
     );
+    let structural = discover(&drifted, "structural_change")?;
+    assert_eq!(structural["changed_modules"], json!(["Defs.lean"]));
+    assert_eq!(structural["module_order_changed"], false);
+    let explicit_plan = {
+        let locked = PromotionRepo::try_lock(&repo)?;
+        let mut preview = StateStore::open_readonly(root.join(DB))?;
+        t3::plan(
+            &mut preview,
+            &locked,
+            NEW_MODULE,
+            &adapted,
+            &drifted,
+            Engine::Lean4,
+        )?
+    };
+    assert_eq!(structural["plan"]["plan_sha256"], explicit_plan.plan_sha256);
+    assert_eq!(structural["plan"]["ledger_event_seq"], live.event_seq);
+    assert!(state.applied_t3_plan(&explicit_plan.plan_sha256)?.is_none());
+
     let err =
         wiki_archive::core_projection::checked_read(root, &repo, &adapted, |_, _| -> Result<()> {
             panic!("query with an outdated reviewed head must be refused")
@@ -718,6 +781,7 @@ fn native_sediment_adaptation_approves_only_a_fresh_target_without_granting_auth
             .context("missing destination Claim")?
             .stale
     );
+    assert_discovery_refused()?;
     let stale = WikiManagedGeneration {
         head: &adapted,
         event_seq: state.status()?.last_event_seq,
@@ -808,6 +872,14 @@ fn native_sediment_adaptation_approves_only_a_fresh_target_without_granting_auth
     assert_eq!(recheck.promoted_commit, adapted);
     assert_eq!(recheck.spec_prefix_sha256, comparison.spec_prefix_sha256);
     assert_ne!(recheck.comparison_receipt_sha256, comparison.receipt_sha256);
+    assert_eq!(
+        restored.receipt_id.as_deref(),
+        Some(recheck.candidate_receipt_sha256.as_str())
+    );
+    assert_ne!(restored.receipt_id, target.receipt_id);
+    // A non-stale Claim with a current T3 receipt must not silently fall back
+    // to the original T1 receipt, even though that promotion remains in Git.
+    assert_discovery_refused()?;
     let restored_seq = state.status()?.last_event_seq;
     wiki_archive::core_projection::checked_read(root, &repo, &rechecked_head, &assert_hidden)?;
     assert_eq!(

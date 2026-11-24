@@ -23,6 +23,7 @@ mod sediment_adaptation;
 mod sediment_lineage;
 mod sediment_recheck;
 mod sweep;
+mod t3_baseline;
 mod tasks;
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{BreakerTripReport, PivotIntent, PivotPlan, PivotResult};
@@ -32,6 +33,7 @@ pub use sediment_adaptation::{SedimentAdaptationApproval, SedimentAdaptationPlan
 pub use sediment_lineage::{SedimentCoreEvidence, SedimentLineage, SedimentLineageInput};
 pub use sediment_recheck::{RetainedSedimentReplay, SedimentReplayScope};
 pub use sweep::{T3SweepState, T3SweepStatus, T3SweepStep};
+pub use t3_baseline::T3DiscoveryBaseline;
 pub(crate) use tasks::scheduler_snapshot;
 pub use tasks::{
     NewTask, OracleTaskHold, TaskCandidate, TaskCandidateSource, TaskLease, TaskRunOutcome,
