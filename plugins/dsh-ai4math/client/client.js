@@ -453,26 +453,40 @@ function T2AuditBadge({ value, currentSeq }) {
   let summary, title
   if (hasObservation) {
     const sample = value.observation
-    const fields = ['schema', 'advisory_only', 'reviewed_commit', 'ledger_event_seq', 'compile_ms', 'module_count', 'debt_findings']
-    const independent = sample?.schema === 'ai4math.t2.resident-sample.v2'
-    if (independent) fields.push('independent_checks')
+    const fields = ['schema', 'advisory_only', 'reviewed_commit', 'ledger_event_seq']
+    const schema = sample?.schema
+    const heartbeats = schema === 'ai4math.t2.resident-heartbeats.v3'
+    const independent = schema === 'ai4math.t2.resident-sample.v2'
+    if (heartbeats) fields.push('regressed', 'max_command_regressed', 'total_commands_regressed')
+    else fields.push('compile_ms', 'module_count', 'debt_findings', ...(independent ? ['independent_checks'] : []))
     if (attempts === 0 || !hasExactOwnKeys(sample, ...fields)) return null
-    const { reviewed_commit: oid, ledger_event_seq: sampleSeq, compile_ms: ms, module_count: modules,
-      debt_findings: debt, independent_checks: checks } = sample
-    if ((!independent && sample.schema !== 'ai4math.t2.resident-sample.v1') || sample.advisory_only !== true
-      || (independent && (debt !== 0 || !isCount(checks) || checks < 1 || checks > 8))
-      || typeof oid !== 'string' || (oid.length !== 40 && oid.length !== 64) || /[^0-9a-f]/.test(oid) || !/[1-9a-f]/.test(oid)
-      || !isCount(sampleSeq) || !isCount(ms) || ms > 120000
-      || !isCount(modules) || modules < 1 || modules > 128 || !isCount(debt) || debt > 3072) return null
+    const { reviewed_commit: oid, ledger_event_seq: sampleSeq } = sample
+    if (sample.advisory_only !== true || typeof oid !== 'string'
+      || (oid.length !== 40 && oid.length !== 64) || /[^0-9a-f]/.test(oid) || !/[1-9a-f]/.test(oid)
+      || !isCount(sampleSeq)) return null
 
     title = 'Reviewed Git commit: ' + oid + '. This sample carries no proof authority.'
-      + (independent ? ' Independent checks cover only the reviewed selection.' : '')
+    if (heartbeats) {
+      const { regressed, max_command_regressed: max, total_commands_regressed: total } = sample
+      if (typeof max !== 'boolean' || typeof total !== 'boolean' || regressed !== (max || total)) return null
+      title += ' Heartbeat comparison covers one selected module.'
+      summary = (regressed
+        ? 'Heartbeat thresholds met (' + [max ? 'max command' : '', total ? 'total commands' : ''].filter(Boolean).join(', ') + ')'
+        : 'Heartbeat thresholds not met') + ' · ' + attemptsText
+    } else {
+      const { compile_ms: ms, module_count: modules, debt_findings: debt, independent_checks: checks } = sample
+      if ((!independent && schema !== 'ai4math.t2.resident-sample.v1')
+        || (independent && (debt !== 0 || !isCount(checks) || checks < 1 || checks > 8))
+        || !isCount(ms) || ms > 120000 || !isCount(modules) || modules < 1 || modules > 128
+        || !isCount(debt) || debt > 3072) return null
+      if (independent) title += ' Independent checks cover only the reviewed selection.'
+      summary = ms + ' ms compile · ' + modules + (modules === 1 ? ' module' : ' modules')
+        + ' · ' + debt + (debt === 1 ? ' debt finding' : ' debt findings')
+        + (independent ? ' · ' + checks + (checks === 1 ? ' independent theorem check' : ' independent theorem checks') : '')
+        + ' · ' + attemptsText
+    }
     if (sampleSeq < currentSeq) summary = 'older ledger sample'
     else if (sampleSeq > currentSeq) summary = 'awaiting matching ledger'
-    else summary = ms + ' ms compile · ' + modules + (modules === 1 ? ' module' : ' modules')
-      + ' · ' + debt + (debt === 1 ? ' debt finding' : ' debt findings')
-      + (independent ? ' · ' + checks + (checks === 1 ? ' independent theorem check' : ' independent theorem checks') : '')
-      + ' · ' + attemptsText
   } else {
     if (typeof status !== 'string' || !Object.hasOwn(T2_AUDIT_STATUS_TEXT, status)) return null
     summary = T2_AUDIT_STATUS_TEXT[status] + ' · ' + attemptsText

@@ -45,7 +45,7 @@ env -i PATH=/usr/bin:/bin ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/DeepSeek H
   "$APP/Contents/Resources/app.asar/dsh" "$PWD/target/debug/ai4mathd" "$PWD/target/debug/ai4math" "$LEAN"
 ```
 
-在上面的命令最后加 `--independent` 可验收配置版本 2：临时库提交固定清单，真实 Nanoda 复核后，安装版 Typert 的 Owner 状态/推流仅返回脱敏计数。需要 Lean 安装目录中的原生 `leanexport` 和 `nanoda_bin`。
+在上面的命令最后加 `--independent` 可验收配置版本 2：临时库提交固定清单，真实 Nanoda 复核后，安装版 Typert 的 Owner 状态/推流仅返回脱敏计数。需要 Lean 安装目录中的原生 `leanexport` 和 `nanoda_bin`。 在同一命令最后改用 `--heartbeats` 可验收配置版本 3：临时 Git 基线与候选触发真实成对 Lean 采样，并验证安装版 Typert 只转发脱敏的阈值判定。
 
 
 ## 尚未覆盖的完整产品设计

@@ -20,6 +20,11 @@ use std::{
 
 const SCHEMA_V1: &str = "ai4math.t2.resident-sample.v1";
 const SCHEMA_V2: &str = "ai4math.t2.resident-sample.v2";
+const SCHEMA_V3: &str = "ai4math.t2.resident-heartbeats.v3";
+
+// Match the limits of the managed-heartbeat comparison worker.
+const MAX_RAW_HEARTBEATS: u64 = (1 << 53) - 1;
+const MAX_INCREASE_PERCENT: u64 = 1_000;
 
 // Struct derives can also accept positional arrays; this protocol is object-only.
 // Delegate the map to the derived decoder so duplicate and unknown keys still fail.
@@ -69,6 +74,12 @@ pub(super) struct Config {
     exporter_sha256: Option<String>,
     #[serde(default, deserialize_with = "present")]
     checker_sha256: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    baseline_commit: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    min_delta_heartbeats_raw: Option<u64>,
+    #[serde(default, deserialize_with = "present")]
+    min_increase_percent: Option<u64>,
 }
 
 pub(super) fn verified_root(project: &Path) -> Result<PathBuf> {
@@ -94,18 +105,45 @@ impl Config {
     }
 
     fn check_fields(&self) -> Result<()> {
-        let timeout_max = match (
-            self.version,
+        let release = (
             self.policy_sha256.as_deref(),
-            self.compiler_sha256.as_deref(),
             self.exporter_sha256.as_deref(),
             self.checker_sha256.as_deref(),
+        );
+        let heartbeats = (
+            self.baseline_commit.as_deref(),
+            self.min_delta_heartbeats_raw,
+            self.min_increase_percent,
+        );
+        let timeout_max = match (
+            self.version,
+            self.compiler_sha256.as_deref(),
+            release,
+            heartbeats,
         ) {
-            (1, None, None, None, None) => 180_000,
-            (2, Some(policy), Some(compiler), Some(exporter), Some(checker))
-                if [policy, compiler, exporter, checker]
-                    .into_iter()
-                    .all(valid_sha256) =>
+            (1, None, (None, None, None), (None, None, None)) => 180_000,
+            (
+                2,
+                Some(compiler),
+                (Some(policy), Some(exporter), Some(checker)),
+                (None, None, None),
+            ) if [policy, compiler, exporter, checker]
+                .into_iter()
+                .all(valid_sha256) =>
+            {
+                270_000
+            }
+            (
+                3,
+                Some(compiler),
+                (None, None, None),
+                (Some(baseline), Some(delta), Some(percent)),
+            ) if valid_sha256(compiler)
+                && valid_oid(baseline)
+                && baseline.len() == self.reviewed_main.len()
+                && baseline != self.reviewed_main
+                && (1..=MAX_RAW_HEARTBEATS).contains(&delta)
+                && (1..=MAX_INCREASE_PERCENT).contains(&percent) =>
             {
                 270_000
             }
@@ -190,15 +228,7 @@ impl Config {
             Ok(None) => Status::Waiting,
             Ok(Some(after)) if after == before => bytes
                 .ok()
-                .and_then(|bytes| {
-                    Summary::parse(
-                        &bytes,
-                        &self.reviewed_main,
-                        after,
-                        self.policy_sha256.as_deref(),
-                    )
-                    .ok()
-                })
+                .and_then(|bytes| self.parse_summary(&bytes, after).ok())
                 .map_or(Status::Unavailable, |observation| Status::Observation {
                     observation,
                 }),
@@ -235,30 +265,94 @@ impl Config {
                 == Some(self.reviewed_main.as_str())
     }
 
+    fn parse_summary(&self, bytes: &[u8], expected_seq: i64) -> Result<Summary> {
+        let reviewed = &self.reviewed_main;
+        match self.version {
+            1 => SampleSummary::parse(bytes, reviewed, expected_seq, None).map(Summary::Sample),
+            2 => SampleSummary::parse(
+                bytes,
+                reviewed,
+                expected_seq,
+                Some(
+                    self.policy_sha256
+                        .as_deref()
+                        .context("missing policy pin")?,
+                ),
+            )
+            .map(Summary::Sample),
+            3 => HeartbeatSummary::parse(
+                bytes,
+                reviewed,
+                expected_seq,
+                self.baseline_commit
+                    .as_deref()
+                    .context("missing baseline pin")?,
+                self.compiler_sha256
+                    .as_deref()
+                    .context("missing compiler pin")?,
+            )
+            .map(Summary::Heartbeats),
+            _ => anyhow::bail!("invalid resident audit version"),
+        }
+    }
+
     fn command(&self, root: &Path) -> Command {
         let mut command = Command::new(&self.cli_executable);
         command
             .current_dir(root)
-            .arg(if self.version == 2 {
-                "t2-release-check"
-            } else {
-                "t2-audit"
+            .arg(match self.version {
+                1 => "t2-audit",
+                2 => "t2-release-check",
+                3 => "t2-compare-managed-heartbeats",
+                _ => unreachable!("validated resident audit version"),
             })
             .arg(root)
             .arg(&self.bare_repo)
-            .arg(&self.anchor_module)
+            .arg(&self.anchor_module);
+        if self.version == 3 {
+            command.arg(
+                self.baseline_commit
+                    .as_deref()
+                    .expect("validated baseline pin"),
+            );
+        }
+        command
             .arg(&self.reviewed_main)
-            .arg(&self.native_executable)
-            .args(
-                [
-                    &self.policy_sha256,
-                    &self.compiler_sha256,
-                    &self.exporter_sha256,
-                    &self.checker_sha256,
-                ]
-                .into_iter()
-                .flatten(),
-            )
+            .arg(&self.native_executable);
+        match self.version {
+            2 => {
+                command.args(
+                    [
+                        &self.policy_sha256,
+                        &self.compiler_sha256,
+                        &self.exporter_sha256,
+                        &self.checker_sha256,
+                    ]
+                    .into_iter()
+                    .flatten(),
+                );
+            }
+            3 => {
+                command
+                    .arg(
+                        self.compiler_sha256
+                            .as_deref()
+                            .expect("validated compiler pin"),
+                    )
+                    .arg(
+                        self.min_delta_heartbeats_raw
+                            .expect("validated raw threshold")
+                            .to_string(),
+                    )
+                    .arg(
+                        self.min_increase_percent
+                            .expect("validated percent threshold")
+                            .to_string(),
+                    );
+            }
+            _ => {}
+        }
+        command
             .arg("--daemon-parent")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
@@ -313,9 +407,16 @@ enum Status {
     HeadChanged,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum Summary {
+    Sample(SampleSummary),
+    Heartbeats(HeartbeatSummary),
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct WorkerSummary {
+struct WorkerSampleSummary {
     schema: String,
     advisory_only: bool,
     reviewed_commit: String,
@@ -331,7 +432,7 @@ struct WorkerSummary {
 
 // The public type cannot retain the worker policy pin.
 #[derive(Debug, Serialize)]
-struct Summary {
+struct SampleSummary {
     schema: String,
     advisory_only: bool,
     reviewed_commit: String,
@@ -343,14 +444,14 @@ struct Summary {
     independent_checks: Option<u8>,
 }
 
-impl Summary {
+impl SampleSummary {
     fn parse(
         bytes: &[u8],
         reviewed_main: &str,
         expected_seq: i64,
         expected_policy: Option<&str>,
     ) -> Result<Self> {
-        let ObjectOnly(summary): ObjectOnly<WorkerSummary> = serde_json::from_slice(bytes)?;
+        let ObjectOnly(summary): ObjectOnly<WorkerSampleSummary> = serde_json::from_slice(bytes)?;
         let audited = match (
             summary.schema.as_str(),
             expected_policy,
@@ -383,6 +484,71 @@ impl Summary {
             module_count: summary.module_count,
             debt_findings: summary.debt_findings,
             independent_checks: summary.independent_checks,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerHeartbeatSummary {
+    schema: String,
+    advisory_only: bool,
+    reviewed_commit: String,
+    ledger_event_seq: i64,
+    baseline_commit: String,
+    compiler_sha256: String,
+    regressed: bool,
+    max_command_regressed: bool,
+    total_commands_regressed: bool,
+}
+
+// The public observation does not retain the worker's baseline or compiler pin.
+#[derive(Debug, Serialize)]
+struct HeartbeatSummary {
+    schema: String,
+    advisory_only: bool,
+    reviewed_commit: String,
+    ledger_event_seq: i64,
+    regressed: bool,
+    max_command_regressed: bool,
+    total_commands_regressed: bool,
+}
+
+impl HeartbeatSummary {
+    fn parse(
+        bytes: &[u8],
+        reviewed_main: &str,
+        expected_seq: i64,
+        expected_baseline: &str,
+        expected_compiler: &str,
+    ) -> Result<Self> {
+        let ObjectOnly(summary): ObjectOnly<WorkerHeartbeatSummary> =
+            serde_json::from_slice(bytes)?;
+        ensure!(
+            summary.schema == SCHEMA_V3
+                && summary.advisory_only
+                && valid_oid(&summary.reviewed_commit)
+                && summary.reviewed_commit == reviewed_main
+                && summary.ledger_event_seq >= 0
+                && summary.ledger_event_seq == expected_seq
+                && valid_oid(&summary.baseline_commit)
+                && summary.baseline_commit.len() == summary.reviewed_commit.len()
+                && summary.baseline_commit != summary.reviewed_commit
+                && summary.baseline_commit == expected_baseline
+                && valid_sha256(&summary.compiler_sha256)
+                && summary.compiler_sha256 == expected_compiler
+                && summary.regressed
+                    == (summary.max_command_regressed || summary.total_commands_regressed),
+            "invalid resident heartbeat summary"
+        );
+        Ok(Self {
+            schema: summary.schema,
+            advisory_only: summary.advisory_only,
+            reviewed_commit: summary.reviewed_commit,
+            ledger_event_seq: summary.ledger_event_seq,
+            regressed: summary.regressed,
+            max_command_regressed: summary.max_command_regressed,
+            total_commands_regressed: summary.total_commands_regressed,
         })
     }
 }
@@ -432,10 +598,12 @@ mod tests {
     #[test]
     fn exact_status_and_observation_shapes() -> Result<()> {
         let sample = summary();
-        let observation = Summary::parse(&serde_json::to_vec(&sample)?, HEAD, 13, None)?;
+        let observation = SampleSummary::parse(&serde_json::to_vec(&sample)?, HEAD, 13, None)?;
         assert_eq!(
             serde_json::to_value(AuditState::new(
-                Status::Observation { observation },
+                Status::Observation {
+                    observation: Summary::Sample(observation)
+                },
                 2,
                 true
             ))?,
@@ -476,22 +644,22 @@ mod tests {
             let mut bad_sample = summary();
             bad_sample[field] = bad;
             assert!(
-                Summary::parse(&serde_json::to_vec(&bad_sample)?, HEAD, 13, None).is_err(),
+                SampleSummary::parse(&serde_json::to_vec(&bad_sample)?, HEAD, 13, None).is_err(),
                 "accepted {field}"
             );
         }
         let positional = serde_json::to_vec(&json!([SCHEMA_V1, true, HEAD, 13, 42, 1, 0]))?;
-        assert!(Summary::parse(&positional, HEAD, 13, None).is_err());
+        assert!(SampleSummary::parse(&positional, HEAD, 13, None).is_err());
         let mut missing = summary();
         missing.as_object_mut().unwrap().remove("debt_findings");
-        assert!(Summary::parse(&serde_json::to_vec(&missing)?, HEAD, 13, None).is_err());
+        assert!(SampleSummary::parse(&serde_json::to_vec(&missing)?, HEAD, 13, None).is_err());
         let mut trailing = serde_json::to_vec(&summary())?;
         trailing.extend_from_slice(b"\n{}\n");
-        assert!(Summary::parse(&trailing, HEAD, 13, None).is_err());
+        assert!(SampleSummary::parse(&trailing, HEAD, 13, None).is_err());
         let mut duplicate = serde_json::to_vec(&summary())?;
         duplicate.pop();
         duplicate.extend_from_slice(b",\"module_count\":1}");
-        assert!(Summary::parse(&duplicate, HEAD, 13, None).is_err());
+        assert!(SampleSummary::parse(&duplicate, HEAD, 13, None).is_err());
         Ok(())
     }
 
@@ -508,20 +676,21 @@ mod tests {
     fn release_protocol_is_exact_and_version_bound() -> Result<()> {
         let sample = release_summary();
         let policy = "a".repeat(64);
-        let parse =
-            |value: &Value| Summary::parse(&serde_json::to_vec(value)?, HEAD, 13, Some(&policy));
+        let parse = |value: &Value| {
+            SampleSummary::parse(&serde_json::to_vec(value)?, HEAD, 13, Some(&policy))
+        };
         let observation = parse(&sample)?;
         let mut public = sample.clone();
         public.as_object_mut().unwrap().remove("policy_sha256");
         assert_eq!(serde_json::to_value(observation)?, public);
 
         assert!(parse(&summary()).is_err());
-        assert!(Summary::parse(&serde_json::to_vec(&sample)?, HEAD, 13, None).is_err());
+        assert!(SampleSummary::parse(&serde_json::to_vec(&sample)?, HEAD, 13, None).is_err());
         for field in ["policy_sha256", "independent_checks"] {
             let mut v1 = summary();
             for value in [Value::Null, sample[field].clone()] {
                 v1[field] = value;
-                assert!(Summary::parse(&serde_json::to_vec(&v1)?, HEAD, 13, None).is_err());
+                assert!(SampleSummary::parse(&serde_json::to_vec(&v1)?, HEAD, 13, None).is_err());
             }
             let mut missing = sample.clone();
             missing.as_object_mut().unwrap().remove(field);
@@ -551,7 +720,7 @@ mod tests {
         let mut duplicate = serde_json::to_vec(&sample)?;
         duplicate.pop();
         duplicate.extend_from_slice(b",\"independent_checks\":1}");
-        assert!(Summary::parse(&duplicate, HEAD, 13, Some(&policy)).is_err());
+        assert!(SampleSummary::parse(&duplicate, HEAD, 13, Some(&policy)).is_err());
         let mut lower_bound = sample;
         lower_bound["independent_checks"] = json!(1);
         assert!(parse(&lower_bound).is_ok());
@@ -716,6 +885,150 @@ mod tests {
         }
         document["audit_timeout_ms"] = json!(100);
         assert!(validate(document).is_ok());
+        Ok(())
+    }
+
+    const BASELINE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const COMPILER: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+
+    fn config_v3() -> Value {
+        let mut document = config_v1();
+        document["version"] = json!(3);
+        document["audit_timeout_ms"] = json!(270_000);
+        document["baseline_commit"] = json!(BASELINE);
+        document["compiler_sha256"] = json!(COMPILER);
+        document["min_delta_heartbeats_raw"] = json!(MAX_RAW_HEARTBEATS);
+        document["min_increase_percent"] = json!(MAX_INCREASE_PERCENT);
+        document
+    }
+
+    #[test]
+    fn strict_heartbeat_config() -> Result<()> {
+        let document = config_v3();
+        validate(document.clone())?;
+        for field in [
+            "baseline_commit",
+            "compiler_sha256",
+            "min_delta_heartbeats_raw",
+            "min_increase_percent",
+        ] {
+            let mut missing = document.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(validate(missing).is_err(), "accepted missing {field}");
+            let mut null = document.clone();
+            null[field] = Value::Null;
+            assert!(validate(null).is_err(), "accepted null {field}");
+            if field != "compiler_sha256" {
+                let mut v1 = config_v1();
+                v1[field] = document[field].clone();
+                assert!(validate(v1).is_err(), "accepted {field} in v1");
+            }
+        }
+        for (field, bad) in [
+            ("version", json!(4)),
+            ("policy_sha256", json!(COMPILER)),
+            ("exporter_sha256", json!(COMPILER)),
+            ("checker_sha256", json!(COMPILER)),
+            ("baseline_commit", json!(HEAD)),
+            ("baseline_commit", json!("b".repeat(64))),
+            ("baseline_commit", json!("b".repeat(39))),
+            ("baseline_commit", json!("B".repeat(40))),
+            ("baseline_commit", json!("0".repeat(40))),
+            ("compiler_sha256", json!("g".repeat(64))),
+            ("compiler_sha256", json!("C".repeat(64))),
+            ("compiler_sha256", json!("c".repeat(63))),
+            ("audit_timeout_ms", json!(270_001)),
+            ("min_delta_heartbeats_raw", json!(0)),
+            ("min_delta_heartbeats_raw", json!(MAX_RAW_HEARTBEATS + 1)),
+            ("min_delta_heartbeats_raw", json!(1.0)),
+            ("min_delta_heartbeats_raw", json!("1")),
+            ("min_increase_percent", json!(0)),
+            ("min_increase_percent", json!(-1)),
+            ("min_increase_percent", json!(MAX_INCREASE_PERCENT + 1)),
+        ] {
+            let mut invalid = document.clone();
+            invalid[field] = bad;
+            assert!(validate(invalid).is_err(), "accepted malformed {field}");
+        }
+        let mut sha256_repo = document;
+        sha256_repo["baseline_commit"] = json!("b".repeat(64));
+        sha256_repo["reviewed_main"] = json!("a".repeat(64));
+        validate(sha256_repo)?;
+        Ok(())
+    }
+
+    fn heartbeat_summary(max: bool, total: bool) -> Value {
+        json!({
+            "schema": SCHEMA_V3,
+            "advisory_only": true,
+            "reviewed_commit": HEAD,
+            "ledger_event_seq": 13,
+            "baseline_commit": BASELINE,
+            "compiler_sha256": COMPILER,
+            "regressed": max || total,
+            "max_command_regressed": max,
+            "total_commands_regressed": total,
+        })
+    }
+
+    #[test]
+    fn heartbeat_protocol_checks_every_key_and_drops_private_pins() -> Result<()> {
+        let config = validate(config_v3())?;
+        let parse = |value: &Value| config.parse_summary(&serde_json::to_vec(value)?, 13);
+        for (max, total) in [(false, false), (true, false), (false, true), (true, true)] {
+            let mut sample = heartbeat_summary(max, total);
+            let observation = parse(&sample)?;
+            let mut inconsistent = sample.clone();
+            inconsistent["regressed"] = json!(!(max || total));
+            assert!(parse(&inconsistent).is_err(), "accepted inconsistent OR");
+            sample.as_object_mut().unwrap().remove("baseline_commit");
+            sample.as_object_mut().unwrap().remove("compiler_sha256");
+            assert_eq!(serde_json::to_value(observation)?, sample);
+        }
+        let sample = heartbeat_summary(true, false);
+        for field in sample.as_object().unwrap().keys() {
+            let mut missing = sample.clone();
+            missing.as_object_mut().unwrap().remove(field);
+            assert!(parse(&missing).is_err(), "accepted missing {field}");
+        }
+        for (field, bad) in [
+            ("schema", json!(SCHEMA_V2)),
+            ("advisory_only", json!(false)),
+            ("reviewed_commit", json!(BASELINE)),
+            ("ledger_event_seq", json!(12)),
+            ("ledger_event_seq", json!(-1)),
+            ("ledger_event_seq", json!(13.0)),
+            ("baseline_commit", json!("a".repeat(40))),
+            ("compiler_sha256", json!("a".repeat(64))),
+            ("max_command_regressed", json!(1)),
+            ("total_commands_regressed", Value::Null),
+            ("repo_path", json!("private-path")),
+            ("claim", json!("private-claim")),
+            ("total_command_heartbeats_raw", json!(123)),
+            ("min_increase_percent", json!(100)),
+            ("compile_ms", Value::Null),
+        ] {
+            let mut invalid = sample.clone();
+            invalid[field] = bad;
+            assert!(parse(&invalid).is_err(), "accepted invalid {field}");
+        }
+        let positional = json!([
+            SCHEMA_V3, true, HEAD, 13, BASELINE, COMPILER, true, true, false
+        ]);
+        assert!(parse(&positional).is_err());
+        let mut duplicate = serde_json::to_vec(&sample)?;
+        duplicate.pop();
+        duplicate.extend_from_slice(b",\"regressed\":true}");
+        assert!(config.parse_summary(&duplicate, 13).is_err());
+        let mut trailing = serde_json::to_vec(&sample)?;
+        trailing.extend_from_slice(b"\n{}\n");
+        assert!(config.parse_summary(&trailing, 13).is_err());
+
+        let bytes = serde_json::to_vec(&sample)?;
+        assert!(validate(config_v1())?.parse_summary(&bytes, 13).is_err());
+        for other in [summary(), release_summary()] {
+            assert!(parse(&other).is_err());
+        }
         Ok(())
     }
 }

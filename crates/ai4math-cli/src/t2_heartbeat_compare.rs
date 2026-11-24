@@ -27,6 +27,13 @@ pub(crate) struct HeartbeatComparison {
     total_commands: MetricComparison,
 }
 
+#[cfg(unix)]
+impl HeartbeatComparison {
+    pub(crate) fn metric_regressions(&self) -> (bool, bool) {
+        (self.max_command.regressed, self.total_commands.regressed)
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct Thresholds {
     min_delta_heartbeats_raw: u64,

@@ -74,7 +74,23 @@ test('HUD renders only admissible resident T2 observations and forgets them on r
   const prefix = 'T2 Audit · advisory only · ';
   const exact = '123 ms compile · 2 modules · 0 debt findings · 1 attempt';
   const v2 = (seq, fields = {}) => sample(seq, { schema: 'ai4math.t2.resident-sample.v2', independent_checks: 2, ...fields });
+  const v3 = (seq, fields = {}) => ({ status: 'observation', attempts: 1, exhausted: false,
+    observation: { schema: 'ai4math.t2.resident-heartbeats.v3', advisory_only: true,
+      reviewed_commit: commit, ledger_event_seq: seq, regressed: true, max_command_regressed: true,
+      total_commands_regressed: true, ...fields },
+  });
   const cases = [
+    ['v3 both flags', seq => v3(seq), 'Heartbeat thresholds met (max command, total commands) · 1 attempt'],
+    ['v3 max only', seq => v3(seq, { total_commands_regressed: false }), 'Heartbeat thresholds met (max command) · 1 attempt'],
+    ['v3 total only', seq => v3(seq, { max_command_regressed: false }), 'Heartbeat thresholds met (total commands) · 1 attempt'],
+    ['v3 no flag', seq => v3(seq, { regressed: false, max_command_regressed: false, total_commands_regressed: false }), 'Heartbeat thresholds not met · 1 attempt'],
+    ['v3 mismatched OR', seq => v3(seq, { regressed: false })],
+    ['v3 flag type confusion', seq => v3(seq, { total_commands_regressed: 1 })],
+    ['v3 private baseline pin', seq => v3(seq, { baseline_commit: '1'.repeat(40) })],
+    ['v3 private compiler pin', seq => v3(seq, { compiler_sha256: 'f'.repeat(64) })],
+    ['v3 unexpected raw number', seq => v3(seq, { median: 1234 })],
+    ['v3 older observation', seq => v3(seq - 1), 'older ledger sample'],
+    ['v3 future observation', seq => v3(seq + 1), 'awaiting matching ledger'],
     ['v2 exact observation', seq => v2(seq), '123 ms compile · 2 modules · 0 debt findings · 2 independent theorem checks · 1 attempt'],
     ['v2 single check', seq => v2(seq, { independent_checks: 1 }), '123 ms compile · 2 modules · 0 debt findings · 1 independent theorem check · 1 attempt'],
     ['v2 older observation', seq => v2(seq - 1), 'older ledger sample'],

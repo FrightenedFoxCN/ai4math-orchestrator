@@ -843,6 +843,184 @@ mod native {
 
     #[test]
     #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
+    fn native_resident_t2_heartbeat_regression_is_sanitized_and_read_only() -> Result<()> {
+        use std::{collections::BTreeMap, os::unix::process::CommandExt};
+
+        const DELTA: u64 = 1_000;
+        const PERCENT: u64 = 100;
+        const TIMEOUT_MS: u64 = 270_000;
+        let tmp = short_tempdir()?;
+        let f = Fixture::new(
+            tmp.path().canonicalize()?,
+            &native_binary("AI4MATH_TEST_CLI")?,
+            native_binary("AI4MATH_TEST_LEAN")?,
+        )?;
+        let baseline = f.main()?;
+        // Keep the ordered module set unchanged and add one synchronous, expensive
+        // elaboration to the measured anchor. Compare deterministic allocations,
+        // not wall time, and don't assert exact native heartbeat counts.
+        let anchor = f.review.join(ANCHOR);
+        let source = fs::read_to_string(&anchor)?;
+        fs::write(
+            &anchor,
+            format!(
+                "{source}\nset_option maxRecDepth 10000 in\n\
+                 theorem residentHeartbeatWork : (List.range (x * 500)).length = 1000 := by decide\n"
+            ),
+        )?;
+        git(&f.review, &["add", "--", ANCHOR])?;
+        git(
+            &f.review,
+            &["commit", "-m", "review heavier Lean elaboration"],
+        )?;
+        git(&f.review, &["push", "origin", "HEAD:refs/heads/main"])?;
+        let reviewed = f.main()?;
+        assert_ne!(reviewed, baseline);
+        assert_eq!(git(&f.bare, &["rev-parse", "main^"])?, baseline);
+        let compiler = file_sha256(&f.lean)?;
+
+        // Keep the WAL present and compare it, the database and the whole bare
+        // repository (including objects, refs, and reflogs) byte for byte.
+        let store = StateStore::open(f.database())?;
+        let seq = store.status()?.last_event_seq;
+        let wal = f.root.join(".runtime/state.sqlite-wal");
+        let durable_state = || -> Result<_> {
+            let mut git_files = BTreeMap::new();
+            let mut dirs = vec![f.bare.clone()];
+            while let Some(dir) = dirs.pop() {
+                for entry in fs::read_dir(dir)? {
+                    let entry = entry?;
+                    let path = entry.path();
+                    let kind = entry.file_type()?;
+                    let hash = if kind.is_dir() {
+                        dirs.push(path.clone());
+                        None
+                    } else {
+                        ensure!(kind.is_file(), "unexpected Git fixture entry: {path:?}");
+                        Some(file_sha256(&path)?)
+                    };
+                    git_files.insert(path, hash);
+                }
+            }
+            Ok((fs::read(f.database())?, fs::read(&wal)?, git_files))
+        };
+        let before = durable_state()?;
+
+        // Independently inspect the actual private worker wire output. Keep the
+        // lifeline writer outside Child so wait_with_output does not close it.
+        let worker = |pin: &str| -> Result<Output> {
+            let mut child = Command::new(&f.cli)
+                .current_dir(&f.root)
+                .args([
+                    "t2-compare-managed-heartbeats",
+                    utf8(&f.root),
+                    utf8(&f.bare),
+                ])
+                .args([ANCHOR, &baseline, &reviewed, utf8(&f.lean), pin])
+                .arg(DELTA.to_string())
+                .arg(PERCENT.to_string())
+                .arg("--daemon-parent")
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .process_group(0)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()?;
+            let lifeline = child.stdin.take().context("missing worker lifeline")?;
+            let output = child.wait_with_output()?;
+            drop(lifeline);
+            Ok(output)
+        };
+        let mut observation = json!({
+            "schema": "ai4math.t2.resident-heartbeats.v3",
+            "advisory_only": true,
+            "reviewed_commit": reviewed,
+            "ledger_event_seq": seq,
+            "baseline_commit": baseline,
+            "compiler_sha256": compiler,
+            "regressed": true,
+            "max_command_regressed": true,
+            "total_commands_regressed": true,
+        });
+        let private: Value =
+            serde_json::from_str(&success(worker(&compiler)?, "resident heartbeat worker")?)?;
+        assert_eq!(private, observation);
+        let bad_pin = format!(
+            "{}{}",
+            if compiler.starts_with('0') { '1' } else { '0' },
+            &compiler[1..]
+        );
+        let fault = worker(&bad_pin)?;
+        assert!(fault.status.code().is_some_and(|code| code != 0));
+        assert!(
+            fault.stdout.is_empty(),
+            "worker fault emitted a partial observation"
+        );
+        assert_eq!(durable_state()?, before);
+
+        let config = f.root.join("resident-heartbeats.json");
+        write_new(
+            &config,
+            0o600,
+            &serde_json::to_vec(&json!({
+                "version": 3,
+                "cli_executable": f.cli,
+                "bare_repo": f.bare,
+                "anchor_module": ANCHOR,
+                "reviewed_main": reviewed,
+                "native_executable": f.lean,
+                "interval_ms": 1000,
+                "audit_timeout_ms": TIMEOUT_MS,
+                "max_runs": 1,
+                "baseline_commit": baseline,
+                "compiler_sha256": compiler,
+                "min_delta_heartbeats_raw": DELTA,
+                "min_increase_percent": PERCENT,
+            }))?,
+        )?;
+        let public = observation
+            .as_object_mut()
+            .context("expected heartbeat object")?;
+        public.remove("baseline_commit");
+        public.remove("compiler_sha256");
+        let expected = json!({
+            "status": "observation", "attempts": 1, "exhausted": true,
+            "observation": observation,
+        });
+        let mut daemon = Daemon::spawn_with_flag(&f.root, Some(&config), "--t2-audit")?;
+        ready(&mut daemon, &f.root)?;
+        let live = daemon.poll(
+            Duration::from_millis(TIMEOUT_MS + 5_000),
+            "resident heartbeat regression",
+            || {
+                let live = status(&f.root)?;
+                Ok((live["t2_audit"]["exhausted"] == true).then_some(live))
+            },
+        )?;
+        assert_eq!(live["event_seq"], seq);
+        assert_eq!(live["t2_audit"], expected, "{}", daemon.logs());
+        let mut stream = request(
+            &f.root,
+            "subscribe",
+            json!({"topics": ["vital_signs.tick"]}),
+        )?;
+        let reply = frame(&mut stream)?;
+        assert_eq!(reply["id"], 1);
+        assert_eq!(reply["result"]["topics"], json!(["vital_signs.tick"]));
+        let tick = frame(&mut stream)?;
+        assert_eq!(tick["method"], "vital_signs.tick");
+        assert_eq!(tick["params"]["event_seq"], seq);
+        assert_eq!(tick["params"]["t2_audit"], expected);
+        drop(stream);
+        f.stop(daemon)?;
+        assert_eq!(durable_state()?, before);
+        assert_eq!(store.status()?.last_event_seq, seq);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
     fn native_follow_autosweep_requires_approval_per_forward_main() -> Result<()> {
         let tmp = short_tempdir()?;
         let f = Fixture::new(

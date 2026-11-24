@@ -1227,6 +1227,38 @@ fn run() -> Result<()> {
         ["t2-release-inspect", root, repo, label, expected_oid] => print_json(
             t2_batch::inspect_release(Path::new(root), Path::new(repo), label, Some(expected_oid))?,
         ),
+        #[cfg(unix)]
+        [
+            "t2-compare-managed-heartbeats",
+            root,
+            repo,
+            target,
+            baseline,
+            reviewed,
+            executable,
+            compiler_pin,
+            raw_delta,
+            relative_percent,
+            "--daemon-parent",
+        ] => {
+            let result =
+                t2_build::compare_heartbeats_for_daemon(t2_build::ManagedHeartbeatRequest {
+                    root: Path::new(root),
+                    repo: Path::new(repo),
+                    target,
+                    baseline,
+                    reviewed,
+                    executable: Path::new(executable),
+                    compiler_pin,
+                    raw_delta,
+                    relative_percent,
+                });
+            // Faults are not observations, and diagnostics may contain project paths.
+            if result.is_err() {
+                std::process::exit(1);
+            }
+            Ok(())
+        }
         [
             "t2-compare-managed-heartbeats",
             root,

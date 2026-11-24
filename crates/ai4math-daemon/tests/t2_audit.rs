@@ -23,6 +23,8 @@ const MAIN: &str = "refs/heads/main";
 const ANCHOR: &str = "Proof.lean";
 const INTERVAL_MS: u64 = 1_000;
 const WAIT: Duration = Duration::from_secs(8);
+const HEARTBEAT_SCHEMA: &str = "ai4math.t2.resident-heartbeats.v3";
+const HEARTBEAT_COMPILER: &str = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee";
 const PIN_FIELDS: [&str; 4] = [
     "policy_sha256",
     "compiler_sha256",
@@ -78,6 +80,7 @@ struct Fixture {
     _temp: tempfile::TempDir,
     root: PathBuf,
     repo: PathBuf,
+    baseline: String,
     reviewed: String,
     successor: String,
     seq: i64,
@@ -99,7 +102,12 @@ impl Fixture {
         )?;
         fs::write(work.join(ANCHOR), "theorem proof : True := True.intro\n")?;
         git(&work, &["add", ANCHOR])?;
-        git(&work, &["commit", "--quiet", "-m", "reviewed main"])?;
+        git(&work, &["commit", "--quiet", "-m", "baseline"])?;
+        let baseline = git(&work, &["rev-parse", MAIN])?;
+        git(
+            &work,
+            &["commit", "--quiet", "--allow-empty", "-m", "reviewed main"],
+        )?;
         let reviewed = git(&work, &["rev-parse", MAIN])?;
         git(
             &work,
@@ -127,23 +135,34 @@ impl Fixture {
 
         fs::write(root.join("reviewed-oid"), format!("{reviewed}\n"))?;
         fs::write(root.join("release-pins"), release_pins().join(" ") + "\n")?;
+        fs::write(
+            root.join("heartbeat-pins"),
+            format!("{baseline} {HEARTBEAT_COMPILER}\n"),
+        )?;
         write_private(
             &root.join("fixture-cli"),
             0o700,
             br#"#!/bin/sh
 set -eu
 IFS= read -r reviewed < reviewed-oid
-[ "$2" = "$PWD" ] && [ "$3" = "$2/repo.git" ] && [ "$4" = Proof.lean ] &&
-    [ "$5" = "$reviewed" ] && [ "$6" = "$2/unused-native" ] || exit 97
+[ "$2" = "$PWD" ] && [ "$3" = "$2/repo.git" ] && [ "$4" = Proof.lean ] || exit 97
 case "$1" in
     t2-audit)
-        [ "$#" -eq 7 ] && [ "$7" = --daemon-parent ] || exit 97
+        [ "$#" -eq 7 ] && [ "$5" = "$reviewed" ] && [ "$6" = "$2/unused-native" ] &&
+            [ "$7" = --daemon-parent ] || exit 97
         ;;
     t2-release-check)
         read -r policy compiler exporter checker < release-pins
-        [ "$#" -eq 11 ] && [ "$7" = "$policy" ] && [ "$8" = "$compiler" ] &&
+        [ "$#" -eq 11 ] && [ "$5" = "$reviewed" ] && [ "$6" = "$2/unused-native" ] &&
+            [ "$7" = "$policy" ] && [ "$8" = "$compiler" ] &&
             [ "$9" = "$exporter" ] && [ "${10}" = "$checker" ] &&
             [ "${11}" = --daemon-parent ] || exit 97
+        ;;
+    t2-compare-managed-heartbeats)
+        read -r baseline compiler < heartbeat-pins
+        [ "$#" -eq 11 ] && [ "$5" = "$baseline" ] && [ "$6" = "$reviewed" ] &&
+            [ "$7" = "$2/unused-native" ] && [ "$8" = "$compiler" ] &&
+            [ "$9" = 12345 ] && [ "${10}" = 67 ] && [ "${11}" = --daemon-parent ] || exit 97
         ;;
     *) exit 97 ;;
 esac
@@ -157,6 +176,7 @@ printf 'begin\n' >> calls
 while [ -e hold ] && [ ! -e release ]; do /bin/sleep 0.02; done
 /bin/cat sample.json
 printf 'end\n' >> calls
+if [ -e worker-fault ]; then exit 2; fi
 "#,
         )?;
         write_private(&root.join("unused-native"), 0o700, b"#!/bin/sh\nexit 99\n")?;
@@ -164,6 +184,7 @@ printf 'end\n' >> calls
             _temp: temp,
             root,
             repo,
+            baseline,
             reviewed,
             successor,
             seq,
@@ -193,6 +214,16 @@ printf 'end\n' >> calls
         config
     }
 
+    fn heartbeat_config(&self, max_runs: u64, timeout_ms: u64) -> Value {
+        let mut config = self.config(max_runs, timeout_ms);
+        config["version"] = json!(3);
+        config["baseline_commit"] = json!(self.baseline);
+        config["compiler_sha256"] = json!(HEARTBEAT_COMPILER);
+        config["min_delta_heartbeats_raw"] = json!(12345);
+        config["min_increase_percent"] = json!(67);
+        config
+    }
+
     fn write_config(&self, label: &str, config: &Value) -> Result<PathBuf> {
         let path = self.root.join(format!("{label}.json"));
         write_private(&path, 0o600, &serde_json::to_vec(config)?)?;
@@ -218,6 +249,20 @@ printf 'end\n' >> calls
         sample["independent_checks"] = json!(2);
         sample["policy_sha256"] = json!(release_pins()[0]);
         sample
+    }
+
+    fn heartbeat_sample(&self, max_regressed: bool, total_regressed: bool) -> Value {
+        json!({
+            "schema": HEARTBEAT_SCHEMA,
+            "advisory_only": true,
+            "reviewed_commit": self.reviewed,
+            "ledger_event_seq": self.seq,
+            "baseline_commit": self.baseline,
+            "compiler_sha256": HEARTBEAT_COMPILER,
+            "regressed": max_regressed || total_regressed,
+            "max_command_regressed": max_regressed,
+            "total_commands_regressed": total_regressed,
+        })
     }
 
     fn write_sample(&self, payload: &Value) -> Result<()> {
@@ -387,8 +432,8 @@ impl Drop for Daemon {
 #[test]
 fn resident_t2_is_absent_without_opt_in() -> Result<()> {
     let f = Fixture::new()?;
-    f.write_config("t2-audit", &f.config(1, 5_000))?;
-    f.write_sample(&f.sample())?;
+    f.write_config("t2-audit", &f.heartbeat_config(1, 5_000))?;
+    f.write_sample(&f.heartbeat_sample(true, false))?;
     let mut daemon = Daemon::spawn(&f, None)?;
     let status = daemon.wait_for(&f, "ordinary status", |_| true)?;
     assert!(
@@ -657,6 +702,43 @@ fn resident_t2_release_refuses_cross_version_and_unaudited_payloads() -> Result<
         f.check_state(&f.reviewed)?;
     }
     Ok(())
+}
+
+#[test]
+fn resident_t2_heartbeats_publish_only_advisory_flags() -> Result<()> {
+    for (max, total) in [(false, false), (false, true)] {
+        let f = Fixture::new()?;
+        let config = f.write_config("t2-heartbeats", &f.heartbeat_config(1, 270_000))?;
+        let mut public = f.heartbeat_sample(max, total);
+        f.write_sample(&public)?;
+        public.as_object_mut().unwrap().remove("baseline_commit");
+        public.as_object_mut().unwrap().remove("compiler_sha256");
+        let mut daemon = Daemon::spawn(&f, Some(&config))?;
+        daemon.wait_audit(
+            &f,
+            &json!({"status":"observation", "attempts":1, "exhausted":true, "observation":public}),
+        )?;
+        assert!(!daemon.log().contains(&f.baseline));
+        assert!(!daemon.log().contains(HEARTBEAT_COMPILER));
+        assert_eq!(f.calls()?, "begin\nend\n");
+        f.check_state(&f.reviewed)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn resident_t2_heartbeats_discard_even_valid_output_on_worker_fault() -> Result<()> {
+    let f = Fixture::new()?;
+    f.write_sample(&f.heartbeat_sample(true, false))?;
+    fs::write(f.root.join("worker-fault"), b"")?;
+    let config = f.write_config("t2-heartbeats", &f.heartbeat_config(1, 5_000))?;
+    let mut daemon = Daemon::spawn(&f, Some(&config))?;
+    daemon.wait_audit(
+        &f,
+        &json!({"status":"unavailable", "attempts":1, "exhausted":true}),
+    )?;
+    assert_eq!(f.calls()?, "begin\nend\n");
+    f.check_state(&f.reviewed)
 }
 
 #[test]

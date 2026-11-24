@@ -13,6 +13,8 @@ use serde::Serialize;
 use std::path::Path;
 
 mod managed_heartbeats;
+#[cfg(unix)]
+pub(crate) use managed_heartbeats::compare_for_daemon as compare_heartbeats_for_daemon;
 pub(crate) use managed_heartbeats::{ManagedHeartbeatRequest, compare_managed_heartbeats};
 
 #[derive(Serialize)]

@@ -3,7 +3,7 @@
 //   '/Applications/DeepSeek Harness.app/Contents/MacOS/DeepSeek Harness' \
 //   plugins/dsh-ai4math/host/test/installed-t2-audit.mjs \
 //   '/Applications/DeepSeek Harness.app/Contents/Resources/app.asar/dsh' \
-//   /absolute/ai4mathd /absolute/ai4math /absolute/lean-toolchain/bin/lean [--independent]
+//   /absolute/ai4mathd /absolute/ai4math /absolute/lean-toolchain/bin/lean [--independent|--heartbeats]
 // Only the installed SDK libraries and a disposable ai4math project are used; no DSH profile or GUI.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
@@ -18,9 +18,10 @@ import { NdjsonConnection, requireSocketPath } from '../connection.mjs';
 
 const args = process.argv.slice(2);
 const independent = args.at(-1) === '--independent';
-if (independent) args.pop();
+const heartbeats = args.at(-1) === '--heartbeats';
+if (independent || heartbeats) args.pop();
 assert.ok(args.length === 4 && args.every(isAbsolute),
-  'usage: installed-t2-audit.mjs DSH_SDK_ROOT AI4MATHD_BINARY AI4MATH_BINARY NATIVE_LEAN [--independent]');
+  'usage: installed-t2-audit.mjs DSH_SDK_ROOT AI4MATHD_BINARY AI4MATH_BINARY NATIVE_LEAN [--independent|--heartbeats]');
 const [dshRoot, daemonPath, cliPath, leanPath] = args.map((arg) => resolve(arg));
 const [daemonExe, cliExe, nativeLean] = await Promise.all([daemonPath, cliPath, leanPath].map((path) => fs.realpath(path)));
 const lookup = createRequire(join(dshRoot, 'package.json'));
@@ -43,7 +44,7 @@ const hook = registerHooks({ resolve(specifier, ctx, next) {
   return next(specifier, ctx);
 }});
 
-const AUDIT_TIMEOUT_MS = independent ? 90_000 : 30_000;
+const AUDIT_TIMEOUT_MS = heartbeats ? 180_000 : independent ? 90_000 : 30_000;
 const POLICY = 'ai4math-t2-release.json';
 async function sha256(path) {
   const digest = createHash('sha256');
@@ -97,9 +98,12 @@ function startDaemon(root, configPath, env, controller) {
 // Failure-only, opt-in local diagnostic. Use the same private CLI mode and a
 // dedicated group/lifeline so no native process survives a diagnostic timeout.
 async function diagnoseUnavailable(cli, root, bareRepo, reviewed, pins, signal) {
-  const child = spawn(cli, [independent ? 't2-release-check' : 't2-audit', root, bareRepo, ANCHOR, reviewed, nativeLean,
-    ...(independent ? [pins.policy_sha256, pins.compiler_sha256, pins.exporter_sha256, pins.checker_sha256] : []),
-    '--daemon-parent'], {
+  const auditArgs = heartbeats
+    ? ['t2-compare-managed-heartbeats', root, bareRepo, ANCHOR, pins.baseline_commit, reviewed, nativeLean,
+      pins.compiler_sha256, String(pins.min_delta_heartbeats_raw), String(pins.min_increase_percent)]
+    : [independent ? 't2-release-check' : 't2-audit', root, bareRepo, ANCHOR, reviewed, nativeLean,
+      ...(independent ? [pins.policy_sha256, pins.compiler_sha256, pins.exporter_sha256, pins.checker_sha256] : [])];
+  const child = spawn(cli, [...auditArgs, '--daemon-parent'], {
     cwd: root, env: { PATH: '/usr/bin:/bin' }, detached: true, stdio: ['pipe', 'ignore', 'pipe'],
   });
   const output = Buffer.alloc(8_192);
@@ -131,6 +135,16 @@ async function diagnoseUnavailable(cli, root, bareRepo, reviewed, pins, signal) 
 function assertObservation(status, reviewed, seq) {
   assert.equal(status.event_seq, seq, 'telemetry moved off the bound ledger generation');
   const audit = status.t2_audit;
+  if (heartbeats) {
+    assert.deepEqual(audit, {
+      status: 'observation', attempts: 1, exhausted: true,
+      observation: {
+        schema: 'ai4math.t2.resident-heartbeats.v3', advisory_only: true, reviewed_commit: reviewed,
+        ledger_event_seq: seq, regressed: true, max_command_regressed: true, total_commands_regressed: true,
+      },
+    });
+    return audit;
+  }
   const compileMs = audit?.observation?.compile_ms;
   assert.ok(Number.isSafeInteger(compileMs) && compileMs >= 0 && compileMs <= 120_000,
     'expected a bounded compile time in the T2 observation');
@@ -191,6 +205,16 @@ try {
   }
   git(work, 'add', '--', ANCHOR, ...(independent ? [POLICY] : []));
   git(work, 'commit', '--quiet', '-m', 'reviewed T2 fixture');
+  if (heartbeats) {
+    pins.baseline_commit = git(work, 'rev-parse', '--verify', MAIN);
+    pins.compiler_sha256 = await sha256(nativeLean);
+    pins.min_delta_heartbeats_raw = 1000;
+    pins.min_increase_percent = 100;
+    await fs.appendFile(join(work, ANCHOR), '\nset_option maxRecDepth 10000 in\n'
+      + 'theorem fixtureHeavy : (List.range 1000).length = 1000 := by decide\n');
+    git(work, 'add', '--', ANCHOR);
+    git(work, 'commit', '--quiet', '-m', 'increase measured heartbeat workload');
+  }
   const reviewed = git(work, 'rev-parse', '--verify', MAIN);
   git(root, 'clone', '--quiet', '--bare', '--no-hardlinks', '--template=', work, bareRepo);
   assert.equal(mainRef(), MAIN + ' ' + reviewed + ' commit');
@@ -205,7 +229,7 @@ try {
 
   const configPath = join(root, 't2.json');
   await fs.writeFile(configPath, JSON.stringify({
-    version: independent ? 2 : 1, cli_executable: cli, bare_repo: bareRepo, anchor_module: ANCHOR,
+    version: heartbeats ? 3 : independent ? 2 : 1, cli_executable: cli, bare_repo: bareRepo, anchor_module: ANCHOR,
     reviewed_main: reviewed, native_executable: nativeLean,
     interval_ms: 1_000, audit_timeout_ms: AUDIT_TIMEOUT_MS, max_runs: 1, ...pins,
   }), { flag: 'wx', mode: 0o600 });
@@ -280,7 +304,7 @@ try {
   // The observation must already exist before making any launch-shaped requests.
   const uds = new NdjsonConnection(socket, { timeoutMs: RPC_TIMEOUT_MS });
   try {
-    for (const [remote, local] of [['t2Audit', 't2.audit'], ['t2AuditRun', 't2.audit.run'], ['t2ReleaseCheck', 't2.releaseCheck']]) {
+    for (const [remote, local] of [['t2Audit', 't2.audit'], ['t2AuditRun', 't2.audit.run'], ['t2ReleaseCheck', 't2.releaseCheck'], ['t2CompareManagedHeartbeats', 't2.compareManagedHeartbeats']]) {
       assert.equal(ctx.typert.local.get('ai4math/' + remote), undefined);
       assert.equal((await wait(() => dispatch(remote))).ok, false);
       await assert.rejects(uds.request(local, {}, signal), { code: 'daemon', rpcCode: -32601 });
@@ -311,5 +335,5 @@ try {
 }
 if (errors.length === 1) throw errors[0];
 if (errors.length > 1) throw new AggregateError(errors, 'installed T2 audit or fixture cleanup failed');
-console.log('Installed Typert + resident T2 ' + (independent ? 'v2 independent' : 'v1 clean build')
+console.log('Installed Typert + resident T2 ' + (heartbeats ? 'v3 heartbeats' : independent ? 'v2 independent' : 'v1 clean build')
   + ': matching advisory status/tick, guest denied, no launch RPC, Git and ledger unchanged');

@@ -36,7 +36,55 @@ struct ManagedHeartbeatComparison {
     comparison: HeartbeatComparison,
 }
 
+enum Execution {
+    Operator,
+    #[cfg(unix)]
+    Daemon,
+}
+
 pub(crate) fn compare_managed_heartbeats(request: ManagedHeartbeatRequest<'_>) -> Result<()> {
+    let report = collect(&request, Execution::Operator)?;
+    let regressed = report.comparison.regressed;
+    crate::print_json(report)?;
+    ensure!(
+        !regressed,
+        "measured managed T2 heartbeat increase meets both comparison thresholds"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+pub(crate) fn compare_for_daemon(request: ManagedHeartbeatRequest<'_>) -> Result<()> {
+    use std::io::Write;
+
+    crate::t3::arm_daemon_lifeline("T2")?;
+    let report = collect(&request, Execution::Daemon)?;
+    let (max_command_regressed, total_commands_regressed) = report.comparison.metric_regressions();
+    // A measured regression is still an admissible observation. The only worker
+    // output is this private protocol object; native measurements remain local.
+    let summary = serde_json::json!({
+        "schema": "ai4math.t2.resident-heartbeats.v3",
+        "advisory_only": true,
+        "reviewed_commit": request.reviewed,
+        "ledger_event_seq": report.ledger_event_seq,
+        "baseline_commit": request.baseline,
+        "compiler_sha256": request.compiler_pin,
+        "regressed": report.comparison.regressed,
+        "max_command_regressed": max_command_regressed,
+        "total_commands_regressed": total_commands_regressed,
+    });
+    writeln!(
+        std::io::stdout().lock(),
+        "{}",
+        serde_json::to_string(&summary)?
+    )?;
+    Ok(())
+}
+
+fn collect(
+    request: &ManagedHeartbeatRequest<'_>,
+    execution: Execution,
+) -> Result<ManagedHeartbeatComparison> {
     let raw_delta = threshold(request.raw_delta)?;
     let percent = threshold(request.relative_percent)?;
     t2_heartbeat_compare::validate_thresholds(raw_delta, percent)?;
@@ -48,12 +96,17 @@ pub(crate) fn compare_managed_heartbeats(request: ManagedHeartbeatRequest<'_>) -
                 .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')),
         "expected Lean compiler SHA-256 must be 64 lowercase hex digits"
     );
-    let report = sample_and_compare(&request, raw_delta, percent, |engine| {
+    sample_and_compare(request, raw_delta, percent, |engine| {
         let toolchain = super::trusted_toolchain(engine, request.executable, None)?;
         ensure!(
             toolchain.compiler_sha256() == request.compiler_pin,
             "Lean compiler SHA-256 mismatch"
         );
+        let toolchain = match execution {
+            Execution::Operator => toolchain,
+            #[cfg(unix)]
+            Execution::Daemon => toolchain.with_supervised_process_group()?,
+        };
         let broker = Broker::new();
         Ok(move |sources: &[(&str, &str)], deadline| {
             broker.audit_lean_heartbeats_until(
@@ -64,14 +117,7 @@ pub(crate) fn compare_managed_heartbeats(request: ManagedHeartbeatRequest<'_>) -
                 deadline,
             )
         })
-    })?;
-    let regressed = report.comparison.regressed;
-    crate::print_json(report)?;
-    ensure!(
-        !regressed,
-        "measured managed T2 heartbeat increase meets both comparison thresholds"
-    );
-    Ok(())
+    })
 }
 
 fn sample_and_compare<F>(
@@ -122,6 +168,7 @@ where
                 .iter()
                 .map(|(path, source)| (*path, source.as_str()))
                 .collect();
+            // Inherit the same absolute deadline into every build and probe.
             let deadline = Instant::now() + SAMPLING_BUDGET;
             generation
                 .check_current("managed main or ledger changed before heartbeat sampling; retry")?;
