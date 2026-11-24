@@ -20,6 +20,7 @@ const THEOREM: &str = "ManagedExportFixture.localIdentity";
 const DEFINITION: &str = "ManagedExportFixture.localDefinition";
 const AXIOMATIC: &str = "ManagedExportFixture.axiomaticIdentity";
 const CLAIM: &str = "managed-export-advisory-fixture";
+const RELEASE_POLICY: &str = "ai4math-t2-release.json";
 const BASIS_SOURCE: &str = "prelude
 namespace ManagedExportFixture
 theorem importedIdentity {p : Prop} : p → p := fun h => h
@@ -265,17 +266,23 @@ fn native_fixture() -> Result<NativeFixture> {
     })
 }
 
-fn assert_fixture_build(lean: &Path, build: &Value) -> Result<()> {
+fn fixture_source_set_sha256() -> String {
     let mut sources = Sha256::new();
     sources.update(b"ai4math:ordered-source-dependencies:v1");
     sources.update((MODULES.len() as u64).to_be_bytes());
-    let modules = build["modules"].as_array().context("built modules")?;
-    assert_eq!(modules.len(), MODULES.len());
-    for (module, (path, source)) in modules.iter().zip(MODULES) {
+    for (path, source) in MODULES {
         for part in [path, source] {
             sources.update((part.len() as u64).to_be_bytes());
             sources.update(part.as_bytes());
         }
+    }
+    format!("{:x}", sources.finalize())
+}
+
+fn assert_fixture_build(lean: &Path, build: &Value) -> Result<()> {
+    let modules = build["modules"].as_array().context("built modules")?;
+    assert_eq!(modules.len(), MODULES.len());
+    for (module, (path, source)) in modules.iter().zip(MODULES) {
         assert_eq!(
             *module,
             json!({
@@ -289,7 +296,7 @@ fn assert_fixture_build(lean: &Path, build: &Value) -> Result<()> {
         *build,
         json!({
             "compiler_sha256": file_sha256(lean)?,
-            "source_set_sha256": format!("{:x}", sources.finalize()),
+            "source_set_sha256": fixture_source_set_sha256(),
             "compile_ms": build["compile_ms"].as_u64().context("build timing")?,
             "modules": modules,
         })
@@ -618,31 +625,31 @@ fn native_t2_check_batch_checks_both_modules_in_input_order() -> Result<()> {
     Ok(())
 }
 
+fn review_fixture_policy(f: &NativeFixture, targets: &[(&str, &str)]) -> Result<(String, String)> {
+    // The SHA-256 pin covers the tracked bytes, including whitespace.
+    let mut bytes = serde_json::to_vec_pretty(&fixture_target_rows(targets))?;
+    bytes.push(b'\n');
+    let path = f.source.join(RELEASE_POLICY);
+    fs::write(&path, bytes)?;
+    let pin = file_sha256(&path)?;
+    git(&f.source, &["add", "--", RELEASE_POLICY])?;
+    git(
+        &f.source,
+        &["commit", "--quiet", "-m", "review release policy"],
+    )?;
+    // This advances only the temporary bare repo that backs this test.
+    git(&f.source, &["push", "--quiet", "../managed.git", "main"])?;
+    let head = git(&f.repo, &["rev-parse", "--verify", "refs/heads/main"])?;
+    Ok((head, pin))
+}
+
 #[test]
 #[ignore = "requires native macOS Seatbelt and AI4MATH_TEST_LEAN from the bundled toolchain"]
 fn native_t2_release_check_verifies_reviewed_policy_without_writes() -> Result<()> {
-    const POLICY: &str = "ai4math-t2-release.json";
     let f = native_fixture()?;
     let scratch = f.fixture.join("tmp");
     fs::create_dir(&scratch)?;
     let compiler_pin = file_sha256(&f.lean)?;
-    let review_policy = |targets: &[(&str, &str)]| -> Result<(String, String)> {
-        // The SHA-256 pin covers the tracked bytes, including whitespace.
-        let mut bytes = serde_json::to_vec_pretty(&fixture_target_rows(targets))?;
-        bytes.push(b'\n');
-        let path = f.source.join(POLICY);
-        fs::write(&path, bytes)?;
-        let pin = file_sha256(&path)?;
-        git(&f.source, &["add", "--", POLICY])?;
-        git(
-            &f.source,
-            &["commit", "--quiet", "-m", "review release policy"],
-        )?;
-        // This advances only the temporary bare repo that backs this test.
-        git(&f.source, &["push", "--quiet", "../managed.git", "main"])?;
-        let head = git(&f.repo, &["rev-parse", "--verify", "refs/heads/main"])?;
-        Ok((head, pin))
-    };
     let run = |reviewed: &str, policy: &str, compiler: &str| {
         ai(&f.root, "t2-release-check")
             .env("TMPDIR", &scratch)
@@ -655,11 +662,11 @@ fn native_t2_release_check_verifies_reviewed_policy_without_writes() -> Result<(
 
     // Report order follows the policy, even though the basis must compile first.
     let targets = [(TARGET, THEOREM), (BASIS, IMPORTED)];
-    let (reviewed, policy_pin) = review_policy(&targets)?;
+    let (reviewed, policy_pin) = review_fixture_policy(&f, &targets)?;
     assert_ne!(reviewed, f.head);
     // Leave an obsolete valid policy in the project root. Only the pinned Git
     // tree may select release theorems, even when the local copy also looks valid.
-    fs::copy(f.source.join(POLICY), f.root.join(POLICY))?;
+    fs::copy(f.source.join(RELEASE_POLICY), f.root.join(RELEASE_POLICY))?;
     let before = snapshot(&f.fixture)?;
     let unchanged = |case| assert_unchanged(&f.fixture, &before, &f.store, f.seq, case);
     let report: Value = serde_json::from_slice(&checked(
@@ -699,7 +706,8 @@ fn native_t2_release_check_verifies_reviewed_policy_without_writes() -> Result<(
     // The basis theorem passes first in both manifest and policy order. The
     // target elaborates in Lean, but its axiom makes Nanoda refuse it. Neither
     // the first result nor the clean build may leak as a partial gate report.
-    let (broken_review, broken_pin) = review_policy(&[(BASIS, IMPORTED), (TARGET, AXIOMATIC)])?;
+    let (broken_review, broken_pin) =
+        review_fixture_policy(&f, &[(BASIS, IMPORTED), (TARGET, AXIOMATIC)])?;
     assert_ne!(broken_review, reviewed);
     assert_ne!(broken_pin, policy_pin);
     let before_rejection = snapshot(&f.fixture)?;
@@ -715,5 +723,181 @@ fn native_t2_release_check_verifies_reviewed_policy_without_writes() -> Result<(
         f.seq,
         "rejected release gate",
     )?;
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires native macOS Seatbelt and AI4MATH_TEST_LEAN from the bundled toolchain"]
+fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()> {
+    const LABEL: &str = "native-fixture";
+    const MAIN: &str = "refs/heads/main";
+    let f = native_fixture()?;
+    let scratch = f.fixture.join("tmp");
+    fs::create_dir(&scratch)?;
+    let compiler_pin = file_sha256(&f.lean)?;
+    let targets = [(TARGET, THEOREM), (BASIS, IMPORTED)];
+    let (reviewed, policy_pin) = review_fixture_policy(&f, &targets)?;
+    // Keep a valid but eventually stale local policy; the tag gate must use Git.
+    fs::copy(f.source.join(RELEASE_POLICY), f.root.join(RELEASE_POLICY))?;
+    let tag_name = format!("ai4math-release/{LABEL}");
+    let tag_ref = format!("refs/tags/{tag_name}");
+    let run = |commit: &str, policy: &str, compiler: &str, label: &str| {
+        ai(&f.root, "t2-release-tag")
+            .env("TMPDIR", &scratch)
+            .arg(&f.repo)
+            .args([BASIS, commit])
+            .arg(&f.lean)
+            .args([policy, compiler, &f.exporter_pin, &f.checker_pin, label])
+            .output()
+    };
+    let refs = || {
+        git(
+            &f.repo,
+            &["for-each-ref", "--format=%(refname) %(objectname)"],
+        )
+    };
+    let ledger = || -> Result<_> {
+        Ok((
+            serde_json::to_value(f.store.status()?)?,
+            serde_json::to_value(f.store.events_after(0, u32::MAX)?)?,
+            serde_json::to_value(f.store.claim(CLAIM)?)?,
+            f.store.managed_proof_recipe(CLAIM)?,
+        ))
+    };
+    let repo_rel = f.repo.strip_prefix(&f.fixture)?;
+    let tag_storage = [repo_rel.join("objects"), repo_rel.join("refs/tags")];
+    let assert_only_tag_files_added =
+        |before: &BTreeMap<PathBuf, Option<String>>, case: &str| -> Result<()> {
+            let mut after = snapshot(&f.fixture)?;
+            after.retain(|path, _| {
+                before.contains_key(path) || !tag_storage.iter().any(|dir| path.starts_with(dir))
+            });
+            assert_eq!(&after, before, "{case}: changed files outside the new tag");
+            Ok(())
+        };
+    let before = snapshot(&f.fixture)?;
+    let ledger_before = ledger()?;
+    let assert_same_ledger = |case| -> Result<()> {
+        assert_eq!(
+            ledger()?,
+            ledger_before,
+            "{case}: changed ledger or proof authority"
+        );
+        Ok(())
+    };
+    assert_eq!(refs()?, format!("{MAIN} {reviewed}"));
+
+    rejected(
+        run(&reviewed, &policy_pin, &wrong_pin(&compiler_pin), LABEL)?,
+        "wrong compiler pin",
+        "Lean compiler SHA-256 mismatch",
+    );
+    assert_unchanged(&f.fixture, &before, &f.store, f.seq, "wrong compiler pin")?;
+    assert_same_ledger("wrong compiler pin")?;
+    assert_eq!(refs()?, format!("{MAIN} {reviewed}"));
+
+    let report: Value = serde_json::from_slice(&checked(
+        run(&reviewed, &policy_pin, &compiler_pin, LABEL)?,
+        "publish native local-release tag",
+    )?)?;
+    let tag_oid = git(&f.repo, &["rev-parse", "--verify", &tag_ref])?;
+    assert!(hex_field(&json!(tag_oid), 40));
+    assert_eq!(
+        report,
+        json!({
+            "schema": "ai4math.t2.local-release.v1",
+            "tag_ref": tag_ref,
+            "tag_oid": tag_oid,
+            "reviewed_commit": reviewed,
+            "ledger_event_seq": f.seq,
+        })
+    );
+    let released_refs = format!("{MAIN} {reviewed}\n{tag_ref} {tag_oid}");
+    assert_eq!(refs()?, released_refs);
+    assert_eq!(git(&f.repo, &["cat-file", "-t", &tag_oid])?, "tag");
+    assert_eq!(
+        git(
+            &f.repo,
+            &["rev-parse", "--verify", &format!("{tag_ref}^{{commit}}")]
+        )?,
+        reviewed
+    );
+    let tag = git(&f.repo, &["cat-file", "tag", &tag_oid])?;
+    let (headers, body) = tag.split_once("\n\n").context("missing Git tag message")?;
+    let mut headers = headers.lines();
+    assert_eq!(headers.next(), Some(format!("object {reviewed}").as_str()));
+    assert_eq!(headers.next(), Some("type commit"));
+    assert_eq!(headers.next(), Some(format!("tag {tag_name}").as_str()));
+    let evidence: Value = serde_json::from_str(body)?;
+    let checks: Vec<_> = targets
+        .into_iter()
+        .zip(fixture_exports(&f.lean, &targets)?)
+        .map(|((target_module, declaration), bytes)| {
+            json!({
+                "target_module": target_module,
+                "declaration": declaration,
+                "export_sha256": format!("{:x}", Sha256::digest(&bytes)),
+            })
+        })
+        .collect();
+    // Exact equality rejects timing and all other unapproved fields.
+    assert_eq!(
+        evidence,
+        json!({
+            "schema": "ai4math.t2.local-release-evidence.v1",
+            "reviewed_commit": reviewed,
+            "ledger_event_seq": f.seq,
+            "policy_sha256": policy_pin,
+            "trust_debt_findings": 0,
+            "source_set_sha256": fixture_source_set_sha256(),
+            "compiler_sha256": compiler_pin,
+            "exporter_sha256": f.exporter_pin,
+            "checker_sha256": f.checker_pin,
+            "checks": checks,
+        })
+    );
+    assert_only_tag_files_added(&before, "accepted release tag")?;
+    assert_same_ledger("accepted release tag")?;
+
+    let before_duplicate = snapshot(&f.fixture)?;
+    rejected(
+        run(&reviewed, &policy_pin, &compiler_pin, LABEL)?,
+        "duplicate tag label",
+        "already exists",
+    );
+    // A failed create-only ref transaction can leave an unreachable object,
+    // but the old tag OID, main, all other refs, and the ledger must not change.
+    assert_eq!(refs()?, released_refs);
+    assert_only_tag_files_added(&before_duplicate, "duplicate tag")?;
+    assert_same_ledger("duplicate tag")?;
+
+    // The first theorem passes; the second elaborates but Nanoda rejects it.
+    // With a fresh label and the new main pinned, this must fail at the gate.
+    let (broken_review, broken_pin) =
+        review_fixture_policy(&f, &[(BASIS, IMPORTED), (TARGET, AXIOMATIC)])?;
+    assert_ne!(broken_review, reviewed);
+    let before_rejection = snapshot(&f.fixture)?;
+    rejected(
+        run(
+            &broken_review,
+            &broken_pin,
+            &compiler_pin,
+            "native-fixture-broken",
+        )?,
+        "axiom-dependent reviewed theorem",
+        "Nanoda rejected the Lean export",
+    );
+    assert_eq!(
+        refs()?,
+        format!("{MAIN} {broken_review}\n{tag_ref} {tag_oid}")
+    );
+    assert_unchanged(
+        &f.fixture,
+        &before_rejection,
+        &f.store,
+        f.seq,
+        "bad theorem",
+    )?;
+    assert_same_ledger("bad theorem")?;
     Ok(())
 }

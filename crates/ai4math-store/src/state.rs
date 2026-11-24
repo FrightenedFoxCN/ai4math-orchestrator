@@ -5,12 +5,16 @@ use crate::{
 use ai4math_broker::VerifiedWitness;
 use ai4math_core::{aggregate_plan, best_proof_plan};
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
+    config::DbConfig, params,
+};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::Path,
+    time::Duration,
 };
 
 mod claim_replay;
@@ -403,8 +407,8 @@ impl StateStore {
 
     /// For operator dry-runs. No DDL, migrations, or state updates are performed.
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<Self> {
-        let db = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        db.busy_timeout(std::time::Duration::from_secs(5))?;
+        let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        db.busy_timeout(Duration::from_secs(5))?;
         Ok(Self { db })
     }
 
@@ -420,16 +424,39 @@ impl StateStore {
     /// Compact read stamp for guarded Wiki reads. Pending Git state must not be
     /// presented as current even when the journal did not append a new event.
     pub fn managed_wiki_stamp(&self) -> Result<Option<(String, i64)>> {
-        Ok(self
-            .db
-            .query_row(
-                "SELECT repo,(SELECT coalesce(max(event_seq),0) FROM events) FROM managed_repo
-             WHERE singleton=1 AND NOT EXISTS (SELECT 1 FROM promotion_intent)
-             AND NOT EXISTS (SELECT 1 FROM pivot_resume_intent)",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?)
+        read_managed_wiki_stamp(&self.db)
+    }
+
+    /// Reserve the SQLite writer while rechecking the generation and running the final
+    /// operator Git operation. The caller must validate the private ledger path and
+    /// coordinate concurrent Git operations separately. The callback must be short
+    /// and must not call another SQLite writer. Nothing is written to the ledger.
+    pub fn with_managed_generation_reservation<T>(
+        path: &Path,
+        expected_repo: &str,
+        expected_seq: i64,
+        operation: impl FnOnce() -> Result<T>,
+    ) -> Result<T> {
+        let mut db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_WRITE)
+            .context("open existing managed ledger for generation reservation")?;
+        db.busy_timeout(Duration::from_secs(1))?;
+        ensure!(!db.is_readonly("main")?, "managed ledger is read-only");
+        // Even as the last connection, do not checkpoint someone else's WAL writes.
+        db.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)?;
+        let tx = db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("reserve managed ledger writer")?;
+        let (repo, seq) = read_managed_wiki_stamp(&tx)?
+            .context("managed ledger has no repository binding or a pending Git promotion/Pivot")?;
+        ensure!(
+            repo == expected_repo && seq == expected_seq,
+            "managed ledger generation changed; review the current repository and event sequence again"
+        );
+        let result = operation();
+        // Release the reservation by rollback on drop, without a fallible commit
+        // after the external operation has already run.
+        drop(tx);
+        result
     }
 
     /// Trust-boundary setup called by the operator with the canonical repository
@@ -1403,6 +1430,18 @@ impl StateStore {
         tx.commit()?;
         Ok(value)
     }
+}
+
+fn read_managed_wiki_stamp(db: &Connection) -> Result<Option<(String, i64)>> {
+    Ok(db
+        .query_row(
+            "SELECT repo,(SELECT coalesce(max(event_seq),0) FROM events) FROM managed_repo
+             WHERE singleton=1 AND NOT EXISTS (SELECT 1 FROM promotion_intent)
+             AND NOT EXISTS (SELECT 1 FROM pivot_resume_intent)",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?)
 }
 
 fn read_managed_proof_recipe(

@@ -136,6 +136,25 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
             ],
         )
     };
+    let publish = |reviewed: &str, label: &str| {
+        ai(
+            &root,
+            "t2-release-tag",
+            &[
+                repo_str,
+                "Audit.lean",
+                reviewed,
+                nonexistent,
+                &pin,
+                &pin,
+                &pin,
+                &pin,
+                label,
+            ],
+        )
+    };
+    rejects(publish(&head, "../bad"), "release label");
+    rejects(publish(&head, "launch-v1"), "initialized private project");
     rejects(
         release(repo_str, &head, "bad"),
         "policy SHA-256 must be 64 lowercase hex digits",
@@ -196,6 +215,10 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
         release(repo_str, &old, &pin),
         "reviewed T2 commit is not current main",
     );
+    rejects(
+        publish(&old, "launch-v1"),
+        "reviewed T2 commit is not current main",
+    );
     let lease = ProjectNativeGate::new(&root).try_heavy().unwrap();
     rejects(audit(repo_str, &head), "project native execution is busy");
     rejects(
@@ -210,9 +233,14 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
         release(repo_str, &head, &pin),
         "project native execution is busy",
     );
+    rejects(
+        publish(&head, "launch-v1"),
+        "project native execution is busy",
+    );
     drop(lease);
     fs::copy(&manifest, root.join("ai4math-t2-release.json")).unwrap();
     rejects(release(repo_str, &head, &pin), "ai4math-t2-release.json");
+    rejects(publish(&head, "launch-v1"), "ai4math-t2-release.json");
     let after = StateStore::open_readonly(&state)
         .unwrap()
         .status()
@@ -247,6 +275,10 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
     let with_debt = store.status().unwrap().last_event_seq;
     rejects(
         release(repo_str, &head, &pin),
+        "T2 release requires zero audited L4 trust debt findings",
+    );
+    rejects(
+        publish(&head, "launch-v1"),
         "T2 release requires zero audited L4 trust debt findings",
     );
     assert_eq!(store.status().unwrap().last_event_seq, with_debt);

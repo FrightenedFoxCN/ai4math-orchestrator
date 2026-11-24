@@ -227,6 +227,30 @@ pub(crate) fn at_snapshot_generation<T, B>(
     observe: impl FnOnce(&StateStore, i64) -> Result<T>,
     build: impl FnOnce(Engine, &Promotion<'_>, &[(&str, &str)]) -> Result<B>,
 ) -> Result<(B, T, i64, Engine)> {
+    let (result, observation, seq, engine, ()) = at_snapshot_generation_then(
+        root,
+        repo,
+        anchor,
+        reviewed,
+        observe,
+        build,
+        |_, _, _, _, _| Ok(()),
+    )?;
+    Ok((result, observation, seq, engine))
+}
+
+/// The finalizer still holds the project native lease and managed Git lock.
+/// A finalizer that mutates Git must additionally reserve the ledger generation
+/// and use a ref transaction that compares the reviewed main.
+pub(crate) fn at_snapshot_generation_then<T, B, F>(
+    root: &Path,
+    repo: &Path,
+    anchor: &str,
+    reviewed: &str,
+    observe: impl FnOnce(&StateStore, i64) -> Result<T>,
+    build: impl FnOnce(Engine, &Promotion<'_>, &[(&str, &str)]) -> Result<B>,
+    finish: impl FnOnce(&PromotionRepo, &Path, i64, &B, &T) -> Result<F>,
+) -> Result<(B, T, i64, Engine, F)> {
     let path =
         private_state_path(root).context("T2 build requires an initialized private project")?;
     let engine = bound_engine(root, anchor)?;
@@ -278,7 +302,8 @@ pub(crate) fn at_snapshot_generation<T, B>(
         git.main_head()? == reviewed && state.managed_wiki_stamp()?.as_ref() == Some(&stamp),
         "managed main or ledger changed during T2 build; retry"
     );
-    Ok((build, observation, stamp.1, engine))
+    let finished = finish(&git, &path, stamp.1, &build, &observation)?;
+    Ok((build, observation, stamp.1, engine, finished))
 }
 
 fn compile(

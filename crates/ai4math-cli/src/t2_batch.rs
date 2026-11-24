@@ -1,6 +1,7 @@
 //! Independent Lean batch checks and the reviewed T2 release gate.
 use crate::{
-    t2_build::{at_generation, at_snapshot_generation},
+    promotion::{PromotionRepo, validate_release_label},
+    t2_build::{at_generation, at_snapshot_generation_then},
     trusted_toolchain,
 };
 use ai4math_broker::{Broker, MAX_MANAGED_T2_THEOREMS, ManagedLeanBatchAudit};
@@ -201,13 +202,89 @@ fn release_debt(state: &ai4math_store::StateStore, seq: i64) -> Result<usize> {
 }
 
 pub(crate) fn release(request: ReleaseRequest<'_>) -> Result<ReleaseReport> {
-    release_mode(request, ReleaseMode::Operator)
+    release_with(&request, ReleaseMode::Operator, |_, _, _, _, _| Ok(())).map(|(report, ())| report)
+}
+
+#[derive(Serialize)]
+pub(crate) struct LocalReleaseReport {
+    schema: &'static str,
+    tag_ref: String,
+    tag_oid: String,
+    reviewed_commit: String,
+    ledger_event_seq: i64,
+}
+
+#[derive(Serialize)]
+struct LocalReleaseEvidence<'a> {
+    schema: &'static str,
+    reviewed_commit: &'a str,
+    ledger_event_seq: i64,
+    policy_sha256: &'a str,
+    trust_debt_findings: usize,
+    source_set_sha256: &'a str,
+    compiler_sha256: &'a str,
+    exporter_sha256: &'a str,
+    checker_sha256: &'a str,
+    checks: Vec<LocalReleaseCheck<'a>>,
+}
+
+#[derive(Serialize)]
+struct LocalReleaseCheck<'a> {
+    target_module: &'a str,
+    declaration: &'a str,
+    export_sha256: &'a str,
+}
+
+pub(crate) fn release_tag(request: ReleaseRequest<'_>, label: &str) -> Result<LocalReleaseReport> {
+    validate_release_label(label)?;
+    // Re-run the gate rather than accepting an operator- or daemon-supplied report.
+    let (report, (tag_ref, tag_oid)) = release_with(
+        &request,
+        ReleaseMode::Operator,
+        |git, path, seq, build, debt| {
+            let evidence = LocalReleaseEvidence {
+                schema: "ai4math.t2.local-release-evidence.v1",
+                reviewed_commit: request.reviewed,
+                ledger_event_seq: seq,
+                policy_sha256: request.policy_sha256,
+                trust_debt_findings: *debt,
+                source_set_sha256: &build.build.source_set_sha256,
+                compiler_sha256: &build.build.compiler_sha256,
+                exporter_sha256: &build.exporter_sha256,
+                checker_sha256: request.checker_sha256,
+                checks: build
+                    .checks
+                    .iter()
+                    .map(|check| LocalReleaseCheck {
+                        target_module: &check.target_module,
+                        declaration: &check.declaration,
+                        export_sha256: &check.independent_check.export_sha256,
+                    })
+                    .collect(),
+            };
+            let evidence = serde_json::to_vec(&evidence)?;
+            let repo = git
+                .path()
+                .to_str()
+                .context("invalid managed release repository path")?;
+            ai4math_store::StateStore::with_managed_generation_reservation(path, repo, seq, || {
+                git.create_release_tag(label, request.reviewed, &evidence)
+            })
+        },
+    )?;
+    Ok(LocalReleaseReport {
+        schema: "ai4math.t2.local-release.v1",
+        tag_ref,
+        tag_oid,
+        reviewed_commit: report.reviewed_commit,
+        ledger_event_seq: report.ledger_event_seq,
+    })
 }
 
 #[cfg(unix)]
 pub(crate) fn release_for_daemon(request: ReleaseRequest<'_>) -> Result<()> {
     crate::t3::arm_daemon_lifeline("T2")?;
-    let report = release_mode(request, ReleaseMode::Daemon)?;
+    let (report, ()) = release_with(&request, ReleaseMode::Daemon, |_, _, _, _, _| Ok(()))?;
     // Keep proof identities, project paths, build hashes and native diagnostics
     // out of the private worker protocol. The daemon checks the policy pin.
     crate::print_json(serde_json::json!({
@@ -229,7 +306,11 @@ enum ReleaseMode {
     Daemon,
 }
 
-fn release_mode(request: ReleaseRequest<'_>, mode: ReleaseMode) -> Result<ReleaseReport> {
+fn release_with<T>(
+    request: &ReleaseRequest<'_>,
+    mode: ReleaseMode,
+    finish: impl FnOnce(&PromotionRepo, &Path, i64, &ManagedLeanBatchAudit, &usize) -> Result<T>,
+) -> Result<(ReleaseReport, T)> {
     for (value, label) in [
         (request.policy_sha256, "T2 release policy"),
         (request.compiler_sha256, "Lean compiler"),
@@ -238,7 +319,7 @@ fn release_mode(request: ReleaseRequest<'_>, mode: ReleaseMode) -> Result<Releas
     ] {
         require_pin(value, label)?;
     }
-    let (result, trust_debt_findings, ledger_event_seq, _) = at_snapshot_generation(
+    let (result, trust_debt_findings, ledger_event_seq, _, finished) = at_snapshot_generation_then(
         request.root,
         request.repo,
         request.anchor,
@@ -273,16 +354,20 @@ fn release_mode(request: ReleaseRequest<'_>, mode: ReleaseMode) -> Result<Releas
                 )
                 .context("T2 release independent theorem checks failed")
         },
+        finish,
     )?;
-    Ok(ReleaseReport {
-        schema: "ai4math.t2.release-check.v1",
-        gate_passed: true,
-        reviewed_commit: request.reviewed.into(),
-        ledger_event_seq,
-        policy_sha256: request.policy_sha256.into(),
-        trust_debt_findings,
-        result,
-    })
+    Ok((
+        ReleaseReport {
+            schema: "ai4math.t2.release-check.v1",
+            gate_passed: true,
+            reviewed_commit: request.reviewed.into(),
+            ledger_event_seq,
+            policy_sha256: request.policy_sha256.into(),
+            trust_debt_findings,
+            result,
+        },
+        finished,
+    ))
 }
 
 #[cfg(test)]

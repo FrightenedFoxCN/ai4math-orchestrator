@@ -151,15 +151,23 @@ fn ledger_move_after_debt_scan_prevents_compiler_launch() -> Result<()> {
 fn git_or_ledger_move_during_build_suppresses_both_reports() -> Result<()> {
     for move_git in [false, true] {
         let f = Fixture::new()?;
-        let result = f.run(scan, |engine, modules| {
-            let native = fake_success(engine, modules);
-            if move_git {
-                git(&f.bare, &["update-ref", MAIN, &f.next, &f.initial])?;
-            } else {
-                f.append_from_other_connection()?;
-            }
-            Ok(native)
-        });
+        let result = at_snapshot_generation_then(
+            &f.root,
+            &f.bare,
+            MODULE,
+            &f.initial,
+            scan,
+            |engine, _, modules| {
+                let native = fake_success(engine, modules);
+                if move_git {
+                    git(&f.bare, &["update-ref", MAIN, &f.next, &f.initial])?;
+                } else {
+                    f.append_from_other_connection()?;
+                }
+                Ok(native)
+            },
+            |_, _, _, _, _| -> Result<()> { panic!("generation drift reached the finalizer") },
+        );
         let error = result
             .err()
             .context("audit returned a partial or outdated report")?;
@@ -168,5 +176,31 @@ fn git_or_ledger_move_during_build_suppresses_both_reports() -> Result<()> {
             "{error:#}"
         );
     }
+    Ok(())
+}
+
+#[test]
+fn finalizer_holds_both_gates_after_a_fresh_observation() -> Result<()> {
+    let f = Fixture::new()?;
+    let (_, _, seq, _, tag) = at_snapshot_generation_then(
+        &f.root,
+        &f.bare,
+        MODULE,
+        &f.initial,
+        scan,
+        |engine, _, modules| Ok(fake_success(engine, modules)),
+        |git, path, seq, _, debt| {
+            assert_eq!(git.path(), f.bare);
+            assert_eq!(git.main_head()?, f.initial);
+            assert_eq!(path, private_state_path(&f.root)?);
+            assert_eq!(seq, debt.ledger_event_seq);
+            assert!(PromotionRepo::try_lock_existing(&f.bare).is_err());
+            assert!(managed_native(&f.root).is_err());
+            // No fake tag or receipt: this only proves the finalizer boundary.
+            Ok("called at fresh generation")
+        },
+    )?;
+    assert!(seq > 0);
+    assert_eq!(tag, "called at fresh generation");
     Ok(())
 }

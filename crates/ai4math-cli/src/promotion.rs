@@ -3,12 +3,18 @@ use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{File, OpenOptions},
-    io::Write,
+    io::{Read, Write},
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
+    sync::mpsc::{self, Receiver},
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 const MAIN: &str = "refs/heads/main";
+const RELEASE_TAG_NAMESPACE: &str = "ai4math-release";
+const MAX_RELEASE_TAG_BYTES: usize = 16 * 1024;
+const RELEASE_GIT_TIMEOUT: Duration = Duration::from_secs(5);
 const MODULE_MANIFEST: &str = "ai4math-modules.txt";
 const T2_RELEASE_POLICY: &str = "ai4math-t2-release.json";
 const MAX_T2_RELEASE_POLICY_BYTES: usize = 8 * 1024;
@@ -38,12 +44,7 @@ pub struct Promotion<'repo> {
     t2_release_policy_oid: Option<String>,
 }
 
-fn run_git(
-    repo: &Path,
-    args: &[&str],
-    index: Option<&Path>,
-    input: Option<&[u8]>,
-) -> Result<Output> {
+fn git_command(repo: &Path, args: &[&str], index: Option<&Path>, has_input: bool) -> Command {
     let mut cmd = Command::new("/usr/bin/git");
     cmd.env_clear()
         .env("PATH", "/usr/bin:/bin")
@@ -66,7 +67,7 @@ fn run_git(
             "core.fsync=all",
         ])
         .args(args)
-        .stdin(if input.is_some() {
+        .stdin(if has_input {
             Stdio::piped()
         } else {
             Stdio::null()
@@ -76,7 +77,18 @@ fn run_git(
     if let Some(index) = index {
         cmd.env("GIT_INDEX_FILE", index);
     }
-    let mut child = cmd.spawn().context("start Git")?;
+    cmd
+}
+
+fn run_git(
+    repo: &Path,
+    args: &[&str],
+    index: Option<&Path>,
+    input: Option<&[u8]>,
+) -> Result<Output> {
+    let mut child = git_command(repo, args, index, input.is_some())
+        .spawn()
+        .context("start Git")?;
     let write = input.map(|data| child.stdin.take().expect("piped stdin").write_all(data));
     let out = child.wait_with_output()?;
     if let Some(result) = write.filter(|_| out.status.success()) {
@@ -102,11 +114,224 @@ fn git(repo: &Path, args: &[&str], index: Option<&Path>, input: Option<&[u8]>) -
 fn reject_symbolic_ref(repo: &Path, name: &str) -> Result<()> {
     let args = ["symbolic-ref", "--no-recurse", "-q", name];
     let out = run_git(repo, &args, None, None)?;
+    require_nonsymbolic_ref(name, &args, out)
+}
+
+fn require_nonsymbolic_ref(name: &str, args: &[&str], out: Output) -> Result<()> {
     if out.status.code() == Some(1) {
-        return Ok(()); // Direct or absent; the next ref operation distinguishes these.
+        return Ok(()); // Direct or absent; its associated ref operation distinguishes these.
     }
-    git_success(&args, out)?;
+    git_success(args, out)?;
     bail!("expected a direct Git ref: {name}");
+}
+
+fn release_io<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<Receiver<Result<T>>> {
+    let (sender, receiver) = mpsc::channel();
+    thread::Builder::new().spawn(move || {
+        let _ = sender.send(operation());
+    })?;
+    Ok(receiver)
+}
+
+fn release_time_left(deadline: Instant) -> Result<Duration> {
+    let now = Instant::now();
+    ensure!(now < deadline, "local release Git deadline elapsed");
+    Ok(deadline - now)
+}
+
+fn await_release_io<T>(receiver: Receiver<Result<T>>, deadline: Instant) -> Result<T> {
+    receiver
+        .recv_timeout(release_time_left(deadline)?)
+        .context("local release Git I/O did not complete")?
+}
+
+fn read_release_output(reader: impl Read) -> Result<Vec<u8>> {
+    const LIMIT: u64 = 8 * 1024;
+    let mut bytes = Vec::new();
+    reader.take(LIMIT + 1).read_to_end(&mut bytes)?;
+    ensure!(
+        bytes.len() <= LIMIT as usize,
+        "excessive local release Git output"
+    );
+    Ok(bytes)
+}
+
+// Keep the Child in the caller so a timed-out pipe read cannot strand the
+// Git transaction under the ledger reservation. I/O workers own only pipes.
+struct ReleaseGit {
+    child: Option<Child>,
+    stderr: Option<Receiver<Result<Vec<u8>>>>,
+}
+
+impl ReleaseGit {
+    fn start(repo: &Path, args: &[&str], has_input: bool, deadline: Instant) -> Result<Self> {
+        release_time_left(deadline)?;
+        let child = git_command(repo, args, None, has_input)
+            // Refuse transports even if older Git ignores GIT_NO_LAZY_FETCH.
+            .env("GIT_ALLOW_PROTOCOL", "")
+            .spawn()
+            .context("start local release Git command")?;
+        let mut git = Self {
+            child: Some(child),
+            stderr: None,
+        };
+        let stderr = git.child().stderr.take().expect("piped stderr");
+        git.stderr = Some(release_io(move || read_release_output(stderr))?);
+        Ok(git)
+    }
+
+    fn child(&mut self) -> &mut Child {
+        self.child.as_mut().expect("Git child")
+    }
+
+    fn finish(mut self, deadline: Instant, stdout: Vec<u8>) -> Result<Output> {
+        let status = loop {
+            let remaining = release_time_left(deadline)?;
+            if let Some(status) = self.child().try_wait()? {
+                break status;
+            }
+            thread::sleep(remaining.min(Duration::from_millis(2)));
+        };
+        self.child.take(); // try_wait already reaped it.
+        let stderr = await_release_io(self.stderr.take().expect("Git stderr reader"), deadline)?;
+        Ok(Output {
+            status,
+            stdout,
+            stderr,
+        })
+    }
+}
+
+impl Drop for ReleaseGit {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            // Do not return to the ledger caller while Git could still act.
+            // Reaping can outlast the command deadline if kernel I/O hangs.
+            while let Err(error) = child.wait() {
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+fn bounded_release_git(
+    repo: &Path,
+    args: &[&str],
+    input: Option<Vec<u8>>,
+    deadline: Instant,
+) -> Result<Output> {
+    let mut git = ReleaseGit::start(repo, args, input.is_some(), deadline)?;
+    let stdin = git.child().stdin.take();
+    let stdout = git.child().stdout.take().expect("piped stdout");
+    let output = await_release_io(
+        release_io(move || {
+            let write = input.map(|payload| stdin.expect("piped stdin").write_all(&payload));
+            let stdout = read_release_output(stdout)?;
+            Ok((stdout, write))
+        })?,
+        deadline,
+    )?;
+    let (stdout, write) = output;
+    let result = git.finish(deadline, stdout)?;
+    if let Some(write) = write.filter(|_| result.status.success()) {
+        write?;
+    }
+    Ok(result)
+}
+
+fn reject_release_symref(repo: &Path, name: &str, deadline: Instant) -> Result<()> {
+    let args = ["symbolic-ref", "--no-recurse", "-q", name];
+    let out = bounded_release_git(repo, &args, None, deadline)?;
+    require_nonsymbolic_ref(name, &args, out)
+}
+
+fn publish_release_tag_ref(
+    repo: &Path,
+    reviewed: &str,
+    destination: &str,
+    tag_oid: &str,
+    deadline: Instant,
+) -> Result<()> {
+    let args = [
+        "-c",
+        "core.logAllRefUpdates=false",
+        "-c",
+        "core.filesRefLockTimeout=100",
+        "-c",
+        "core.packedRefsTimeout=1000",
+        "-c",
+        "reftable.lockTimeout=100",
+        "update-ref",
+        "--stdin",
+    ];
+    let transaction = format!(
+        "start\noption no-deref\nverify {MAIN} {reviewed}\noption no-deref\ncreate {destination} {tag_oid}\nprepare\n"
+    );
+    let mut git =
+        ReleaseGit::start(repo, &args, true, deadline).context("release tag was not published")?;
+    let mut stdin = git.child().stdin.take().expect("piped stdin");
+    let mut stdout = git.child().stdout.take().expect("piped stdout");
+    let prepare = (|| {
+        let prepared = await_release_io(
+            release_io(move || {
+                stdin.write_all(transaction.as_bytes())?;
+                const PREPARED: &[u8] = b"start: ok\nprepare: ok\n";
+                let mut ack = [0; PREPARED.len()];
+                stdout.read_exact(&mut ack)?;
+                ensure!(ack == PREPARED, "unexpected Git prepare acknowledgement");
+                Ok((stdin, stdout))
+            })?,
+            deadline,
+        );
+        let (stdin, stdout) = match prepared {
+            Ok(pipes) => pipes,
+            Err(error) => {
+                git_success(&["update-ref"], git.finish(deadline, Vec::new())?)?;
+                return Err(error);
+            }
+        };
+
+        // Even with per-command no-deref, Git can verify a symref to the
+        // reviewed OID. Inspect each name while the prepared transaction
+        // holds both ref locks, not in a racy pre- or post-transaction check.
+        for name in [MAIN, destination] {
+            if let Err(error) = reject_release_symref(repo, name, deadline) {
+                drop(stdin); // EOF aborts the prepared transaction.
+                drop(stdout);
+                let _ = git.finish(deadline, Vec::new());
+                return Err(error);
+            }
+        }
+        Ok((git, stdin, stdout))
+    })();
+    let (git, mut stdin, stdout) = prepare.context("release tag was not published")?;
+
+    // Once commit is sent, a missing acknowledgement leaves the outcome
+    // unknown. Do not retry the transaction or touch the tag for cleanup.
+    (|| {
+        let committed = await_release_io(
+            release_io(move || {
+                release_time_left(deadline)?;
+                stdin.write_all(b"commit\n")?;
+                drop(stdin);
+                let ack = read_release_output(stdout)?;
+                ensure!(
+                    ack == b"commit: ok\n",
+                    "unexpected Git commit acknowledgement"
+                );
+                Ok(())
+            })?,
+            deadline,
+        );
+        git_success(&["update-ref"], git.finish(deadline, Vec::new())?)?;
+        committed
+    })()
+    .context("release tag publication could not be confirmed")
 }
 
 fn text(bytes: Vec<u8>) -> Result<String> {
@@ -187,6 +412,52 @@ impl PromotionRepo {
         )?)?;
         self.require_commit(&head)?;
         Ok(head)
+    }
+
+    /// Create a local, annotated tag for the exact reviewed tip, without moving main.
+    pub(crate) fn create_release_tag(
+        &self,
+        label: &str,
+        reviewed: &str,
+        evidence: &[u8],
+    ) -> Result<(String, String)> {
+        validate_release_label(label)?;
+        ensure!(
+            valid_commit(reviewed),
+            "provide a full reviewed Git commit ID"
+        );
+        let tag_name = format!("{RELEASE_TAG_NAMESPACE}/{label}");
+        let destination = format!("refs/tags/{tag_name}");
+        let seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+        let mut payload = format!(
+            "object {reviewed}\ntype commit\ntag {tag_name}\ntagger AI4Math Broker <broker@localhost> {seconds} +0000\n\n"
+        )
+        .into_bytes();
+        ensure!(
+            evidence.len() <= MAX_RELEASE_TAG_BYTES - payload.len(),
+            "annotated release tag exceeds {MAX_RELEASE_TAG_BYTES} bytes"
+        );
+        payload.extend_from_slice(evidence);
+
+        let deadline = Instant::now() + RELEASE_GIT_TIMEOUT;
+        reject_release_symref(self.path(), MAIN, deadline)?;
+        let args = ["rev-parse", "--verify", MAIN];
+        let head = text(git_success(
+            &args,
+            bounded_release_git(self.path(), &args, None, deadline)?,
+        )?)?;
+        ensure!(head == reviewed, "main changed since release review");
+
+        // Strict Git validation checks that the exact object exists and is a commit,
+        // and that the serialized tag is valid. Only the body contains caller bytes.
+        let args = ["mktag", "--strict"];
+        let tag_oid = text(git_success(
+            &args,
+            bounded_release_git(self.path(), &args, Some(payload), deadline)?,
+        )?)?;
+        ensure!(valid_commit(&tag_oid), "invalid Git tag object ID");
+        publish_release_tag_ref(self.path(), reviewed, &destination, &tag_oid, deadline)?;
+        Ok((destination, tag_oid))
     }
 
     pub fn require_commit(&self, commit: &str) -> Result<()> {
@@ -456,6 +727,23 @@ impl PromotionRepo {
             t2_release_policy_oid,
         })
     }
+}
+
+pub(crate) fn validate_release_label(label: &str) -> Result<()> {
+    fn initial(byte: u8) -> bool {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit()
+    }
+    let mut bytes = label.bytes();
+    ensure!(
+        label.len() <= 64
+            && bytes.next().is_some_and(initial)
+            && bytes.all(|b| initial(b) || matches!(b, b'.' | b'_' | b'-'))
+            && !label.contains("..")
+            && !label.ends_with('.')
+            && !label.ends_with(".lock"),
+        "invalid release label: use at most 64 lowercase ASCII letters, digits, dots, underscores or hyphens, starting with a letter or digit, with no '..', trailing dot or '.lock' suffix"
+    );
+    Ok(())
 }
 
 fn adr_filename(approved_id: &str) -> Result<String> {
@@ -938,6 +1226,259 @@ mod tests {
 
     fn id(digit: char) -> String {
         format!("ADR-PIVOT-{}", digit.to_string().repeat(64))
+    }
+
+    #[test]
+    fn release_labels_are_bounded_plain_components() -> Result<()> {
+        for label in ["v1", "0", "r1.2_rc-1", &"a".repeat(64)] {
+            validate_release_label(label)?;
+        }
+        for label in [
+            "",
+            "Upper",
+            "é",
+            ".v1",
+            "_draft",
+            "-n",
+            "a..b",
+            "a.",
+            "a.lock",
+            "a/b",
+            "refs/tags/a",
+            "a@{b}",
+            "b^0",
+            "a\nb",
+            "a\0b",
+            &"a".repeat(65),
+        ] {
+            assert!(validate_release_label(label).is_err(), "{label:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn release_tag_is_annotated_and_create_only_on_direct_main() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let reviewed = branch(&repo)?;
+        git(
+            repo.path(),
+            &["config", "core.logAllRefUpdates", "always"],
+            None,
+            None,
+        )?;
+        let evidence = b"{\"event\":12}\ntag misleading-body-line\n";
+        let (destination, oid) = repo.create_release_tag("v1.2-rc_3", &reviewed, evidence)?;
+        assert_eq!(destination, "refs/tags/ai4math-release/v1.2-rc_3");
+        let object = read_object(repo.path(), "tag", &oid, MAX_RELEASE_TAG_BYTES)?;
+        let expected = format!(
+            "object {reviewed}\ntype commit\ntag ai4math-release/v1.2-rc_3\ntagger AI4Math Broker <broker@localhost> "
+        );
+        let trailer = object
+            .strip_prefix(expected.as_bytes())
+            .context("bad tag headers")?;
+        let timestamp_end = trailer
+            .iter()
+            .position(|b| *b == b' ')
+            .context("no tagger timezone")?;
+        assert!(std::str::from_utf8(&trailer[..timestamp_end])?.parse::<u64>()? > 0);
+        assert_eq!(
+            trailer[timestamp_end..].strip_prefix(b" +0000\n\n"),
+            Some(evidence.as_slice())
+        );
+        assert_eq!(
+            text(git(
+                repo.path(),
+                &["rev-parse", "--verify", &destination],
+                None,
+                None
+            )?)?,
+            oid
+        );
+        assert_eq!(repo.main_head()?, reviewed);
+        assert!(!repo.path().join("logs").join(&destination).exists());
+        assert!(!repo.path().join("index").exists());
+
+        let duplicate = repo
+            .create_release_tag("v1.2-rc_3", &reviewed, b"different")
+            .unwrap_err();
+        assert_eq!(duplicate.to_string(), "release tag was not published");
+        assert_eq!(
+            text(git(
+                repo.path(),
+                &["rev-parse", "--verify", &destination],
+                None,
+                None
+            )?)?,
+            oid
+        );
+        assert_eq!(repo.main_head()?, reviewed);
+        Ok(())
+    }
+
+    #[test]
+    fn release_tag_refuses_stale_main_even_at_the_transaction() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let reviewed = branch(&repo)?;
+        let (_, oid) = repo.create_release_tag("first", &reviewed, b"first evidence")?;
+        let tree = text(git(repo.path(), &["mktree"], None, Some(b""))?)?;
+        let newer = commit_tree(&repo, &tree, &reviewed)?;
+        git(
+            repo.path(),
+            &["update-ref", MAIN, &newer, &reviewed],
+            None,
+            None,
+        )?;
+        assert!(
+            repo.create_release_tag("stale", &reviewed, b"stale evidence")
+                .is_err()
+        );
+        let target = "refs/tags/ai4math-release/stale";
+        // Exercise the final CAS directly to model main moving after the quick preflight.
+        assert!(
+            publish_release_tag_ref(
+                repo.path(),
+                &reviewed,
+                target,
+                &oid,
+                Instant::now() + RELEASE_GIT_TIMEOUT
+            )
+            .is_err()
+        );
+        assert!(
+            !run_git(
+                repo.path(),
+                &["show-ref", "--verify", "--quiet", target],
+                None,
+                None
+            )?
+            .status
+            .success()
+        );
+        assert_eq!(repo.main_head()?, newer);
+        Ok(())
+    }
+
+    #[test]
+    fn release_tag_refuses_symbolic_main_even_at_the_reviewed_oid() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let reviewed = branch(&repo)?;
+        let (_, oid) = repo.create_release_tag("prior", &reviewed, b"evidence")?;
+        let other = "refs/heads/other";
+        git(repo.path(), &["update-ref", other, &reviewed], None, None)?;
+        git(repo.path(), &["symbolic-ref", MAIN, other], None, None)?;
+        assert_eq!(
+            text(git(
+                repo.path(),
+                &["rev-parse", "--verify", MAIN],
+                None,
+                None
+            )?)?,
+            reviewed
+        );
+        assert!(
+            repo.create_release_tag("symbolic-main", &reviewed, b"evidence")
+                .is_err()
+        );
+        assert_eq!(
+            text(git(
+                repo.path(),
+                &["symbolic-ref", "--no-recurse", MAIN],
+                None,
+                None
+            )?)?,
+            other
+        );
+        let target = "refs/tags/ai4math-release/symbolic-main";
+        // Main can become symbolic after the quick preflight; the prepared CAS
+        // must still refuse it even on Git versions whose verify accepts it.
+        assert!(
+            publish_release_tag_ref(
+                repo.path(),
+                &reviewed,
+                target,
+                &oid,
+                Instant::now() + RELEASE_GIT_TIMEOUT
+            )
+            .is_err()
+        );
+        assert!(
+            !run_git(
+                repo.path(),
+                &["show-ref", "--verify", "--quiet", target],
+                None,
+                None
+            )?
+            .status
+            .success()
+        );
+        // The rejected prepared transaction leaves no locks behind.
+        git(
+            repo.path(),
+            &["update-ref", "--no-deref", MAIN, &reviewed],
+            None,
+            None,
+        )?;
+        repo.create_release_tag("symbolic-main", &reviewed, b"evidence")?;
+        Ok(())
+    }
+
+    #[test]
+    fn release_tag_does_not_overwrite_linked_or_dangling_symbolic_tags() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let reviewed = branch(&repo)?;
+        let missing = "refs/heads/absent";
+        for (label, original) in [("linked", MAIN), ("dangling", missing)] {
+            let destination = format!("refs/tags/ai4math-release/{label}");
+            git(
+                repo.path(),
+                &["symbolic-ref", &destination, original],
+                None,
+                None,
+            )?;
+            assert!(
+                repo.create_release_tag(label, &reviewed, b"evidence")
+                    .is_err()
+            );
+            assert_eq!(
+                text(git(
+                    repo.path(),
+                    &["symbolic-ref", "--no-recurse", &destination],
+                    None,
+                    None
+                )?)?,
+                original
+            );
+        }
+        assert!(
+            !run_git(
+                repo.path(),
+                &["show-ref", "--verify", "--quiet", missing],
+                None,
+                None
+            )?
+            .status
+            .success()
+        );
+        assert_eq!(repo.main_head()?, reviewed);
+        Ok(())
+    }
+
+    #[test]
+    fn release_tag_bounds_the_whole_object_and_rejects_revision_syntax() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let reviewed = branch(&repo)?;
+        assert!(
+            repo.create_release_tag("large", &reviewed, &vec![b'x'; MAX_RELEASE_TAG_BYTES])
+                .is_err()
+        );
+        for revision in ["main", &format!("{reviewed}^{{commit}}"), &reviewed[..12]] {
+            assert!(
+                repo.create_release_tag("syntax", revision, b"evidence")
+                    .is_err()
+            );
+        }
+        assert!(git(repo.path(), &["tag", "--list"], None, None)?.is_empty());
+        Ok(())
     }
 
     #[test]
