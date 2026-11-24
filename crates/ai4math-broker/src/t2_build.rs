@@ -145,7 +145,21 @@ impl Broker {
         tool: &Toolchain,
         modules: &[(&str, &str)],
     ) -> Result<LeanBuildAudit> {
-        let deadline = Instant::now() + TOTAL_TIMEOUT;
+        let (build, _) =
+            self.audit_lean_build_with(tool, modules, None::<(&str, fn(&Path) -> Result<()>)>)?;
+        Ok(build)
+    }
+
+    /// Run one broker-owned observation on the exact pool prefix ending at the
+    /// named module. Retain its result (including errors) privately until the
+    /// whole ordered build succeeds, and do not charge its time to the build.
+    pub(super) fn audit_lean_build_with<T>(
+        &self,
+        tool: &Toolchain,
+        modules: &[(&str, &str)],
+        mut after_target: Option<(&str, impl FnOnce(&Path) -> Result<T>)>,
+    ) -> Result<(LeanBuildAudit, Option<T>)> {
+        let mut deadline = Instant::now() + TOTAL_TIMEOUT;
         validate_inputs(tool, modules)?;
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
         remaining(deadline)?;
@@ -156,6 +170,8 @@ impl Broker {
         fs::create_dir(&predecessors)?;
         let mut audited = Vec::with_capacity(modules.len());
         let mut remaining_bytes = TOTAL_ARTIFACT_CAP;
+        let mut observation = None;
+        let mut observation_time = Duration::ZERO;
         for &(path, source) in modules {
             remaining(deadline)?;
             let module = path_for(Engine::Lean4, path)?;
@@ -189,16 +205,35 @@ impl Broker {
                 source_sha256: digest(source.as_bytes()),
                 compile_ms: compile_time.as_millis() as u64,
             });
+            if after_target
+                .as_ref()
+                .is_some_and(|(target, _)| *target == module)
+            {
+                remaining(deadline)?;
+                let (_, observe) = after_target.take().expect("matched build observation");
+                let check_start = Instant::now();
+                observation = Some(observe(&predecessors));
+                observation_time = check_start.elapsed();
+                deadline += observation_time;
+            }
         }
         room.close().context("discard Lean build audit room")?;
         let source_set_sha256 = dependencies_digest(modules);
         remaining(deadline)?;
-        Ok(LeanBuildAudit {
+        ensure!(
+            after_target.is_none(),
+            "Lean build audit target module was not built"
+        );
+        let build = LeanBuildAudit {
             source_set_sha256,
             compiler_sha256: tool.binary_sha256.clone(),
-            compile_ms: build_start.elapsed().as_millis() as u64,
+            compile_ms: build_start
+                .elapsed()
+                .saturating_sub(observation_time)
+                .as_millis() as u64,
             modules: audited,
-        })
+        };
+        Ok((build, observation.transpose()?))
     }
 }
 

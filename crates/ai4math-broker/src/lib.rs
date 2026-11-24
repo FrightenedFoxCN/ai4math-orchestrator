@@ -21,6 +21,8 @@ pub use golden::{RegressionArtifacts, clone_golden};
 mod sandbox;
 mod t2_build;
 pub use t2_build::{LeanBuildAudit, LeanBuildModuleAudit};
+mod t2_managed_export;
+pub use t2_managed_export::ManagedLeanTheoremAudit;
 mod t2_nanoda;
 pub use t2_nanoda::{LEAN_EXPORT_MAX_BYTES, LeanExportCheck, check_lean_export};
 mod t3;

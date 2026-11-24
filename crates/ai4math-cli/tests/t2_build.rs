@@ -83,7 +83,27 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
             &[repo, "Audit.lean", reviewed, nonexistent],
         )
     };
+    let pin = "a".repeat(64);
+    let managed_theorem = |repo: &str, reviewed: &str| {
+        ai(
+            &root,
+            "t2-check-managed",
+            &[
+                repo,
+                "Audit.lean",
+                "Fixture.n",
+                reviewed,
+                nonexistent,
+                &pin,
+                &pin,
+            ],
+        )
+    };
     rejects(audit(repo_str, &head), "initialized private project");
+    rejects(
+        managed_theorem(repo_str, &head),
+        "initialized private project",
+    );
     assert!(!root.join(".runtime").exists());
     checked(ai(&root, "init", &["lean4"]));
     rejects(audit(repo_str, &head), "bind the managed repository");
@@ -103,8 +123,20 @@ fn t2_refuses_outside_the_bound_current_snapshot_or_when_native_resources_are_bu
         audit(repo_str, &old),
         "reviewed T2 commit is not current main",
     );
+    rejects(
+        managed_theorem(other_str, &head),
+        "not bound to the supplied managed repository",
+    );
+    rejects(
+        managed_theorem(repo_str, &old),
+        "reviewed T2 commit is not current main",
+    );
     let lease = ProjectNativeGate::new(&root).try_heavy().unwrap();
     rejects(audit(repo_str, &head), "project native execution is busy");
+    rejects(
+        managed_theorem(repo_str, &head),
+        "project native execution is busy",
+    );
     drop(lease);
     let after = StateStore::open_readonly(&state)
         .unwrap()

@@ -3,7 +3,7 @@ use crate::{
     bound_engine, managed_native, promotion::PromotionRepo, trusted_toolchain,
     worker_dispatch::private_state_path,
 };
-use ai4math_broker::{Broker, LeanBuildAudit};
+use ai4math_broker::{Broker, LeanBuildAudit, ManagedLeanTheoremAudit};
 use ai4math_core::Engine;
 use ai4math_store::{StateStore, TrustDebtScan};
 use anyhow::{Context, Result, ensure};
@@ -118,6 +118,63 @@ fn audit_with_debt_mode(
     })
 }
 
+#[derive(Serialize)]
+pub(crate) struct ManagedTheoremReport {
+    schema: &'static str,
+    advisory_only: bool,
+    reviewed_commit: String,
+    ledger_event_seq: i64,
+    target_module: String,
+    declaration: String,
+    #[serde(flatten)]
+    result: ManagedLeanTheoremAudit,
+}
+
+pub(crate) struct ManagedTheoremRequest<'a> {
+    pub root: &'a Path,
+    pub repo: &'a Path,
+    pub module: &'a str,
+    pub declaration: &'a str,
+    pub reviewed: &'a str,
+    pub executable: &'a Path,
+    pub exporter_sha256: &'a str,
+    pub checker_sha256: &'a str,
+}
+
+pub(crate) fn audit_managed_theorem(
+    request: ManagedTheoremRequest<'_>,
+) -> Result<ManagedTheoremReport> {
+    let (result, (), ledger_event_seq, _) = at_generation(
+        request.root,
+        request.repo,
+        request.module,
+        request.reviewed,
+        |_, _| Ok(()),
+        |engine, modules| {
+            let toolchain = trusted_toolchain(engine, request.executable, None)?;
+            Broker::new()
+                .audit_lean_theorem(
+                    &toolchain,
+                    modules,
+                    request.module,
+                    request.declaration,
+                    request.exporter_sha256,
+                    request.checker_sha256,
+                )
+                .context("managed Lean independent theorem check failed")
+        },
+    )?;
+    Ok(ManagedTheoremReport {
+        schema: "ai4math.t2.managed-theorem-check.v1",
+        advisory_only: true,
+        reviewed_commit: request.reviewed.into(),
+        ledger_event_seq,
+        target_module: request.module.into(),
+        declaration: request.declaration.into(),
+        result,
+    })
+}
+
 fn audit_inner<T>(
     root: &Path,
     repo: &Path,
@@ -126,6 +183,30 @@ fn audit_inner<T>(
     observe: impl FnOnce(&StateStore, i64) -> Result<T>,
     build: impl FnOnce(Engine, &[(&str, &str)]) -> Result<LeanBuildAudit>,
 ) -> Result<(T2BuildReport, T)> {
+    let (build, observation, ledger_event_seq, engine) =
+        at_generation(root, repo, anchor, reviewed, observe, build)?;
+    Ok((
+        T2BuildReport {
+            schema: "ai4math.t2.clean-build.v1",
+            reviewed_commit: reviewed.into(),
+            ledger_event_seq,
+            engine: engine.as_str(),
+            external_checker_passed: None,
+            advisory_only: true,
+            build,
+        },
+        observation,
+    ))
+}
+
+fn at_generation<T, B>(
+    root: &Path,
+    repo: &Path,
+    anchor: &str,
+    reviewed: &str,
+    observe: impl FnOnce(&StateStore, i64) -> Result<T>,
+    build: impl FnOnce(Engine, &[(&str, &str)]) -> Result<B>,
+) -> Result<(B, T, i64, Engine)> {
     let path =
         private_state_path(root).context("T2 build requires an initialized private project")?;
     let engine = bound_engine(root, anchor)?;
@@ -177,18 +258,7 @@ fn audit_inner<T>(
         git.main_head()? == reviewed && state.managed_wiki_stamp()?.as_ref() == Some(&stamp),
         "managed main or ledger changed during T2 build; retry"
     );
-    Ok((
-        T2BuildReport {
-            schema: "ai4math.t2.clean-build.v1",
-            reviewed_commit: reviewed.into(),
-            ledger_event_seq: stamp.1,
-            engine: engine.as_str(),
-            external_checker_passed: None,
-            advisory_only: true,
-            build,
-        },
-        observation,
-    ))
+    Ok((build, observation, stamp.1, engine))
 }
 
 fn compile(

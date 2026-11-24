@@ -133,26 +133,79 @@ pub(crate) fn run_with_data(
     )
 }
 
-#[cfg(target_os = "macos")]
 pub(crate) fn run_grouped(
     spec: Invocation<'_>,
     data_reads: &[PathBuf],
     literal_data_reads: &[PathBuf],
     group: ProcessGroup,
 ) -> Result<String> {
+    let bytes = run_inner(spec, data_reads, literal_data_reads, group, None)?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
+
+const MAX_CAPTURE_STDOUT: usize = 16 * 1024 * 1024;
+
+/// Capture stdout verbatim; stderr is reserved for bounded diagnostics.
+pub(crate) fn run_capture_bytes(
+    spec: Invocation<'_>,
+    data_reads: &[PathBuf],
+    literal_data_reads: &[PathBuf],
+    group: ProcessGroup,
+    max_stdout: usize,
+) -> Result<Vec<u8>> {
+    ensure!(
+        max_stdout <= MAX_CAPTURE_STDOUT,
+        "sandbox stdout capture limit exceeds 16 MiB"
+    );
+    run_inner(
+        spec,
+        data_reads,
+        literal_data_reads,
+        group,
+        Some(max_stdout),
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn check_capture_size(file: &std::fs::File, max: usize, overflow: &str) -> Result<()> {
+    ensure!(file.metadata()?.len() <= max as u64, "{overflow}");
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn read_capture(file: &mut std::fs::File, max: usize, overflow: &str) -> Result<Vec<u8>> {
+    use std::io::{Read, Seek};
+
+    check_capture_size(file, max, overflow)?;
+    file.rewind()?;
+    let mut bytes = Vec::new();
+    file.take(max as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= max, "{overflow}");
+    Ok(bytes)
+}
+
+#[cfg(target_os = "macos")]
+fn run_inner(
+    spec: Invocation<'_>,
+    data_reads: &[PathBuf],
+    literal_data_reads: &[PathBuf],
+    group: ProcessGroup,
+    max_stdout: Option<usize>,
+) -> Result<Vec<u8>> {
     use anyhow::Context;
     use std::{
-        fs,
-        io::{self, Read, Seek},
+        fs, io,
         os::unix::process::CommandExt,
         process::{Child, Command, Stdio},
         thread,
         time::Instant,
     };
 
-    // Capture through a bounded regular file, not pipes that a stuck process could keep open.
+    // Capture through anonymous regular files, not pipes that a stuck process could keep open.
     const FILE_CAP: u64 = 32 * 1024 * 1024;
-    const LOG_CAP: u64 = 256 * 1024;
+    const LOG_CAP: usize = 256 * 1024;
+    const LOG_OVERFLOW: &str = "sandbox diagnostic output exceeded limit";
+    const STDOUT_OVERFLOW: &str = "sandbox stdout exceeded limit";
     const SEATBELT: &str = "/usr/bin/sandbox-exec";
     let executable = fs::canonicalize(spec.executable)?;
     let room = fs::canonicalize(spec.room)?;
@@ -193,6 +246,11 @@ pub(crate) fn run_grouped(
         &literal_data_reads,
     )?;
     let mut log = tempfile::tempfile()?;
+    let mut stdout = match max_stdout {
+        Some(max) => Some((tempfile::tempfile()?, max)),
+        None => None,
+    };
+    let output = stdout.as_ref().map_or(&log, |(file, _)| file);
     let mut command = Command::new(SEATBELT);
     command
         .arg("-p")
@@ -206,7 +264,7 @@ pub(crate) fn run_grouped(
         .envs(spec.env.iter().copied())
         .current_dir(&room)
         .stdin(Stdio::null())
-        .stdout(log.try_clone()?)
+        .stdout(output.try_clone()?)
         .stderr(log.try_clone()?);
     let cpu = spec.timeout.as_secs().saturating_add(1);
     let own_session = group == ProcessGroup::OwnSession;
@@ -277,39 +335,36 @@ pub(crate) fn run_grouped(
             "sandbox timeout after {:?}",
             spec.timeout
         );
-        ensure!(
-            log.metadata()?.len() <= LOG_CAP,
-            "sandbox diagnostic output exceeded limit"
-        );
+        check_capture_size(&log, LOG_CAP, LOG_OVERFLOW)?;
+        if let Some((file, max)) = &stdout {
+            check_capture_size(file, *max, STDOUT_OVERFLOW)?;
+        }
         thread::sleep(Duration::from_millis(10));
     };
     // The sandbox denies every fork, so successful leader exit leaves no descendants.
     running.0 = None;
-    log.rewind()?;
-    let mut text = Vec::new();
-    log.take(LOG_CAP + 1).read_to_end(&mut text)?;
-    ensure!(
-        text.len() as u64 <= LOG_CAP,
-        "sandbox diagnostic output exceeded limit"
-    );
-    let text = String::from_utf8_lossy(&text);
+    let diagnostics = read_capture(&mut log, LOG_CAP, LOG_OVERFLOW)?;
     if !status.success() {
         return Err(ChildExit {
             status,
-            diagnostics: text.into_owned(),
+            diagnostics: String::from_utf8_lossy(&diagnostics).into_owned(),
         }
         .into());
     }
-    Ok(text.into_owned())
+    match &mut stdout {
+        Some((file, max)) => read_capture(file, *max, STDOUT_OVERFLOW),
+        None => Ok(diagnostics),
+    }
 }
 
 #[cfg(not(target_os = "macos"))]
-pub(crate) fn run_grouped(
+fn run_inner(
     spec: Invocation<'_>,
     _data_reads: &[PathBuf],
     _literal_data_reads: &[PathBuf],
     _group: ProcessGroup,
-) -> Result<String> {
+    _max_stdout: Option<usize>,
+) -> Result<Vec<u8>> {
     let Invocation {
         executable,
         args,
@@ -402,4 +457,59 @@ pub fn sandbox_self_test() -> Result<()> {
         "timeout self-test failed"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn capture_reads_exact_limit_and_preserves_bytes() -> Result<()> {
+        let mut file = tempfile::tempfile()?;
+        let bytes = b"{\"name\":\"\xff\"}\n";
+        file.write_all(bytes)?;
+        assert_eq!(read_capture(&mut file, bytes.len(), "overflow")?, bytes);
+        Ok(())
+    }
+
+    #[test]
+    fn capture_rejects_file_past_limit() -> Result<()> {
+        let mut file = tempfile::tempfile()?;
+        assert!(read_capture(&mut file, 0, "overflow")?.is_empty());
+        file.set_len(17)?;
+        assert_eq!(
+            read_capture(&mut file, 16, "overflow")
+                .unwrap_err()
+                .to_string(),
+            "overflow"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn capture_rejects_limit_above_ceiling_before_launch() {
+        let unused = Path::new("");
+        let spec = Invocation {
+            executable: unused,
+            args: &[],
+            room: unused,
+            writable: unused,
+            reads: &[],
+            env: &[],
+            timeout: Duration::ZERO,
+        };
+        let err = run_capture_bytes(
+            spec,
+            &[],
+            &[],
+            ProcessGroup::OwnSession,
+            16 * 1024 * 1024 + 1,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "sandbox stdout capture limit exceeds 16 MiB"
+        );
+    }
 }
