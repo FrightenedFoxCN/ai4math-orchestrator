@@ -777,7 +777,7 @@ fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()>
         };
     let before = snapshot(&f.fixture)?;
     let ledger_before = ledger()?;
-    let assert_same_ledger = |case| -> Result<()> {
+    let assert_same_ledger = |case: &str| -> Result<()> {
         assert_eq!(
             ledger()?,
             ledger_before,
@@ -859,6 +859,57 @@ fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()>
     assert_only_tag_files_added(&before, "accepted release tag")?;
     assert_same_ledger("accepted release tag")?;
 
+    let inspect = |tag_pin: Option<&str>, case: &str| -> Result<Output> {
+        let before = snapshot(&f.fixture)?;
+        let before_refs = refs()?;
+        let output = ai(&f.root, "t2-release-inspect")
+            .env("TMPDIR", &scratch)
+            .arg(&f.repo)
+            .arg(LABEL)
+            .args(tag_pin)
+            .output()?;
+        assert_eq!(
+            snapshot(&f.fixture)?,
+            before,
+            "{case}: wrote durable fixture files"
+        );
+        assert_eq!(refs()?, before_refs, "{case}: changed Git refs");
+        assert_same_ledger(case)?;
+        Ok(output)
+    };
+    let expected_inspection = |current_main: &str, heads_match: bool| {
+        json!({
+            "schema": "ai4math.t2.release-inspection.v1",
+            "advisory_only": true,
+            "tag_ref": tag_ref,
+            "tag_oid": tag_oid,
+            "reviewed_commit": reviewed,
+            "ledger_event_seq": f.seq,
+            "current_main": current_main,
+            "current_ledger_event_seq": f.seq,
+            "heads_match": heads_match,
+            "ledger_matches": true,
+            "evidence": evidence,
+        })
+    };
+    {
+        // Even with the exclusive lane occupied, readback should not need a native lease.
+        let _native_lease = ProjectNativeGate::new(&f.root).try_heavy()?;
+        for (tag_pin, case) in [
+            (None, "inspect current release"),
+            (
+                Some(tag_oid.as_str()),
+                "inspect current release with matching tag pin",
+            ),
+        ] {
+            let report: Value = serde_json::from_slice(&checked(inspect(tag_pin, case)?, case)?)?;
+            assert_eq!(report, expected_inspection(&reviewed, true), "{case}");
+        }
+    }
+    // The pin names the annotated tag object, not the commit it peels to.
+    let case = "inspect with reviewed commit instead of tag pin";
+    rejected(inspect(Some(&reviewed), case)?, case, "tag OID mismatch");
+
     let before_duplicate = snapshot(&f.fixture)?;
     rejected(
         run(&reviewed, &policy_pin, &compiler_pin, LABEL)?,
@@ -876,6 +927,12 @@ fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()>
     let (broken_review, broken_pin) =
         review_fixture_policy(&f, &[(BASIS, IMPORTED), (TARGET, AXIOMATIC)])?;
     assert_ne!(broken_review, reviewed);
+    // Current main now selects an unreleasable policy, but the old annotation
+    // still reads back as historical evidence; the ledger has not changed.
+    let case = "inspect historical release after main advances";
+    let report: Value = serde_json::from_slice(&checked(inspect(Some(&tag_oid), case)?, case)?)?;
+    assert_eq!(report, expected_inspection(&broken_review, false), "{case}");
+
     let before_rejection = snapshot(&f.fixture)?;
     rejected(
         run(

@@ -30,6 +30,13 @@ pub struct PromotionRepo {
     _lock: File,
 }
 
+pub(crate) struct LocalReleaseTag {
+    pub tag_ref: String,
+    pub tag_oid: String,
+    pub reviewed_commit: String,
+    pub evidence: Vec<u8>,
+}
+
 pub struct PendingRef<'repo> {
     repo: &'repo Path,
     name: String,
@@ -148,13 +155,13 @@ fn await_release_io<T>(receiver: Receiver<Result<T>>, deadline: Instant) -> Resu
 }
 
 fn read_release_output(reader: impl Read) -> Result<Vec<u8>> {
-    const LIMIT: u64 = 8 * 1024;
+    read_bounded_release_output(reader, 8 * 1024)
+}
+
+fn read_bounded_release_output(reader: impl Read, limit: usize) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader.take(LIMIT + 1).read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= LIMIT as usize,
-        "excessive local release Git output"
-    );
+    reader.take(limit as u64 + 1).read_to_end(&mut bytes)?;
+    ensure!(bytes.len() <= limit, "excessive local release Git output");
     Ok(bytes)
 }
 
@@ -225,13 +232,23 @@ fn bounded_release_git(
     input: Option<Vec<u8>>,
     deadline: Instant,
 ) -> Result<Output> {
+    bounded_release_git_with_limit(repo, args, input, deadline, 8 * 1024)
+}
+
+fn bounded_release_git_with_limit(
+    repo: &Path,
+    args: &[&str],
+    input: Option<Vec<u8>>,
+    deadline: Instant,
+    stdout_limit: usize,
+) -> Result<Output> {
     let mut git = ReleaseGit::start(repo, args, input.is_some(), deadline)?;
     let stdin = git.child().stdin.take();
     let stdout = git.child().stdout.take().expect("piped stdout");
     let output = await_release_io(
         release_io(move || {
             let write = input.map(|payload| stdin.expect("piped stdin").write_all(&payload));
-            let stdout = read_release_output(stdout)?;
+            let stdout = read_bounded_release_output(stdout, stdout_limit)?;
             Ok((stdout, write))
         })?,
         deadline,
@@ -248,6 +265,112 @@ fn reject_release_symref(repo: &Path, name: &str, deadline: Instant) -> Result<(
     let args = ["symbolic-ref", "--no-recurse", "-q", name];
     let out = bounded_release_git(repo, &args, None, deadline)?;
     require_nonsymbolic_ref(name, &args, out)
+}
+
+fn direct_release_tag_oid(repo: &Path, name: &str, deadline: Instant) -> Result<String> {
+    reject_release_symref(repo, name, deadline)?;
+    // Read the OID and the ref's own flags in the same observation, rather than
+    // accidentally resolving a newly installed symref between two commands.
+    // for-each-ref also matches descendants: require the full refname verbatim.
+    let args = [
+        "for-each-ref",
+        "--count=1",
+        "--sort=refname",
+        "--format=%(objectname) %(refname) %(flag)",
+        "--",
+        name,
+    ];
+    let output = git_success(&args, bounded_release_git(repo, &args, None, deadline)?)?;
+    let line = std::str::from_utf8(&output)?
+        .strip_suffix('\n')
+        .context("missing release tag ref")?;
+    let mut fields = line.split(' ');
+    let oid = fields.next().context("missing release tag object ID")?;
+    ensure!(
+        valid_commit(oid)
+            && fields.next() == Some(name)
+            && matches!(fields.next(), Some("" | "packed"))
+            && fields.next().is_none(),
+        "expected the exact direct release tag ref: {name}"
+    );
+    Ok(oid.to_owned())
+}
+
+fn read_raw_release_tag(repo: &Path, oid: &str, deadline: Instant) -> Result<Vec<u8>> {
+    let args = ["cat-file", "-s", oid];
+    let size = text(git_success(
+        &args,
+        bounded_release_git(repo, &args, None, deadline)?,
+    )?)?
+    .parse::<usize>()?;
+    ensure!(
+        size <= MAX_RELEASE_TAG_BYTES,
+        "annotated release tag exceeds {MAX_RELEASE_TAG_BYTES} bytes"
+    );
+
+    // Batch mode returns the exact object type and unmodified content. In
+    // contrast, asking cat-file for a type can resolve through a tag.
+    let header = format!("{oid} tag {size}\n");
+    let args = ["cat-file", "--batch"];
+    let output = git_success(
+        &args,
+        bounded_release_git_with_limit(
+            repo,
+            &args,
+            Some(format!("{oid}\n").into_bytes()),
+            deadline,
+            header.len() + size + 1,
+        )?,
+    )?;
+    let raw = output
+        .strip_prefix(header.as_bytes())
+        .and_then(|bytes| bytes.strip_suffix(b"\n"))
+        .context("expected the exact annotated Git tag object")?;
+    ensure!(raw.len() == size, "Git tag size changed while reading");
+    Ok(raw.to_vec())
+}
+
+fn parse_release_tag<'a>(
+    raw: &'a [u8],
+    tag_name: &str,
+    oid_len: usize,
+) -> Result<(&'a str, &'a [u8])> {
+    let mut lines = raw.splitn(5, |&byte| byte == b'\n');
+    let commit = lines
+        .next()
+        .and_then(|line| line.strip_prefix(b"object "))
+        .context("missing release tag object header")?;
+    let commit = std::str::from_utf8(commit)?;
+    ensure!(
+        valid_commit(commit) && commit.len() == oid_len,
+        "invalid reviewed commit ID in release tag"
+    );
+    ensure!(
+        lines.next() == Some(b"type commit"),
+        "invalid release tag type header"
+    );
+    ensure!(
+        lines.next() == Some(format!("tag {tag_name}").as_bytes()),
+        "invalid release tag name header"
+    );
+    let timestamp = lines
+        .next()
+        .and_then(|line| line.strip_prefix(b"tagger AI4Math Broker <broker@localhost> "))
+        .and_then(|line| line.strip_suffix(b" +0000"))
+        .context("invalid release tag tagger header")?;
+    let timestamp = std::str::from_utf8(timestamp)?;
+    let seconds = timestamp
+        .parse::<u64>()
+        .context("invalid release tag timestamp")?;
+    ensure!(
+        seconds.to_string() == timestamp,
+        "noncanonical release tag timestamp"
+    );
+    let evidence = lines
+        .next()
+        .and_then(|tail| tail.strip_prefix(b"\n"))
+        .context("invalid release tag header terminator")?;
+    Ok((commit, evidence))
 }
 
 fn publish_release_tag_ref(
@@ -458,6 +581,53 @@ impl PromotionRepo {
         ensure!(valid_commit(&tag_oid), "invalid Git tag object ID");
         publish_release_tag_ref(self.path(), reviewed, &destination, &tag_oid, deadline)?;
         Ok((destination, tag_oid))
+    }
+
+    /// Inspect the exact local release ref without writing Git state or consulting main.
+    pub(crate) fn read_release_tag(
+        &self,
+        label: &str,
+        expected_oid: Option<&str>,
+    ) -> Result<LocalReleaseTag> {
+        validate_release_label(label)?;
+        if let Some(oid) = expected_oid {
+            ensure!(valid_commit(oid), "invalid expected release tag object ID");
+        }
+        let tag_name = format!("{RELEASE_TAG_NAMESPACE}/{label}");
+        let tag_ref = format!("refs/tags/{tag_name}");
+        let deadline = Instant::now() + RELEASE_GIT_TIMEOUT;
+        let tag_oid = direct_release_tag_oid(self.path(), &tag_ref, deadline)?;
+        if let Some(oid) = expected_oid {
+            ensure!(
+                tag_oid == oid,
+                "release tag OID mismatch: ref does not match the pin"
+            );
+        }
+
+        let raw = read_raw_release_tag(self.path(), &tag_oid, deadline)?;
+        let (reviewed_commit, evidence) = parse_release_tag(&raw, &tag_name, tag_oid.len())?;
+        let args = ["cat-file", "-t", reviewed_commit];
+        ensure!(
+            git_success(
+                &args,
+                bounded_release_git(self.path(), &args, None, deadline)?
+            )? == b"commit\n",
+            "release tag does not target a Git commit"
+        );
+        ensure!(
+            direct_release_tag_oid(self.path(), &tag_ref, deadline)? == tag_oid,
+            "release tag changed while reading"
+        );
+        Ok(LocalReleaseTag {
+            tag_ref,
+            tag_oid,
+            reviewed_commit: reviewed_commit.to_owned(),
+            evidence: evidence.to_vec(),
+        })
+    }
+
+    pub(crate) fn recheck_release_tag(&self, label: &str, expected_oid: &str) -> Result<()> {
+        self.read_release_tag(label, Some(expected_oid)).map(drop)
     }
 
     pub fn require_commit(&self, commit: &str) -> Result<()> {
@@ -1269,6 +1439,12 @@ mod tests {
         let evidence = b"{\"event\":12}\ntag misleading-body-line\n";
         let (destination, oid) = repo.create_release_tag("v1.2-rc_3", &reviewed, evidence)?;
         assert_eq!(destination, "refs/tags/ai4math-release/v1.2-rc_3");
+        let observed = repo.read_release_tag("v1.2-rc_3", None)?;
+        assert_eq!(observed.tag_ref, destination);
+        assert_eq!(observed.tag_oid, oid);
+        assert_eq!(observed.reviewed_commit, reviewed);
+        assert_eq!(observed.evidence, evidence);
+        repo.recheck_release_tag("v1.2-rc_3", &oid)?;
         let object = read_object(repo.path(), "tag", &oid, MAX_RELEASE_TAG_BYTES)?;
         let expected = format!(
             "object {reviewed}\ntype commit\ntag ai4math-release/v1.2-rc_3\ntagger AI4Math Broker <broker@localhost> "
@@ -1312,6 +1488,149 @@ mod tests {
             oid
         );
         assert_eq!(repo.main_head()?, reviewed);
+        Ok(())
+    }
+
+    fn install_raw_release_tag(repo: &PromotionRepo, name: &str, raw: &[u8]) -> Result<String> {
+        let oid = text(git(
+            repo.path(),
+            &["hash-object", "--literally", "-w", "-t", "tag", "--stdin"],
+            None,
+            Some(raw),
+        )?)?;
+        // Deliberately install the loose ref without update-ref, which may
+        // try to parse the very malformed tag objects this fixture needs.
+        let reference = repo.path().join(name);
+        std::fs::create_dir_all(reference.parent().expect("test ref parent"))?;
+        std::fs::write(reference, format!("{oid}\n"))?;
+        Ok(oid)
+    }
+
+    #[test]
+    fn release_tag_readback_rejects_stale_missing_lightweight_and_symbolic_refs() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let reviewed = branch(&repo)?;
+        let (name, old_oid) = repo.create_release_tag("recover", &reviewed, b"first evidence")?;
+        let tree = text(git(repo.path(), &["mktree"], None, Some(b""))?)?;
+        let newer = commit_tree(&repo, &tree, &reviewed)?;
+        git(repo.path(), &["update-ref", MAIN, &newer], None, None)?;
+        git(repo.path(), &["pack-refs", "--all", "--prune"], None, None)?;
+        let old = repo.read_release_tag("recover", Some(&old_oid))?;
+        assert_eq!(old.reviewed_commit, reviewed);
+        assert_eq!(old.evidence, b"first evidence");
+        assert_eq!(repo.main_head()?, newer);
+
+        let raw = format!(
+            "object {reviewed}\ntype commit\ntag ai4math-release/recover\ntagger AI4Math Broker <broker@localhost> 1 +0000\n\nsecond evidence"
+        );
+        let oid = install_raw_release_tag(&repo, &name, raw.as_bytes())?;
+        assert_eq!(repo.read_release_tag("recover", None)?.tag_oid, oid);
+        let error = repo.recheck_release_tag("recover", &old_oid).unwrap_err();
+        assert!(error.to_string().contains("tag OID mismatch"));
+        repo.recheck_release_tag("recover", &oid)?;
+        assert!(repo.read_release_tag("recover", Some(&oid[..12])).is_err());
+        assert!(repo.read_release_tag("recover^0", None).is_err());
+
+        let lightweight = "refs/tags/ai4math-release/lightweight";
+        git(
+            repo.path(),
+            &["update-ref", lightweight, &reviewed],
+            None,
+            None,
+        )?;
+        assert!(repo.recheck_release_tag("lightweight", &reviewed).is_err());
+        let target = "refs/tags/other";
+        git(repo.path(), &["update-ref", target, &oid], None, None)?;
+        git(repo.path(), &["symbolic-ref", &name, target], None, None)?;
+        assert!(repo.recheck_release_tag("recover", &oid).is_err());
+        let absent = "refs/tags/ai4math-release/absent";
+        git(repo.path(), &["symbolic-ref", &name, absent], None, None)?;
+        assert!(repo.read_release_tag("recover", None).is_err());
+        assert_eq!(
+            text(git(repo.path(), &["symbolic-ref", &name], None, None)?)?,
+            absent
+        );
+        git(
+            repo.path(),
+            &["update-ref", "refs/tags/ai4math-release/absent/child", &oid],
+            None,
+            None,
+        )?;
+        assert!(repo.read_release_tag("absent", None).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn release_tag_readback_requires_canonical_headers_and_actual_commit_type() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let reviewed = branch(&repo)?;
+        let (_, annotated) = repo.create_release_tag("inner", &reviewed, b"inner evidence")?;
+        let missing = if reviewed == "f".repeat(reviewed.len()) {
+            "e".repeat(reviewed.len())
+        } else {
+            "f".repeat(reviewed.len())
+        };
+        let name = "refs/tags/ai4math-release/recover";
+        let valid = format!(
+            "object {reviewed}\ntype commit\ntag ai4math-release/recover\ntagger AI4Math Broker <broker@localhost> 1 +0000\n\nevidence\n"
+        );
+        for (reason, malformed) in [
+            ("wrong label", valid.replace("/recover\n", "/other\n")),
+            (
+                "wrong declared type",
+                valid.replace("type commit\n", "type tree\n"),
+            ),
+            (
+                "tag masquerading as a commit",
+                valid.replace(&reviewed, &annotated),
+            ),
+            ("missing commit", valid.replace(&reviewed, &missing)),
+            ("abbreviated OID", valid.replace(&reviewed, &reviewed[..12])),
+            (
+                "wrong tagger",
+                valid.replace("broker@localhost", "other@localhost"),
+            ),
+            ("signed timestamp", valid.replace(" 1 +0000", " +1 +0000")),
+            (
+                "overflowing timestamp",
+                valid.replace(" 1 +0000", " 18446744073709551616 +0000"),
+            ),
+            ("wrong timezone", valid.replace("+0000", "-0000")),
+            (
+                "extra header",
+                valid.replace("\n\n", "\ngpgsig unsigned\n\n"),
+            ),
+            ("no separator", valid.replace("\n\n", "\n")),
+            ("CRLF header", valid.replace('\n', "\r\n")),
+        ] {
+            let oid = install_raw_release_tag(&repo, name, malformed.as_bytes())?;
+            assert!(
+                repo.recheck_release_tag("recover", &oid).is_err(),
+                "{reason}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn release_tag_readback_bounds_raw_object_and_keeps_binary_evidence() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let reviewed = branch(&repo)?;
+        let header = format!(
+            "object {reviewed}\ntype commit\ntag ai4math-release/bound\ntagger AI4Math Broker <broker@localhost> 0 +0000\n\n"
+        );
+        let mut raw = header.as_bytes().to_vec();
+        raw.extend_from_slice(b"\n\r\0\xff  ");
+        raw.resize(MAX_RELEASE_TAG_BYTES, b'x');
+        let name = "refs/tags/ai4math-release/bound";
+        let oid = install_raw_release_tag(&repo, name, &raw)?;
+        assert_eq!(
+            repo.read_release_tag("bound", Some(&oid))?.evidence,
+            raw[header.len()..]
+        );
+        raw.push(b'\n');
+        let oversized = install_raw_release_tag(&repo, name, &raw)?;
+        assert!(repo.recheck_release_tag("bound", &oversized).is_err());
         Ok(())
     }
 

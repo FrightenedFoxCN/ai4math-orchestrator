@@ -120,6 +120,14 @@ fn validate_targets<'a>(
         .collect()
 }
 
+/// Validate managed Lean target paths, exact names, count and uniqueness without compiling.
+pub fn validate_managed_lean_targets(
+    modules: &[(&str, &str)],
+    targets: &[(&str, &str)],
+) -> Result<()> {
+    validate_targets(modules, targets).map(|_| ())
+}
+
 fn validate_declaration(declaration: &str) -> Result<()> {
     ensure!(
         declaration.len() <= DECLARATION_MAX_BYTES

@@ -24,6 +24,7 @@ pub use t2_build::{LeanBuildAudit, LeanBuildModuleAudit};
 mod t2_managed_export;
 pub use t2_managed_export::{
     MAX_MANAGED_T2_THEOREMS, ManagedLeanBatchAudit, ManagedLeanBatchCheck, ManagedLeanTheoremAudit,
+    validate_managed_lean_targets,
 };
 mod t2_nanoda;
 pub use t2_nanoda::{LEAN_EXPORT_MAX_BYTES, LeanExportCheck, check_lean_export};
@@ -426,6 +427,11 @@ fn stage_source(
         .with_context(|| format!("stage fresh source module {relative:?}"))?
         .write_all(source.as_bytes())?;
     Ok(())
+}
+
+/// Bind ordered paths and exact bytes using the broker's dependency hash format.
+pub fn ordered_source_set_sha256(modules: &[(&str, &str)]) -> String {
+    dependencies_digest(modules)
 }
 
 /// Bind ordered paths and exact bytes without concatenation ambiguity.

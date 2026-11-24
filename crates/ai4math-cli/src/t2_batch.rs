@@ -1,10 +1,16 @@
 //! Independent Lean batch checks and the reviewed T2 release gate.
 use crate::{
+    bound_engine,
     promotion::{PromotionRepo, validate_release_label},
     t2_build::{at_generation, at_snapshot_generation_then},
     trusted_toolchain,
+    worker_dispatch::private_state_path,
 };
-use ai4math_broker::{Broker, MAX_MANAGED_T2_THEOREMS, ManagedLeanBatchAudit};
+use ai4math_broker::{
+    Broker, MAX_MANAGED_T2_THEOREMS, ManagedLeanBatchAudit, ordered_source_set_sha256,
+    validate_managed_lean_targets,
+};
+use ai4math_store::StateStore;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
@@ -214,25 +220,159 @@ pub(crate) struct LocalReleaseReport {
     ledger_event_seq: i64,
 }
 
-#[derive(Serialize)]
-struct LocalReleaseEvidence<'a> {
-    schema: &'static str,
-    reviewed_commit: &'a str,
+const LOCAL_EVIDENCE_SCHEMA: &str = "ai4math.t2.local-release-evidence.v1";
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalReleaseEvidence {
+    schema: String,
+    reviewed_commit: String,
     ledger_event_seq: i64,
-    policy_sha256: &'a str,
+    policy_sha256: String,
     trust_debt_findings: usize,
-    source_set_sha256: &'a str,
-    compiler_sha256: &'a str,
-    exporter_sha256: &'a str,
-    checker_sha256: &'a str,
-    checks: Vec<LocalReleaseCheck<'a>>,
+    source_set_sha256: String,
+    compiler_sha256: String,
+    exporter_sha256: String,
+    checker_sha256: String,
+    checks: Vec<LocalReleaseCheck>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalReleaseCheck {
+    target_module: String,
+    declaration: String,
+    export_sha256: String,
 }
 
 #[derive(Serialize)]
-struct LocalReleaseCheck<'a> {
-    target_module: &'a str,
-    declaration: &'a str,
-    export_sha256: &'a str,
+pub(crate) struct ReleaseInspection {
+    schema: &'static str,
+    advisory_only: bool,
+    tag_ref: String,
+    tag_oid: String,
+    reviewed_commit: String,
+    ledger_event_seq: i64,
+    current_main: String,
+    current_ledger_event_seq: i64,
+    heads_match: bool,
+    ledger_matches: bool,
+    evidence: LocalReleaseEvidence,
+}
+
+fn read_evidence(bytes: &[u8], reviewed_commit: &str) -> Result<LocalReleaseEvidence> {
+    let evidence: LocalReleaseEvidence =
+        serde_json::from_slice(bytes).context("invalid local release evidence JSON")?;
+    // The publisher stores exactly this encoding. Comparing canonical bytes
+    // also rejects positional arrays and alternate encodings of typed fields.
+    ensure!(
+        serde_json::to_vec(&evidence)? == bytes,
+        "local release evidence is not in canonical form"
+    );
+    ensure!(
+        evidence.schema == LOCAL_EVIDENCE_SCHEMA
+            && evidence.reviewed_commit == reviewed_commit
+            && evidence.ledger_event_seq > 0
+            && evidence.trust_debt_findings == 0
+            && (1..=MAX_MANAGED_T2_THEOREMS).contains(&evidence.checks.len()),
+        "invalid local release evidence binding"
+    );
+    for (pin, label) in [
+        (&evidence.policy_sha256, "T2 release policy"),
+        (&evidence.source_set_sha256, "ordered source set"),
+        (&evidence.compiler_sha256, "Lean compiler"),
+        (&evidence.exporter_sha256, "Lean exporter"),
+        (&evidence.checker_sha256, "Nanoda checker"),
+    ] {
+        require_pin(pin, label)?;
+    }
+    for check in &evidence.checks {
+        require_pin(&check.export_sha256, "Lean export")?;
+    }
+    Ok(evidence)
+}
+
+pub(crate) fn inspect_release(
+    root: &Path,
+    repo: &Path,
+    label: &str,
+    expected_oid: Option<&str>,
+) -> Result<ReleaseInspection> {
+    validate_release_label(label)?;
+    let path = private_state_path(root)
+        .context("release inspection requires an initialized private project")?;
+    bound_engine(root, "Release.lean").context("release inspection requires a Lean project")?;
+    let state = StateStore::open_readonly(&path)?;
+    let stamp = state
+        .managed_wiki_stamp()?
+        .context("release inspection requires a bound ledger without pending Git work")?;
+    let canonical = repo.canonicalize()?;
+    ensure!(
+        canonical == Path::new(&stamp.0),
+        "project is not bound to the supplied managed repository"
+    );
+    // No native lease, compiler, or writer is needed for an immutable readback.
+    let git = PromotionRepo::try_lock_existing(&canonical)?;
+    ensure!(
+        git.path() == canonical,
+        "managed repository moved while obtaining its lock"
+    );
+    let main = git.main_head()?;
+    ensure!(
+        state.managed_wiki_stamp()?.as_ref() == Some(&stamp),
+        "managed ledger changed before release inspection; retry"
+    );
+    let tag = git.read_release_tag(label, expected_oid)?;
+    let evidence = read_evidence(&tag.evidence, &tag.reviewed_commit)?;
+    ensure!(
+        evidence.ledger_event_seq <= stamp.1,
+        "release tag records a future ledger generation"
+    );
+    let pinned = git.snapshot(
+        &evidence.checks[0].target_module,
+        Some(&tag.reviewed_commit),
+    )?;
+    let policy = pinned.t2_release_policy()?;
+    let targets = release_targets(&policy, &evidence.policy_sha256)?;
+    let targets: Vec<_> = targets
+        .iter()
+        .map(|ObjectTarget(target)| (target.target_module.as_str(), target.declaration.as_str()))
+        .collect();
+    ensure!(
+        targets.iter().copied().eq(evidence
+            .checks
+            .iter()
+            .map(|check| (check.target_module.as_str(), check.declaration.as_str()))),
+        "release evidence checks do not match reviewed policy order and scope"
+    );
+    let sources = pinned.project()?;
+    let sources: Vec<_> = sources
+        .iter()
+        .map(|(path, source)| (*path, source.as_str()))
+        .collect();
+    validate_managed_lean_targets(&sources, &targets)?;
+    ensure!(
+        ordered_source_set_sha256(&sources) == evidence.source_set_sha256,
+        "release evidence ordered source set SHA-256 mismatch"
+    );
+    git.recheck_release_tag(label, &tag.tag_oid)?;
+    ensure!(
+        git.main_head()? == main && state.managed_wiki_stamp()?.as_ref() == Some(&stamp),
+        "managed main or ledger changed during release inspection; retry"
+    );
+    Ok(ReleaseInspection {
+        schema: "ai4math.t2.release-inspection.v1",
+        advisory_only: true,
+        tag_ref: tag.tag_ref,
+        tag_oid: tag.tag_oid,
+        heads_match: main == tag.reviewed_commit,
+        ledger_matches: stamp.1 == evidence.ledger_event_seq,
+        reviewed_commit: tag.reviewed_commit,
+        ledger_event_seq: evidence.ledger_event_seq,
+        current_main: main,
+        current_ledger_event_seq: stamp.1,
+        evidence,
+    })
 }
 
 pub(crate) fn release_tag(request: ReleaseRequest<'_>, label: &str) -> Result<LocalReleaseReport> {
@@ -243,22 +383,22 @@ pub(crate) fn release_tag(request: ReleaseRequest<'_>, label: &str) -> Result<Lo
         ReleaseMode::Operator,
         |git, path, seq, build, debt| {
             let evidence = LocalReleaseEvidence {
-                schema: "ai4math.t2.local-release-evidence.v1",
-                reviewed_commit: request.reviewed,
+                schema: LOCAL_EVIDENCE_SCHEMA.into(),
+                reviewed_commit: request.reviewed.into(),
                 ledger_event_seq: seq,
-                policy_sha256: request.policy_sha256,
+                policy_sha256: request.policy_sha256.into(),
                 trust_debt_findings: *debt,
-                source_set_sha256: &build.build.source_set_sha256,
-                compiler_sha256: &build.build.compiler_sha256,
-                exporter_sha256: &build.exporter_sha256,
-                checker_sha256: request.checker_sha256,
+                source_set_sha256: build.build.source_set_sha256.clone(),
+                compiler_sha256: build.build.compiler_sha256.clone(),
+                exporter_sha256: build.exporter_sha256.clone(),
+                checker_sha256: request.checker_sha256.into(),
                 checks: build
                     .checks
                     .iter()
                     .map(|check| LocalReleaseCheck {
-                        target_module: &check.target_module,
-                        declaration: &check.declaration,
-                        export_sha256: &check.independent_check.export_sha256,
+                        target_module: check.target_module.clone(),
+                        declaration: check.declaration.clone(),
+                        export_sha256: check.independent_check.export_sha256.clone(),
                     })
                     .collect(),
             };
@@ -422,6 +562,69 @@ mod tests {
         assert!(release_targets(invalid, &pin).is_err());
         Ok(())
     }
+
+    #[test]
+    fn evidence_requires_exact_encoding_and_bindings() -> Result<()> {
+        let commit = "a".repeat(40);
+        let sample = || LocalReleaseEvidence {
+            schema: LOCAL_EVIDENCE_SCHEMA.into(),
+            reviewed_commit: commit.clone(),
+            ledger_event_seq: 2,
+            policy_sha256: "b".repeat(64),
+            trust_debt_findings: 0,
+            source_set_sha256: "c".repeat(64),
+            compiler_sha256: "d".repeat(64),
+            exporter_sha256: "e".repeat(64),
+            checker_sha256: "f".repeat(64),
+            checks: vec![LocalReleaseCheck {
+                target_module: "A.lean".into(),
+                declaration: "N.x".into(),
+                export_sha256: "1".repeat(64),
+            }],
+        };
+        let bytes = serde_json::to_vec(&sample())?;
+        assert!(read_evidence(&bytes, &commit).is_ok());
+        assert!(read_evidence(&bytes, &"9".repeat(40)).is_err());
+        assert!(read_evidence(&serde_json::to_vec_pretty(&sample())?, &commit).is_err());
+        let line = String::from_utf8(bytes)?;
+        assert!(
+            read_evidence(
+                format!("{{\"schema\":\"duplicate\",{}", &line[1..]).as_bytes(),
+                &commit
+            )
+            .is_err()
+        );
+        assert!(
+            read_evidence(
+                &line
+                    .replace(
+                        "\"ledger_event_seq\":2",
+                        "\"ledger_event_seq\":2,\"unknown\":true"
+                    )
+                    .into_bytes(),
+                &commit
+            )
+            .is_err()
+        );
+        for mutate in [
+            (|e: &mut LocalReleaseEvidence| e.ledger_event_seq = 0)
+                as fn(&mut LocalReleaseEvidence),
+            |e| e.trust_debt_findings = 1,
+            |e| e.checks.clear(),
+            |e| e.checks[0].export_sha256.make_ascii_uppercase(),
+            |e| e.compiler_sha256 = "sha256:fake".into(),
+        ] {
+            let mut e = sample();
+            // The export pin includes a letter so uppercase corruption is observable.
+            e.checks[0].export_sha256 = "f".repeat(64);
+            mutate(&mut e);
+            assert!(read_evidence(&serde_json::to_vec(&e)?, &commit).is_err());
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    mod inspection;
 
     #[cfg(unix)]
     #[test]
