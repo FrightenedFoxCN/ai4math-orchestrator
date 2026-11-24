@@ -44,7 +44,7 @@ struct DerivedClaim<'a> {
     exhausted_by: Option<&'a str>,
 }
 
-fn check_replay(replay: &GraphReplay) -> Result<GraphSemanticCheck> {
+pub(super) fn check_replay(replay: &GraphReplay) -> Result<GraphSemanticCheck> {
     let claims: BTreeMap<_, _> = replay
         .claims
         .iter()

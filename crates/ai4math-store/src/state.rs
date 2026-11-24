@@ -32,6 +32,7 @@ mod sweep;
 mod t3_baseline;
 mod t3_follow;
 mod tasks;
+mod trust_debt;
 pub use claim_replay::{ClaimReplay, ReplayedClaim};
 pub use graph_audit::{GraphAudit, GraphMismatch, GraphMismatchKind};
 pub use graph_check::{GraphSemanticCheck, GraphSemanticMismatch};
@@ -50,6 +51,9 @@ pub(crate) use tasks::scheduler_snapshot;
 pub use tasks::{
     NewTask, OracleTaskHold, TaskCandidate, TaskCandidateSource, TaskLease, TaskRunOutcome,
     TaskSchedulerStatus, TaskTrack, TaskTrackStatus,
+};
+pub use trust_debt::{
+    TrustDebtCounts, TrustDebtFinding, TrustDebtKind, TrustDebtRole, TrustDebtScan,
 };
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";

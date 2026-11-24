@@ -80,7 +80,7 @@ struct LivePlan {
     effective_trust: String,
 }
 
-fn compare_graph(tx: &Transaction<'_>, replay: &GraphReplay) -> Result<GraphAudit> {
+pub(super) fn compare_graph(tx: &Transaction<'_>, replay: &GraphReplay) -> Result<GraphAudit> {
     use GraphMismatchKind::{FieldMismatch, MissingProjection, UnexpectedProjection};
 
     let mut budget = LiveReadBudget {
