@@ -12,6 +12,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+mod sediment;
+pub use sediment::{SedimentArtifact, SedimentInput, publish_sediment, render_sediment};
+
 const DDL: &str = include_str!("../../../schemas/wiki-index.sql");
 const STRATA: [WikiStratum; 3] = [
     WikiStratum::Core,
