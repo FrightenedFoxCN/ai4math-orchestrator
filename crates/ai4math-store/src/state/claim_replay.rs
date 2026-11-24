@@ -120,7 +120,7 @@ struct RoutesExhausted {
 #[serde(deny_unknown_fields)]
 struct RoutesReopened {}
 
-fn apply(
+pub(super) fn apply(
     state: &mut Option<ReplayedClaim>,
     id: &str,
     seq: i64,

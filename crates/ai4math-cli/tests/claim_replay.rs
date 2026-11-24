@@ -157,3 +157,82 @@ fn plan_replay_uses_event_sequence_without_graph_or_repo_lookup() {
     }
     assert_eq!(fs::read(path).unwrap(), before);
 }
+
+#[test]
+fn graph_replay_exports_a_single_event_cut_and_never_initializes_state() {
+    use ai4math_store::{Change, NewPlan, PlanStatus, StateStore};
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    assert!(!ai(root, "graph-replay", &[]).status.success());
+    assert!(!root.join(".runtime").exists());
+    ok(ai(root, "init", &["lean4"]));
+    ok(ai(
+        root,
+        "declare-claim",
+        &[
+            "z-target",
+            "Target.lean",
+            "result",
+            "Target",
+            "An informal claim",
+        ],
+    ));
+    ok(ai(
+        root,
+        "declare-claim",
+        &[
+            "a-dep",
+            "Dep.lean",
+            "result",
+            "Dependency",
+            "An informal dependency",
+        ],
+    ));
+    let path = root.join(".runtime/state.sqlite");
+    let (prefix, head) = {
+        let mut store = StateStore::open(&path).unwrap();
+        let before = store.status().unwrap().last_event_seq;
+        store
+            .create_plan(
+                NewPlan {
+                    id: "route",
+                    target: "z-target",
+                    name: "Route",
+                    track: "infrastructure",
+                    status: PlanStatus::Active,
+                    dependencies: &[("a-dep", "lemma")],
+                },
+                Change {
+                    actor: "test:operator",
+                    git_commit: None,
+                },
+            )
+            .unwrap();
+        (before, store.status().unwrap().last_event_seq)
+    };
+    let before_bytes = fs::read(&path).unwrap();
+    let latest = json(ai(root, "graph-replay", &[]));
+    assert_eq!(latest["through_event_seq"], head);
+    assert_eq!(latest["ledger_head_event_seq"], head);
+    assert_eq!(latest["applied_claim_events"], 2);
+    assert_eq!(latest["applied_plan_events"], 1);
+    assert_eq!(latest["dependency_edge_count"], 1);
+    assert_eq!(latest["claims"][0]["claim_id"], "a-dep");
+    assert_eq!(latest["claims"][1]["claim_id"], "z-target");
+    assert_eq!(
+        latest["plans"][0]["dependencies"],
+        serde_json::json!([{"claim_id":"a-dep","kind":"lemma"}])
+    );
+    let previous = json(ai(root, "graph-replay", &[&prefix.to_string()]));
+    assert_eq!(previous["claims"], latest["claims"]);
+    assert_eq!(previous["through_event_seq"], prefix);
+    assert_eq!(previous["ledger_head_event_seq"], head);
+    assert_eq!(previous["plans"], serde_json::json!([]));
+    let future = (head + 1).to_string();
+    for cursor in ["-1", "01", &future] {
+        let bad = ai(root, "graph-replay", &[cursor]);
+        assert!(!bad.status.success());
+        assert!(bad.stdout.is_empty());
+    }
+    assert_eq!(fs::read(path).unwrap(), before_bytes);
+}

@@ -105,7 +105,7 @@ struct RouteBlocked {
 #[serde(deny_unknown_fields)]
 struct RouteUnblocked {}
 
-fn apply(
+pub(super) fn apply(
     state: &mut Option<ReplayedPlan>,
     id: &str,
     seq: i64,
