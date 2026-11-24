@@ -160,3 +160,5 @@ Broker 每 2 秒采样宿主机可用内存，执行三级背压（并实时输�
 * **T1（加锁串行 Promotion）**：Layer 1 静态禁入 → Layer 3 洁净室签发 Receipt → 加主干互斥锁 → 受影响下游切片（Affected Cone）增量编译 + `maxHeartbeats` 退化检查 → 原子快进 `main`（失败自动回滚）；
 * **T2（周期后台）**：全仓增量构建 + 编译耗时/Heartbeat 基线回归 + 第三方外部内核校验（如 `lean4checker` / `nanoda`）+ `L4a`/`L4b` 债务扫描；
 * **T3（定义/ADR 转向后）**：沿 Claim Graph 标脏受影响下游子树并按拓扑序重检。
+
+现有 T2 切片可手动采集 Lean 冷构建样本并 [离线比较墙钟中位数](architecture-acceptance.md#L514)；它不是周期任务、heartbeat 或第三方内核复核。

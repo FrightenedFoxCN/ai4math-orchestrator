@@ -469,6 +469,42 @@ fn native_t2_clean_build_is_advisory_and_fail_closed() -> Result<()> {
         Ok(git(&repo, &["rev-parse", MAIN]))
     };
 
+    // Sample both actually built versions three times; do not assert a noisy wall-time trend.
+    let collect = |commit: &str| -> Result<Vec<Value>> {
+        (0..3)
+            .map(|_| {
+                serde_json::to_value(crate::t2_build::audit(root, &repo, ANCHOR, commit, &exec)?)
+                    .map_err(Into::into)
+            })
+            .collect()
+    };
+    let baseline = collect(&reviewed)?;
+    let second = commit_to_main(
+        ORDERED,
+        "import Support\ntheorem target : True := True.intro\n",
+        "change reviewed proof source",
+    )?;
+    let next_git = git_state()?;
+    let candidate = collect(&second)?;
+    let comparison = crate::t2_compare::compare(
+        &serde_json::to_vec(&baseline)?,
+        &serde_json::to_vec(&candidate)?,
+        120_000,
+        1_000,
+    )?;
+    assert!(!comparison.regressed);
+    let comparison = serde_json::to_value(comparison)?;
+    assert_eq!(comparison["advisory_only"], true);
+    assert_eq!(comparison["baseline"]["reviewed_commit"], reviewed);
+    assert_eq!(comparison["candidate"]["reviewed_commit"], second);
+    assert_eq!(comparison["baseline"]["sample_count"], 3);
+    assert_eq!(comparison["candidate"]["sample_count"], 3);
+    assert_eq!(comparison["modules"][0]["source_changed"], false);
+    assert_eq!(comparison["modules"][1]["source_changed"], true);
+    assert!(sqlite()? == db_before, "comparison workflow wrote SQLite");
+    assert!(git_state()? == next_git, "comparison workflow wrote Git");
+    assert_no_authority_change()?;
+
     let wrong_order = commit_to_main(REVERSED, PROOF, "move importer before its dependency")?;
     assert_rejected(
         &wrong_order,
