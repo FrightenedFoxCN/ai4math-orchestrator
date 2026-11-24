@@ -14,7 +14,7 @@ fn request<'a>(f: &'a Fixture, base: &'a str, reviewed: &'a str) -> ManagedHeart
         root: &f.root,
         repo: &f.bare,
         target: MODULE,
-        baseline: base,
+        baseline: HeartbeatBaseline::Commit(base),
         reviewed,
         executable: Path::new("/never-launched"),
         compiler_pin: PIN,
@@ -53,7 +53,7 @@ fn same_generation_runs_three_interleaved_pairs_with_one_absolute_deadline() -> 
     git(&f.bare, &["update-ref", MAIN, &f.next, &f.initial])?;
     let calls = Cell::new(0);
     let mut first = None;
-    let res = sample_and_compare(&request(&f, &f.initial, &f.next), 2, 20, |engine| {
+    let (res, release) = sample_and_compare(&request(&f, &f.initial, &f.next), 2, 20, |engine| {
         assert_eq!(engine, Engine::Lean4);
         Ok(|modules: &[(&str, &str)], deadline| {
             assert_eq!(*first.get_or_insert(deadline), deadline);
@@ -63,6 +63,7 @@ fn same_generation_runs_three_interleaved_pairs_with_one_absolute_deadline() -> 
         })
     })?;
     assert_eq!(calls.get(), 6);
+    assert!(release.is_none());
     let j = serde_json::to_value(res)?;
     assert_eq!(j["comparison"]["baseline"]["reviewed_commit"], f.initial);
     assert_eq!(j["comparison"]["candidate"]["reviewed_commit"], f.next);
@@ -132,5 +133,89 @@ fn rejects_equal_future_and_grafted_baselines_before_native_preparation() -> Res
     .err()
     .context("expected grafted ancestry refusal")?;
     assert!(format!("{err:#}").contains("ancestor"));
+    Ok(())
+}
+
+#[test]
+fn release_baseline_pin_is_checked_before_and_after_sampling() -> Result<()> {
+    use crate::{promotion::PromotionRepo, worker_dispatch::private_state_path};
+    use ai4math_store::StateStore;
+    let policy = br#"[{"target_module":"Audit.lean","declaration":"N.audit"}]"#;
+    let f = Fixture::with_release_policy(Some(policy))?;
+    let seq = StateStore::open_readonly(private_state_path(&f.root)?)?
+        .status()?
+        .last_event_seq;
+    let (tag_ref, oid) = {
+        let repo = PromotionRepo::try_lock_existing(&f.bare)?;
+        let snapshot = repo.snapshot(MODULE, Some(&f.initial))?;
+        let files = snapshot.project()?;
+        let sources: Vec<_> = files
+            .iter()
+            .map(|(path, source)| (*path, source.as_str()))
+            .collect();
+        // Canonical field order as written by the release publisher. This is
+        // synthetic metadata for coordinator lifecycle, not verifier evidence.
+        let payload = format!(
+            concat!(
+                "{{\"schema\":\"ai4math.t2.local-release-evidence.v1\",\"reviewed_commit\":\"{}\",",
+                "\"ledger_event_seq\":{},\"policy_sha256\":\"{:x}\",\"trust_debt_findings\":0,",
+                "\"source_set_sha256\":\"{}\",\"compiler_sha256\":\"{}\",\"exporter_sha256\":\"{}\",\"checker_sha256\":\"{}\",",
+                "\"checks\":[{{\"target_module\":\"Audit.lean\",\"declaration\":\"N.audit\",\"export_sha256\":\"{}\"}}]}}"
+            ),
+            f.initial,
+            seq,
+            Sha256::digest(policy),
+            ai4math_broker::ordered_source_set_sha256(&sources),
+            PIN,
+            "1".repeat(64),
+            "2".repeat(64),
+            "3".repeat(64)
+        );
+        repo.create_release_tag("milestone", &f.initial, payload.as_bytes())?
+    };
+    git(&f.bare, &["update-ref", MAIN, &f.next, &f.initial])?;
+    let mut req = request(&f, &f.initial, &f.next);
+    req.baseline = HeartbeatBaseline::LocalRelease {
+        label: "milestone",
+        oid: &oid,
+    };
+    let calls = Cell::new(0);
+    let (_, pin) = sample_and_compare(&req, 2, 20, |_| {
+        Ok(|sources: &[(&str, &str)], _| {
+            calls.set(calls.get() + 1);
+            Ok(measured(sources, 42))
+        })
+    })?;
+    let pin = pin.context("expected pinned tag in report")?;
+    assert_eq!(pin.baseline_tag_ref, tag_ref);
+    assert_eq!(pin.baseline_tag_oid, oid);
+    assert_eq!(pin.baseline_release_ledger_event_seq, seq);
+    assert_eq!(calls.get(), 6);
+
+    calls.set(0);
+    let err = sample_and_compare(&req, 2, 20, |_| {
+        Ok(|sources: &[(&str, &str)], _| {
+            calls.set(calls.get() + 1);
+            if calls.get() == 6 {
+                git(&f.bare, &["update-ref", "-d", &tag_ref, &oid])?;
+            }
+            Ok(measured(sources, 42))
+        })
+    })
+    .err()
+    .context("moved tag still emitted a comparison")?;
+    assert!(format!("{err:#}").contains("tag changed during heartbeat sampling"));
+    assert_eq!(calls.get(), 6);
+    let err = sample_and_compare(
+        &req,
+        2,
+        20,
+        |_| -> Result<fn(&[(&str, &str)], Instant) -> Result<LeanHeartbeatAudit>> {
+            panic!("missing tag prepared native sampling")
+        },
+    )
+    .err()
+    .context("missing tag was accepted")?;
+    assert!(format!("{err:#}").contains("release tag"));
     Ok(())
 }

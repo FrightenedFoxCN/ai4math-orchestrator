@@ -1,6 +1,7 @@
 //! Fresh same-host baseline and candidate captures for one managed Lean generation.
 use super::{HeartbeatReport, with_generation};
 use crate::{
+    t2_batch::validated_release_baseline,
     t2_compare_io::threshold,
     t2_heartbeat_compare::{self, HeartbeatComparison},
 };
@@ -20,12 +21,36 @@ pub(crate) struct ManagedHeartbeatRequest<'a> {
     pub root: &'a Path,
     pub repo: &'a Path,
     pub target: &'a str,
-    pub baseline: &'a str,
+    pub baseline: HeartbeatBaseline<'a>,
     pub reviewed: &'a str,
     pub executable: &'a Path,
     pub compiler_pin: &'a str,
     pub raw_delta: &'a str,
     pub relative_percent: &'a str,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum HeartbeatBaseline<'a> {
+    Commit(&'a str),
+    LocalRelease { label: &'a str, oid: &'a str },
+}
+
+// This information is for the explicit operator release route only.
+#[derive(Serialize)]
+struct ReleasePin {
+    baseline_tag_ref: String,
+    baseline_tag_oid: String,
+    baseline_release_ledger_event_seq: i64,
+}
+
+#[derive(Serialize)]
+struct ReleaseHeartbeatComparison {
+    schema: &'static str,
+    advisory_only: bool,
+    ledger_event_seq: i64,
+    #[serde(flatten)]
+    baseline: ReleasePin,
+    comparison: HeartbeatComparison,
 }
 
 #[derive(Serialize)]
@@ -43,9 +68,19 @@ enum Execution {
 }
 
 pub(crate) fn compare_managed_heartbeats(request: ManagedHeartbeatRequest<'_>) -> Result<()> {
-    let report = collect(&request, Execution::Operator)?;
+    let (report, release) = collect(&request, Execution::Operator)?;
     let regressed = report.comparison.regressed;
-    crate::print_json(report)?;
+    if let Some(baseline) = release {
+        crate::print_json(ReleaseHeartbeatComparison {
+            schema: "ai4math.t2.release-heartbeat-comparison.v1",
+            advisory_only: true,
+            ledger_event_seq: report.ledger_event_seq,
+            baseline,
+            comparison: report.comparison,
+        })?;
+    } else {
+        crate::print_json(report)?;
+    }
     ensure!(
         !regressed,
         "measured managed T2 heartbeat increase meets both comparison thresholds"
@@ -57,8 +92,11 @@ pub(crate) fn compare_managed_heartbeats(request: ManagedHeartbeatRequest<'_>) -
 pub(crate) fn compare_for_daemon(request: ManagedHeartbeatRequest<'_>) -> Result<()> {
     use std::io::Write;
 
+    let HeartbeatBaseline::Commit(baseline) = request.baseline else {
+        anyhow::bail!("daemon heartbeat requires an explicit baseline commit");
+    };
     crate::t3::arm_daemon_lifeline("T2")?;
-    let report = collect(&request, Execution::Daemon)?;
+    let (report, _) = collect(&request, Execution::Daemon)?;
     let (max_command_regressed, total_commands_regressed) = report.comparison.metric_regressions();
     // A measured regression is still an admissible observation. The only worker
     // output is this private protocol object; native measurements remain local.
@@ -67,7 +105,7 @@ pub(crate) fn compare_for_daemon(request: ManagedHeartbeatRequest<'_>) -> Result
         "advisory_only": true,
         "reviewed_commit": request.reviewed,
         "ledger_event_seq": report.ledger_event_seq,
-        "baseline_commit": request.baseline,
+        "baseline_commit": baseline,
         "compiler_sha256": request.compiler_pin,
         "regressed": report.comparison.regressed,
         "max_command_regressed": max_command_regressed,
@@ -84,7 +122,7 @@ pub(crate) fn compare_for_daemon(request: ManagedHeartbeatRequest<'_>) -> Result
 fn collect(
     request: &ManagedHeartbeatRequest<'_>,
     execution: Execution,
-) -> Result<ManagedHeartbeatComparison> {
+) -> Result<(ManagedHeartbeatComparison, Option<ReleasePin>)> {
     let raw_delta = threshold(request.raw_delta)?;
     let percent = threshold(request.relative_percent)?;
     t2_heartbeat_compare::validate_thresholds(raw_delta, percent)?;
@@ -125,7 +163,7 @@ fn sample_and_compare<F>(
     raw_delta: u64,
     percent: u64,
     prepare: impl FnOnce(ai4math_core::Engine) -> Result<F>,
-) -> Result<ManagedHeartbeatComparison>
+) -> Result<(ManagedHeartbeatComparison, Option<ReleasePin>)>
 where
     F: FnMut(&[(&str, &str)], Instant) -> Result<LeanHeartbeatAudit>,
 {
@@ -136,16 +174,40 @@ where
         request.reviewed,
         |generation| {
             let git = generation.git;
+            let (baseline_commit, release) = match request.baseline {
+                HeartbeatBaseline::Commit(commit) => (commit.to_owned(), None),
+                HeartbeatBaseline::LocalRelease { label, oid } => {
+                    let validated = validated_release_baseline(
+                        git,
+                        label,
+                        Some(oid),
+                        generation.seq(),
+                        Some(COMBINED_SOURCE_BYTES),
+                    )?;
+                    ensure!(
+                        validated.compiler_sha256() == request.compiler_pin,
+                        "release baseline Lean compiler SHA-256 does not match the requested compiler"
+                    );
+                    let release_seq = validated.ledger_event_seq();
+                    let commit = validated.reviewed_commit;
+                    let pin = ReleasePin {
+                        baseline_tag_ref: validated.tag_ref,
+                        baseline_tag_oid: validated.tag_oid,
+                        baseline_release_ledger_event_seq: release_seq,
+                    };
+                    (commit, Some((label, pin)))
+                }
+            };
             ensure!(
-                request.baseline != request.reviewed,
+                baseline_commit != request.reviewed,
                 "heartbeat baseline must be a distinct ancestor of reviewed main"
             );
             ensure!(
-                git.is_ungrafted_ancestor(request.baseline, request.reviewed)?,
+                git.is_ungrafted_ancestor(&baseline_commit, request.reviewed)?,
                 "heartbeat baseline must be an ancestor of reviewed main"
             );
             let baseline = git
-                .snapshot(request.target, Some(request.baseline))
+                .snapshot(request.target, Some(&baseline_commit))
                 .context("read managed heartbeat baseline")?;
             let candidate = git
                 .snapshot(request.target, Some(request.reviewed))
@@ -179,7 +241,7 @@ where
                 for (label, commit, sources, reports) in [
                     (
                         "baseline",
-                        request.baseline,
+                        baseline_commit.as_str(),
                         &baseline_sources,
                         &mut baseline_reports,
                     ),
@@ -209,18 +271,28 @@ where
                 raw_delta,
                 percent,
             )?;
+            let release = if let Some((label, pin)) = release {
+                git.recheck_release_tag(label, &pin.baseline_tag_oid)
+                    .context("release baseline tag changed during heartbeat sampling; retry")?;
+                Some(pin)
+            } else {
+                None
+            };
             generation
                 .check_current("managed main or ledger changed during heartbeat sampling; retry")?;
             ensure!(
                 Instant::now() < deadline,
                 "managed heartbeat sampling wall-clock budget exhausted"
             );
-            Ok(ManagedHeartbeatComparison {
-                schema: "ai4math.t2.managed-heartbeat-comparison.v1",
-                advisory_only: true,
-                ledger_event_seq: generation.seq(),
-                comparison,
-            })
+            Ok((
+                ManagedHeartbeatComparison {
+                    schema: "ai4math.t2.managed-heartbeat-comparison.v1",
+                    advisory_only: true,
+                    ledger_event_seq: generation.seq(),
+                    comparison,
+                },
+                release,
+            ))
         },
     )
 }

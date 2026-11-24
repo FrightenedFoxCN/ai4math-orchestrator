@@ -266,11 +266,11 @@ fn native_fixture() -> Result<NativeFixture> {
     })
 }
 
-fn fixture_source_set_sha256() -> String {
+fn source_set_sha256(modules: &[(&str, &str)]) -> String {
     let mut sources = Sha256::new();
     sources.update(b"ai4math:ordered-source-dependencies:v1");
-    sources.update((MODULES.len() as u64).to_be_bytes());
-    for (path, source) in MODULES {
+    sources.update((modules.len() as u64).to_be_bytes());
+    for &(path, source) in modules {
         for part in [path, source] {
             sources.update((part.len() as u64).to_be_bytes());
             sources.update(part.as_bytes());
@@ -296,7 +296,7 @@ fn assert_fixture_build(lean: &Path, build: &Value) -> Result<()> {
         *build,
         json!({
             "compiler_sha256": file_sha256(lean)?,
-            "source_set_sha256": fixture_source_set_sha256(),
+            "source_set_sha256": source_set_sha256(&MODULES),
             "compile_ms": build["compile_ms"].as_u64().context("build timing")?,
             "modules": modules,
         })
@@ -731,11 +731,26 @@ fn native_t2_release_check_verifies_reviewed_policy_without_writes() -> Result<(
 fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()> {
     const LABEL: &str = "native-fixture";
     const MAIN: &str = "refs/heads/main";
+    const MEASURED: &str = "BManagedReleaseHeartbeat.lean";
+    const MEASURED_SOURCE: &str = "theorem measuredIdentity : 1 + 1 = 2 := by decide\n";
+    const HEAVY: &str = "set_option maxRecDepth 10000 in
+theorem measuredHeavy : (List.range 1000).length = 1000 := by decide
+";
     let f = native_fixture()?;
     let scratch = f.fixture.join("tmp");
     fs::create_dir(&scratch)?;
     let compiler_pin = file_sha256(&f.lean)?;
     let targets = [(TARGET, THEOREM), (BASIS, IMPORTED)];
+    // The comparison target belongs to the release build, but is deliberately
+    // absent from the independent checks; heartbeat results imply no assurance.
+    fs::write(f.source.join(MEASURED), MEASURED_SOURCE)?;
+    fs::write(
+        f.source.join("ai4math-modules.txt"),
+        format!("{BASIS}\n{TARGET}\n{MEASURED}\n"),
+    )?;
+    git(&f.source, &["add", "--", "ai4math-modules.txt", MEASURED])?;
+    let measured_source_set_sha256 =
+        |source| source_set_sha256(&[MODULES[0], MODULES[1], (MEASURED, source)]);
     let (reviewed, policy_pin) = review_fixture_policy(&f, &targets)?;
     // Keep a valid but eventually stale local policy; the tag gate must use Git.
     fs::copy(f.source.join(RELEASE_POLICY), f.root.join(RELEASE_POLICY))?;
@@ -849,7 +864,7 @@ fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()>
             "ledger_event_seq": f.seq,
             "policy_sha256": policy_pin,
             "trust_debt_findings": 0,
-            "source_set_sha256": fixture_source_set_sha256(),
+            "source_set_sha256": measured_source_set_sha256(MEASURED_SOURCE),
             "compiler_sha256": compiler_pin,
             "exporter_sha256": f.exporter_pin,
             "checker_sha256": f.checker_pin,
@@ -859,15 +874,10 @@ fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()>
     assert_only_tag_files_added(&before, "accepted release tag")?;
     assert_same_ledger("accepted release tag")?;
 
-    let inspect = |tag_pin: Option<&str>, case: &str| -> Result<Output> {
+    let read_only = |command: &mut Command, case: &str| -> Result<Output> {
         let before = snapshot(&f.fixture)?;
         let before_refs = refs()?;
-        let output = ai(&f.root, "t2-release-inspect")
-            .env("TMPDIR", &scratch)
-            .arg(&f.repo)
-            .arg(LABEL)
-            .args(tag_pin)
-            .output()?;
+        let output = command.output()?;
         assert_eq!(
             snapshot(&f.fixture)?,
             before,
@@ -876,6 +886,29 @@ fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()>
         assert_eq!(refs()?, before_refs, "{case}: changed Git refs");
         assert_same_ledger(case)?;
         Ok(output)
+    };
+    let inspect = |tag_pin: Option<&str>, case: &str| {
+        read_only(
+            ai(&f.root, "t2-release-inspect")
+                .env("TMPDIR", &scratch)
+                .arg(&f.repo)
+                .arg(LABEL)
+                .args(tag_pin),
+            case,
+        )
+    };
+    let compare = |commit: &str, tag_pin: &str, compiler: &str, delta: u64, case: &str| {
+        read_only(
+            ai(&f.root, "t2-compare-release-heartbeats")
+                .env("TMPDIR", &scratch)
+                .arg(&f.repo)
+                .args([MEASURED, LABEL, tag_pin, commit])
+                .arg(&f.lean)
+                .arg(compiler)
+                .arg(delta.to_string())
+                .arg("100"),
+            case,
+        )
     };
     let expected_inspection = |current_main: &str, heads_match: bool| {
         json!({
@@ -922,8 +955,18 @@ fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()>
     assert_only_tag_files_added(&before_duplicate, "duplicate tag")?;
     assert_same_ledger("duplicate tag")?;
 
-    // The first theorem passes; the second elaborates but Nanoda rejects it.
-    // With a fresh label and the new main pinned, this must fail at the gate.
+    let case = "compare release against its own reviewed main";
+    rejected(
+        compare(&reviewed, &tag_oid, &compiler_pin, 1_000, case)?,
+        case,
+        "heartbeat baseline must be a distinct ancestor of reviewed main",
+    );
+
+    // Advance once: add heavier elaboration to the measured module and select
+    // a policy whose second independent check will be rejected by Nanoda.
+    let heavier_source = format!("{MEASURED_SOURCE}{HEAVY}");
+    fs::write(f.source.join(MEASURED), &heavier_source)?;
+    git(&f.source, &["add", "--", MEASURED])?;
     let (broken_review, broken_pin) =
         review_fixture_policy(&f, &[(BASIS, IMPORTED), (TARGET, AXIOMATIC)])?;
     assert_ne!(broken_review, reviewed);
@@ -933,6 +976,105 @@ fn native_t2_release_tag_publishes_only_annotated_local_evidence() -> Result<()>
     let report: Value = serde_json::from_slice(&checked(inspect(Some(&tag_oid), case)?, case)?)?;
     assert_eq!(report, expected_inspection(&broken_review, false), "{case}");
 
+    for (min_delta, regressed) in [(1_000, true), (9_000_000_000_000_000, false)] {
+        let case = format!("compare historical release at raw delta {min_delta}");
+        let output = compare(&broken_review, &tag_oid, &compiler_pin, min_delta, &case)?;
+        assert_eq!(
+            output.status.code(),
+            Some(i32::from(regressed)),
+            "{case}: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        let report: Value = serde_json::from_slice(&output.stdout).with_context(|| case.clone())?;
+        let comparison = &report["comparison"];
+        assert_eq!(
+            report,
+            json!({
+                "schema": "ai4math.t2.release-heartbeat-comparison.v1",
+                "advisory_only": true,
+                "ledger_event_seq": f.seq,
+                "baseline_tag_ref": tag_ref,
+                "baseline_tag_oid": tag_oid,
+                "baseline_release_ledger_event_seq": evidence["ledger_event_seq"],
+                "comparison": comparison,
+            }),
+            "{case}"
+        );
+        let metric = |key: &str| -> Result<Value> {
+            let baseline = comparison[key]["baseline_median_heartbeats_raw"]
+                .as_u64()
+                .context("missing baseline median")?;
+            let candidate = comparison[key]["candidate_median_heartbeats_raw"]
+                .as_u64()
+                .context("missing candidate median")?;
+            assert!(baseline > 0 && candidate > 2 * baseline, "{case}: {key}");
+            let delta = candidate - baseline;
+            assert_eq!(delta >= min_delta, regressed, "{case}: {key}");
+            Ok(json!({
+                "baseline_median_heartbeats_raw": baseline,
+                "candidate_median_heartbeats_raw": candidate,
+                "delta_heartbeats_raw": delta,
+                "status": "compared",
+                "regressed": regressed,
+            }))
+        };
+        assert_eq!(
+            *comparison,
+            json!({
+                "schema": "ai4math.t2.heartbeat-comparison.v1",
+                "advisory_only": true,
+                "regressed": regressed,
+                "target_module": MEASURED,
+                "thresholds": {"min_delta_heartbeats_raw": min_delta, "min_increase_percent": 100},
+                "baseline": {
+                    "sample_count": 3,
+                    "reviewed_commit": reviewed,
+                    "source_set_sha256": evidence["source_set_sha256"],
+                    "compiler_sha256": compiler_pin,
+                    "command_count": 1,
+                },
+                "candidate": {
+                    "sample_count": 3,
+                    "reviewed_commit": broken_review,
+                    "source_set_sha256": measured_source_set_sha256(&heavier_source),
+                    "compiler_sha256": compiler_pin,
+                    "command_count": 2,
+                },
+                "target_source_changed": true,
+                "target_prefix_changed": true,
+                "max_command": metric("max_command")?,
+                "total_commands": metric("total_commands")?,
+            }),
+            "{case}"
+        );
+    }
+
+    let case = "compare release with a stale reviewed main";
+    rejected(
+        compare(&reviewed, &tag_oid, &compiler_pin, 1_000, case)?,
+        case,
+        "reviewed T2 commit is not current main",
+    );
+    let case = "compare release with the commit OID instead of the tag object OID";
+    rejected(
+        compare(&broken_review, &reviewed, &compiler_pin, 1_000, case)?,
+        case,
+        "tag OID mismatch",
+    );
+    let case = "compare release with a different compiler pin";
+    rejected(
+        compare(
+            &broken_review,
+            &tag_oid,
+            &wrong_pin(&compiler_pin),
+            1_000,
+            case,
+        )?,
+        case,
+        "compiler SHA-256",
+    );
+
+    // With a fresh label and the new main pinned, the changed policy still fails.
     let before_rejection = snapshot(&f.fixture)?;
     rejected(
         run(

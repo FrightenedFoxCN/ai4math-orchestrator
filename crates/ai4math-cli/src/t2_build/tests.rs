@@ -38,6 +38,10 @@ pub(super) fn git(dir: &Path, args: &[&str]) -> Result<String> {
 
 impl Fixture {
     pub(super) fn new() -> Result<Self> {
+        Self::with_release_policy(None)
+    }
+
+    pub(super) fn with_release_policy(policy: Option<&[u8]>) -> Result<Self> {
         let temp = tempfile::tempdir()?;
         let root = temp.path().canonicalize()?;
         let source = root.join("fixture");
@@ -47,6 +51,10 @@ impl Fixture {
         git(&source, &["init", "--initial-branch=main", "--quiet"])?;
         fs::write(source.join(MODULE), SOURCE)?;
         git(&source, &["add", MODULE])?;
+        if let Some(policy) = policy {
+            fs::write(source.join("ai4math-t2-release.json"), policy)?;
+            git(&source, &["add", "ai4math-t2-release.json"])?;
+        }
         git(&source, &["commit", "-m", "audit fixture", "--quiet"])?;
         let initial = git(&source, &["rev-parse", "HEAD"])?;
         git(

@@ -292,6 +292,77 @@ fn read_evidence(bytes: &[u8], reviewed_commit: &str) -> Result<LocalReleaseEvid
     Ok(evidence)
 }
 
+pub(crate) struct ValidatedReleaseBaseline {
+    pub(crate) tag_ref: String,
+    pub(crate) tag_oid: String,
+    pub(crate) reviewed_commit: String,
+    evidence: LocalReleaseEvidence,
+}
+
+impl ValidatedReleaseBaseline {
+    pub(crate) fn ledger_event_seq(&self) -> i64 {
+        self.evidence.ledger_event_seq
+    }
+
+    pub(crate) fn compiler_sha256(&self) -> &str {
+        &self.evidence.compiler_sha256
+    }
+}
+
+/// Validate the exact local tag against its pinned project and the caller's
+/// ledger generation. The caller holds the Git lock and rechecks the tag before
+/// returning its result; this helper does not take another lock.
+pub(crate) fn validated_release_baseline(
+    git: &PromotionRepo,
+    label: &str,
+    expected_oid: Option<&str>,
+    current_seq: i64,
+    source_budget: Option<usize>,
+) -> Result<ValidatedReleaseBaseline> {
+    let tag = git.read_release_tag(label, expected_oid)?;
+    let evidence = read_evidence(&tag.evidence, &tag.reviewed_commit)?;
+    ensure!(
+        evidence.ledger_event_seq <= current_seq,
+        "release tag records a future ledger generation"
+    );
+    let pinned = git.snapshot(
+        &evidence.checks[0].target_module,
+        Some(&tag.reviewed_commit),
+    )?;
+    let policy = pinned.t2_release_policy()?;
+    let targets = release_targets(&policy, &evidence.policy_sha256)?;
+    let targets: Vec<_> = targets
+        .iter()
+        .map(|ObjectTarget(target)| (target.target_module.as_str(), target.declaration.as_str()))
+        .collect();
+    ensure!(
+        targets.iter().copied().eq(evidence
+            .checks
+            .iter()
+            .map(|check| (check.target_module.as_str(), check.declaration.as_str()))),
+        "release evidence checks do not match reviewed policy order and scope"
+    );
+    let sources = match source_budget {
+        Some(mut remaining) => pinned.project_with_byte_budget(&mut remaining)?,
+        None => pinned.project()?,
+    };
+    let sources: Vec<_> = sources
+        .iter()
+        .map(|(path, source)| (*path, source.as_str()))
+        .collect();
+    validate_managed_lean_targets(&sources, &targets)?;
+    ensure!(
+        ordered_source_set_sha256(&sources) == evidence.source_set_sha256,
+        "release evidence ordered source set SHA-256 mismatch"
+    );
+    Ok(ValidatedReleaseBaseline {
+        tag_ref: tag.tag_ref,
+        tag_oid: tag.tag_oid,
+        reviewed_commit: tag.reviewed_commit,
+        evidence,
+    })
+}
+
 pub(crate) fn inspect_release(
     root: &Path,
     repo: &Path,
@@ -322,56 +393,25 @@ pub(crate) fn inspect_release(
         state.managed_wiki_stamp()?.as_ref() == Some(&stamp),
         "managed ledger changed before release inspection; retry"
     );
-    let tag = git.read_release_tag(label, expected_oid)?;
-    let evidence = read_evidence(&tag.evidence, &tag.reviewed_commit)?;
-    ensure!(
-        evidence.ledger_event_seq <= stamp.1,
-        "release tag records a future ledger generation"
-    );
-    let pinned = git.snapshot(
-        &evidence.checks[0].target_module,
-        Some(&tag.reviewed_commit),
-    )?;
-    let policy = pinned.t2_release_policy()?;
-    let targets = release_targets(&policy, &evidence.policy_sha256)?;
-    let targets: Vec<_> = targets
-        .iter()
-        .map(|ObjectTarget(target)| (target.target_module.as_str(), target.declaration.as_str()))
-        .collect();
-    ensure!(
-        targets.iter().copied().eq(evidence
-            .checks
-            .iter()
-            .map(|check| (check.target_module.as_str(), check.declaration.as_str()))),
-        "release evidence checks do not match reviewed policy order and scope"
-    );
-    let sources = pinned.project()?;
-    let sources: Vec<_> = sources
-        .iter()
-        .map(|(path, source)| (*path, source.as_str()))
-        .collect();
-    validate_managed_lean_targets(&sources, &targets)?;
-    ensure!(
-        ordered_source_set_sha256(&sources) == evidence.source_set_sha256,
-        "release evidence ordered source set SHA-256 mismatch"
-    );
-    git.recheck_release_tag(label, &tag.tag_oid)?;
+    let baseline = validated_release_baseline(&git, label, expected_oid, stamp.1, None)?;
+    git.recheck_release_tag(label, &baseline.tag_oid)?;
     ensure!(
         git.main_head()? == main && state.managed_wiki_stamp()?.as_ref() == Some(&stamp),
         "managed main or ledger changed during release inspection; retry"
     );
+    let ledger_event_seq = baseline.ledger_event_seq();
     Ok(ReleaseInspection {
         schema: "ai4math.t2.release-inspection.v1",
         advisory_only: true,
-        tag_ref: tag.tag_ref,
-        tag_oid: tag.tag_oid,
-        heads_match: main == tag.reviewed_commit,
-        ledger_matches: stamp.1 == evidence.ledger_event_seq,
-        reviewed_commit: tag.reviewed_commit,
-        ledger_event_seq: evidence.ledger_event_seq,
+        tag_ref: baseline.tag_ref,
+        tag_oid: baseline.tag_oid,
+        heads_match: main == baseline.reviewed_commit,
+        ledger_matches: stamp.1 == ledger_event_seq,
+        reviewed_commit: baseline.reviewed_commit,
+        ledger_event_seq,
         current_main: main,
         current_ledger_event_seq: stamp.1,
-        evidence,
+        evidence: baseline.evidence,
     })
 }
 

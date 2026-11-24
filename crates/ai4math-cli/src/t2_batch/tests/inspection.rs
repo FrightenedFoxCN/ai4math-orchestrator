@@ -112,8 +112,44 @@ fn retained_policy_sources_and_ledger_are_checked_without_authority() -> Result<
         oid
     };
     let refs = git(&repo, &["show-ref"])?;
+    {
+        // The shared validator runs inside the caller's existing Git lock.
+        let locked = PromotionRepo::try_lock_existing(&repo)?;
+        let baseline =
+            validated_release_baseline(&locked, "structure", Some(&oid), seq, Some(SOURCE.len()))?;
+        assert_eq!(baseline.tag_ref, "refs/tags/ai4math-release/structure");
+        assert_eq!(baseline.tag_oid, oid);
+        assert_eq!(baseline.reviewed_commit, head);
+        assert_eq!(baseline.ledger_event_seq(), seq);
+        assert_eq!(baseline.compiler_sha256(), "1".repeat(64));
+        for label in ["structure", "wrong-sources"] {
+            let err = validated_release_baseline(&locked, label, None, seq, Some(SOURCE.len() - 1))
+                .err()
+                .context("accepted evidence without enough source bytes")?;
+            assert!(format!("{err:#}").contains("combined managed heartbeat sources exceed"));
+        }
+        let err = validated_release_baseline(&locked, "structure", Some(&head), seq, None)
+            .err()
+            .context("accepted a nonmatching tag pin")?;
+        assert!(format!("{err:#}").contains("release tag OID mismatch"));
+    }
     let read = inspect_release(&root, &repo, "structure", Some(&oid))?;
-    assert!(read.advisory_only && read.ledger_matches && read.heads_match);
+    assert_eq!(
+        serde_json::to_value(read)?,
+        json!({
+            "schema": "ai4math.t2.release-inspection.v1",
+            "advisory_only": true,
+            "tag_ref": "refs/tags/ai4math-release/structure",
+            "tag_oid": oid,
+            "reviewed_commit": head,
+            "ledger_event_seq": seq,
+            "current_main": head,
+            "current_ledger_event_seq": seq,
+            "heads_match": true,
+            "ledger_matches": true,
+            "evidence": make_record(),
+        })
+    );
     for (label, diagnostic) in [
         ("wrong-policy", "policy SHA-256 mismatch"),
         ("wrong-sources", "ordered source set SHA-256 mismatch"),
