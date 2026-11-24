@@ -8,7 +8,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufRead, BufReader, ErrorKind, Write},
     os::unix::{
-        fs::{FileTypeExt, OpenOptionsExt, PermissionsExt},
+        fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt, PermissionsExt},
         net::UnixStream,
     },
     path::{Path, PathBuf},
@@ -382,9 +382,9 @@ fn assert_invalid(root: &Path, config: &Path) -> Result<()> {
     let status = daemon.poll("startup rejection", |child| Ok(child.try_wait()?))?;
     assert!(!status.success());
     let logs = daemon.logs();
-    assert!(
-        logs.contains("invalid --t3-discovery configuration"),
-        "{logs}"
+    assert_eq!(
+        logs.trim(),
+        "ai4mathd: invalid --t3-discovery configuration"
     );
     assert!(
         !root.join(SOCKET).exists(),
@@ -400,6 +400,181 @@ fn malformed_discovery_configuration_does_not_publish_a_socket() -> Result<()> {
     let config = root.join("discovery.json");
     write_config(&config, 0o600, b"{not JSON")?;
     assert_invalid(&root, &config)
+}
+
+fn claim_catalog(cli: &Path, bare: &Path, claim_id: &str) -> Value {
+    json!({
+        "version": 2,
+        "cli_executable": cli,
+        "bare_repo": bare,
+        "claim_id": claim_id,
+        "interval_ms": INTERVAL_MS,
+        "probe_timeout_ms": 5_000,
+    })
+}
+
+fn publish_frame(root: &Path, frame: &Value) -> Result<()> {
+    // Replace the file atomically so an active probe never reads a partial frame.
+    let mut next = tempfile::NamedTempFile::new_in(root)?;
+    serde_json::to_writer(&mut next, frame)?;
+    next.persist(root.join("worker-summary.json"))?;
+    Ok(())
+}
+
+#[test]
+fn resident_claim_discovery_enforces_config_and_worker_protocol() -> Result<()> {
+    let temp = short_tempdir()?;
+    let root = temp.path().canonicalize()?;
+    let cli = root.join("fixture-cli");
+    let repo = root.join("repo.git");
+    fs::create_dir(&repo)?;
+    // This private fake executable asserts dispatch shape without requiring Git,
+    // the real CLI, or a verified proof. The real Claim lookup is tested separately.
+    write_config(
+        &cli,
+        0o700,
+        br#"#!/bin/sh
+[ "$#" = 5 ] && [ "$1" = t3-discover-claim ] && [ "$2" = "$PWD" ] &&
+    [ "$3" = "$PWD/repo.git" ] && [ "$4" = FixtureClaim ] && [ "$5" = --daemon-parent ] || exit 64
+exec /bin/cat worker-summary.json
+"#,
+    )?;
+    let catalog = claim_catalog(&cli, &repo, "FixtureClaim");
+    let mut missing = catalog.clone();
+    missing.as_object_mut().unwrap().remove("claim_id");
+    let invalid = root.join("invalid.json");
+    write_config(&invalid, 0o600, &serde_json::to_vec(&missing)?)?;
+    assert_invalid(&root, &invalid).context("missing claim_id")?;
+    for (field, bad) in [
+        ("claim_id", Value::Null),
+        ("claim_id", json!(42)),
+        ("claim_id", json!("")),
+        ("claim_id", json!(" FixtureClaim")),
+        ("claim_id", json!("é".repeat(129))),
+        ("claim_id", json!("Claim\nsecret")),
+        ("anchor_module", json!(ANCHOR)),
+        ("anchor_module", Value::Null),
+        ("baseline_commit", json!("a".repeat(40))),
+        ("baseline_commit", Value::Null),
+    ] {
+        let mut mixed = catalog.clone();
+        mixed[field] = bad;
+        let bytes = serde_json::to_vec(&mixed)?;
+        fs::write(&invalid, bytes)?;
+        assert_invalid(&root, &invalid).with_context(|| format!("invalid {field}: {mixed}"))?;
+    }
+    let mut mixed = catalog.clone();
+    mixed["version"] = json!(1);
+    mixed["anchor_module"] = json!(ANCHOR);
+    mixed["baseline_commit"] = json!("a".repeat(40));
+    fs::write(&invalid, serde_json::to_vec(&mixed)?)?;
+    assert_invalid(&root, &invalid).context("v1 with claim_id")?;
+    mixed["claim_id"] = Value::Null;
+    fs::write(&invalid, serde_json::to_vec(&mixed)?)?;
+    assert_invalid(&root, &invalid).context("v1 with explicit null claim_id")?;
+
+    let runtime = root.join(".runtime");
+    fs::DirBuilder::new().mode(0o700).create(&runtime)?;
+    write_config(&runtime.join("primary_engine"), 0o600, b"lean4\n")?;
+    let store_path = runtime.join("state.sqlite");
+    let seq = StateStore::open(&store_path)?.status()?.last_event_seq;
+    let config = root.join("discovery.json");
+    write_config(&config, 0o600, &serde_json::to_vec(&catalog)?)?;
+    let summary = json!({
+        "status": "structural_change",
+        "base_commit": "a".repeat(40),
+        "observed_head": "b".repeat(40),
+        "ledger_event_seq": seq,
+        "module_order_changed": false,
+        "changed_module_count": 1,
+        "plan_sha256": "c".repeat(64),
+        "advisory_only": true,
+        "baseline_scope": "claim_t1",
+    });
+    publish_frame(&root, &summary)?;
+    let mut daemon = Daemon::spawn(&root, Some(&config))?;
+    daemon.wait_status(&root, &summary, seq)?;
+
+    let unavailable = json!({"status": "unavailable"});
+    for (field, bad) in [
+        ("baseline_scope", None),
+        ("baseline_scope", Some(Value::Null)),
+        ("baseline_scope", Some(json!("operator"))),
+        ("baseline_claim", Some(json!("FixtureClaim"))),
+        ("baseline_receipt_sha256", Some(json!("d".repeat(64)))),
+        ("bare_repo", Some(json!(repo))),
+    ] {
+        let mut frame = summary.clone();
+        if let Some(bad) = bad {
+            frame[field] = bad;
+        } else {
+            frame.as_object_mut().unwrap().remove(field);
+        }
+        publish_frame(&root, &frame)?;
+        daemon
+            .wait_status(&root, &unavailable, seq)
+            .with_context(|| format!("expected rejection of frame with invalid {field}"))?;
+        // Require recovery between cases, so none can pass on a previous failure.
+        publish_frame(&root, &summary)?;
+        daemon.wait_status(&root, &summary, seq)?;
+    }
+    assert!(
+        StateStore::open_readonly(store_path)?
+            .events_after(seq, 1)?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires AI4MATH_TEST_CLI pointing to a built ai4math binary; no native proof engine required"]
+fn resident_claim_discovery_has_no_fallback_for_unknown_or_unverified_claims() -> Result<()> {
+    let f = Fixture::new()?;
+    let head = f.push_change()?;
+    let refs = git(&f.bare, &["show-ref"])?;
+    let seq = f.state()?.status()?.last_event_seq;
+    let original_claims = f.claims()?;
+
+    // The same repository has a real structural delta against its operator's
+    // baseline. Claim mode must not fall back to this otherwise valid plan.
+    let plan: Value =
+        serde_json::from_str(&f.run("t3-preview", &[utf8(&f.bare), ANCHOR, &f.base, &head])?)?;
+    assert_eq!(plan["changed_modules"], json!(["Defs.lean"]));
+    let hash = plan["plan_sha256"]
+        .as_str()
+        .context("missing plan digest")?;
+    let unavailable = json!({"status": "unavailable"});
+    for claim in ["UnknownClaim", "Proof"] {
+        let args = [utf8(&f.bare), claim];
+        let direct = f.cli_output("t3-discover-claim", &args)?;
+        assert!(!direct.status.success() && direct.stdout.is_empty());
+        let stderr = String::from_utf8_lossy(&direct.stderr);
+        assert!(
+            stderr.contains("no current exact managed Lean T1 baseline"),
+            "{stderr}"
+        );
+
+        let config = f.config.with_file_name(format!("claim-{claim}.json"));
+        let catalog = claim_catalog(&f.cli, &f.bare, claim);
+        write_config(&config, 0o600, &serde_json::to_vec(&catalog)?)?;
+        let mut daemon = Daemon::spawn(&f.root, Some(&config))?;
+        daemon.wait_status(&f.root, &unavailable, seq)?;
+        assert!(
+            !daemon
+                .logs()
+                .contains("no current exact managed Lean T1 baseline")
+        );
+        daemon.stop_for_restart(&f.root)?;
+    }
+
+    let state = f.state()?;
+    assert_eq!(state.status()?.last_event_seq, seq);
+    assert!(state.events_after(seq, 1)?.is_empty());
+    assert!(state.claim("UnknownClaim")?.is_none());
+    assert_eq!(f.claims()?, original_claims);
+    assert!(state.applied_t3_plan(hash)?.is_none());
+    assert_eq!(git(&f.bare, &["show-ref"])?, refs);
+    Ok(())
 }
 
 #[test]

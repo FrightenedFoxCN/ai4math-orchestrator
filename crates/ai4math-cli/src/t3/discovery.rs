@@ -112,9 +112,21 @@ pub(crate) fn discover_for_daemon(
 ) -> Result<()> {
     super::parent::arm()?;
     let observed = observe(root, repo, anchor, baseline, true)?;
+    print_daemon_summary(&observed, None)
+}
+
+#[cfg(unix)]
+pub(crate) fn discover_claim_for_daemon(root: &Path, repo: &Path, claim: &str) -> Result<()> {
+    super::parent::arm()?;
+    let discovery = discover_claim_observation(root, repo, claim)?;
+    print_daemon_summary(&discovery.observation, Some(discovery.baseline_scope))
+}
+
+#[cfg(unix)]
+fn print_daemon_summary(observed: &Observation, scope: Option<&str>) -> Result<()> {
     // Omit Claim details, source bytes, and the unbounded advisory plan from
     // the subprocess protocol. The digest can be used only for human review.
-    print_json(serde_json::json!({
+    let mut summary = serde_json::json!({
         "status":observed.status,
         "base_commit":observed.base_commit,
         "observed_head":observed.observed_head,
@@ -123,7 +135,11 @@ pub(crate) fn discover_for_daemon(
         "changed_module_count":observed.changed_modules.len(),
         "plan_sha256":observed.plan.as_ref().map(|p|&p.plan_sha256),
         "advisory_only":true,
-    }))
+    });
+    if let Some(scope) = scope {
+        summary["baseline_scope"] = scope.into();
+    }
+    print_json(summary)
 }
 
 fn observe(

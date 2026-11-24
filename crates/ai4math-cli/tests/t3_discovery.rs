@@ -381,20 +381,24 @@ fn sibling_of_main_is_diverged_even_when_its_tree_is_identical() {
 fn daemon_summary_refuses_a_direct_cli_call_without_lifeline() {
     use std::os::unix::process::CommandExt;
     let f = Fixture::new();
-    let output = Command::new(env!("CARGO_BIN_EXE_ai4math"))
-        .arg("t3-discover")
-        .arg(&f.root)
-        .arg(&f.bare)
-        .arg(ANCHOR)
-        .arg(&f.base)
-        .arg("--daemon-parent")
-        .process_group(0)
-        .stdin(std::process::Stdio::null())
-        .output()
-        .unwrap();
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("lifeline"));
+    for (name, args) in [
+        ("t3-discover", vec![ANCHOR, f.base.as_str()]),
+        ("t3-discover-claim", vec!["Proof"]),
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_ai4math"))
+            .arg(name)
+            .arg(&f.root)
+            .arg(&f.bare)
+            .args(args)
+            .arg("--daemon-parent")
+            .process_group(0)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("lifeline"));
+    }
 }
 
 #[test]

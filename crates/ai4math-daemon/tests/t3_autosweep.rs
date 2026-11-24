@@ -30,11 +30,15 @@ struct Daemon {
 
 impl Daemon {
     fn spawn(root: &Path, config: Option<&Path>) -> Result<Self> {
+        Self::spawn_with_flag(root, config, "--t3-autosweep")
+    }
+
+    fn spawn_with_flag(root: &Path, config: Option<&Path>, flag: &str) -> Result<Self> {
         let log = tempfile::NamedTempFile::new_in(root)?;
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_ai4mathd"));
         cmd.arg("--project").arg(root).args(["--tick-ms", "100"]);
         if let Some(config) = config {
-            cmd.arg("--t3-autosweep").arg(config);
+            cmd.arg(flag).arg(config);
         }
         let child = cmd
             .stdin(Stdio::null())
@@ -452,6 +456,80 @@ mod native {
             }
             Ok(None)
         })
+    }
+
+    #[test]
+    #[ignore = "requires outer-unsandboxed macOS Seatbelt and absolute AI4MATH_TEST_LEAN and AI4MATH_TEST_CLI binaries"]
+    fn native_resident_claim_discovery_tracks_t1_then_clears_on_taint() -> Result<()> {
+        let tmp = short_tempdir()?;
+        let f = Fixture::new(
+            tmp.path().canonicalize()?,
+            &native_binary("AI4MATH_TEST_CLI")?,
+            native_binary("AI4MATH_TEST_LEAN")?,
+        )?;
+        let promoted = f.main()?;
+        let receipt = f.claim("C")?.receipt_id.context("no native T1 receipt")?;
+        let baseline_seq = f.state()?.status()?.last_event_seq;
+        let config = f.root.join("claim-discovery.json");
+        write_new(
+            &config,
+            0o600,
+            &serde_json::to_vec(&json!({"version":2,"cli_executable":f.cli,
+            "bare_repo":f.bare,"claim_id":"C","interval_ms":100,"probe_timeout_ms":10_000}))?,
+        )?;
+        let mut daemon = Daemon::spawn_with_flag(&f.root, Some(&config), "--t3-discovery")?;
+        ready(&mut daemon, &f.root)?;
+        let first = daemon.poll(Duration::from_secs(15), "current T1 discovery", || {
+            let sample = status(&f.root)?["t3_discovery"].clone();
+            Ok((sample["status"] == "unchanged").then_some(sample))
+        })?;
+        assert_eq!(
+            first,
+            json!({"status":"unchanged","baseline_scope":"claim_t1","base_commit":promoted,
+            "observed_head":promoted,"ledger_event_seq":baseline_seq,"module_order_changed":false,"changed_module_count":0,
+            "plan_sha256":null,"advisory_only":true})
+        );
+
+        let reviewed = f.review_defs("Nat.succ 1")?;
+        let preview = f.preview(&promoted, &reviewed)?;
+        let hash = digest(&preview)?;
+        let changed = daemon.poll(
+            Duration::from_secs(15),
+            "T1-scoped structural discovery",
+            || {
+                let sample = status(&f.root)?["t3_discovery"].clone();
+                Ok((sample["status"] == "structural_change").then_some(sample))
+            },
+        )?;
+        assert_eq!(
+            changed,
+            json!({"status":"structural_change","baseline_scope":"claim_t1","base_commit":promoted,
+            "observed_head":reviewed,"ledger_event_seq":baseline_seq,"module_order_changed":false,"changed_module_count":1,
+            "plan_sha256":hash,"advisory_only":true})
+        );
+        assert!(!changed.to_string().contains(&receipt));
+        assert!(f.state()?.applied_t3_plan(hash)?.is_none());
+        assert!(!f.claim("C")?.stale);
+        assert_eq!(f.state()?.status()?.last_event_seq, baseline_seq);
+        assert_eq!(f.receipt_count()?, 1);
+
+        f.apply(&promoted, &reviewed, hash)?;
+        let applied_seq = f.state()?.status()?.last_event_seq;
+        let unavailable = daemon.poll(
+            Duration::from_secs(15),
+            "tainted Claim hides previous summary",
+            || {
+                let sample = status(&f.root)?["t3_discovery"].clone();
+                Ok((sample["status"] == "unavailable").then_some(sample))
+            },
+        )?;
+        assert_eq!(unavailable, json!({"status":"unavailable"}));
+        assert!(f.claim("C")?.stale);
+        assert_eq!(f.receipt_count()?, 1);
+        assert_eq!(f.state()?.status()?.last_event_seq, applied_seq);
+        assert_eq!(f.main()?, reviewed);
+        f.stop(daemon)?;
+        Ok(())
     }
 
     #[test]

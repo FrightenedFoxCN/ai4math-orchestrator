@@ -43,16 +43,18 @@ test('HUD shows resident T3 as a read-only last sample and clears it when unavai
     },
     async status() {
       return ok(snapshot(12, { t3_discovery: { status: 'structural_change', observed_head: 'b'.repeat(40),
-        ledger_event_seq: 10, changed_module_count: 3, module_order_changed: true, advisory_only: true } }));
+        ledger_event_seq: 10, changed_module_count: 3, module_order_changed: true, advisory_only: true,
+        baseline_scope: 'claim_t1', baseline_claim: 'PrivateClaimName', baseline_receipt_sha256: 'a'.repeat(64) } }));
     },
     async alertsList() { return ok({ items: [], truncated: false }); },
   });
   const hud = app.mount('shell.bottom');
-  await expectText(hud, /Last T3 discovery Structure changed · 3 source change\(s\) · module list changed · advisory only · older ledger sample/);
+  await expectText(hud, /Last T3 discovery Structure changed · 3 source change\(s\) · module list changed · Claim T1 baseline · advisory only · older ledger sample/);
+  assert.doesNotMatch(hud.text(), /PrivateClaimName|a{64}/);
   assert.throws(() => hud.find('button', 'Apply T3'), /render did not contain/);
   report();
   await expectText(hud, /T3 discovery Unavailable/);
-  assert.doesNotMatch(hud.text(), /Structure changed|older ledger sample/);
+  assert.doesNotMatch(hud.text(), /Structure changed|older ledger sample|Claim T1 baseline/);
 });
 
 test('lazy browser bundle mounts shell.bottom and four sidebar tabs with owned cleanup', async t => {

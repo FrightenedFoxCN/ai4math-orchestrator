@@ -24,16 +24,85 @@ const MAX_SNAPSHOT_MODULES: u64 = 128;
 const MAX_CHANGED_MODULES: u64 = 2 * MAX_SNAPSHOT_MODULES - 1;
 
 #[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "ConfigFields")]
 pub struct Config {
+    cli_executable: PathBuf,
+    bare_repo: PathBuf,
+    baseline: Baseline,
+    interval_ms: u64,
+    probe_timeout_ms: u64,
+}
+
+enum Baseline {
+    Explicit {
+        anchor_module: String,
+        baseline_commit: String,
+    },
+    Claim {
+        claim_id: String,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFields {
     version: u8,
     cli_executable: PathBuf,
     bare_repo: PathBuf,
-    anchor_module: String,
-    baseline_commit: String,
+    #[serde(default, deserialize_with = "present_non_null")]
+    anchor_module: Option<String>,
+    #[serde(default, deserialize_with = "present_non_null")]
+    baseline_commit: Option<String>,
+    #[serde(default, deserialize_with = "present_non_null")]
+    claim_id: Option<String>,
     interval_ms: u64,
     #[serde(default = "default_timeout_ms")]
     probe_timeout_ms: u64,
+}
+
+impl TryFrom<ConfigFields> for Config {
+    type Error = anyhow::Error;
+
+    fn try_from(fields: ConfigFields) -> Result<Self> {
+        let baseline = match (
+            fields.version,
+            fields.anchor_module,
+            fields.baseline_commit,
+            fields.claim_id,
+        ) {
+            (1, Some(anchor_module), Some(baseline_commit), None)
+                if valid_anchor(&anchor_module) && valid_oid(&baseline_commit) =>
+            {
+                Baseline::Explicit {
+                    anchor_module,
+                    baseline_commit,
+                }
+            }
+            (2, None, None, Some(claim_id)) if valid_claim_id(&claim_id) => {
+                Baseline::Claim { claim_id }
+            }
+            _ => anyhow::bail!("invalid discovery baseline configuration"),
+        };
+        ensure!(
+            INTERVAL_MS.contains(&fields.interval_ms)
+                && TIMEOUT_MS.contains(&fields.probe_timeout_ms),
+            "invalid discovery timing configuration"
+        );
+        Ok(Self {
+            cli_executable: fields.cli_executable,
+            bare_repo: fields.bare_repo,
+            baseline,
+            interval_ms: fields.interval_ms,
+            probe_timeout_ms: fields.probe_timeout_ms,
+        })
+    }
+}
+
+// An optional wire field may be omitted, but must not be null when supplied.
+fn present_non_null<'de, D: Deserializer<'de>, T: Deserialize<'de>>(
+    input: D,
+) -> Result<Option<T>, D::Error> {
+    T::deserialize(input).map(Some)
 }
 
 const fn default_timeout_ms() -> u64 {
@@ -53,24 +122,11 @@ impl Config {
     pub fn load(path: &Path) -> Result<Self> {
         let result = (|| {
             let config: Self = read_trusted_config(path)?;
-            config.validate()?;
             config.check_paths()?;
             Ok::<_, anyhow::Error>(config)
         })();
         // Configured paths and parser diagnostics never cross the startup boundary.
         result.map_err(|_| anyhow::anyhow!("invalid --t3-discovery configuration"))
-    }
-
-    fn validate(&self) -> Result<()> {
-        ensure!(
-            self.version == 1
-                && valid_anchor(&self.anchor_module)
-                && valid_oid(&self.baseline_commit)
-                && INTERVAL_MS.contains(&self.interval_ms)
-                && TIMEOUT_MS.contains(&self.probe_timeout_ms),
-            "invalid discovery configuration"
-        );
-        Ok(())
     }
 
     fn check_paths(&self) -> Result<()> {
@@ -99,32 +155,48 @@ impl Config {
         }
     }
 
-    fn probe(&self, root: &Path) -> Result<Summary> {
-        self.check_paths()?;
-        trusted_state_path(root)?;
-        check_state_file(&trusted_metadata(&root.join(".runtime/primary_engine"))?)?;
-        let started = Instant::now();
-        let mut child = Command::new(&self.cli_executable)
-            .current_dir(root)
-            .arg("t3-discover")
-            .arg(root)
-            .arg(&self.bare_repo)
-            .arg(&self.anchor_module)
-            .arg(&self.baseline_commit)
+    fn command(&self, root: &Path) -> Command {
+        let mut command = Command::new(&self.cli_executable);
+        command.current_dir(root);
+        match &self.baseline {
+            Baseline::Explicit {
+                anchor_module,
+                baseline_commit,
+            } => command
+                .arg("t3-discover")
+                .arg(root)
+                .arg(&self.bare_repo)
+                .arg(anchor_module)
+                .arg(baseline_commit),
+            Baseline::Claim { claim_id } => command
+                .arg("t3-discover-claim")
+                .arg(root)
+                .arg(&self.bare_repo)
+                .arg(claim_id),
+        };
+        command
             .arg("--daemon-parent")
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .process_group(0)
-            .spawn()?;
+            .process_group(0);
+        command
+    }
+
+    fn probe(&self, root: &Path) -> Result<Summary> {
+        self.check_paths()?;
+        trusted_state_path(root)?;
+        check_state_file(&trusted_metadata(&root.join(".runtime/primary_engine"))?)?;
+        let started = Instant::now();
+        let mut child = self.command(root).spawn()?;
         let bytes = capture_stdout(
             &mut child,
             started,
             Duration::from_millis(self.probe_timeout_ms),
         )?;
-        Summary::parse(&bytes, &self.baseline_commit)
+        Summary::parse(&bytes, &self.baseline)
     }
 }
 
@@ -156,6 +228,12 @@ pub struct Summary {
     #[serde(deserialize_with = "nullable_digest")]
     plan_sha256: Option<String>,
     advisory_only: bool,
+    #[serde(
+        default,
+        deserialize_with = "present_non_null",
+        skip_serializing_if = "Option::is_none"
+    )]
+    baseline_scope: Option<String>,
 }
 
 fn nullable_digest<'de, D: Deserializer<'de>>(input: D) -> Result<Option<String>, D::Error> {
@@ -171,12 +249,23 @@ enum Status {
 }
 
 impl Summary {
-    fn parse(bytes: &[u8], baseline_commit: &str) -> Result<Self> {
+    fn parse(bytes: &[u8], baseline: &Baseline) -> Result<Self> {
         let summary: Self = serde_json::from_slice(bytes)?;
+        let mode_matches = match (baseline, summary.baseline_scope.as_deref()) {
+            (
+                Baseline::Explicit {
+                    baseline_commit, ..
+                },
+                None,
+            ) => summary.base_commit == *baseline_commit,
+            (Baseline::Claim { .. }, Some("claim_t1")) => true,
+            _ => false,
+        };
         ensure!(
             summary.advisory_only
-                && summary.base_commit == baseline_commit
-                && summary.observed_head.len() == baseline_commit.len()
+                && mode_matches
+                && valid_oid(&summary.base_commit)
+                && summary.observed_head.len() == summary.base_commit.len()
                 && valid_oid(&summary.observed_head)
                 && summary.ledger_event_seq >= 0
                 && summary.changed_module_count <= MAX_CHANGED_MODULES
@@ -184,7 +273,7 @@ impl Summary {
                     || summary.changed_module_count <= MAX_SNAPSHOT_MODULES),
             "invalid discovery summary"
         );
-        let different = summary.observed_head != baseline_commit;
+        let different = summary.observed_head != summary.base_commit;
         let changed = summary.changed_module_count != 0 || summary.module_order_changed;
         let consistent = match summary.status {
             Status::Unchanged => !changed && summary.plan_sha256.is_none(),
@@ -219,6 +308,13 @@ fn valid_anchor(module: &str) -> bool {
                 && stem.starts_with(|c: char| c.is_ascii_uppercase())
                 && stem.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
         })
+}
+
+fn valid_claim_id(claim_id: &str) -> bool {
+    !claim_id.is_empty()
+        && claim_id == claim_id.trim()
+        && claim_id.len() <= 256
+        && !claim_id.chars().any(char::is_control)
 }
 
 fn capture_stdout(child: &mut Child, started: Instant, timeout: Duration) -> Result<Vec<u8>> {
@@ -313,8 +409,15 @@ mod tests {
         })
     }
 
+    fn explicit(baseline_commit: &str) -> Baseline {
+        Baseline::Explicit {
+            anchor_module: "Anchor.lean".into(),
+            baseline_commit: baseline_commit.into(),
+        }
+    }
+
     fn parse(value: &Value, baseline: &str) -> Result<Summary> {
-        Summary::parse(&serde_json::to_vec(value)?, baseline)
+        Summary::parse(&serde_json::to_vec(value)?, &explicit(baseline))
     }
 
     #[test]
@@ -361,11 +464,21 @@ mod tests {
 
     #[test]
     fn rejects_invalid_and_noncanonical_summaries() {
+        let mode = Baseline::Claim {
+            claim_id: "private claim".into(),
+        };
+        let mut wrong_explicit_base = summary();
+        wrong_explicit_base["base_commit"] = json!("1".repeat(40));
+        assert!(parse(&wrong_explicit_base, BASE).is_err());
         for (key, bad) in [
             ("status", json!("unexpected")),
             ("status", json!("unchanged")),
             ("status", json!("diverged")),
             ("base_commit", json!(HEAD)),
+            ("base_commit", json!("0".repeat(40))),
+            ("base_commit", json!("A".repeat(40))),
+            ("base_commit", json!("a".repeat(64))),
+            ("base_commit", json!("a".repeat(39))),
             ("observed_head", json!(BASE)),
             ("observed_head", json!("a".repeat(64))),
             ("observed_head", json!("A".repeat(40))),
@@ -383,7 +496,12 @@ mod tests {
         ] {
             let mut value = summary();
             value[key] = bad;
-            assert!(parse(&value, BASE).is_err(), "accepted invalid {key}");
+            assert!(parse(&value, BASE).is_err(), "accepted invalid v1 {key}");
+            value["baseline_scope"] = json!("claim_t1");
+            assert!(
+                Summary::parse(&serde_json::to_vec(&value).unwrap(), &mode).is_err(),
+                "accepted invalid v2 {key}"
+            );
         }
         let mut value = summary();
         value["status"] = json!("unchanged");
@@ -392,7 +510,7 @@ mod tests {
         assert!(parse(&value, BASE).is_err());
         let mut frame = serde_json::to_vec(&summary()).unwrap();
         frame.extend_from_slice(b"\n{}\n");
-        assert!(Summary::parse(&frame, BASE).is_err());
+        assert!(Summary::parse(&frame, &explicit(BASE)).is_err());
     }
 
     #[test]
@@ -406,8 +524,20 @@ mod tests {
             "interval_ms": 100
         });
         let good: Config = serde_json::from_value(value.clone())?;
-        good.validate()?;
         assert_eq!(good.probe_timeout_ms, 10_000);
+        assert_eq!(
+            good.command(Path::new("/root"))
+                .get_args()
+                .collect::<Vec<_>>(),
+            [
+                "t3-discover",
+                "/root",
+                "/repo",
+                "Anchor.lean",
+                BASE,
+                "--daemon-parent"
+            ]
+        );
         for (key, bad) in [
             ("version", json!(2)),
             ("anchor_module", json!("../Anchor.lean")),
@@ -415,6 +545,8 @@ mod tests {
             ("anchor_module", json!("Anchor.txt")),
             ("baseline_commit", json!("HEAD")),
             ("baseline_commit", json!("0".repeat(40))),
+            ("claim_id", json!("private claim")),
+            ("claim_id", Value::Null),
             ("interval_ms", json!(99)),
             ("interval_ms", json!(3_600_001)),
             ("probe_timeout_ms", json!(99)),
@@ -424,10 +556,130 @@ mod tests {
         ] {
             let mut malformed = value.clone();
             malformed[key] = bad;
-            let accepted =
-                serde_json::from_value::<Config>(malformed).is_ok_and(|c| c.validate().is_ok());
-            assert!(!accepted, "accepted invalid {key}");
+            assert!(
+                serde_json::from_value::<Config>(malformed).is_err(),
+                "accepted invalid {key}"
+            );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn claim_config_requires_exact_version_shape_and_bounded_identifier() -> Result<()> {
+        let value = json!({
+            "version": 2,
+            "cli_executable": "/cli",
+            "bare_repo": "/repo",
+            "claim_id": "private/math Claim α",
+            "interval_ms": 3_600_000,
+            "probe_timeout_ms": 100
+        });
+        let good: Config = serde_json::from_value(value.clone())?;
+        let cmd = good.command(Path::new("/root"));
+        assert_eq!(cmd.get_program(), "/cli");
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/root")));
+        assert_eq!(
+            cmd.get_args().collect::<Vec<_>>(),
+            [
+                "t3-discover-claim",
+                "/root",
+                "/repo",
+                "private/math Claim α",
+                "--daemon-parent"
+            ]
+        );
+        for (key, bad) in [
+            ("version", json!(1)),
+            ("version", json!(3)),
+            ("version", json!("2")),
+            ("anchor_module", json!("Anchor.lean")),
+            ("anchor_module", Value::Null),
+            ("baseline_commit", json!(BASE)),
+            ("baseline_commit", Value::Null),
+            ("claim_id", Value::Null),
+            ("claim_id", json!("")),
+            ("claim_id", json!("   ")),
+            ("claim_id", json!(" private")),
+            ("claim_id", json!("private ")),
+            ("claim_id", json!("private\nclaim")),
+            ("claim_id", json!("private\u{85}claim")),
+            ("claim_id", json!("é".repeat(129))),
+            ("interval_ms", json!(3_600_001)),
+            ("probe_timeout_ms", Value::Null),
+        ] {
+            let mut malformed = value.clone();
+            malformed[key] = bad;
+            assert!(
+                serde_json::from_value::<Config>(malformed).is_err(),
+                "accepted invalid v2 {key}"
+            );
+        }
+        for key in ["version", "claim_id"] {
+            let mut malformed = value.clone();
+            malformed.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<Config>(malformed).is_err());
+        }
+        let mut at_limit = value;
+        at_limit["claim_id"] = json!("é".repeat(128));
+        serde_json::from_value::<Config>(at_limit)?;
+        Ok(())
+    }
+
+    #[test]
+    fn claim_summary_requires_exact_scope_and_publishes_only_scalars() -> Result<()> {
+        let mode = Baseline::Claim {
+            claim_id: "private/math Claim α".into(),
+        };
+        let parse_claim = |value: &Value| Summary::parse(&serde_json::to_vec(value)?, &mode);
+        let mut scoped = summary();
+        assert!(parse_claim(&scoped).is_err());
+        for scope in [
+            Value::Null,
+            json!("unknown"),
+            json!({"claim_t1": null}),
+            json!("claim_t1"),
+        ] {
+            scoped["baseline_scope"] = scope;
+            assert!(parse(&scoped, BASE).is_err());
+            if scoped["baseline_scope"] != "claim_t1" {
+                assert!(parse_claim(&scoped).is_err());
+            }
+        }
+        assert_eq!(
+            serde_json::to_value(DiscoveryState::Observation(parse_claim(&scoped)?))?,
+            scoped
+        );
+        for key in [
+            "claim_id",
+            "baseline_claim",
+            "baseline_receipt_sha256",
+            "bare_repo",
+            "cli_executable",
+        ] {
+            let mut leaked = scoped.clone();
+            leaked[key] = json!("private");
+            assert!(
+                parse_claim(&leaked).is_err(),
+                "accepted private field {key}"
+            );
+        }
+
+        scoped["base_commit"] = json!("1".repeat(64));
+        scoped["observed_head"] = json!("2".repeat(64));
+        scoped["module_order_changed"] = json!(true);
+        scoped["changed_module_count"] = json!(MAX_CHANGED_MODULES);
+        parse_claim(&scoped)?;
+        scoped["changed_module_count"] = json!(MAX_CHANGED_MODULES + 1);
+        assert!(parse_claim(&scoped).is_err());
+        scoped["module_order_changed"] = json!(false);
+        scoped["changed_module_count"] = json!(0);
+        scoped["plan_sha256"] = Value::Null;
+        for status in ["diverged", "unchanged"] {
+            scoped["status"] = json!(status);
+            parse_claim(&scoped)?;
+        }
+        scoped.as_object_mut().unwrap().remove("plan_sha256");
+        assert!(parse_claim(&scoped).is_err());
         Ok(())
     }
 

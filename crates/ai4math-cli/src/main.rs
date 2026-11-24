@@ -1034,6 +1034,10 @@ fn run() -> Result<()> {
         ["t3-discover", root, repo, anchor, baseline] => {
             t3::discover(Path::new(root), Path::new(repo), anchor, baseline)
         }
+        #[cfg(unix)]
+        ["t3-discover-claim", root, repo, claim, "--daemon-parent"] => {
+            t3::discover_claim_for_daemon(Path::new(root), Path::new(repo), claim)
+        }
         ["t3-discover-claim", root, repo, claim] => {
             t3::discover_claim(Path::new(root), Path::new(repo), claim)
         }

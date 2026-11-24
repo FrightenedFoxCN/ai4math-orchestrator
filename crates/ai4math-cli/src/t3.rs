@@ -4,9 +4,9 @@ mod discovery;
 mod parent;
 #[cfg(test)]
 pub(crate) use discovery::discover_claim_observation;
-#[cfg(unix)]
-pub(crate) use discovery::discover_for_daemon;
 pub(crate) use discovery::{discover, discover_claim};
+#[cfg(unix)]
+pub(crate) use discovery::{discover_claim_for_daemon, discover_for_daemon};
 #[cfg(test)]
 mod tests;
 use super::{

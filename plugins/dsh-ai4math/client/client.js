@@ -404,6 +404,8 @@ function DiscoveryBadge({ value, currentSeq }) {
   if (value.status === 'starting') return labelValue('T3 discovery', 'Waiting for first sample')
   if (value.status === 'unavailable') return labelValue('T3 discovery', 'Unavailable')
   const hash = value.observed_head
+  if (Object.hasOwn(value, 'baseline_scope') && value.baseline_scope !== 'claim_t1') return null
+  const claimScoped = value.baseline_scope === 'claim_t1'
   if (value.advisory_only !== true || !isCount(value.ledger_event_seq)
     || typeof hash !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hash)) return null
   let summary
@@ -418,8 +420,9 @@ function DiscoveryBadge({ value, currentSeq }) {
       break
     default: return null
   }
-  return h('span', { title: 'Observed Git commit: ' + hash + '. This sample does not approve or apply a T3 plan.' },
-    labelValue('Last T3 discovery', summary + ' · advisory only'
+  const scopeNote = claimScoped ? ' Baseline verified for one Claim, not for all of main.' : ''
+  return h('span', { title: 'Observed Git commit: ' + hash + '. This sample does not approve or apply a T3 plan.' + scopeNote },
+    labelValue('Last T3 discovery', summary + (claimScoped ? ' · Claim T1 baseline' : '') + ' · advisory only'
       + (isCount(currentSeq) && value.ledger_event_seq < currentSeq ? ' · older ledger sample' : '')))
 }
 
