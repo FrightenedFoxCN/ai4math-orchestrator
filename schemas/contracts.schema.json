@@ -11,6 +11,8 @@
         "rocq",
         "agda",
         "smt",
+        "atp",
+        "cas",
         "python"
       ]
     },
@@ -20,7 +22,9 @@
         "lean4",
         "rocq",
         "agda",
-        "smt"
+        "smt",
+        "atp",
+        "cas"
       ]
     },
     "Role": {
@@ -31,6 +35,7 @@
         "explorer",
         "infra_builder",
         "prover_worker",
+        "tool_automation",
         "independent_reviewer"
       ]
     },
@@ -39,9 +44,11 @@
       "enum": [
         "L0",
         "L1",
-        "L2",
+        "L2a",
+        "L2b",
         "L3",
-        "L4",
+        "L4a",
+        "L4b",
         "L5"
       ]
     },
@@ -143,7 +150,10 @@
             "AUDIT_SPEC",
             "AUDIT_BRIDGE",
             "GOLF_PROOF",
-            "REHYDRATE_SEDIMENT"
+            "REHYDRATE_SEDIMENT",
+            "HAMMER_RECONSTRUCT",
+            "ORACLE_PRUNE",
+            "WITNESS_VERIFY"
           ]
         },
         "frozen_targets": {
@@ -192,7 +202,8 @@
         "verified_level": {
           "type": "string",
           "enum": [
-            "L4",
+            "L4a",
+            "L4b",
             "L5"
           ]
         },

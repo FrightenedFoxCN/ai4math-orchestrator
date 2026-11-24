@@ -6,7 +6,7 @@
 
 1. **开放数学问题探索**：中间猜想高度流动（经常需要证伪、修正或重构抽象），非形式化创意与形式化验证深度交织。
 2. **大规模边探边建基建**：Mathlib 现有覆盖不足以支撑目标问题，必须在探索过程中并行派发子代理搭建长期可复用的形式化基础设施。
-3. **多引擎协同**：以 **Lean 4 + SMT（Z3 / cvc5）** 为默认主线，在显式准入与跨引擎契约约束下协同 **Rocq** 与 **Agda**。
+3. **多引擎协同**：项目初始化时显式选定单一主引擎（**Lean 4 / Agda / Rocq**，默认 Lean 4），默认禁用跨 ITP 公理桥接防语义漏洞；按需经由 `tool_automation` 子代理调度 Hammer、SMT/ATP 与 CAS（含剪枝前交叉印证防线）。
 4. **单机多核本地运行**：在严格的内存与 CPU 水位线约束下，通过中央验证调度器与写时复制（CoW）隔离工作区支撑高频回归。
 5. **无人值守 + 异步人机共驾**：系统可长时间自主推进，同时提供非阻塞决策收件箱（Decision Inbox）与 5 分钟复盘简报，支持人类随时介入讨论、纠偏与拍板。
 
@@ -18,14 +18,16 @@
 | [docs/02-roles-permissions-contracts.md](docs/02-roles-permissions-contracts.md) | 5 角色拓扑、物理工具权限矩阵与四道防火墙、结构化交接契约（Dispatch / Result / InfraRFC / Escalation） |
 | [docs/03-local-math-wiki.md](docs/03-local-math-wiki.md) | 本地数学 Wiki 索引设计：三层沉降库（CORE / SEDIMENT / GRAVEYARD）、惰性重验、三级渐进唤醒（含 Shadow Hint）、四维混合检索与双层存储 |
 | [docs/04-review-briefing-and-hitl.md](docs/04-review-briefing-and-hitl.md) | 常驻生命体征监控（Live HUD）、按需+P0推送双语复盘简报、可恢复 Definition Smell 局部熔断器与 Pivot Dry-Run 闭环 |
+| [docs/05-multi-engine-and-hammers.md](docs/05-multi-engine-and-hammers.md) | 多引擎协同、对称 Trust Ledger（`L2a/L2b`, `L4a/L4b`）、项目级可配置主引擎、按需 Hammer 工具子代理与 Oracle 剪枝前补充验证防线 |
 | [docs/adr/ADR-0001-core-workflow-decisions.md](docs/adr/ADR-0001-core-workflow-decisions.md) | 架构决策记录 #0001：首轮核心编排、权限与知识库策略拍板（D1–D6） |
 | [docs/adr/ADR-0002-review-briefing-and-telemetry.md](docs/adr/ADR-0002-review-briefing-and-telemetry.md) | 架构决策记录 #0002：生命体征解耦、Push Alert、双语呈现与可恢复熔断器决策（D7–D11） |
+| [docs/adr/ADR-0003-multi-engine-oracles-and-hammers.md](docs/adr/ADR-0003-multi-engine-oracles-and-hammers.md) | 架构决策记录 #0003：对称 Trust Ledger、主引擎可配置、默认禁用跨 ITP 桥接、动态 Hammer 与 Oracle 防线（D12–D15，修订 D4） |
 | [schemas/contracts.schema.json](schemas/contracts.schema.json) | 编排契约、信任账本与决策收件箱的 JSON Schema 定义 |
 | [schemas/briefing-telemetry.schema.json](schemas/briefing-telemetry.schema.json) | 常驻生命体征、复盘 Fact Pack、Push Alert、可恢复熔断器与 Pivot 计划的 JSON Schema |
+| [schemas/multi-engine.schema.json](schemas/multi-engine.schema.json) | 项目主引擎配置、Oracle 交叉印证记录、Hammer 探测结果与适配器能力的 JSON Schema |
 | [schemas/wiki-index.sql](schemas/wiki-index.sql) | 本地 Wiki SQLite 索引库 DDL（关系表、符号倒排、图谱边表、FTS5 与可选向量表） |
 
 ## 后续待细化模块（Roadmap）
 
-- [ ] `docs/05-verification-broker.md`：单机多核 Local Verification Broker（热池 REPL、Fast/Heavy 双车道、APFS/Btrfs CoW Worktree、内存准入控制）
-- [ ] `docs/06-claim-graph-state-machine.md`：Claim Graph 状态机与上游变更自动标脏传播（Taint Propagation）
-- [ ] `docs/07-multi-engine-adapters.md`：Lean 4 / Rocq / Agda / SMT 统一适配器接口与 `L4` Bridge Contract 审计规范
+- [ ] `docs/06-verification-broker.md`：单机多核 Local Verification Broker（热池 REPL、Fast/Heavy 双车道、APFS/Btrfs CoW Worktree、内存准入控制）
+- [ ] `docs/07-claim-graph-state-machine.md`：Claim Graph 状态机与上游变更自动标脏传播（Taint Propagation）

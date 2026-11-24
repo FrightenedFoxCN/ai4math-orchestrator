@@ -144,9 +144,11 @@
           "required": [
             "L0",
             "L1",
-            "L2",
+            "L2a",
+            "L2b",
             "L3",
-            "L4",
+            "L4a",
+            "L4b",
             "L5",
             "stale"
           ],
@@ -159,7 +161,11 @@
               "type": "integer",
               "minimum": 0
             },
-            "L2": {
+            "L2a": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "L2b": {
               "type": "integer",
               "minimum": 0
             },
@@ -167,7 +173,11 @@
               "type": "integer",
               "minimum": 0
             },
-            "L4": {
+            "L4a": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "L4b": {
               "type": "integer",
               "minimum": 0
             },
@@ -186,18 +196,27 @@
           "type": "object",
           "required": [
             "L5_net",
-            "L4_net",
-            "L2_new",
+            "L4a_net",
+            "L4b_net",
+            "L2a_new",
+            "L2b_new",
             "stale_net"
           ],
           "properties": {
             "L5_net": {
               "type": "integer"
             },
-            "L4_net": {
+            "L4a_net": {
               "type": "integer"
             },
-            "L2_new": {
+            "L4b_net": {
+              "type": "integer"
+            },
+            "L2a_new": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "L2b_new": {
               "type": "integer",
               "minimum": 0
             },
@@ -498,7 +517,8 @@
               "new_trust_level": {
                 "type": "string",
                 "enum": [
-                  "L4",
+                  "L4a",
+                  "L4b",
                   "L5"
                 ]
               },
@@ -566,7 +586,8 @@
           "type": "object",
           "required": [
             "tripped_breakers",
-            "unaudited_l4_bridges",
+            "l4a_oracle_debts",
+            "exceptional_l4b_bridges",
             "stale_claim_count",
             "regression_anomalies"
           ],
@@ -575,12 +596,6 @@
               "type": "array",
               "items": {
                 "$ref": "#/$defs/CircuitBreakerState"
-              }
-            },
-            "unaudited_l4_bridges": {
-              "type": "array",
-              "items": {
-                "type": "string"
               }
             },
             "stale_claim_count": {
@@ -613,6 +628,18 @@
                   }
                 },
                 "additionalProperties": false
+              }
+            },
+            "l4a_oracle_debts": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exceptional_l4b_bridges": {
+              "type": "array",
+              "items": {
+                "type": "string"
               }
             }
           },

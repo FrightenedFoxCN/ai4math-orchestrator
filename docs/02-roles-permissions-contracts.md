@@ -11,7 +11,8 @@
 | **Explorer / Falsifier**（探索与证伪） | 强推理 + 强代码 | Track A：非形式化推演、写 Python/Sage/SMT 脚本做数值探测与**主动证伪**、写含 `sorry` 的最小骨架、起草 `InfraRFC` | 严禁修改基建稳定区代码；产物仅限于 `scratch` 与 RFC 草案 |
 | **Infra Builder**（基建架构） | 强推理模型（重抽象设计） | Track B：消费 RFC，在隔离 worktree 编写定义、notation、typeclass 实例，并**亲自证通 2–3 条核心特征化引理 + 非空烟雾测试**，达标后进入冻结窗口 | 不做大规模常规 `sorry` 暴力填充（移交 Prover 池）；不可绕过 Reviewer 直接冻结核心定义 |
 | **Prover Worker**（证明工兵池） | 廉价高并发 / 专有 Prover | Track B：针对前缀冻结的目标命题，在 Fast Lane 热池高频试错，填写 proof body；探索派生引理默认支持 `PROVE_OR_REFUTE` 双向证伪 | 严禁修改定义、定理签名、公理或全局属性；不可操作主干合并 |
-| **Independent Reviewer**（独立审查） | 强推理模型（**强制盲审上下文**） | 对照非形式化意图审查正式声明（查空真/弱化/语义漂移）；审计 `L4` 跨引擎公理兼容性；可选执行 `L5` 后证明压缩（Golfing 模式） | 不可读取 Writer/Builder 的对话辩解历史；审查模式下只输出结构化裁决票据，不私改源码 |
+| **Tool / Automation Subagent**（工具与锤子子代理） | 轻量代码模型 / 确定性路由 | 由 Orchestrator 按需派发：执行前提选择 + Hammer 重建（`LeanHammer` / `lean-smt` / `CoqHammer` 等）、SMT/ATP/CAS Oracle 探测与剪枝前交叉印证、`L2a → L2b` witness 核验 | 仅通过受限接口提交重建补丁或结构化 Oracle 证据；不得私自修改定义或直接剪枝主干路径 |
+| **Independent Reviewer**（独立审查） | 强推理模型（**强制盲审上下文**） | 对照非形式化意图审查正式声明（查空真/弱化/语义漂移）；审计高风险 Oracle 假设或特批 `L4b` 桥接兼容性；可选执行 `L5` 后证明压缩（Golfing 模式） | 不可读取 Writer/Builder 的对话辩解历史；审查模式下只输出结构化裁决票据，不私改源码 |
 
 ---
 
@@ -66,7 +67,7 @@
 ### 3.2 回报契约：`ResultContract`（Subagent → Orchestrator）
 
 * **状态枚举（`status`）**：
-  * `PROVED`：达到目标信任等级（`L5` / `L4`），必须附带 Comparator 或 Bridge 校验回执；
+  * `PROVED`：达到目标信任等级（`L5` / `L4a` / 特批 `L4b`），必须附带对应内核回执、Oracle 交叉印证记录或 Bridge 审计票据；
   * `REFUTED`：找到反例或证出 `¬P`，必须附带可复现 witness（自动入库 `GRAVEYARD`）；
   * `PARTIAL_PROGRESS`：未终结但形成可复用的明确阶段产物；
   * `BLOCKED_MISSING_INFRA`：缺失上游形式化库支持（附所需引理清单）；
@@ -83,9 +84,9 @@
 * `consumer_usage_sketch`：探索轨给出的目标调用片段（必须能在定义完成后零警告通过类型检查）
 * `smoke_test_criteria`：Infra Builder 必须先证通 2–3 条核心特征化引理并给出至少一个非平凡实例，证明前提非空真、typeclass 推导顺畅，随后才允许进入 Freeze Window 并行铺证明。
 
-### 3.4 跨引擎桥接契约：`CrossEngineBridgeContract`（`L4` 专用）
+### 3.4 跨引擎桥接契约：`CrossEngineBridgeContract`（`L4b` 特批专用，默认禁用）
 
-凡通过 Rocq / Agda / 未重建 SMT Oracle 向主引擎引入受控 `axiom`，必须先走准入评估（默认划入 Amber Zone），并登记：
+依据 [ADR-0003](adr/ADR-0003-multi-engine-oracles-and-hammers.md)，跨 ITP 内核公理桥接默认状态为 **`FORBIDDEN`**；仅在主引擎面临极端困难并经人类显式 ADR 解锁 `EXCEPTIONAL_ADR_ONLY` 后，方可登记：
 * `source_engine`, `source_repo_commit`, `source_decl_path`
 * `target_engine`, `target_axiom_name`, `target_signature`
 * `logic_compatibility_audit`：明确核对 Classical / UIP / Funext / 宇宙多态 / 终止性假设是否存在冲突，并附 Independent Reviewer 审签结论。
@@ -98,5 +99,5 @@
 1. **两层编排上限**：支持 Chief + Regional Infra Orchestrator，硬锁最大层级 = 2；
 2. **定义与核心 API 捆绑验收**：Infra Builder 必须亲自证通核心特征化引理 + 非空实例，再冻结并移交并行 Prover 池；
 3. **默认双向证伪契约**：探索派生引理默认开启 `PROVE_OR_REFUTE`，仅人类/文献确认真值的经典基建引理设为 `PROVE_ONLY`；
-4. **单主引擎优先 + 显式跨引擎准入**：默认全走 Lean 4 + SMT，切换 Rocq / Agda 需满足现成库复用或人类 ADR 指定，禁止模型“逃避式换引擎”；
+4. **项目级可配置主引擎 + 跨 ITP 桥接默认禁用**（已由 [ADR-0003](adr/ADR-0003-multi-engine-oracles-and-hammers.md) 修订）：初始化时选定主引擎（Lean 4 / Agda / Rocq），默认禁止 `L4b` 公理桥接；Hammer 与 Oracle 统一由 Orchestrator 按需路由给 `tool_automation` 子代理，且剪枝前须经补充交叉验证；
 5. **无损引理回收 + 分层沉降**：开启失败任务的独立引理回收，但默认沉降入 `SEDIMENT`，永不删除且零默认上下文污染。

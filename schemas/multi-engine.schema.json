@@ -1,0 +1,304 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://local.ai4math-orchestrator/schemas/multi-engine.schema.json",
+  "title": "AI4Math Multi-Engine Config, Tool Automation, Oracle Corroboration & Adapter Schemas",
+  "$defs": {
+    "PrimaryITP": {
+      "type": "string",
+      "enum": [
+        "lean4",
+        "agda",
+        "rocq"
+      ]
+    },
+    "OracleTool": {
+      "type": "string",
+      "enum": [
+        "z3",
+        "cvc5",
+        "vampire",
+        "eprover",
+        "zipperposition",
+        "mace4",
+        "mathematica",
+        "sympy",
+        "sage",
+        "singular",
+        "gap",
+        "mpmath"
+      ]
+    },
+    "OracleRiskTier": {
+      "type": "string",
+      "enum": [
+        "HIGH",
+        "MEDIUM",
+        "LOW"
+      ]
+    },
+    "EngineProjectConfig": {
+      "type": "object",
+      "required": [
+        "primary_engine",
+        "cross_itp_bridge_mode",
+        "allow_secondary_itp_prototyping",
+        "enabled_oracles",
+        "init_adr_id"
+      ],
+      "properties": {
+        "primary_engine": {
+          "$ref": "#/$defs/PrimaryITP"
+        },
+        "cross_itp_bridge_mode": {
+          "type": "string",
+          "enum": [
+            "FORBIDDEN",
+            "EXCEPTIONAL_ADR_ONLY"
+          ],
+          "default": "FORBIDDEN"
+        },
+        "allow_secondary_itp_prototyping": {
+          "type": "boolean",
+          "default": true
+        },
+        "enabled_secondary_itps": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/PrimaryITP"
+          }
+        },
+        "enabled_oracles": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/OracleTool"
+          }
+        },
+        "init_adr_id": {
+          "type": "string"
+        },
+        "bridge_unlock_adr_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "CorroborationCheck": {
+      "type": "object",
+      "required": [
+        "method",
+        "tool",
+        "passed",
+        "summary"
+      ],
+      "properties": {
+        "method": {
+          "type": "string",
+          "enum": [
+            "domain_edge_case_audit",
+            "high_precision_numeric_sampling",
+            "interval_arithmetic_check",
+            "second_solver_cross_check",
+            "exact_witness_substitution",
+            "kernel_witness_check"
+          ]
+        },
+        "tool": {
+          "type": "string"
+        },
+        "passed": {
+          "type": "boolean"
+        },
+        "edge_cases_tested": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "summary": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "OracleCheckRecord": {
+      "type": "object",
+      "required": [
+        "oracle_id",
+        "claim_id",
+        "tool",
+        "risk_tier",
+        "verdict",
+        "script_ref",
+        "implicit_assumptions",
+        "corroborations",
+        "pruning_allowed"
+      ],
+      "properties": {
+        "oracle_id": {
+          "type": "string"
+        },
+        "claim_id": {
+          "type": "string"
+        },
+        "tool": {
+          "$ref": "#/$defs/OracleTool"
+        },
+        "tool_version": {
+          "type": "string"
+        },
+        "risk_tier": {
+          "$ref": "#/$defs/OracleRiskTier"
+        },
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "SUPPORT_TRUE_L4a",
+            "COUNTEREXAMPLE_L2a",
+            "INCONCLUSIVE",
+            "TIMEOUT"
+          ]
+        },
+        "script_ref": {
+          "type": "string"
+        },
+        "implicit_assumptions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Explicitly audited side conditions: branch cuts, positivity, convergence, non-zero denominators, encoding bounds."
+        },
+        "corroborations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/CorroborationCheck"
+          }
+        },
+        "pruning_allowed": {
+          "type": "boolean",
+          "description": "True only when risk-tier corroboration gate passed; L2a permits soft pruning only."
+        },
+        "witness_summary": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "oracle_debt": {
+          "type": "boolean",
+          "default": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "HammerProbeResult": {
+      "type": "object",
+      "required": [
+        "probe_id",
+        "engine",
+        "hammer_backend",
+        "outcome",
+        "wall_seconds"
+      ],
+      "properties": {
+        "probe_id": {
+          "type": "string"
+        },
+        "engine": {
+          "$ref": "#/$defs/PrimaryITP"
+        },
+        "hammer_backend": {
+          "type": "string",
+          "enum": [
+            "lean_grind",
+            "lean_hammer",
+            "lean_smt",
+            "lean_bv_decide",
+            "lean_polyrith",
+            "rocq_coqhammer",
+            "rocq_smtcoq",
+            "rocq_sniper",
+            "agda_auto",
+            "agda_reflection_solver"
+          ]
+        },
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "RECONSTRUCTED_L5",
+            "ORACLE_ONLY_L4a",
+            "COUNTEREXAMPLE_L2a",
+            "FAILED",
+            "TIMEOUT"
+          ]
+        },
+        "reconstructed_patch_ref": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "used_premises": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Premises or unsat core extracted when external ATP/SMT succeeds even if reconstruction fails."
+        },
+        "counterexample_witness": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "wall_seconds": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "AdapterCapabilities": {
+      "type": "object",
+      "required": [
+        "engine",
+        "backend_protocol",
+        "supports_tactic_multi_attempt",
+        "supports_hole_case_split",
+        "supports_file_fingerprint",
+        "trust_audit_mechanism",
+        "available_hammers"
+      ],
+      "properties": {
+        "engine": {
+          "$ref": "#/$defs/PrimaryITP"
+        },
+        "backend_protocol": {
+          "type": "string"
+        },
+        "supports_tactic_multi_attempt": {
+          "type": "boolean"
+        },
+        "supports_hole_case_split": {
+          "type": "boolean"
+        },
+        "supports_file_fingerprint": {
+          "type": "boolean"
+        },
+        "trust_audit_mechanism": {
+          "type": "string"
+        },
+        "available_hammers": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

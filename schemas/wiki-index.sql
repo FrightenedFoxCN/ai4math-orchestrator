@@ -9,8 +9,8 @@ PRAGMA journal_mode = WAL;
 CREATE TABLE IF NOT EXISTS entries (
   id TEXT PRIMARY KEY,
   stratum TEXT NOT NULL CHECK (stratum IN ('core', 'sediment', 'graveyard')),
-  trust_level TEXT NOT NULL CHECK (trust_level IN ('L0', 'L1', 'L2', 'L3', 'L4', 'L5')),
-  engine TEXT NOT NULL CHECK (engine IN ('lean4', 'rocq', 'agda', 'smt', 'informal')),
+  trust_level TEXT NOT NULL CHECK (trust_level IN ('L0', 'L1', 'L2a', 'L2b', 'L3', 'L4a', 'L4b', 'L5')),
+  engine TEXT NOT NULL CHECK (engine IN ('lean4', 'rocq', 'agda', 'smt', 'atp', 'cas', 'informal')),
   status TEXT NOT NULL CHECK (status IN ('active', 'unreferenced', 'superseded', 'refuted')),
   pinned INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0, 1)),
   title TEXT NOT NULL,

@@ -69,18 +69,20 @@
 
 ---
 
-## 4. 统一信任账本（Trust Ledger: L0–L5）
+## 4. 统一信任账本（Trust Ledger: 对称 L0–L5）
 
-系统对所有数学命题维护显式信任等级，支持跨引擎（Lean 4 / Rocq / Agda / SMT）统一记账与上游变更自动标脏（Taint Propagation）：
+系统对所有数学命题维护显式信任等级，并严格区分**外部 Oracle 结论（`L2a` / `L4a`）**与**证明助手内核结论（`L2b` / `L4b` / `L5`）**（详见 [05-multi-engine-and-hammers.md](05-multi-engine-and-hammers.md)）：
 
 | 等级 | 名称 | 定义与准入条件 |
 | :--- | :--- | :--- |
 | **L0** | `Conjecture` | 尚未验证的初始猜想 |
-| **L1** | `Probed` | 经过数值/SMT 有限样本测试未见反例（附脚本与范围） |
-| **L2** | `Refuted` | **已证伪**（附具体反例 witness 或 `¬P` 检验回执，永久入库 `GRAVEYARD`） |
-| **L3** | `Formal-Sketch` | 形式化声明编译通过但含 `sorry`；已通过独立 Reviewer 语义对齐与非空探针 |
-| **L4** | `Cross-Verified` | 由 SMT Oracle 或辅助引擎（Rocq / Agda）证完，在主引擎暂挂受控 `axiom`，并登记 **Bridge Contract**（含外部源码 commit、公理映射与逻辑前提差异审查） |
-| **L5** | `Kernel-Verified` | 主引擎端到端完全证明：0 `sorry` + 白名单 `#print axioms` + 前缀冻结 Comparator 通过 |
+| **L1** | `Probed` | 经过数值/有限模型测试未见反例（附脚本与范围） |
+| **L2a** | `Oracle-Refuted` | SMT / ATP / CAS 找到疑似反例或否定结论，尚未经主引擎内核核验；经补充交叉印证后仅可**软剪枝** |
+| **L2b** | `Kernel-Refuted` | 主引擎内核证出 `¬P` 或完成反例 witness 核验；**硬证伪**，永久入库 `GRAVEYARD` |
+| **L3** | `Formal-Sketch` | 主引擎形式化声明编译通过但含 `sorry` / `postulate`；已通过独立盲审语义对齐与非空探针 |
+| **L4a** | `Oracle-Backed` | 外部 SMT / ATP / CAS 判真但未完成内核证明重建；显式挂 `oracle_debt`，用于探索剪枝或临时占位，交付前须消债 |
+| **L4b** | `Cross-ITP-Verified` | 辅助 ITP 内核证完并桥接至主引擎；**默认禁用（`FORBIDDEN`）**，仅在主引擎极端困难且经人类 ADR 显式解锁时允许 |
+| **L5** | `Kernel-Verified` | 主引擎内核端到端完全证明（0 `sorry`/`postulate` + 白名单公理，含完成内核重建的 Hammer/SMT 证明） |
 
 ---
 
@@ -107,7 +109,7 @@
    * 需破坏性修改稳定基建定义；
    * 出现多条高成本且互斥的数学进攻路线待剪枝；
    * 关键引理超预算且既证不出也证不伪；
-   * 需引入跨引擎（Rocq / Agda）新分支或登记 `L4` Bridge 公理。
+   * 需解锁跨 ITP `L4b` 桥接公理（默认禁用）或批准在最终交付中保留 `L4a` Oracle 假设。
 3. **常驻生命体征面 + 按需/P0推送双语复盘简报**（详见 [04-review-briefing-and-hitl.md](04-review-briefing-and-hitl.md)）：
    * **常驻生命体征条**长期静默刷新（0 LLM 消耗），随时监控单机资源、双轨状态、Trust Ledger 存量与告警计数；
    * **双语复盘简报**仅在触发 P0 Push Alert 或人类主动拉取时生成留存，基于确定性 Fact Pack 呈现数学前沿增量、活跃瓶颈地图、早期风险雷达（含可恢复 Definition Smell 局部熔断）、Top-3 决策收件箱与 Wiki 考古线索。
@@ -119,4 +121,4 @@
 
 * **Phase 1（最小闭环底座）**：Lean 4 + SMT（Z3/cvc5）主线；落地 Local Verification Broker、Comparator 门禁、基础 Claim Graph（L0–L5）及 5 角色核心权限隔离。
 * **Phase 2（双轨协作 + 分层 Wiki + 异步共驾）**：落地 Exploration/Infra 双轨（RFC + Smoke Test + Freeze Window）、三层本地 Wiki 索引（CORE/SEDIMENT/GRAVEYARD）、Decision Inbox 与 5 分钟复盘简报。
-* **Phase 3（多引擎扩展）**：通过统一 Proof-Assistant Adapter 接入 Rocq（`rocq-lsp`/Pytanque）与 Agda（`agda-mcp`），启用 `L4` Bridge Contract 审计与跨引擎 T2 回归。
+* **Phase 3（多引擎扩展）**：通过统一 Proof-Assistant Adapter 支持项目级可配置主引擎（Lean 4 / Agda / Rocq）、`tool_automation` Hammer 子代理及剪枝前 Oracle 交叉印证门禁。

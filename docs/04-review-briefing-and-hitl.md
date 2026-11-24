@@ -43,7 +43,7 @@
 | :--- | :--- | :--- |
 | **系统与资源** | `broker_fast_pool`（可用/忙碌）、`broker_heavy_queue`（运行中/排队）、单机 RAM 水位（%）、活跃子代理数 | 一眼判断单机是否接近内存墙或出现编译堵塞 |
 | **双轨脉搏** | 探索轨状态（active / suspended / idle）、基建轨状态（活跃 RFC 列表与完成比） | 判断算力是否在有效产出 |
-| **Trust Ledger 实时盘口** | `L5` / `L4` / `L3` / `L2` / `stale` 实时计数，以及距上次检查点的净增量徽章（如 `+6 L5`） | 无需打开简报即可感知整体进度 |
+| **Trust Ledger 实时盘口** | `L5` / `L4b` / `L4a(债)` / `L3` / `L2b` / `L2a` / `stale` 实时计数，以及距上次检查点的净增量徽章（如 `+6 L5`） | 无需打开简报即可感知整体进度与信任债 |
 | **告警与待办指示灯** | 当前处于 `TRIPPED` 状态的熔断器数、待处理 `DecisionInbox` 条数（按 P0/P1 分色）、最近一次 P0 Push Alert 摘要 | 决定此刻是否值得拉取完整简报介入 |
 
 ---
@@ -56,7 +56,7 @@
 
 ### 3.2 主动推送（P0 Push Alert）
 无人值守期间，规则引擎仅在命中以下 **P0 级高价值中断条件** 时发送轻量推送（本地桌面通知 / Webhook / 终端响铃），并自动预生成对应简报留存待查：
-1. **顶层或关键路径核心猜想被证伪（`L2` Refutation on Critical Path）**：原主路线逻辑崩塌，急需人类决策转向；
+1. **顶层或关键路径核心猜想被内核硬证伪（`L2b` Kernel-Refuted on Critical Path）**：原主路线逻辑崩塌，急需人类决策转向（`L2a` 须先经 `WITNESS_VERIFY` 核验升格为 `L2b` 后才推 P0，防 Oracle 误报）；
 2. **全轨道停摆（Global Starvation / All Tracks Blocked）**：所有活跃探索与基建轨道全部挂起或等待审批，机器已无有意义任务可跑；
 3. **关键路径触发 Definition Smell 熔断且无替代轨道**：主基建定义被局部熔断，亟需人类判断恢复或重构；
 4. **验证底座严重异常（Broker / Regression Meltdown）**：例如连续多次 T1 Promotion 失败回滚、或内存保护连续驱逐主引擎热池。
@@ -76,7 +76,7 @@
 
 示例双语卡片格式：
 ```markdown
-#### [CLM-108] 谱隙正性引理（Status: L2 Refuted · Lean 4）
+#### [CLM-108] 谱隙正性引理（Status: L2b Kernel-Refuted · Lean 4）
 | 非形式化数学表述 | 精确形式化签名（Frozen Prefix） |
 | :--- | :--- |
 | 对任意有限简单图 $G$，其归一化拉普拉斯算子的第二特征值 $\lambda_2(G) > 0$。 | `lemma spectral_gap_pos {V : Type*} [Fintype V] [DecidableEq V] (G : SimpleGraph V) : 0 < normalizedLaplacianEigenvalue₂ G` |
@@ -84,11 +84,11 @@
 ```
 
 ### 5 个固定版块
-1. **数学前沿增量（Breakthroughs & High-Impact Refutations）**：仅列出改变关键路径的 `L5`/`L4` 里程碑、推翻原路线的 `L2` 反例及整包交付的 `InfraRFC`；常规辅助引理仅报聚合计数。
+1. **数学前沿增量（Breakthroughs & High-Impact Refutations）**：仅列出改变关键路径的 `L5`（及带债标注的 `L4a`/`L4b`）里程碑、推翻原路线的 `L2b` 硬证伪反例及整包交付的 `InfraRFC`；常规辅助引理仅报聚合计数。
 2. **活跃证明前沿与瓶颈地图（Active Frontier Slice）**：仅裁剪 Claim Graph 中距离主目标最近的未证边界子图（ASCII/Mermaid），每个瓶颈带类型标签（`[MATH_IDEA]` / `[MISSING_INFRA]` / `[DEF_FRICTION]` / `[ENGINE_WALL]`）及双语签名。
 3. **早期风险雷达（Early Warning Radar）**：
    * **Definition Smell 熔断报告**（见第 5 节）；
-   * **信任债清单**：新增/未审 `L4` 跨引擎公理与 `stale` 子树规模；
+   * **信任债清单**：存量/新增 `L4a` Oracle 债务（附风险等级与交叉印证状态）、特批 `L4b` 跨 ITP 桥接（若有）及 `stale` 子树规模；
    * **回归与算力异常**：`maxHeartbeats` 飙升文件、零产出高消耗探索分支。
 4. **高杠杆决策收件箱（Decision Inbox Top-3）**：按杠杆分（解阻塞下游节点数 × 算力释放量）排序，每条卡片包含：双语问题与证据、2–3 个备选方案（含代价与推荐项）、以及“暂缓拍板的非阻塞影响”。
 5. **Wiki 与考古摘录（Wiki & Archaeology Digest）**：本周期沉降入 `SEDIMENT` 的独立引理数（最多 2 条高亮）、新增 `GRAVEYARD` 计数、以及卡壳时由 **Shadow Hit** 浮现的历史伏笔线索。
