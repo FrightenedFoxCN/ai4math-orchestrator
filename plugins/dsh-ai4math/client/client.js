@@ -415,11 +415,17 @@ const rows = (value, max = 80) => Array.isArray(value)
   ? value.slice(0, max).filter(item => item && typeof item === 'object' && !Array.isArray(item)) : []
 const pct = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100
   ? Math.round(value) + '%' : NA
+const trustTone = level => level === 'L5' ? 'good' : level === 'L2b' ? 'danger' : (level === 'L4a' || level === 'L4b') ? 'brand' : undefined
 const badge = (label, tone) => h('span', { className: 'ai4m-badge', 'data-tone': tone }, label)
-const labelValue = (label, value) => h('span', null, h('span', { className: 'ai4m-muted' }, label + ' '), value)
-const button = (label, onClick, disabled) => h('button', { className: 'ai4m-button', type: 'button', onClick, disabled }, label)
+const labelValue = (label, value) => h('span', { className: 'ai4m-kv' },
+  h('span', { className: 'ai4m-muted' }, label + ' '),
+  value === NA ? h('span', { className: 'ai4m-muted' }, value) : value)
+const button = (label, onClick, disabled, variant) => h('button', {
+  className: 'ai4m-button', type: 'button', onClick, disabled, ...(variant ? { 'data-variant': variant } : {}),
+}, label)
 const note = (value, role) => h('p', { className: 'ai4m-muted', role }, value)
-const empty = (value) => note(value ?? 'No records returned.')
+const banner = (value, tone, role) => h('p', { className: 'ai4m-banner', ...(tone ? { 'data-tone': tone } : {}), role }, value)
+const empty = (value) => h('p', { className: 'ai4m-empty' }, value ?? 'No records returned.')
 const panels = Object.freeze([
   { key: 'briefing', label: 'Briefing', description: 'Preview or retain a deterministic fact pack.' },
   { key: 'frontier', label: 'Frontier', description: 'Inspect active claims, dependency plans, and breaker signals.' },
@@ -428,13 +434,17 @@ const panels = Object.freeze([
 ])
 
 function trustTape(trust) {
-  return h('span', { className: 'ai4m-tape', 'aria-label': 'Trust ledger' }, TRUST.map(level =>
-    h('span', { key: level }, labelValue(level, count(trust?.[level])))))
+  return h('span', { className: 'ai4m-tape', 'aria-label': 'Trust ledger' }, TRUST.map(level => {
+    const value = trust?.[level]
+    const nonzero = isCount(value) && value > 0
+    return h('span', { key: level, className: 'ai4m-tier', 'data-level': level, 'data-nonzero': nonzero ? 'true' : 'false' },
+      labelValue(level, count(value)))
+  }))
 }
 
 function AlertCatchUp({ live, state }) {
   if (!state.alertHistoryIncomplete) return null
-  return h('div', { className: 'ai4m-actions' },
+  return h('div', { className: 'ai4m-hud-catchup' },
     note(state.alertHistoryLoading ? 'Loading next P0 alert batch…' : state.phase === 'live'
       ? 'P0 alert catch-up incomplete.' : 'P0 alert catch-up incomplete. Waiting for the daemon to reconnect.', 'status'),
     button('Continue P0 alert catch-up', live.continueAlertCatchUp, state.phase !== 'live' || state.alertHistoryLoading))
@@ -445,9 +455,9 @@ function BreakerTotals({ snapshot }) {
   const halfOpen = snapshot?.half_open_breakers
   const archived = snapshot?.archived_breakers
   return h('span', { className: 'ai4m-meta', role: 'status' },
-    badge('Tripped ' + count(tripped), isCount(tripped) && tripped > 0 ? 'danger' : undefined),
+    badge('Tripped ' + count(tripped), isCount(tripped) && tripped > 0 ? 'danger' : 'muted'),
     isCount(halfOpen) && badge('HALF_OPEN ' + halfOpen + (halfOpen > 0 ? ' · Affected ordinary queues remain frozen' : ''),
-      halfOpen > 0 ? 'warn' : undefined),
+      halfOpen > 0 ? 'warn' : 'muted'),
     isCount(archived) && archived > 0 && badge('ARCHIVED ' + archived + ' · Affected ordinary queues remain gated', 'warn'))
 }
 
@@ -465,13 +475,15 @@ function InfraRfcTotals({ snapshot }) {
   if (!isCount(seq) || !isCount(drafts) || !isCount(approved) || drafts > seq || approved > seq - drafts) return null
   const hasLifecycle = smoke !== undefined || frozen !== undefined || completed !== undefined
   if (!hasLifecycle) {
-    return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run')
+    return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run',
+      drafts + approved === 0 ? 'muted' : undefined)
   }
   if (!isCount(smoke) || !isCount(frozen) || !isCount(completed)) return null
   const total = drafts + approved + smoke + frozen + completed
   if (!Number.isSafeInteger(total) || total > seq) return null
   return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved
-    + ' · SMOKE ' + smoke + ' · FROZEN ' + frozen + ' · COMPLETED ' + completed)
+    + ' · SMOKE ' + smoke + ' · FROZEN ' + frozen + ' · COMPLETED ' + completed,
+    total === 0 ? 'muted' : undefined)
 }
 
 function DiscoveryBadge({ value, currentSeq }) {
@@ -587,9 +599,11 @@ function LiveHud({ live, open }) {
   const alert = recentAlerts[0]
   const alertText = text(alert?.headline, '')
   const memory = snapshot?.memory
+  const pressure = typeof memory?.pressure === 'string' ? memory.pressure : undefined
   const broker = snapshot?.broker
   const advisoryBadge = snapshotFresh ? leanAdvisoryBadge(broker) : null
   const workers = snapshot?.workers
+  const staleClaims = snapshot?.stale_claims
   const oracleHeld = snapshot?.task_scheduler?.exploration?.held_for_oracle
   const brokerText = !broker ? NA
     : 'fast ' + count(broker.fast_busy) + '/' + count(broker.fast_capacity) + ' busy · heavy '
@@ -598,37 +612,51 @@ function LiveHud({ live, open }) {
     : phase === 'reconnecting' ? (snapshot ? 'Reconnecting · stale' : 'Reconnecting') : 'Connecting'
   return h('section', { className: 'ai4m ai4m-hud', 'aria-label': 'AI4Math Live HUD' },
     h('div', { className: 'ai4m-hud-line' },
-      h('strong', null, 'AI4Math'),
-      h('span', { role: 'status' }, badge(phaseLabel, snapshotFresh ? 'good' : 'warn')),
-      labelValue('RAM', pct(memory?.used_percent) + (typeof memory?.pressure === 'string' ? ' · ' + memory.pressure : '')),
-      h('span', { title: 'Daemon-managed work only; independent CLI processes are not counted.' },
-        labelValue('Daemon broker', brokerText), advisoryBadge && ' ', advisoryBadge),
-      labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active)),
-      trustTape(snapshot?.trust),
-      labelValue('Stale', count(snapshot?.stale_claims)),
-      snapshotFresh && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
-      snapshotFresh && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
-      h(BreakerTotals, { snapshot }),
-      snapshotFresh && h(InfraRfcTotals, { snapshot }),
-      snapshotFresh && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
-        title: 'Temporary exploration scheduling hold; not a Claim refutation.',
-      }, labelValue('Oracle-held exploration', count(oracleHeld))),
-      ...PRIORITIES.map(priority => h('span', { key: priority }, badge(priority + ' ' + count(snapshot?.pending_inbox?.[priority]),
-        snapshot?.pending_inbox?.[priority] > 0 ? priority === 'P0' ? 'danger' : priority === 'P1' ? 'warn' : undefined : undefined))),
-      h('span', { title: text(snapshot?.observed_at, '') }, labelValue('Seq', count(snapshot?.event_seq))),
-      h('nav', { className: 'ai4m-actions', 'aria-label': 'AI4Math panels' }, panels.map(panel =>
-        h('button', { key: panel.key, type: 'button', className: 'ai4m-button', onClick: event => {
+      h('div', { className: 'ai4m-hud-brand' },
+        h('strong', null, 'AI4Math'),
+        h('span', { className: 'ai4m-hud-status', role: 'status' }, badge(phaseLabel, snapshotFresh ? 'good' : 'warn'))),
+      h('div', { className: 'ai4m-hud-telemetry' },
+        h('div', { className: 'ai4m-hud-group' },
+          h('span', { className: 'ai4m-hud-metric', 'data-pressure': pressure },
+            labelValue('RAM', pct(memory?.used_percent) + (pressure ? ' · ' + pressure : ''))),
+          h('span', { title: 'Daemon-managed work only; independent CLI processes are not counted.' },
+            labelValue('Daemon broker', brokerText), advisoryBadge && ' ', advisoryBadge),
+          labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active))),
+        h('div', { className: 'ai4m-hud-group' },
+          trustTape(snapshot?.trust)),
+        h('div', { className: 'ai4m-hud-group' },
+          h('span', { className: 'ai4m-hud-metric', 'data-nonzero': isCount(staleClaims) && staleClaims > 0 ? 'true' : 'false' },
+            labelValue('Stale', count(staleClaims))),
+          snapshotFresh && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
+          snapshotFresh && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
+          h(BreakerTotals, { snapshot }),
+          snapshotFresh && h(InfraRfcTotals, { snapshot }),
+          snapshotFresh && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
+            className: 'ai4m-hud-metric', 'data-nonzero': 'true',
+            title: 'Temporary exploration scheduling hold; not a Claim refutation.',
+          }, labelValue('Oracle-held exploration', count(oracleHeld))))),
+      h('div', { className: 'ai4m-hud-pinned' },
+        ...PRIORITIES.map(priority => {
+          const value = snapshot?.pending_inbox?.[priority]
+          const active = isCount(value) && value > 0
+          return h('span', { key: priority, className: 'ai4m-hud-priority', 'data-zero': active ? 'false' : 'true' },
+            badge(priority + ' ' + count(value),
+              active ? (priority === 'P0' ? 'danger' : priority === 'P1' ? 'warn' : 'brand') : 'muted'))
+        }),
+        h('span', { className: 'ai4m-hud-seq', title: text(snapshot?.observed_at, '') }, labelValue('Seq', count(snapshot?.event_seq)))),
+      h('nav', { className: 'ai4m-hud-nav', 'aria-label': 'AI4Math panels' }, panels.map(panel =>
+        h('button', { key: panel.key, type: 'button', className: 'ai4m-button', title: panel.description, onClick: event => {
           setNavigationError(!open(panel.key, event.currentTarget))
         } }, panel.label)))),
-    navigationError && note('Open a DSH session before opening an AI4Math tab.', 'status'),
+    navigationError && banner('Open a DSH session before opening an AI4Math tab.', 'warn', 'status'),
     h(AlertCatchUp, { live, state }),
     h('div', { role: 'status', 'aria-atomic': true }, (latestBreaker?.probe || latestBreaker?.state === 'ARCHIVED') &&
-      h('div', { className: 'ai4m-hud-alert' },
+      h('div', { className: 'ai4m-hud-alert ai4m-hud-alert--breaker' },
         'Latest breaker event · ', h('code', null, text(breaker.entity_id)), ' · #' + count(breaker.event_seq) + ' ',
         h(BreakerReading, { reading: latestBreaker }))),
     alertText && h('div', { className: 'ai4m-hud-alert' },
       badge('Last P0', 'danger'), ' ', alertText,
-      alert.briefing_id && ' · ' + text(alert.briefing_id)))
+      alert.briefing_id && h('span', null, ' · ', h('code', null, text(alert.briefing_id)))))
 }
 
 // Each mounted tab owns its request. Manual actions do not retry writes, and
@@ -653,9 +681,9 @@ function useQuery(remote) {
 }
 
 function queryNote(query, fallback) {
-  if (query.phase === 'loading') return note('Loading AI4Math data…', 'status')
-  if (query.phase === 'error') return note('AI4Math data unavailable. Check the host daemon connection or retry.', 'alert')
-  if (query.phase === 'idle') return note(fallback)
+  if (query.phase === 'loading') return banner('Loading AI4Math data…', 'loading', 'status')
+  if (query.phase === 'error') return banner('AI4Math data unavailable. Check the host daemon connection or retry.', 'danger', 'alert')
+  if (query.phase === 'idle') return fallback ? empty(fallback) : null
   return null
 }
 
@@ -668,30 +696,44 @@ function Panel({ title, subtitle, actions, children }) {
 }
 
 function MathCard({ informal, formal, target }) {
+  const informalText = text(informal, 'Not supplied')
+  const formalText = text(formal, 'Not supplied')
   return h('div', { className: 'ai4m-math' },
-    h('div', null, h('strong', null, 'Informal statement'), h('p', null, text(informal, 'Not supplied'))),
-    h('div', null, h('strong', null, 'Formal signature'), h('pre', null, text(formal, 'Not supplied')),
-      text(target, '') && h('p', null, labelValue('Formal target', h('code', null, target)))))
+    h('div', { className: 'ai4m-math-informal' },
+      h('strong', null, 'Informal statement'),
+      h('p', { className: informalText === 'Not supplied' ? 'ai4m-placeholder' : undefined }, informalText)),
+    h('div', { className: 'ai4m-math-formal' },
+      h('strong', null, 'Formal signature'),
+      h('pre', { className: formalText === 'Not supplied' ? 'ai4m-placeholder' : undefined }, formalText),
+      text(target, '') && h('p', { className: 'ai4m-math-target' }, labelValue('Formal target', h('code', null, target)))))
 }
 
 function ClaimCard({ claim }) {
-  return h('article', { className: 'ai4m-card' },
+  const accent = claim.stale === true || claim.oracle_debt === true ? 'warn'
+    : claim.effective_trust === 'L2b' ? 'danger'
+    : claim.effective_trust === 'L5' ? 'good' : undefined
+  return h('article', { className: 'ai4m-card', 'data-accent': accent },
     h('h4', null, text(claim.title, text(claim.claim_id, 'Unnamed claim'))),
     h('div', { className: 'ai4m-meta' },
-      h('code', null, text(claim.claim_id)), badge(text(claim.engine)),
-      badge('Effective ' + text(claim.effective_trust)), badge('Local ' + text(claim.local_trust)),
-      claim.critical === true && badge('Critical'), claim.stale === true && badge('Stale', 'warn'),
+      h('code', null, text(claim.claim_id)), badge(text(claim.engine), 'muted'),
+      badge('Effective ' + text(claim.effective_trust), trustTone(claim.effective_trust)),
+      badge('Local ' + text(claim.local_trust), trustTone(claim.local_trust)),
+      claim.critical === true && badge('Critical', 'brand'),
+      claim.stale === true && badge('Stale', 'warn'),
       claim.oracle_debt === true && badge('Oracle debt', 'warn')),
     h(MathCard, { informal: claim.informal_statement, formal: claim.formal_signature, target: claim.formal_target }),
-    typeof claim.wiki_id === 'string' && labelValue('Wiki reference', h('code', null, claim.wiki_id)))
+    typeof claim.wiki_id === 'string' && h('div', { className: 'ai4m-card-foot' }, labelValue('Wiki reference', h('code', null, claim.wiki_id))))
 }
 
 function InboxCard({ item }) {
-  return h('article', { className: 'ai4m-card' },
+  const accent = item.priority === 'P0' ? 'danger' : item.priority === 'P1' ? 'warn' : undefined
+  return h('article', { className: 'ai4m-card', 'data-accent': accent },
     h('h4', null, text(item.summary, 'No summary supplied')),
-    h('div', { className: 'ai4m-meta' }, badge(text(item.priority), item.priority === 'P0' ? 'danger' : item.priority === 'P1' ? 'warn' : undefined),
-      badge(text(item.category)), h('code', null, text(item.inbox_id)), labelValue('Leverage', numeric(item.leverage_score)),
-      text(item.created_at)),
+    h('div', { className: 'ai4m-meta' },
+      badge(text(item.priority), item.priority === 'P0' ? 'danger' : item.priority === 'P1' ? 'warn' : 'muted'),
+      badge(text(item.category)), h('code', null, text(item.inbox_id)),
+      labelValue('Leverage', numeric(item.leverage_score)),
+      h('span', { className: 'ai4m-muted' }, text(item.created_at))),
     item.payload != null && h(Evidence, { title: 'Recorded evidence / options', value: item.payload }),
     item.payload_truncated === true && note('Evidence was truncated by the daemon.'))
 }
@@ -705,8 +747,8 @@ function EvidenceText({ value }) {
   return h('pre', { className: 'ai4m-evidence' }, JSON.stringify(value, null, 2)?.slice(0, 8000))
 }
 
-function Section({ title, children }) {
-  return h('section', { className: 'ai4m-section' }, h('h3', null, title), children)
+function Section({ title, className, children }) {
+  return h('section', { className: className ? 'ai4m-section ' + className : 'ai4m-section' }, h('h3', null, title), children)
 }
 
 function Cards({ page, itemKey, card, emptyText }) {
@@ -771,23 +813,27 @@ function readBreakerEvent(event) {
 function BreakerReading({ reading }) {
   const { state, probe, tone, halfOpen, progress } = reading
   return h('span', { className: 'ai4m-meta' },
-    badge(state, state === 'TRIPPED' ? 'danger' : halfOpen ? 'warn' : undefined),
+    badge(state, state === 'TRIPPED' ? 'danger' : (halfOpen || state === 'ARCHIVED') ? 'warn' : state === 'CLOSED' ? 'good' : undefined),
     probe && badge(probe, tone),
     progress && h('span', null, progress),
-    halfOpen && h('span', null, 'Ordinary queue remains frozen'),
-    state === 'ARCHIVED' && h('span', null, 'Ordinary queue remains gated'))
+    halfOpen && h('span', { className: 'ai4m-muted' }, 'Ordinary queue remains frozen'),
+    state === 'ARCHIVED' && h('span', { className: 'ai4m-muted' }, 'Ordinary queue remains gated'))
 }
 
 function BreakerCard({ item }) {
-  return h('article', { className: 'ai4m-card' },
+  const reading = readBreaker(item)
+  const accent = reading.state === 'TRIPPED' ? 'danger'
+    : (reading.halfOpen || reading.state === 'ARCHIVED') ? 'warn'
+    : reading.state === 'CLOSED' ? 'good' : undefined
+  return h('article', { className: 'ai4m-card', 'data-accent': accent },
     h('h4', null, text(item.target_definition_id, text(item.breaker_id, 'Breaker'))),
-    h('div', { className: 'ai4m-meta' }, h(BreakerReading, { reading: readBreaker(item) }),
+    h('div', { className: 'ai4m-meta' }, h(BreakerReading, { reading }),
       h('code', null, text(item.module_path)), text(item.engine), text(item.updated_at, '')))
 }
 
 function BreakerSignal({ event }) {
   const reading = readBreakerEvent(event)
-  return h('article', { className: 'ai4m-card' },
+  return h('article', { className: 'ai4m-card', 'data-accent': 'warn' },
     h('h4', null, 'Latest breaker event'),
     h('div', { className: 'ai4m-meta', role: 'status' }, badge(text(event.event_type), 'warn'),
       h('code', null, text(event.entity_id)), labelValue('Seq', count(event.event_seq)),
@@ -839,19 +885,23 @@ function Briefing({ remote, live }) {
   const checkpoint = pack?.checkpoint
   const hasCheckpoint = checkpoint != null && typeof checkpoint === 'object' && !Array.isArray(checkpoint)
   const busy = query.phase === 'loading'
+  const modeLabel = query.method === 'briefingPeek' ? 'Preview' : query.method === 'briefingGet' ? 'Retained alert' : 'Pull'
+  const modeTone = query.method === 'briefingGet' ? 'danger' : query.method === 'briefingPull' ? 'brand' : 'muted'
   return h(Panel, { title: 'Review briefing', subtitle: 'Deterministic fact packs; neither action advances the human checkpoint.',
     actions: [h('span', { key: 'peek' }, button('Peek (preview only)', () => void query.run('briefingPeek', {}), busy)),
-      h('span', { key: 'pull' }, button('Pull and retain', () => void query.run('briefingPull', {}), busy))] },
+      h('span', { key: 'pull' }, button('Pull and retain', () => void query.run('briefingPull', {}), busy, 'primary'))] },
     queryNote(query, 'Choose Peek or Pull to request a briefing.'),
-    query.phase === 'done' && !pack && note('No fact pack supplied.'),
+    query.phase === 'done' && !pack && empty('No fact pack supplied.'),
     (recentAlerts.length > 0 || alertHistoryIncomplete) && h(Section, { title: 'Recent P0 alerts' },
       h(AlertCatchUp, { live, state }),
-      recentAlerts.length > 0 && h('ul', { className: 'ai4m-edges' }, recentAlerts.map(alert =>
-        h('li', { key: alert.event_seq }, '#' + count(alert.event_seq) + ' · ' + alert.headline,
+      recentAlerts.length > 0 && h('ul', { className: 'ai4m-edges ai4m-edges--alerts' }, recentAlerts.map(alert =>
+        h('li', { key: alert.event_seq },
+          h('span', null, '#' + count(alert.event_seq) + ' · ' + alert.headline),
           typeof alert.briefing_id === 'string' && /^[0-9a-f]{64}$/.test(alert.briefing_id)
             && button('Open retained facts', () => void query.run('briefingGet', { id: alert.briefing_id }, alert.event_seq), busy))))),
     pack && h('div', { className: 'ai4m-stack' },
-      h('div', { className: 'ai4m-meta' }, badge(query.method === 'briefingPeek' ? 'Preview' : query.method === 'briefingGet' ? 'Retained alert' : 'Pull'),
+      h('div', { className: 'ai4m-meta-box' },
+        badge(modeLabel, modeTone),
         labelValue('Event window', '(' + count(pack.event_from_exclusive) + ', ' + count(pack.event_to_inclusive) + ']'),
         query.value.retained_id != null && labelValue('Retained', h('code', null, text(query.value.retained_id))),
         hasCheckpoint && labelValue('Retained human checkpoint event_seq', count(checkpoint.event_seq)),
@@ -860,15 +910,22 @@ function Briefing({ remote, live }) {
       query.method === 'briefingGet' && h(Section, { title: 'P0 alert sources' },
         h(EventList, { page: { items: pack.alert_sources }, openEventSeq: query.alertEventSeq,
           emptyText: 'No P0 alert source events in this retained fact pack.' })),
-      h(Section, { title: 'Trust ledger' }, trustTape(pack.trust), ' · Stale ', count(pack.stale_claims),
-        pack.risk_radar && ' · Oracle debt ' + count(pack.risk_radar.oracle_debts) + ' · Cross-engine debt ' + count(pack.risk_radar.cross_engine_debts)),
-      h(Section, { title: 'Milestones / Refutations' }, ...[['Milestones', pack.milestones], ['Refutations', pack.refutations]].map(([title, page]) =>
-        h('div', { key: title }, h('h4', null, title), h(Cards, { page, itemKey: 'event_seq', card: (item, key) =>
-          h('article', { key, className: 'ai4m-card' }, h('h4', null, text(item.claim?.title ?? item.claim_id)),
-            badge(item.new_local_trust), ' · Event #' + count(item.event_seq),
+      h(Section, { title: 'Trust ledger' },
+        trustTape(pack.trust),
+        h('div', { className: 'ai4m-summary-row' },
+          labelValue('Stale', count(pack.stale_claims)),
+          pack.risk_radar && labelValue('Oracle debt', count(pack.risk_radar.oracle_debts)),
+          pack.risk_radar && labelValue('Cross-engine debt', count(pack.risk_radar.cross_engine_debts)))),
+      h(Section, { title: 'Milestones / Refutations' }, ...[['Milestones', pack.milestones, 'good'], ['Refutations', pack.refutations, 'danger']].map(([title, page, accent]) =>
+        h('div', { key: title, className: 'ai4m-subgroup' }, h('h4', null, title), h(Cards, { page, itemKey: 'event_seq', card: (item, key) =>
+          h('article', { key, className: 'ai4m-card', 'data-accent': accent },
+            h('h4', null, text(item.claim?.title ?? item.claim_id)),
+            h('div', { className: 'ai4m-meta' },
+              item.new_local_trust && badge(item.new_local_trust, trustTone(item.new_local_trust)),
+              h('span', { className: 'ai4m-muted' }, 'Event #' + count(item.event_seq))),
             h(MathCard, { informal: item.claim?.informal_statement, formal: item.claim?.formal_signature,
               target: item.claim?.formal_target }),
-            item.graveyard_id && labelValue('Graveyard witness', text(item.graveyard_id))) })))),
+            item.graveyard_id && h('div', { className: 'ai4m-card-foot' }, labelValue('Graveyard witness', h('code', null, text(item.graveyard_id))))) })))),
       h(Section, { title: 'Frontier claims' }, h(Cards, { page: pack.frontier, itemKey: 'claim_id',
         card: (claim, key) => h(ClaimCard, { claim, key }) })),
       h(PlanSlice, { page: pack.frontier?.plans }),
@@ -887,8 +944,9 @@ function Frontier({ remote, live }) {
   return h(Panel, { title: 'Active frontier', subtitle: 'A bounded claim and dependency slice, not the full proof DAG.',
     actions: button('Refresh', refresh, query.phase === 'loading') },
     h(Section, { title: 'Circuit breakers' },
-      h('p', null, h(BreakerTotals, { snapshot }),
-        (phase !== 'live' || snapshotStale) && ' · Live status unavailable or stale'),
+      h('div', { className: 'ai4m-summary-row' },
+        h(BreakerTotals, { snapshot }),
+        (phase !== 'live' || snapshotStale) && h('span', { className: 'ai4m-muted' }, '· Live status unavailable or stale')),
       phase === 'live' && breaker && h(BreakerSignal, { event: breaker }),
       note('Read-only. To review stored breaker records, use Briefing → Peek.')),
     queryNote(query, 'Waiting for frontier…'),
@@ -920,11 +978,11 @@ const isDerivedCore = (id, stratum) => stratum === 'core'
   && typeof id === 'string' && /^CORE-ADAPT-[0-9a-f]{64}$/.test(id)
 
 function wikiCoverageNote(value, surface) {
-  if (value.managed_core === true) return note(surface === 'search'
+  if (value.managed_core === true) return banner(surface === 'search'
     ? 'Derived CORE was checked for this search. Search again to check for changes.'
     : 'Derived CORE lineage was checked for this response. Inspect again to check for changes.')
-  if (value.managed_core !== false) return note('Derived CORE coverage was not reported for this ' + surface + '.')
-  return note(surface === 'search'
+  if (value.managed_core !== false) return banner('Derived CORE coverage was not reported for this ' + surface + '.')
+  return banner(surface === 'search'
     ? 'Static Wiki only; derived CORE entries were not included.'
     : 'Static Wiki lineage only; derived CORE edges were not included.')
 }
@@ -933,29 +991,36 @@ function WikiCard({ hit, inspectProvenance }) {
   const hasPath = typeof hit.file_path === 'string'
   const virtual = hasPath && hit.file_path.startsWith(managedCorePath)
   const derived = virtual && isDerivedCore(hit.id, hit.stratum) && hit.file_path === managedCorePath + hit.id
-  return h('article', { className: 'ai4m-card' },
+  return h('article', { className: 'ai4m-card', 'data-accent': derived ? 'brand' : undefined },
     h('h4', null, text(hit.title, text(hit.id, 'Untitled Wiki entry'))),
-    h('div', { className: 'ai4m-meta' }, h('code', null, text(hit.id)), badge(text(hit.engine)),
-      badge(derived ? 'Derived CORE' : text(hit.stratum)),
-      badge((derived ? 'Indexed trust ' : '') + text(hit.trust_level)), badge(text(hit.status))),
+    h('div', { className: 'ai4m-meta' }, h('code', null, text(hit.id)), badge(text(hit.engine), 'muted'),
+      badge(derived ? 'Derived CORE' : text(hit.stratum), derived ? 'brand' : undefined),
+      badge((derived ? 'Indexed trust ' : '') + text(hit.trust_level), trustTone(hit.trust_level)),
+      badge(text(hit.status), 'muted')),
     h(MathCard, { informal: hit.informal_gloss, formal: hit.formal_signature }),
-    hasPath && labelValue(virtual ? 'Virtual index location' : 'Source path', h('code', null, hit.file_path)),
-    derived && typeof hit.verified_at_commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hit.verified_at_commit)
-      && labelValue('Verified at Git commit', h('code', null, hit.verified_at_commit)),
-    derived && note('This derived index record is not an authored Wiki page or a proof source.'),
+    (hasPath || (derived && typeof hit.verified_at_commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hit.verified_at_commit)))
+      && h('div', { className: 'ai4m-card-foot' },
+        hasPath && labelValue(virtual ? 'Virtual index location' : 'Source path', h('code', null, hit.file_path)),
+        derived && typeof hit.verified_at_commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hit.verified_at_commit)
+          && labelValue('Verified at Git commit', h('code', null, hit.verified_at_commit))),
+    derived && banner('This derived index record is not an authored Wiki page or a proof source.'),
     validProvenanceId(hit.id) && h('div', { className: 'ai4m-actions' },
       button('Inspect provenance for ' + hit.id, () => inspectProvenance(hit.id, derived))))
 }
 
-function WikiProvenance({ target, query }) {
+function WikiProvenance({ target, query, sectionRef, onClose }) {
   const edges = rows(query.value?.edges, 24)
   const hasDerived = target.derived || edges.some(edge => isDerivedCore(edge.src_id, edge.src_stratum)
     || isDerivedCore(edge.dst_id, edge.dst_stratum))
   const endpoint = (value, stratum) => h('span', null, h('code', null, text(value)), ' ',
-    badge(isDerivedCore(value, stratum) ? 'Derived CORE' : text(stratum, 'Outside index')))
-  return h(Section, { title: 'Provenance for ' + target.id },
+    badge(isDerivedCore(value, stratum) ? 'Derived CORE' : text(stratum, 'Outside index'),
+      isDerivedCore(value, stratum) ? 'brand' : 'muted'))
+  return h('section', { ref: sectionRef, className: 'ai4m-section ai4m-provenance' },
+    h('div', { className: 'ai4m-provenance-head' },
+      h('h3', null, 'Provenance for ' + target.id),
+      onClose && button('Close', onClose)),
     note('Read-only lineage across strata; recorded edges do not confer proof status.'),
-    hasDerived && note('Derived CORE nodes are index records, not authored Wiki pages or proof sources.'),
+    hasDerived && banner('Derived CORE nodes are index records, not authored Wiki pages or proof sources.'),
     queryNote(query),
     query.value && wikiCoverageNote(query.value, 'provenance response'),
     query.phase === 'done' && (edges.length ? h('ol', { className: 'ai4m-edges' }, edges.map((edge, index) =>
@@ -984,11 +1049,15 @@ function validRouteLesson(record) {
 function RouteLessons({ entries, truncated }) {
   if (entries.length === 0 && !truncated) return null
   return h(Section, { title: 'Operator route lessons' },
-    note('Historical warnings only. These lessons are not proofs or mathematical refutations.'),
-    ...entries.map(item => h('article', { key: item.lesson_id, className: 'ai4m-card' },
-      h('h4', null, item.title), badge('L0 · advisory only'), h('p', null, item.lesson),
-      labelValue('Lesson', h('code', null, item.lesson_id)), labelValue('Approved ADR', h('code', null, item.adr_id)),
-      labelValue('Archived routes', item.plan_ids.join(', ')))),
+    banner('Historical warnings only. These lessons are not proofs or mathematical refutations.', 'warn'),
+    ...entries.map(item => h('article', { key: item.lesson_id, className: 'ai4m-card', 'data-accent': 'warn' },
+      h('h4', null, item.title),
+      h('div', { className: 'ai4m-meta' }, badge('L0 · advisory only', 'warn')),
+      h('p', null, item.lesson),
+      h('div', { className: 'ai4m-card-foot' },
+        labelValue('Lesson', h('code', null, item.lesson_id)),
+        labelValue('Approved ADR', h('code', null, item.adr_id)),
+        labelValue('Archived routes', item.plan_ids.join(', '))))),
     truncated && note('Only a bounded route lesson slice is shown.'))
 }
 
@@ -996,9 +1065,13 @@ function Wiki({ remote }) {
   const query = useQuery(remote)
   const provenance = useQuery(remote)
   const [provenanceTarget, setProvenanceTarget] = useState(null)
+  const provenanceRef = useRef(null)
   const [input, setInput] = useState('')
   const [scope, setScope] = useState('core')
   const [searched, setSearched] = useState(null)
+  useEffect(() => {
+    if (provenanceTarget) provenanceRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' })
+  }, [provenanceTarget])
   const busy = query.phase === 'loading'
   const term = input.trim()
   const invalid = new TextEncoder().encode(term).byteLength > 512 || term.includes('\0')
@@ -1017,18 +1090,21 @@ function Wiki({ remote }) {
     void provenance.run('wikiProvenance', { id, max_depth: 2, limit: 24 })
   }
   return h(Panel, { title: 'Math Wiki', subtitle: 'Search CORE first; inspect SEDIMENT and GRAVEYARD as separate strata.' },
-    h('form', { className: 'ai4m-actions', onSubmit: event => { event.preventDefault(); submit(term, scope) } },
-      h('label', null, 'Query ', h('input', { type: 'search', value: input, maxLength: 512,
+    h('form', { className: 'ai4m-search-form', onSubmit: event => { event.preventDefault(); submit(term, scope) } },
+      h('label', { className: 'ai4m-field ai4m-field--grow' }, 'Query ', h('input', { type: 'search', value: input, maxLength: 512,
+        placeholder: 'Title, mathematical phrase, or ID…',
         onChange: event => setInput(event.target.value), required: true })),
-      h('label', null, 'Scope ', h('select', { value: scope, onChange: event => setScope(event.target.value) },
+      h('label', { className: 'ai4m-field' }, 'Scope ', h('select', { value: scope, onChange: event => setScope(event.target.value) },
         WIKI_SCOPES.map(value => h('option', { key: value, value }, value.toUpperCase())))),
-      h('button', { className: 'ai4m-button', type: 'submit', disabled: busy || !term || invalid }, 'Search')),
-    invalid && note('Queries must be at most 512 UTF-8 bytes and cannot contain a NUL character.', 'status'),
+      h('button', { className: 'ai4m-button', 'data-variant': 'primary', type: 'submit', disabled: busy || !term || invalid }, 'Search')),
+    invalid && banner('Queries must be at most 512 UTF-8 bytes and cannot contain a NUL character.', 'warn', 'status'),
     queryNote(query, 'Enter a title, mathematical phrase, or identifier.'),
-    query.value && searched && note('Results for “' + searched.term + '” · ' + searched.stratum.toUpperCase()),
+    query.value && searched && h('p', { className: 'ai4m-results-head' }, 'Results for “' + searched.term + '” · ' + searched.stratum.toUpperCase()),
     query.value && searched?.stratum === 'core' && wikiCoverageNote(query.value, 'search'),
-    query.value && searched?.stratum === 'graveyard' && note('Graveyard matches are historical warnings, not verified evidence.'),
-    provenanceTarget && h(WikiProvenance, { target: provenanceTarget, query: provenance }),
+    query.value && searched?.stratum === 'graveyard' && banner('Graveyard matches are historical warnings, not verified evidence.', 'warn'),
+    provenanceTarget && h(WikiProvenance, {
+      target: provenanceTarget, query: provenance, sectionRef: provenanceRef, onClose: () => setProvenanceTarget(null),
+    }),
     query.value && (hits.length > 0 ? h('div', { className: 'ai4m-stack' },
       hits.map((hit, index) => h(WikiCard, { key: text(hit.id, 'hit') + ':' + index, hit, inspectProvenance })))
       : (lessonRows.length === 0 && !routeLessonsTruncated && empty('No matching records returned.'))),
@@ -1036,12 +1112,13 @@ function Wiki({ remote }) {
     query.value?.truncated === true && note('Only a bounded search slice is shown.'),
     shadow && searched && h('details', null,
       h('summary', null, 'Shadow hint · SEDIMENT ' + count(shadow.sediment_count) + ' / GRAVEYARD ' + count(shadow.graveyard_count)),
-      shadow.top_sediment && note('Closest sediment lead: ' + text(shadow.top_sediment.title, text(shadow.top_sediment.id))),
-      shadow.top_graveyard_id && note('Graveyard warning: ' + text(shadow.top_graveyard_id) + ' is historical, not verified evidence.'),
-      h('div', { className: 'ai4m-actions' },
-        ...['sediment', 'graveyard'].map(stratum => h('span', { key: stratum }, button('Search ' + stratum.toUpperCase(), () => {
-          setInput(searched.term); setScope(stratum); submit(searched.term, stratum)
-        }, busy || !(shadow[stratum + '_count'] > 0)))))))
+      h('div', { className: 'ai4m-shadow-body' },
+        shadow.top_sediment && note('Closest sediment lead: ' + text(shadow.top_sediment.title, text(shadow.top_sediment.id))),
+        shadow.top_graveyard_id && note('Graveyard warning: ' + text(shadow.top_graveyard_id) + ' is historical, not verified evidence.'),
+        h('div', { className: 'ai4m-actions' },
+          ...['sediment', 'graveyard'].map(stratum => h('span', { key: stratum }, button('Search ' + stratum.toUpperCase(), () => {
+            setInput(searched.term); setScope(stratum); submit(searched.term, stratum)
+          }, busy || !(shadow[stratum + '_count'] > 0))))))))
 }
 
 module.exports = { LiveHud, panels, views: { briefing: Briefing, frontier: Frontier, inbox: Inbox, wiki: Wiki },
@@ -1052,7 +1129,7 @@ module.exports = { LiveHud, panels, views: { briefing: Briefing, frontier: Front
   const load = name => {
     if (name === 'react') return platformRequire(name);
     if (name === './contract') return {"REMOTE_PACKAGE":"dsh-ai4math","REMOTE_NAMESPACE":"ai4math","REMOTE_METHODS":{"proofSubmit":{"method":"proof.submit","description":"Check a proof body in an operator-assigned frozen slot; does not promote.","params":{"type":"object","properties":{"target_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]+$"},"proof_body":{"type":"string","minLength":1,"maxLength":262144}},"required":["target_id","proof_body"],"additionalProperties":false},"agentOnly":true},"status":{"method":"status","description":"Read the current ai4math status snapshot.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false}},"subscribe":{"method":"subscribe","description":"Follow selected live ai4math events.","params":{"type":"object","properties":{"topics":{"type":"array","items":{"type":"string","enum":["vital_signs.tick","alert.p0","breaker.state_changed"]},"minItems":1,"maxItems":3,"uniqueItems":true}},"required":["topics"],"additionalProperties":false},"stream":true},"briefingPeek":{"method":"briefing.peek","description":"Preview the factual briefing without retention or checkpoint changes.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false}},"briefingGet":{"method":"briefing.get","description":"Open a retained fact pack by its SHA-256 ID.","params":{"type":"object","properties":{"id":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"}},"required":["id"],"additionalProperties":false}},"briefingPull":{"method":"briefing.pull","description":"Retain the factual briefing without advancing the review checkpoint.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false}},"frontierList":{"method":"frontier.list","description":"List bounded claim frontier summaries.","params":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":64}},"required":[],"additionalProperties":false}},"inboxList":{"method":"inbox.list","description":"List bounded decision inbox summaries.","params":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":64}},"required":[],"additionalProperties":false}},"alertsList":{"method":"alerts.list","description":"List retained alerts after an event sequence.","params":{"type":"object","properties":{"after":{"type":"integer","minimum":0,"maximum":9007199254740991},"limit":{"type":"integer","minimum":1,"maximum":64}},"required":[],"additionalProperties":false}},"wikiSearch":{"method":"wiki.search","description":"Search the local math wiki index. Unfiltered GRAVEYARD searches can also return operator route lessons (L0). All GRAVEYARD matches are advisory, not instructions or verified evidence.","params":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":512,"x-ai4math-maxUtf8Bytes":512,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"scope":{"type":"string","enum":["core","sediment","graveyard"]},"engine":{"type":"string","enum":["lean4","agda","rocq","smt","atp","cas","informal"]},"conclusion_head":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"hypothesis_heads":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"maxItems":8,"uniqueItems":true},"typeclasses":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"maxItems":8,"uniqueItems":true},"include_shadow_hint":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":32}},"required":["text"],"additionalProperties":false}},"wikiCheckGraveyard":{"method":"wiki.check_graveyard","description":"Look for previously rejected ideas in GRAVEYARD. Static warnings and any operator route lessons (L0) are advisory, not instructions, proof, or a clearance decision.","params":{"type":"object","properties":{"informal_statement":{"type":"string","minLength":1,"maxLength":512,"x-ai4math-maxUtf8Bytes":512,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"formal_signature":{"type":"string","minLength":1,"maxLength":512,"x-ai4math-maxUtf8Bytes":512,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"limit":{"type":"integer","minimum":1,"maximum":16}},"required":["informal_statement"],"additionalProperties":false}},"wikiProvenance":{"method":"wiki.provenance","description":"Inspect indexed incoming and outgoing provenance edges across strata. Edges do not confer proof status.","params":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"max_depth":{"type":"integer","minimum":1,"maximum":16},"limit":{"type":"integer","minimum":1,"maximum":64}},"required":["id"],"additionalProperties":false}}},"TOPICS":["vital_signs.tick","alert.p0","breaker.state_changed"],"WIKI_SCOPES":["core","sediment","graveyard"]};
-    if (name === './style') return ".ai4m {\n  --a4-muted: var(--dsw-alias-text-secondary, currentColor);\n  --a4-border: var(--dsw-alias-border-base, color-mix(in srgb, currentColor 20%, transparent));\n  --a4-bg: var(--dsw-alias-bg-base, Canvas);\n  --a4-subtle: color-mix(in srgb, currentColor 6%, transparent);\n  box-sizing: border-box;\n  font: inherit;\n  overflow-wrap: anywhere;\n}\n.ai4m *, .ai4m *::before, .ai4m *::after { box-sizing: inherit; }\n.ai4m-hud {\n  border-block-start: 1px solid var(--a4-border);\n  background: var(--a4-bg);\n  padding: 3px 10px;\n  font-size: 11px;\n  font-variant-numeric: tabular-nums;\n}\n.ai4m-hud-line { display: flex; align-items: center; gap: 4px 10px; overflow-x: auto; padding: 2px; }\n.ai4m-hud-line > * { flex: 0 0 auto; white-space: nowrap; }\n.ai4m-hud-alert { padding: 2px 2px 4px; max-height: 4.5em; overflow: auto; }\n.ai4m-tape, .ai4m-meta, .ai4m-actions { display: inline-flex; gap: 4px 7px; align-items: center; flex-wrap: wrap; }\n.ai4m-hud-line .ai4m-actions { margin-inline-start: auto; flex-wrap: nowrap; }\n.ai4m-muted { color: var(--a4-muted); }\n.ai4m-badge {\n  display: inline-block;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-subtle);\n  border-radius: 5px;\n  padding: 1px 4px;\n  line-height: 1.2;\n  font-size: .92em;\n}\n.ai4m-badge[data-tone=\"good\"] { border-color: #358860; }\n.ai4m-badge[data-tone=\"warn\"] { border-color: #ab7116; }\n.ai4m-badge[data-tone=\"danger\"] { border-color: #c74748; font-weight: 650; }\n.ai4m-button, .ai4m input, .ai4m select {\n  border: 1px solid var(--a4-border);\n  background: var(--a4-subtle);\n  color: inherit;\n  font: inherit;\n  border-radius: 5px;\n  padding: .22em .55em;\n}\n.ai4m input { max-width: min(60vw, 15em); }\n.ai4m select option { background: var(--a4-bg); }\n.ai4m-button:not(:disabled), .ai4m details > summary { cursor: pointer; }\n.ai4m-button:not(:disabled):hover { background: color-mix(in srgb, currentColor 12%, transparent); }\n.ai4m-button:disabled { opacity: .55; }\n.ai4m :focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }\n.ai4m-panel {\n  height: 100%; min-height: 0; min-width: 0; overflow: auto;\n  padding: 12px; display: flex; flex-direction: column; gap: 12px;\n  font-size: 13px; line-height: 1.45;\n}\n.ai4m h2, .ai4m h3, .ai4m h4, .ai4m p, .ai4m pre { margin: 0; }\n.ai4m h2 { font-size: 16px; }\n.ai4m h3 { font-size: 14px; }\n.ai4m h4 { font-size: 13px; }\n.ai4m-panel header .ai4m-actions { margin-block-start: 6px; }\n.ai4m-stack, .ai4m-section, .ai4m-card { display: flex; flex-direction: column; gap: 7px; }\n.ai4m-card, .ai4m details { border: 1px solid var(--a4-border); border-radius: 8px; padding: 8px; }\n.ai4m-math { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 8px; }\n.ai4m-math > div { background: var(--a4-subtle); border-radius: 5px; padding: 6px; }\n.ai4m pre { margin-block-start: 4px; white-space: pre-wrap; overflow-wrap: anywhere; }\n.ai4m-evidence { max-height: 16rem; overflow: auto; }\n.ai4m-edges { display: grid; gap: 5px; margin: 0; padding-inline-start: 1.4em; }\n";
+    if (name === './style') return ".ai4m {\n  --a4-text: var(--dsw-alias-label-primary, CanvasText);\n  --a4-muted: var(--dsw-alias-label-secondary, color-mix(in srgb, currentColor 62%, transparent));\n  --a4-bg: var(--dsw-alias-bg-base, Canvas);\n  --a4-surface: var(--dsw-alias-bg-layer-1, color-mix(in srgb, currentColor 3%, transparent));\n  --a4-surface-2: var(--dsw-alias-bg-layer-2, color-mix(in srgb, currentColor 6%, transparent));\n  --a4-sidebar: var(--dsw-specific-sidebar-fill, var(--a4-bg));\n  --a4-border: var(--dsw-alias-border-l1, color-mix(in srgb, currentColor 14%, transparent));\n  --a4-border-strong: var(--dsw-alias-border-l2, color-mix(in srgb, currentColor 24%, transparent));\n  --a4-brand: var(--dsw-alias-brand-primary, currentColor);\n  --a4-good: var(--dsw-alias-state-success-primary, currentColor);\n  --a4-warn: var(--dsw-alias-state-warn-primary, currentColor);\n  --a4-danger: var(--dsw-alias-state-error-primary, currentColor);\n  --a4-idle: var(--dsw-alias-state-idle-primary, var(--a4-muted));\n  --a4-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;\n  box-sizing: border-box;\n  color: var(--a4-text);\n  font: inherit;\n  overflow-wrap: anywhere;\n}\n.ai4m *, .ai4m *::before, .ai4m *::after { box-sizing: inherit; }\n\n/* --- Inline typography & atoms ------------------------------------------- */\n.ai4m h2, .ai4m h3, .ai4m h4, .ai4m p, .ai4m pre { margin: 0; }\n.ai4m h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; }\n.ai4m h3 {\n  font-size: 11.5px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  text-transform: uppercase;\n  color: var(--a4-muted);\n  padding-block-end: 5px;\n  border-block-end: 1px solid var(--a4-border);\n}\n.ai4m h4 { font-size: 13px; font-weight: 600; line-height: 1.35; }\n.ai4m code {\n  font-family: var(--a4-mono);\n  font-size: 0.9em;\n  padding: 1px 5px;\n  border-radius: 4px;\n  background: var(--a4-surface-2);\n  border: 1px solid var(--a4-border);\n  overflow-wrap: anywhere;\n}\n.ai4m-muted { color: var(--a4-muted); }\n.ai4m-placeholder { color: var(--a4-muted); font-style: italic; }\n.ai4m-kv { display: inline-flex; align-items: baseline; gap: 4px; flex-wrap: wrap; max-width: 100%; min-width: 0; }\n.ai4m-hud .ai4m-kv { flex-wrap: nowrap; }\n.ai4m-results-head {\n  font-size: 12px;\n  font-weight: 600;\n  color: var(--a4-text);\n  padding-block: 2px;\n}\n\n/* --- Badges -------------------------------------------------------------- */\n.ai4m-badge {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface-2);\n  color: var(--a4-text);\n  border-radius: 999px;\n  padding: 1px 7px;\n  line-height: 1.35;\n  font-size: 11px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n.ai4m-badge[data-tone=\"good\"] {\n  border-color: color-mix(in srgb, var(--a4-good) 38%, transparent);\n  background: color-mix(in srgb, var(--a4-good) 12%, transparent);\n  color: var(--a4-good);\n}\n.ai4m-badge[data-tone=\"warn\"] {\n  border-color: color-mix(in srgb, var(--a4-warn) 42%, transparent);\n  background: color-mix(in srgb, var(--a4-warn) 13%, transparent);\n  color: var(--a4-warn);\n}\n.ai4m-badge[data-tone=\"danger\"] {\n  border-color: color-mix(in srgb, var(--a4-danger) 46%, transparent);\n  background: color-mix(in srgb, var(--a4-danger) 14%, transparent);\n  color: var(--a4-danger);\n  font-weight: 600;\n}\n.ai4m-badge[data-tone=\"brand\"] {\n  border-color: color-mix(in srgb, var(--a4-brand) 38%, transparent);\n  background: color-mix(in srgb, var(--a4-brand) 12%, transparent);\n  color: var(--a4-brand);\n}\n.ai4m-badge[data-tone=\"muted\"] {\n  color: var(--a4-muted);\n  background: var(--a4-surface);\n}\n\n/* --- Controls ------------------------------------------------------------ */\n.ai4m-button, .ai4m input, .ai4m select {\n  border: 1px solid var(--a4-border-strong);\n  background: var(--a4-surface);\n  color: var(--a4-text);\n  font: inherit;\n  border-radius: 6px;\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\n}\n.ai4m-button {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 5px;\n  height: 28px;\n  padding: 0 10px;\n  font-size: 12px;\n  font-weight: 500;\n  line-height: 1;\n  white-space: nowrap;\n}\n.ai4m-button[data-variant=\"primary\"] {\n  background: color-mix(in srgb, var(--a4-brand) 14%, var(--a4-surface));\n  border-color: color-mix(in srgb, var(--a4-brand) 44%, var(--a4-border));\n  color: var(--a4-brand);\n}\n.ai4m-button:not(:disabled), .ai4m details > summary { cursor: pointer; }\n.ai4m-button:not(:disabled):hover {\n  background: var(--a4-surface-2);\n  border-color: var(--a4-border-strong);\n}\n.ai4m-button[data-variant=\"primary\"]:not(:disabled):hover {\n  background: color-mix(in srgb, var(--a4-brand) 22%, var(--a4-surface));\n  border-color: color-mix(in srgb, var(--a4-brand) 60%, var(--a4-border));\n}\n.ai4m-button:disabled { opacity: 0.48; cursor: default; }\n.ai4m input, .ai4m select {\n  height: 30px;\n  padding: 0 9px;\n  font-size: 12.5px;\n  background: var(--a4-bg);\n}\n.ai4m input:focus, .ai4m select:focus { border-color: var(--a4-brand); }\n.ai4m input:focus:not(:focus-visible), .ai4m select:focus:not(:focus-visible) { outline: none; }\n.ai4m select option { background: var(--a4-bg); color: var(--a4-text); }\n.ai4m :focus-visible { outline: 2px solid var(--a4-brand); outline-offset: 2px; }\n\n/* --- Bottom Live HUD ----------------------------------------------------- */\n.ai4m-hud {\n  container-type: inline-size;\n  container-name: ai4m-hud;\n  border-block-start: 1px solid var(--a4-border);\n  background: var(--a4-sidebar);\n  padding: 5px 10px;\n  font-size: 11.5px;\n  line-height: 1.35;\n  font-variant-numeric: tabular-nums;\n}\n.ai4m-hud-line {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n}\n.ai4m-hud-brand {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  flex: 0 0 auto;\n  white-space: nowrap;\n}\n.ai4m-hud-brand > strong {\n  font-size: 11.5px;\n  font-weight: 650;\n  letter-spacing: -0.01em;\n}\n.ai4m-hud-status .ai4m-badge::before {\n  content: \"\";\n  width: 6px;\n  height: 6px;\n  border-radius: 999px;\n  background: currentColor;\n  flex: 0 0 auto;\n}\n.ai4m-hud-telemetry {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex: 1 1 auto;\n  min-width: 0;\n  overflow-x: auto;\n  scrollbar-width: thin;\n  padding: 1px 16px 1px 2px;\n  mask-image: linear-gradient(to right, currentColor calc(100% - 14px), transparent);\n}\n.ai4m-hud-group {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  flex: 0 0 auto;\n  white-space: nowrap;\n}\n.ai4m-hud-group + .ai4m-hud-group {\n  padding-inline-start: 8px;\n  border-inline-start: 1px solid var(--a4-border);\n}\n.ai4m-hud-metric[data-pressure=\"GREEN\"] { color: var(--a4-text); }\n.ai4m-hud-metric[data-pressure=\"YELLOW\"] { color: var(--a4-warn); font-weight: 500; }\n.ai4m-hud-metric[data-pressure=\"RED\"] { color: var(--a4-danger); font-weight: 600; }\n.ai4m-hud-metric[data-nonzero=\"true\"] { color: var(--a4-warn); font-weight: 600; }\n.ai4m-hud-pinned {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  flex: 0 0 auto;\n  padding-inline-start: 8px;\n  border-inline-start: 1px solid var(--a4-border);\n  white-space: nowrap;\n}\n.ai4m-hud-priority[data-zero=\"true\"] .ai4m-badge { background: transparent; }\n.ai4m-hud-seq { font-family: var(--a4-mono); font-size: 11px; margin-inline-start: 3px; }\n.ai4m-hud-nav {\n  display: inline-flex;\n  align-items: center;\n  gap: 3px;\n  flex: 0 0 auto;\n  padding-inline-start: 8px;\n  border-inline-start: 1px solid var(--a4-border);\n  white-space: nowrap;\n}\n@container ai4m-hud (max-width: 760px) {\n  .ai4m-hud-line { flex-wrap: wrap; row-gap: 5px; }\n  .ai4m-hud-telemetry { order: 3; flex: 1 1 100%; padding-inline-start: 0; }\n  .ai4m-hud-pinned { border-inline-start: none; padding-inline-start: 0; margin-inline-start: auto; }\n}\n.ai4m-hud .ai4m-button {\n  height: 22px;\n  padding: 0 8px;\n  font-size: 11px;\n  border-color: var(--a4-border);\n  background: var(--a4-surface);\n}\n.ai4m-hud .ai4m-button:not(:disabled):hover {\n  background: var(--a4-surface-2);\n  border-color: var(--a4-border-strong);\n}\n\n/* HUD Trust Tape: compact segmented capsule */\n.ai4m-hud .ai4m-tape {\n  display: inline-flex;\n  align-items: center;\n  gap: 2px;\n  padding: 1px 4px;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n}\n.ai4m-hud .ai4m-tier {\n  display: inline-flex;\n  align-items: baseline;\n  gap: 2px;\n  padding: 0 4px;\n  border-radius: 4px;\n}\n.ai4m-hud .ai4m-tier .ai4m-kv { gap: 3px; }\n.ai4m-hud .ai4m-tier[data-nonzero=\"false\"] { color: var(--a4-muted); }\n.ai4m-hud .ai4m-tier[data-nonzero=\"true\"] { font-weight: 600; }\n.ai4m-tier[data-level=\"L5\"][data-nonzero=\"true\"] {\n  color: var(--a4-good);\n  background: color-mix(in srgb, var(--a4-good) 12%, transparent);\n}\n.ai4m-tier[data-level=\"L2b\"][data-nonzero=\"true\"] {\n  color: var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 12%, transparent);\n}\n.ai4m-tier[data-level=\"L4a\"][data-nonzero=\"true\"],\n.ai4m-tier[data-level=\"L4b\"][data-nonzero=\"true\"] {\n  color: var(--a4-brand);\n  background: color-mix(in srgb, var(--a4-brand) 10%, transparent);\n}\n\n/* HUD Secondary Alerts & Banners */\n.ai4m-hud-alert {\n  margin-block-start: 5px;\n  padding: 4px 8px;\n  max-height: 4.8em;\n  overflow: auto;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  border-inline-start: 3px solid var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 9%, var(--a4-surface));\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  flex-wrap: wrap;\n}\n.ai4m-hud-alert--breaker {\n  border-inline-start-color: var(--a4-warn);\n  background: color-mix(in srgb, var(--a4-warn) 9%, var(--a4-surface));\n}\n.ai4m-hud-catchup {\n  margin-block-start: 5px;\n  padding: 4px 8px;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  border-inline-start: 3px solid var(--a4-warn);\n  background: color-mix(in srgb, var(--a4-warn) 8%, var(--a4-surface));\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  flex-wrap: wrap;\n}\n\n.ai4m-hud > .ai4m-banner { margin-block-start: 5px; padding: 4px 8px; }\n.ai4m-panel .ai4m-hud-catchup { margin-block-start: 0; padding: 7px 10px; }\n\n/* --- Shared flex groups -------------------------------------------------- */\n.ai4m-meta, .ai4m-actions {\n  display: inline-flex;\n  gap: 5px 7px;\n  align-items: center;\n  flex-wrap: wrap;\n}\n\n/* --- Right Sidebar Panels ------------------------------------------------ */\n.ai4m-panel {\n  container-type: inline-size;\n  container-name: ai4m-panel;\n  height: 100%;\n  min-height: 0;\n  min-width: 0;\n  overflow: auto;\n  padding: 14px 16px 24px;\n  background: var(--a4-bg);\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n  font-size: 13px;\n  line-height: 1.5;\n  font-variant-numeric: tabular-nums;\n}\n.ai4m-panel > header {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  padding-block-end: 12px;\n  border-block-end: 1px solid var(--a4-border);\n}\n.ai4m-panel > header > p { font-size: 12px; line-height: 1.45; }\n.ai4m-panel > header .ai4m-actions { margin-block-start: 6px; }\n\n.ai4m-stack { display: flex; flex-direction: column; gap: 10px; min-width: 0; }\n.ai4m-section { display: flex; flex-direction: column; gap: 8px; min-width: 0; }\n.ai4m-subgroup { display: flex; flex-direction: column; gap: 6px; min-width: 0; }\n.ai4m-subgroup > h4 { font-size: 12px; color: var(--a4-muted); font-weight: 600; }\n.ai4m-panel .ai4m-badge {\n  max-width: 100%;\n  white-space: normal;\n  overflow-wrap: anywhere;\n  border-radius: 10px;\n}\n\n/* Panel Trust Ledger: clean tile grid */\n.ai4m-panel .ai4m-tape {\n  display: grid;\n  grid-template-columns: repeat(4, minmax(0, 1fr));\n  gap: 6px;\n}\n@container ai4m-panel (min-width: 480px) {\n  .ai4m-panel .ai4m-tape { grid-template-columns: repeat(8, minmax(0, 1fr)); }\n}\n.ai4m-panel .ai4m-tier {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  padding: 7px 4px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 15px;\n  font-weight: 650;\n  line-height: 1.25;\n}\n.ai4m-panel .ai4m-tier > span {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: 2px;\n}\n.ai4m-panel .ai4m-tier .ai4m-kv > :first-child {\n  font-size: 10.5px;\n  font-weight: 600;\n  letter-spacing: 0.02em;\n}\n.ai4m-panel .ai4m-tier .ai4m-kv > :last-child.ai4m-muted {\n  font-size: 13px;\n  font-weight: 500;\n}\n.ai4m-panel .ai4m-tier[data-nonzero=\"false\"] {\n  color: var(--a4-muted);\n  background: var(--a4-bg);\n}\n\n/* Fact Pack summary box & risk row */\n.ai4m-meta-box {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 6px 10px;\n  padding: 10px 12px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 12px;\n}\n.ai4m-summary-row {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 6px 10px;\n  padding: 8px 10px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 12px;\n}\n\n/* Status, Empty & Advisory Banners */\n.ai4m-empty {\n  padding: 12px 14px;\n  border: 1px dashed var(--a4-border-strong);\n  border-radius: 8px;\n  background: var(--a4-surface);\n  color: var(--a4-muted);\n  font-size: 12px;\n}\n.ai4m-banner {\n  padding: 8px 11px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  color: var(--a4-muted);\n  font-size: 12px;\n  line-height: 1.45;\n}\n.ai4m-banner[data-tone=\"loading\"] {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  border-inline-start: 3px solid var(--a4-brand);\n  color: var(--a4-text);\n}\n.ai4m-banner[data-tone=\"loading\"]::before {\n  content: \"\";\n  width: 7px;\n  height: 7px;\n  border-radius: 999px;\n  background: var(--a4-brand);\n  flex: 0 0 auto;\n  animation: ai4m-pulse 1.2s ease-in-out infinite;\n}\n@keyframes ai4m-pulse {\n  0%, 100% { opacity: 0.35; }\n  50% { opacity: 1; }\n}\n.ai4m-banner[data-tone=\"warn\"] {\n  border-inline-start: 3px solid var(--a4-warn);\n  background: color-mix(in srgb, var(--a4-warn) 8%, var(--a4-surface));\n  color: var(--a4-text);\n}\n.ai4m-banner[data-tone=\"danger\"] {\n  border-inline-start: 3px solid var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 10%, var(--a4-surface));\n  color: var(--a4-danger);\n}\n\n/* Cards */\n.ai4m-card {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  min-width: 0;\n  border: 1px solid var(--a4-border);\n  border-radius: 10px;\n  padding: 11px 12px;\n  background: var(--a4-surface);\n  transition: border-color 120ms ease;\n}\n.ai4m-card:hover { border-color: var(--a4-border-strong); }\n.ai4m-card[data-accent=\"danger\"] { border-inline-start: 3px solid var(--a4-danger); }\n.ai4m-card[data-accent=\"warn\"] { border-inline-start: 3px solid var(--a4-warn); }\n.ai4m-card[data-accent=\"good\"] { border-inline-start: 3px solid var(--a4-good); }\n.ai4m-card[data-accent=\"brand\"] { border-inline-start: 3px solid var(--a4-brand); }\n.ai4m-panel .ai4m-card .ai4m-button {\n  max-width: 100%;\n  height: auto;\n  min-height: 25px;\n  padding: 4px 9px;\n  font-size: 11.5px;\n  line-height: 1.3;\n  white-space: normal;\n  text-align: start;\n  overflow-wrap: anywhere;\n}\n.ai4m-card-foot {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 6px 12px;\n  font-size: 11.5px;\n  color: var(--a4-muted);\n}\n\n/* Math Card: single-column in narrow sidebars, dual-column when wide */\n.ai4m-math {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr);\n  gap: 8px;\n}\n@container ai4m-panel (min-width: 520px) {\n  .ai4m-math { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }\n}\n.ai4m-math > div {\n  border-radius: 7px;\n  padding: 8px 10px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface-2);\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n}\n.ai4m-math > div.ai4m-math-formal { background: var(--a4-bg); }\n.ai4m-math > div > strong {\n  font-size: 10.5px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  text-transform: uppercase;\n  color: var(--a4-muted);\n}\n.ai4m-math > div > p { font-size: 12.5px; line-height: 1.5; }\n.ai4m-math pre {\n  font-family: var(--a4-mono);\n  font-size: 12px;\n  line-height: 1.5;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n}\n.ai4m-math-target { font-size: 11.5px; margin-block-start: 2px; }\n\n/* Collapsible Evidence & Shadow Hint */\n.ai4m details {\n  border: 1px solid var(--a4-border);\n  border-radius: 8px;\n  background: var(--a4-surface);\n  overflow: hidden;\n}\n.ai4m details > summary {\n  padding: 7px 10px;\n  font-size: 12px;\n  font-weight: 500;\n  line-height: 1.4;\n  list-style-position: inside;\n  transition: background-color 120ms ease;\n}\n.ai4m details > summary:hover { background: var(--a4-surface-2); }\n.ai4m details > summary:focus-visible { outline-offset: -2px; }\n.ai4m details[open] > summary {\n  border-block-end: 1px solid var(--a4-border);\n  background: var(--a4-surface-2);\n}\n.ai4m details > :not(summary) { padding: 8px 10px; }\n.ai4m pre.ai4m-evidence {\n  margin: 0;\n  padding: 9px 10px;\n  max-height: 18rem;\n  overflow: auto;\n  background: var(--a4-bg);\n  font-family: var(--a4-mono);\n  font-size: 11.5px;\n  line-height: 1.45;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n}\n\n/* Structured Edge / Alert Lists */\n.ai4m-edges {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  margin: 0;\n  padding: 0;\n  list-style: none;\n}\n.ai4m-edges > li {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 4px 5px;\n  padding: 7px 10px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 12px;\n  line-height: 1.45;\n}\n.ai4m-edges--alerts {\n  max-height: 14rem;\n  overflow-y: auto;\n}\n.ai4m-edges--alerts > li {\n  justify-content: space-between;\n  border-inline-start: 3px solid var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 6%, var(--a4-surface));\n}\n.ai4m-edges > li .ai4m-button { height: 24px; padding: 0 8px; font-size: 11.5px; }\n.ai4m-edges > li details { width: 100%; margin-block-start: 4px; }\n\n/* Wiki Search Toolbar & Provenance Inspector */\n.ai4m-search-form {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: flex-end;\n  gap: 8px;\n  padding: 10px 12px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n}\n.ai4m-field {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  font-size: 11px;\n  font-weight: 600;\n  color: var(--a4-muted);\n}\n.ai4m-field--grow { flex: 1 1 170px; min-width: 0; }\n.ai4m-field--grow input { width: 100%; max-width: none; }\n.ai4m-search-form .ai4m-button { height: 30px; padding: 0 13px; }\n.ai4m-provenance {\n  padding: 10px 12px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border-strong);\n  background: var(--a4-surface);\n}\n.ai4m-provenance-head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  padding-block-end: 5px;\n  border-block-end: 1px solid var(--a4-border);\n}\n.ai4m-provenance-head > h3 {\n  text-transform: none;\n  letter-spacing: 0;\n  font-size: 12.5px;\n  color: var(--a4-text);\n  border-block-end: none;\n  padding-block-end: 0;\n  min-width: 0;\n}\n.ai4m-provenance-head .ai4m-button { height: 24px; padding: 0 8px; font-size: 11.5px; flex: 0 0 auto; }\n.ai4m-shadow-body {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n";
     if (!Object.hasOwn(modules, name)) throw new Error('Unexpected AI4Math module request: ' + name);
     if (!Object.hasOwn(cache, name)) {
       const module = { exports: {} };

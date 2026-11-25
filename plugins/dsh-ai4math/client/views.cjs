@@ -13,11 +13,17 @@ const rows = (value, max = 80) => Array.isArray(value)
   ? value.slice(0, max).filter(item => item && typeof item === 'object' && !Array.isArray(item)) : []
 const pct = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100
   ? Math.round(value) + '%' : NA
+const trustTone = level => level === 'L5' ? 'good' : level === 'L2b' ? 'danger' : (level === 'L4a' || level === 'L4b') ? 'brand' : undefined
 const badge = (label, tone) => h('span', { className: 'ai4m-badge', 'data-tone': tone }, label)
-const labelValue = (label, value) => h('span', null, h('span', { className: 'ai4m-muted' }, label + ' '), value)
-const button = (label, onClick, disabled) => h('button', { className: 'ai4m-button', type: 'button', onClick, disabled }, label)
+const labelValue = (label, value) => h('span', { className: 'ai4m-kv' },
+  h('span', { className: 'ai4m-muted' }, label + ' '),
+  value === NA ? h('span', { className: 'ai4m-muted' }, value) : value)
+const button = (label, onClick, disabled, variant) => h('button', {
+  className: 'ai4m-button', type: 'button', onClick, disabled, ...(variant ? { 'data-variant': variant } : {}),
+}, label)
 const note = (value, role) => h('p', { className: 'ai4m-muted', role }, value)
-const empty = (value) => note(value ?? 'No records returned.')
+const banner = (value, tone, role) => h('p', { className: 'ai4m-banner', ...(tone ? { 'data-tone': tone } : {}), role }, value)
+const empty = (value) => h('p', { className: 'ai4m-empty' }, value ?? 'No records returned.')
 const panels = Object.freeze([
   { key: 'briefing', label: 'Briefing', description: 'Preview or retain a deterministic fact pack.' },
   { key: 'frontier', label: 'Frontier', description: 'Inspect active claims, dependency plans, and breaker signals.' },
@@ -26,13 +32,17 @@ const panels = Object.freeze([
 ])
 
 function trustTape(trust) {
-  return h('span', { className: 'ai4m-tape', 'aria-label': 'Trust ledger' }, TRUST.map(level =>
-    h('span', { key: level }, labelValue(level, count(trust?.[level])))))
+  return h('span', { className: 'ai4m-tape', 'aria-label': 'Trust ledger' }, TRUST.map(level => {
+    const value = trust?.[level]
+    const nonzero = isCount(value) && value > 0
+    return h('span', { key: level, className: 'ai4m-tier', 'data-level': level, 'data-nonzero': nonzero ? 'true' : 'false' },
+      labelValue(level, count(value)))
+  }))
 }
 
 function AlertCatchUp({ live, state }) {
   if (!state.alertHistoryIncomplete) return null
-  return h('div', { className: 'ai4m-actions' },
+  return h('div', { className: 'ai4m-hud-catchup' },
     note(state.alertHistoryLoading ? 'Loading next P0 alert batch…' : state.phase === 'live'
       ? 'P0 alert catch-up incomplete.' : 'P0 alert catch-up incomplete. Waiting for the daemon to reconnect.', 'status'),
     button('Continue P0 alert catch-up', live.continueAlertCatchUp, state.phase !== 'live' || state.alertHistoryLoading))
@@ -43,9 +53,9 @@ function BreakerTotals({ snapshot }) {
   const halfOpen = snapshot?.half_open_breakers
   const archived = snapshot?.archived_breakers
   return h('span', { className: 'ai4m-meta', role: 'status' },
-    badge('Tripped ' + count(tripped), isCount(tripped) && tripped > 0 ? 'danger' : undefined),
+    badge('Tripped ' + count(tripped), isCount(tripped) && tripped > 0 ? 'danger' : 'muted'),
     isCount(halfOpen) && badge('HALF_OPEN ' + halfOpen + (halfOpen > 0 ? ' · Affected ordinary queues remain frozen' : ''),
-      halfOpen > 0 ? 'warn' : undefined),
+      halfOpen > 0 ? 'warn' : 'muted'),
     isCount(archived) && archived > 0 && badge('ARCHIVED ' + archived + ' · Affected ordinary queues remain gated', 'warn'))
 }
 
@@ -63,13 +73,15 @@ function InfraRfcTotals({ snapshot }) {
   if (!isCount(seq) || !isCount(drafts) || !isCount(approved) || drafts > seq || approved > seq - drafts) return null
   const hasLifecycle = smoke !== undefined || frozen !== undefined || completed !== undefined
   if (!hasLifecycle) {
-    return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run')
+    return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run',
+      drafts + approved === 0 ? 'muted' : undefined)
   }
   if (!isCount(smoke) || !isCount(frozen) || !isCount(completed)) return null
   const total = drafts + approved + smoke + frozen + completed
   if (!Number.isSafeInteger(total) || total > seq) return null
   return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved
-    + ' · SMOKE ' + smoke + ' · FROZEN ' + frozen + ' · COMPLETED ' + completed)
+    + ' · SMOKE ' + smoke + ' · FROZEN ' + frozen + ' · COMPLETED ' + completed,
+    total === 0 ? 'muted' : undefined)
 }
 
 function DiscoveryBadge({ value, currentSeq }) {
@@ -185,9 +197,11 @@ function LiveHud({ live, open }) {
   const alert = recentAlerts[0]
   const alertText = text(alert?.headline, '')
   const memory = snapshot?.memory
+  const pressure = typeof memory?.pressure === 'string' ? memory.pressure : undefined
   const broker = snapshot?.broker
   const advisoryBadge = snapshotFresh ? leanAdvisoryBadge(broker) : null
   const workers = snapshot?.workers
+  const staleClaims = snapshot?.stale_claims
   const oracleHeld = snapshot?.task_scheduler?.exploration?.held_for_oracle
   const brokerText = !broker ? NA
     : 'fast ' + count(broker.fast_busy) + '/' + count(broker.fast_capacity) + ' busy · heavy '
@@ -196,37 +210,51 @@ function LiveHud({ live, open }) {
     : phase === 'reconnecting' ? (snapshot ? 'Reconnecting · stale' : 'Reconnecting') : 'Connecting'
   return h('section', { className: 'ai4m ai4m-hud', 'aria-label': 'AI4Math Live HUD' },
     h('div', { className: 'ai4m-hud-line' },
-      h('strong', null, 'AI4Math'),
-      h('span', { role: 'status' }, badge(phaseLabel, snapshotFresh ? 'good' : 'warn')),
-      labelValue('RAM', pct(memory?.used_percent) + (typeof memory?.pressure === 'string' ? ' · ' + memory.pressure : '')),
-      h('span', { title: 'Daemon-managed work only; independent CLI processes are not counted.' },
-        labelValue('Daemon broker', brokerText), advisoryBadge && ' ', advisoryBadge),
-      labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active)),
-      trustTape(snapshot?.trust),
-      labelValue('Stale', count(snapshot?.stale_claims)),
-      snapshotFresh && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
-      snapshotFresh && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
-      h(BreakerTotals, { snapshot }),
-      snapshotFresh && h(InfraRfcTotals, { snapshot }),
-      snapshotFresh && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
-        title: 'Temporary exploration scheduling hold; not a Claim refutation.',
-      }, labelValue('Oracle-held exploration', count(oracleHeld))),
-      ...PRIORITIES.map(priority => h('span', { key: priority }, badge(priority + ' ' + count(snapshot?.pending_inbox?.[priority]),
-        snapshot?.pending_inbox?.[priority] > 0 ? priority === 'P0' ? 'danger' : priority === 'P1' ? 'warn' : undefined : undefined))),
-      h('span', { title: text(snapshot?.observed_at, '') }, labelValue('Seq', count(snapshot?.event_seq))),
-      h('nav', { className: 'ai4m-actions', 'aria-label': 'AI4Math panels' }, panels.map(panel =>
-        h('button', { key: panel.key, type: 'button', className: 'ai4m-button', onClick: event => {
+      h('div', { className: 'ai4m-hud-brand' },
+        h('strong', null, 'AI4Math'),
+        h('span', { className: 'ai4m-hud-status', role: 'status' }, badge(phaseLabel, snapshotFresh ? 'good' : 'warn'))),
+      h('div', { className: 'ai4m-hud-telemetry' },
+        h('div', { className: 'ai4m-hud-group' },
+          h('span', { className: 'ai4m-hud-metric', 'data-pressure': pressure },
+            labelValue('RAM', pct(memory?.used_percent) + (pressure ? ' · ' + pressure : ''))),
+          h('span', { title: 'Daemon-managed work only; independent CLI processes are not counted.' },
+            labelValue('Daemon broker', brokerText), advisoryBadge && ' ', advisoryBadge),
+          labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active))),
+        h('div', { className: 'ai4m-hud-group' },
+          trustTape(snapshot?.trust)),
+        h('div', { className: 'ai4m-hud-group' },
+          h('span', { className: 'ai4m-hud-metric', 'data-nonzero': isCount(staleClaims) && staleClaims > 0 ? 'true' : 'false' },
+            labelValue('Stale', count(staleClaims))),
+          snapshotFresh && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
+          snapshotFresh && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
+          h(BreakerTotals, { snapshot }),
+          snapshotFresh && h(InfraRfcTotals, { snapshot }),
+          snapshotFresh && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
+            className: 'ai4m-hud-metric', 'data-nonzero': 'true',
+            title: 'Temporary exploration scheduling hold; not a Claim refutation.',
+          }, labelValue('Oracle-held exploration', count(oracleHeld))))),
+      h('div', { className: 'ai4m-hud-pinned' },
+        ...PRIORITIES.map(priority => {
+          const value = snapshot?.pending_inbox?.[priority]
+          const active = isCount(value) && value > 0
+          return h('span', { key: priority, className: 'ai4m-hud-priority', 'data-zero': active ? 'false' : 'true' },
+            badge(priority + ' ' + count(value),
+              active ? (priority === 'P0' ? 'danger' : priority === 'P1' ? 'warn' : 'brand') : 'muted'))
+        }),
+        h('span', { className: 'ai4m-hud-seq', title: text(snapshot?.observed_at, '') }, labelValue('Seq', count(snapshot?.event_seq)))),
+      h('nav', { className: 'ai4m-hud-nav', 'aria-label': 'AI4Math panels' }, panels.map(panel =>
+        h('button', { key: panel.key, type: 'button', className: 'ai4m-button', title: panel.description, onClick: event => {
           setNavigationError(!open(panel.key, event.currentTarget))
         } }, panel.label)))),
-    navigationError && note('Open a DSH session before opening an AI4Math tab.', 'status'),
+    navigationError && banner('Open a DSH session before opening an AI4Math tab.', 'warn', 'status'),
     h(AlertCatchUp, { live, state }),
     h('div', { role: 'status', 'aria-atomic': true }, (latestBreaker?.probe || latestBreaker?.state === 'ARCHIVED') &&
-      h('div', { className: 'ai4m-hud-alert' },
+      h('div', { className: 'ai4m-hud-alert ai4m-hud-alert--breaker' },
         'Latest breaker event · ', h('code', null, text(breaker.entity_id)), ' · #' + count(breaker.event_seq) + ' ',
         h(BreakerReading, { reading: latestBreaker }))),
     alertText && h('div', { className: 'ai4m-hud-alert' },
       badge('Last P0', 'danger'), ' ', alertText,
-      alert.briefing_id && ' · ' + text(alert.briefing_id)))
+      alert.briefing_id && h('span', null, ' · ', h('code', null, text(alert.briefing_id)))))
 }
 
 // Each mounted tab owns its request. Manual actions do not retry writes, and
@@ -251,9 +279,9 @@ function useQuery(remote) {
 }
 
 function queryNote(query, fallback) {
-  if (query.phase === 'loading') return note('Loading AI4Math data…', 'status')
-  if (query.phase === 'error') return note('AI4Math data unavailable. Check the host daemon connection or retry.', 'alert')
-  if (query.phase === 'idle') return note(fallback)
+  if (query.phase === 'loading') return banner('Loading AI4Math data…', 'loading', 'status')
+  if (query.phase === 'error') return banner('AI4Math data unavailable. Check the host daemon connection or retry.', 'danger', 'alert')
+  if (query.phase === 'idle') return fallback ? empty(fallback) : null
   return null
 }
 
@@ -266,30 +294,44 @@ function Panel({ title, subtitle, actions, children }) {
 }
 
 function MathCard({ informal, formal, target }) {
+  const informalText = text(informal, 'Not supplied')
+  const formalText = text(formal, 'Not supplied')
   return h('div', { className: 'ai4m-math' },
-    h('div', null, h('strong', null, 'Informal statement'), h('p', null, text(informal, 'Not supplied'))),
-    h('div', null, h('strong', null, 'Formal signature'), h('pre', null, text(formal, 'Not supplied')),
-      text(target, '') && h('p', null, labelValue('Formal target', h('code', null, target)))))
+    h('div', { className: 'ai4m-math-informal' },
+      h('strong', null, 'Informal statement'),
+      h('p', { className: informalText === 'Not supplied' ? 'ai4m-placeholder' : undefined }, informalText)),
+    h('div', { className: 'ai4m-math-formal' },
+      h('strong', null, 'Formal signature'),
+      h('pre', { className: formalText === 'Not supplied' ? 'ai4m-placeholder' : undefined }, formalText),
+      text(target, '') && h('p', { className: 'ai4m-math-target' }, labelValue('Formal target', h('code', null, target)))))
 }
 
 function ClaimCard({ claim }) {
-  return h('article', { className: 'ai4m-card' },
+  const accent = claim.stale === true || claim.oracle_debt === true ? 'warn'
+    : claim.effective_trust === 'L2b' ? 'danger'
+    : claim.effective_trust === 'L5' ? 'good' : undefined
+  return h('article', { className: 'ai4m-card', 'data-accent': accent },
     h('h4', null, text(claim.title, text(claim.claim_id, 'Unnamed claim'))),
     h('div', { className: 'ai4m-meta' },
-      h('code', null, text(claim.claim_id)), badge(text(claim.engine)),
-      badge('Effective ' + text(claim.effective_trust)), badge('Local ' + text(claim.local_trust)),
-      claim.critical === true && badge('Critical'), claim.stale === true && badge('Stale', 'warn'),
+      h('code', null, text(claim.claim_id)), badge(text(claim.engine), 'muted'),
+      badge('Effective ' + text(claim.effective_trust), trustTone(claim.effective_trust)),
+      badge('Local ' + text(claim.local_trust), trustTone(claim.local_trust)),
+      claim.critical === true && badge('Critical', 'brand'),
+      claim.stale === true && badge('Stale', 'warn'),
       claim.oracle_debt === true && badge('Oracle debt', 'warn')),
     h(MathCard, { informal: claim.informal_statement, formal: claim.formal_signature, target: claim.formal_target }),
-    typeof claim.wiki_id === 'string' && labelValue('Wiki reference', h('code', null, claim.wiki_id)))
+    typeof claim.wiki_id === 'string' && h('div', { className: 'ai4m-card-foot' }, labelValue('Wiki reference', h('code', null, claim.wiki_id))))
 }
 
 function InboxCard({ item }) {
-  return h('article', { className: 'ai4m-card' },
+  const accent = item.priority === 'P0' ? 'danger' : item.priority === 'P1' ? 'warn' : undefined
+  return h('article', { className: 'ai4m-card', 'data-accent': accent },
     h('h4', null, text(item.summary, 'No summary supplied')),
-    h('div', { className: 'ai4m-meta' }, badge(text(item.priority), item.priority === 'P0' ? 'danger' : item.priority === 'P1' ? 'warn' : undefined),
-      badge(text(item.category)), h('code', null, text(item.inbox_id)), labelValue('Leverage', numeric(item.leverage_score)),
-      text(item.created_at)),
+    h('div', { className: 'ai4m-meta' },
+      badge(text(item.priority), item.priority === 'P0' ? 'danger' : item.priority === 'P1' ? 'warn' : 'muted'),
+      badge(text(item.category)), h('code', null, text(item.inbox_id)),
+      labelValue('Leverage', numeric(item.leverage_score)),
+      h('span', { className: 'ai4m-muted' }, text(item.created_at))),
     item.payload != null && h(Evidence, { title: 'Recorded evidence / options', value: item.payload }),
     item.payload_truncated === true && note('Evidence was truncated by the daemon.'))
 }
@@ -303,8 +345,8 @@ function EvidenceText({ value }) {
   return h('pre', { className: 'ai4m-evidence' }, JSON.stringify(value, null, 2)?.slice(0, 8000))
 }
 
-function Section({ title, children }) {
-  return h('section', { className: 'ai4m-section' }, h('h3', null, title), children)
+function Section({ title, className, children }) {
+  return h('section', { className: className ? 'ai4m-section ' + className : 'ai4m-section' }, h('h3', null, title), children)
 }
 
 function Cards({ page, itemKey, card, emptyText }) {
@@ -369,23 +411,27 @@ function readBreakerEvent(event) {
 function BreakerReading({ reading }) {
   const { state, probe, tone, halfOpen, progress } = reading
   return h('span', { className: 'ai4m-meta' },
-    badge(state, state === 'TRIPPED' ? 'danger' : halfOpen ? 'warn' : undefined),
+    badge(state, state === 'TRIPPED' ? 'danger' : (halfOpen || state === 'ARCHIVED') ? 'warn' : state === 'CLOSED' ? 'good' : undefined),
     probe && badge(probe, tone),
     progress && h('span', null, progress),
-    halfOpen && h('span', null, 'Ordinary queue remains frozen'),
-    state === 'ARCHIVED' && h('span', null, 'Ordinary queue remains gated'))
+    halfOpen && h('span', { className: 'ai4m-muted' }, 'Ordinary queue remains frozen'),
+    state === 'ARCHIVED' && h('span', { className: 'ai4m-muted' }, 'Ordinary queue remains gated'))
 }
 
 function BreakerCard({ item }) {
-  return h('article', { className: 'ai4m-card' },
+  const reading = readBreaker(item)
+  const accent = reading.state === 'TRIPPED' ? 'danger'
+    : (reading.halfOpen || reading.state === 'ARCHIVED') ? 'warn'
+    : reading.state === 'CLOSED' ? 'good' : undefined
+  return h('article', { className: 'ai4m-card', 'data-accent': accent },
     h('h4', null, text(item.target_definition_id, text(item.breaker_id, 'Breaker'))),
-    h('div', { className: 'ai4m-meta' }, h(BreakerReading, { reading: readBreaker(item) }),
+    h('div', { className: 'ai4m-meta' }, h(BreakerReading, { reading }),
       h('code', null, text(item.module_path)), text(item.engine), text(item.updated_at, '')))
 }
 
 function BreakerSignal({ event }) {
   const reading = readBreakerEvent(event)
-  return h('article', { className: 'ai4m-card' },
+  return h('article', { className: 'ai4m-card', 'data-accent': 'warn' },
     h('h4', null, 'Latest breaker event'),
     h('div', { className: 'ai4m-meta', role: 'status' }, badge(text(event.event_type), 'warn'),
       h('code', null, text(event.entity_id)), labelValue('Seq', count(event.event_seq)),
@@ -437,19 +483,23 @@ function Briefing({ remote, live }) {
   const checkpoint = pack?.checkpoint
   const hasCheckpoint = checkpoint != null && typeof checkpoint === 'object' && !Array.isArray(checkpoint)
   const busy = query.phase === 'loading'
+  const modeLabel = query.method === 'briefingPeek' ? 'Preview' : query.method === 'briefingGet' ? 'Retained alert' : 'Pull'
+  const modeTone = query.method === 'briefingGet' ? 'danger' : query.method === 'briefingPull' ? 'brand' : 'muted'
   return h(Panel, { title: 'Review briefing', subtitle: 'Deterministic fact packs; neither action advances the human checkpoint.',
     actions: [h('span', { key: 'peek' }, button('Peek (preview only)', () => void query.run('briefingPeek', {}), busy)),
-      h('span', { key: 'pull' }, button('Pull and retain', () => void query.run('briefingPull', {}), busy))] },
+      h('span', { key: 'pull' }, button('Pull and retain', () => void query.run('briefingPull', {}), busy, 'primary'))] },
     queryNote(query, 'Choose Peek or Pull to request a briefing.'),
-    query.phase === 'done' && !pack && note('No fact pack supplied.'),
+    query.phase === 'done' && !pack && empty('No fact pack supplied.'),
     (recentAlerts.length > 0 || alertHistoryIncomplete) && h(Section, { title: 'Recent P0 alerts' },
       h(AlertCatchUp, { live, state }),
-      recentAlerts.length > 0 && h('ul', { className: 'ai4m-edges' }, recentAlerts.map(alert =>
-        h('li', { key: alert.event_seq }, '#' + count(alert.event_seq) + ' · ' + alert.headline,
+      recentAlerts.length > 0 && h('ul', { className: 'ai4m-edges ai4m-edges--alerts' }, recentAlerts.map(alert =>
+        h('li', { key: alert.event_seq },
+          h('span', null, '#' + count(alert.event_seq) + ' · ' + alert.headline),
           typeof alert.briefing_id === 'string' && /^[0-9a-f]{64}$/.test(alert.briefing_id)
             && button('Open retained facts', () => void query.run('briefingGet', { id: alert.briefing_id }, alert.event_seq), busy))))),
     pack && h('div', { className: 'ai4m-stack' },
-      h('div', { className: 'ai4m-meta' }, badge(query.method === 'briefingPeek' ? 'Preview' : query.method === 'briefingGet' ? 'Retained alert' : 'Pull'),
+      h('div', { className: 'ai4m-meta-box' },
+        badge(modeLabel, modeTone),
         labelValue('Event window', '(' + count(pack.event_from_exclusive) + ', ' + count(pack.event_to_inclusive) + ']'),
         query.value.retained_id != null && labelValue('Retained', h('code', null, text(query.value.retained_id))),
         hasCheckpoint && labelValue('Retained human checkpoint event_seq', count(checkpoint.event_seq)),
@@ -458,15 +508,22 @@ function Briefing({ remote, live }) {
       query.method === 'briefingGet' && h(Section, { title: 'P0 alert sources' },
         h(EventList, { page: { items: pack.alert_sources }, openEventSeq: query.alertEventSeq,
           emptyText: 'No P0 alert source events in this retained fact pack.' })),
-      h(Section, { title: 'Trust ledger' }, trustTape(pack.trust), ' · Stale ', count(pack.stale_claims),
-        pack.risk_radar && ' · Oracle debt ' + count(pack.risk_radar.oracle_debts) + ' · Cross-engine debt ' + count(pack.risk_radar.cross_engine_debts)),
-      h(Section, { title: 'Milestones / Refutations' }, ...[['Milestones', pack.milestones], ['Refutations', pack.refutations]].map(([title, page]) =>
-        h('div', { key: title }, h('h4', null, title), h(Cards, { page, itemKey: 'event_seq', card: (item, key) =>
-          h('article', { key, className: 'ai4m-card' }, h('h4', null, text(item.claim?.title ?? item.claim_id)),
-            badge(item.new_local_trust), ' · Event #' + count(item.event_seq),
+      h(Section, { title: 'Trust ledger' },
+        trustTape(pack.trust),
+        h('div', { className: 'ai4m-summary-row' },
+          labelValue('Stale', count(pack.stale_claims)),
+          pack.risk_radar && labelValue('Oracle debt', count(pack.risk_radar.oracle_debts)),
+          pack.risk_radar && labelValue('Cross-engine debt', count(pack.risk_radar.cross_engine_debts)))),
+      h(Section, { title: 'Milestones / Refutations' }, ...[['Milestones', pack.milestones, 'good'], ['Refutations', pack.refutations, 'danger']].map(([title, page, accent]) =>
+        h('div', { key: title, className: 'ai4m-subgroup' }, h('h4', null, title), h(Cards, { page, itemKey: 'event_seq', card: (item, key) =>
+          h('article', { key, className: 'ai4m-card', 'data-accent': accent },
+            h('h4', null, text(item.claim?.title ?? item.claim_id)),
+            h('div', { className: 'ai4m-meta' },
+              item.new_local_trust && badge(item.new_local_trust, trustTone(item.new_local_trust)),
+              h('span', { className: 'ai4m-muted' }, 'Event #' + count(item.event_seq))),
             h(MathCard, { informal: item.claim?.informal_statement, formal: item.claim?.formal_signature,
               target: item.claim?.formal_target }),
-            item.graveyard_id && labelValue('Graveyard witness', text(item.graveyard_id))) })))),
+            item.graveyard_id && h('div', { className: 'ai4m-card-foot' }, labelValue('Graveyard witness', h('code', null, text(item.graveyard_id))))) })))),
       h(Section, { title: 'Frontier claims' }, h(Cards, { page: pack.frontier, itemKey: 'claim_id',
         card: (claim, key) => h(ClaimCard, { claim, key }) })),
       h(PlanSlice, { page: pack.frontier?.plans }),
@@ -485,8 +542,9 @@ function Frontier({ remote, live }) {
   return h(Panel, { title: 'Active frontier', subtitle: 'A bounded claim and dependency slice, not the full proof DAG.',
     actions: button('Refresh', refresh, query.phase === 'loading') },
     h(Section, { title: 'Circuit breakers' },
-      h('p', null, h(BreakerTotals, { snapshot }),
-        (phase !== 'live' || snapshotStale) && ' · Live status unavailable or stale'),
+      h('div', { className: 'ai4m-summary-row' },
+        h(BreakerTotals, { snapshot }),
+        (phase !== 'live' || snapshotStale) && h('span', { className: 'ai4m-muted' }, '· Live status unavailable or stale')),
       phase === 'live' && breaker && h(BreakerSignal, { event: breaker }),
       note('Read-only. To review stored breaker records, use Briefing → Peek.')),
     queryNote(query, 'Waiting for frontier…'),
@@ -518,11 +576,11 @@ const isDerivedCore = (id, stratum) => stratum === 'core'
   && typeof id === 'string' && /^CORE-ADAPT-[0-9a-f]{64}$/.test(id)
 
 function wikiCoverageNote(value, surface) {
-  if (value.managed_core === true) return note(surface === 'search'
+  if (value.managed_core === true) return banner(surface === 'search'
     ? 'Derived CORE was checked for this search. Search again to check for changes.'
     : 'Derived CORE lineage was checked for this response. Inspect again to check for changes.')
-  if (value.managed_core !== false) return note('Derived CORE coverage was not reported for this ' + surface + '.')
-  return note(surface === 'search'
+  if (value.managed_core !== false) return banner('Derived CORE coverage was not reported for this ' + surface + '.')
+  return banner(surface === 'search'
     ? 'Static Wiki only; derived CORE entries were not included.'
     : 'Static Wiki lineage only; derived CORE edges were not included.')
 }
@@ -531,29 +589,36 @@ function WikiCard({ hit, inspectProvenance }) {
   const hasPath = typeof hit.file_path === 'string'
   const virtual = hasPath && hit.file_path.startsWith(managedCorePath)
   const derived = virtual && isDerivedCore(hit.id, hit.stratum) && hit.file_path === managedCorePath + hit.id
-  return h('article', { className: 'ai4m-card' },
+  return h('article', { className: 'ai4m-card', 'data-accent': derived ? 'brand' : undefined },
     h('h4', null, text(hit.title, text(hit.id, 'Untitled Wiki entry'))),
-    h('div', { className: 'ai4m-meta' }, h('code', null, text(hit.id)), badge(text(hit.engine)),
-      badge(derived ? 'Derived CORE' : text(hit.stratum)),
-      badge((derived ? 'Indexed trust ' : '') + text(hit.trust_level)), badge(text(hit.status))),
+    h('div', { className: 'ai4m-meta' }, h('code', null, text(hit.id)), badge(text(hit.engine), 'muted'),
+      badge(derived ? 'Derived CORE' : text(hit.stratum), derived ? 'brand' : undefined),
+      badge((derived ? 'Indexed trust ' : '') + text(hit.trust_level), trustTone(hit.trust_level)),
+      badge(text(hit.status), 'muted')),
     h(MathCard, { informal: hit.informal_gloss, formal: hit.formal_signature }),
-    hasPath && labelValue(virtual ? 'Virtual index location' : 'Source path', h('code', null, hit.file_path)),
-    derived && typeof hit.verified_at_commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hit.verified_at_commit)
-      && labelValue('Verified at Git commit', h('code', null, hit.verified_at_commit)),
-    derived && note('This derived index record is not an authored Wiki page or a proof source.'),
+    (hasPath || (derived && typeof hit.verified_at_commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hit.verified_at_commit)))
+      && h('div', { className: 'ai4m-card-foot' },
+        hasPath && labelValue(virtual ? 'Virtual index location' : 'Source path', h('code', null, hit.file_path)),
+        derived && typeof hit.verified_at_commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hit.verified_at_commit)
+          && labelValue('Verified at Git commit', h('code', null, hit.verified_at_commit))),
+    derived && banner('This derived index record is not an authored Wiki page or a proof source.'),
     validProvenanceId(hit.id) && h('div', { className: 'ai4m-actions' },
       button('Inspect provenance for ' + hit.id, () => inspectProvenance(hit.id, derived))))
 }
 
-function WikiProvenance({ target, query }) {
+function WikiProvenance({ target, query, sectionRef, onClose }) {
   const edges = rows(query.value?.edges, 24)
   const hasDerived = target.derived || edges.some(edge => isDerivedCore(edge.src_id, edge.src_stratum)
     || isDerivedCore(edge.dst_id, edge.dst_stratum))
   const endpoint = (value, stratum) => h('span', null, h('code', null, text(value)), ' ',
-    badge(isDerivedCore(value, stratum) ? 'Derived CORE' : text(stratum, 'Outside index')))
-  return h(Section, { title: 'Provenance for ' + target.id },
+    badge(isDerivedCore(value, stratum) ? 'Derived CORE' : text(stratum, 'Outside index'),
+      isDerivedCore(value, stratum) ? 'brand' : 'muted'))
+  return h('section', { ref: sectionRef, className: 'ai4m-section ai4m-provenance' },
+    h('div', { className: 'ai4m-provenance-head' },
+      h('h3', null, 'Provenance for ' + target.id),
+      onClose && button('Close', onClose)),
     note('Read-only lineage across strata; recorded edges do not confer proof status.'),
-    hasDerived && note('Derived CORE nodes are index records, not authored Wiki pages or proof sources.'),
+    hasDerived && banner('Derived CORE nodes are index records, not authored Wiki pages or proof sources.'),
     queryNote(query),
     query.value && wikiCoverageNote(query.value, 'provenance response'),
     query.phase === 'done' && (edges.length ? h('ol', { className: 'ai4m-edges' }, edges.map((edge, index) =>
@@ -582,11 +647,15 @@ function validRouteLesson(record) {
 function RouteLessons({ entries, truncated }) {
   if (entries.length === 0 && !truncated) return null
   return h(Section, { title: 'Operator route lessons' },
-    note('Historical warnings only. These lessons are not proofs or mathematical refutations.'),
-    ...entries.map(item => h('article', { key: item.lesson_id, className: 'ai4m-card' },
-      h('h4', null, item.title), badge('L0 · advisory only'), h('p', null, item.lesson),
-      labelValue('Lesson', h('code', null, item.lesson_id)), labelValue('Approved ADR', h('code', null, item.adr_id)),
-      labelValue('Archived routes', item.plan_ids.join(', ')))),
+    banner('Historical warnings only. These lessons are not proofs or mathematical refutations.', 'warn'),
+    ...entries.map(item => h('article', { key: item.lesson_id, className: 'ai4m-card', 'data-accent': 'warn' },
+      h('h4', null, item.title),
+      h('div', { className: 'ai4m-meta' }, badge('L0 · advisory only', 'warn')),
+      h('p', null, item.lesson),
+      h('div', { className: 'ai4m-card-foot' },
+        labelValue('Lesson', h('code', null, item.lesson_id)),
+        labelValue('Approved ADR', h('code', null, item.adr_id)),
+        labelValue('Archived routes', item.plan_ids.join(', '))))),
     truncated && note('Only a bounded route lesson slice is shown.'))
 }
 
@@ -594,9 +663,13 @@ function Wiki({ remote }) {
   const query = useQuery(remote)
   const provenance = useQuery(remote)
   const [provenanceTarget, setProvenanceTarget] = useState(null)
+  const provenanceRef = useRef(null)
   const [input, setInput] = useState('')
   const [scope, setScope] = useState('core')
   const [searched, setSearched] = useState(null)
+  useEffect(() => {
+    if (provenanceTarget) provenanceRef.current?.scrollIntoView?.({ block: 'nearest', behavior: 'smooth' })
+  }, [provenanceTarget])
   const busy = query.phase === 'loading'
   const term = input.trim()
   const invalid = new TextEncoder().encode(term).byteLength > 512 || term.includes('\0')
@@ -615,18 +688,21 @@ function Wiki({ remote }) {
     void provenance.run('wikiProvenance', { id, max_depth: 2, limit: 24 })
   }
   return h(Panel, { title: 'Math Wiki', subtitle: 'Search CORE first; inspect SEDIMENT and GRAVEYARD as separate strata.' },
-    h('form', { className: 'ai4m-actions', onSubmit: event => { event.preventDefault(); submit(term, scope) } },
-      h('label', null, 'Query ', h('input', { type: 'search', value: input, maxLength: 512,
+    h('form', { className: 'ai4m-search-form', onSubmit: event => { event.preventDefault(); submit(term, scope) } },
+      h('label', { className: 'ai4m-field ai4m-field--grow' }, 'Query ', h('input', { type: 'search', value: input, maxLength: 512,
+        placeholder: 'Title, mathematical phrase, or ID…',
         onChange: event => setInput(event.target.value), required: true })),
-      h('label', null, 'Scope ', h('select', { value: scope, onChange: event => setScope(event.target.value) },
+      h('label', { className: 'ai4m-field' }, 'Scope ', h('select', { value: scope, onChange: event => setScope(event.target.value) },
         WIKI_SCOPES.map(value => h('option', { key: value, value }, value.toUpperCase())))),
-      h('button', { className: 'ai4m-button', type: 'submit', disabled: busy || !term || invalid }, 'Search')),
-    invalid && note('Queries must be at most 512 UTF-8 bytes and cannot contain a NUL character.', 'status'),
+      h('button', { className: 'ai4m-button', 'data-variant': 'primary', type: 'submit', disabled: busy || !term || invalid }, 'Search')),
+    invalid && banner('Queries must be at most 512 UTF-8 bytes and cannot contain a NUL character.', 'warn', 'status'),
     queryNote(query, 'Enter a title, mathematical phrase, or identifier.'),
-    query.value && searched && note('Results for “' + searched.term + '” · ' + searched.stratum.toUpperCase()),
+    query.value && searched && h('p', { className: 'ai4m-results-head' }, 'Results for “' + searched.term + '” · ' + searched.stratum.toUpperCase()),
     query.value && searched?.stratum === 'core' && wikiCoverageNote(query.value, 'search'),
-    query.value && searched?.stratum === 'graveyard' && note('Graveyard matches are historical warnings, not verified evidence.'),
-    provenanceTarget && h(WikiProvenance, { target: provenanceTarget, query: provenance }),
+    query.value && searched?.stratum === 'graveyard' && banner('Graveyard matches are historical warnings, not verified evidence.', 'warn'),
+    provenanceTarget && h(WikiProvenance, {
+      target: provenanceTarget, query: provenance, sectionRef: provenanceRef, onClose: () => setProvenanceTarget(null),
+    }),
     query.value && (hits.length > 0 ? h('div', { className: 'ai4m-stack' },
       hits.map((hit, index) => h(WikiCard, { key: text(hit.id, 'hit') + ':' + index, hit, inspectProvenance })))
       : (lessonRows.length === 0 && !routeLessonsTruncated && empty('No matching records returned.'))),
@@ -634,12 +710,13 @@ function Wiki({ remote }) {
     query.value?.truncated === true && note('Only a bounded search slice is shown.'),
     shadow && searched && h('details', null,
       h('summary', null, 'Shadow hint · SEDIMENT ' + count(shadow.sediment_count) + ' / GRAVEYARD ' + count(shadow.graveyard_count)),
-      shadow.top_sediment && note('Closest sediment lead: ' + text(shadow.top_sediment.title, text(shadow.top_sediment.id))),
-      shadow.top_graveyard_id && note('Graveyard warning: ' + text(shadow.top_graveyard_id) + ' is historical, not verified evidence.'),
-      h('div', { className: 'ai4m-actions' },
-        ...['sediment', 'graveyard'].map(stratum => h('span', { key: stratum }, button('Search ' + stratum.toUpperCase(), () => {
-          setInput(searched.term); setScope(stratum); submit(searched.term, stratum)
-        }, busy || !(shadow[stratum + '_count'] > 0)))))))
+      h('div', { className: 'ai4m-shadow-body' },
+        shadow.top_sediment && note('Closest sediment lead: ' + text(shadow.top_sediment.title, text(shadow.top_sediment.id))),
+        shadow.top_graveyard_id && note('Graveyard warning: ' + text(shadow.top_graveyard_id) + ' is historical, not verified evidence.'),
+        h('div', { className: 'ai4m-actions' },
+          ...['sediment', 'graveyard'].map(stratum => h('span', { key: stratum }, button('Search ' + stratum.toUpperCase(), () => {
+            setInput(searched.term); setScope(stratum); submit(searched.term, stratum)
+          }, busy || !(shadow[stratum + '_count'] > 0))))))))
 }
 
 module.exports = { LiveHud, panels, views: { briefing: Briefing, frontier: Frontier, inbox: Inbox, wiki: Wiki },
