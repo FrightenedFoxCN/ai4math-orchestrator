@@ -11,8 +11,12 @@ use sha2::{Digest, Sha256};
 mod archive_routes;
 mod critical_routes;
 mod lessons;
+mod owner_archive;
 pub use archive_routes::PivotArchivePlan;
 pub use lessons::{PivotLessonDraft, PivotLessonPage, PivotLessonWarning};
+pub use owner_archive::{
+    OwnerArchiveRequest, OwnerArchiveRequestRecord, OwnerArchiveRequestStatus,
+};
 
 pub(crate) const CRITICAL_BREAKER_TRIPPED: &str = "CRITICAL_BREAKER_TRIPPED";
 
@@ -259,6 +263,21 @@ fn read_target(db: &Connection, id: &str) -> Result<(BreakerProjection, InboxPro
     Ok((breaker, inbox, fingerprint))
 }
 
+fn confirm_base(db: &Connection, base: &str) -> Result<()> {
+    let latest: Option<String> = db
+        .query_row(
+            "SELECT git_commit FROM events WHERE git_commit IS NOT NULL ORDER BY event_seq DESC LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    ensure!(
+        latest.as_deref() == Some(base),
+        "ledger does not attest current main"
+    );
+    Ok(())
+}
+
 fn confirm_context(db: &Connection, plan: &PivotPlan, before_cas: bool) -> Result<()> {
     bound_repo(db, &plan.repo)?;
     ensure!(
@@ -270,6 +289,7 @@ fn confirm_context(db: &Connection, plan: &PivotPlan, before_cas: bool) -> Resul
             last_seq(db)? == plan.reviewed_through,
             "ledger changed since Pivot preview; review new facts before applying"
         );
+        confirm_base(db, &plan.base_commit)?;
     }
     let (breaker, inbox, hash) = read_target(db, &plan.breaker.breaker_id)?;
     ensure!(
@@ -285,6 +305,30 @@ fn confirm_context(db: &Connection, plan: &PivotPlan, before_cas: bool) -> Resul
         hash == plan.target_sha256,
         "selected Pivot target changed since review"
     );
+    Ok(())
+}
+
+fn prepare_pivot_in(tx: &Transaction<'_>, intent: &PivotIntent) -> Result<()> {
+    ensure!(
+        intent.adr_id == intent.plan.adr_id()?
+            && oid(&intent.new_commit)
+            && intent.new_commit != intent.plan.base_commit,
+        "invalid prepared Pivot"
+    );
+    owner_archive::ensure_unused_adr(tx, &intent.adr_id)?;
+    ensure!(
+        read_pending(tx)?.is_none() && read_intent(tx)?.is_none(),
+        "recover the pending Git transaction first"
+    );
+    confirm_context(tx, &intent.plan, true)?;
+    tx.execute(
+        "INSERT INTO pivot_resume_intent(singleton,adr_id,plan_json,new_commit) VALUES(1,?1,?2,?3)",
+        params![
+            intent.adr_id,
+            serde_json::to_string(&intent.plan)?,
+            intent.new_commit
+        ],
+    )?;
     Ok(())
 }
 
@@ -486,11 +530,7 @@ impl StateStore {
                 && review.to_git_commit.as_deref() == Some(base),
             "Fact Pack does not match current checkpoint, ledger generation and Git main"
         );
-        let latest:Option<String>=tx.query_row("SELECT git_commit FROM events WHERE git_commit IS NOT NULL ORDER BY event_seq DESC LIMIT 1",[],|r|r.get(0)).optional()?;
-        ensure!(
-            latest.as_deref() == Some(base),
-            "ledger does not attest current main"
-        );
+        confirm_base(&tx, base)?;
         let (breaker, inbox, target_sha256) = read_target(&tx, breaker_id)?;
         ensure!(
             review.reviewed_breaker(breaker_id) == Some(&breaker)
@@ -556,13 +596,7 @@ impl StateStore {
     }
 
     pub fn prepare_pivot(&mut self, intent: &PivotIntent) -> Result<()> {
-        self.write(|tx| {
-            ensure!(intent.adr_id==intent.plan.adr_id()? && oid(&intent.new_commit) && intent.new_commit!=intent.plan.base_commit,"invalid prepared Pivot");
-            ensure!(read_pending(tx)?.is_none() && read_intent(tx)?.is_none(),"recover the pending Git transaction first");
-            confirm_context(tx,&intent.plan,true)?;
-            tx.execute("INSERT INTO pivot_resume_intent(singleton,adr_id,plan_json,new_commit) VALUES(1,?1,?2,?3)",params![intent.adr_id,serde_json::to_string(&intent.plan)?,intent.new_commit])?;
-            Ok(())
-        })
+        self.write(|tx| prepare_pivot_in(tx, intent))
     }
 
     /// The trusted coordinator holds the repository lock. The callback verifies
@@ -576,6 +610,7 @@ impl StateStore {
     ) -> Result<PivotResult> {
         self.write(|tx| {
             ensure!(read_pending(tx)?.as_ref()==Some(intent),"Pivot intent changed or is missing");
+            let owner_request = owner_archive::prepared_for(tx, intent)?;
             let p=&intent.plan;
             confirm_context(tx,p,!already_adopted)?;
             let lesson_id = p.lesson_id()?;
@@ -609,6 +644,9 @@ impl StateStore {
             if let Some(lesson_id) = &lesson_id {
                 lessons::insert(tx, p, id, lesson_id, seq)?;
             }
+            if let Some(request_id) = owner_request {
+                owner_archive::transition(tx, &request_id, OwnerArchiveRequestStatus::Applied)?;
+            }
             tx.execute("DELETE FROM pivot_resume_intent WHERE singleton=1",[])?;
             Ok(PivotResult{adr_id:id.clone(),git_commit:intent.new_commit.clone(),event_seq:seq,reviewed_through:p.reviewed_through,breaker_state,probes_started:false,lesson_id})
         })
@@ -621,6 +659,9 @@ impl StateStore {
                 read_pending(tx)?.as_ref() == Some(intent),
                 "Pivot intent changed or is missing"
             );
+            if let Some(request_id) = owner_archive::prepared_for(tx, intent)? {
+                owner_archive::transition(tx, &request_id, OwnerArchiveRequestStatus::Abandoned)?;
+            }
             tx.execute("DELETE FROM pivot_resume_intent WHERE singleton=1", [])?;
             Ok(())
         })

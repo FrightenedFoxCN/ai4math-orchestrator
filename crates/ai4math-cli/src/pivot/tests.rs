@@ -66,6 +66,122 @@ fn fixture_event(store: &mut StateStore) -> Result<i64> {
 }
 
 #[test]
+fn signed_archive_recovers_exact_prepared_commit_after_lost_response() -> Result<()> {
+    use ai4math_store::OwnerArchiveRequestStatus;
+    use std::{
+        process::{Command, Stdio},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let repo = setup(root)?;
+    let db = root.join(".runtime/state.sqlite");
+    let mut store = StateStore::open(&db)?;
+    let facts = retain(root, serde_json::to_value(store.briefing_facts()?)?)?;
+    let locked = PromotionRepo::try_lock_existing(&repo)?;
+    let p = plan(
+        root,
+        &locked,
+        &mut store,
+        &facts,
+        B,
+        REASON,
+        Selection::just(PivotAction::ArchiveBreaker),
+    )?;
+    let base = p.base_commit.clone();
+    let id = p.adr_id()?;
+    let digest = id.strip_prefix("ADR-PIVOT-").unwrap();
+    drop(locked);
+    drop(store);
+    let expires = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs() + 180;
+    let message = crate::owner_approval::ArchiveApproval::new(
+        root,
+        &repo,
+        &base,
+        digest,
+        "request-1",
+        expires,
+    )?;
+    let key = root.join("fixture-key");
+    let run = |args: &[&str]| -> Result<()> {
+        let out = Command::new("/usr/bin/ssh-keygen")
+            .args(args)
+            .stdin(Stdio::null())
+            .output()?;
+        ensure!(
+            out.status.success(),
+            "fixture ssh-keygen failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Ok(())
+    };
+    run(&["-q", "-t", "ed25519", "-N", "", "-f", key.to_str().unwrap()])?;
+    let msg = root.join("approval");
+    fs::write(&msg, message.signing_bytes())?;
+    run(&[
+        "-Y",
+        "sign",
+        "-n",
+        "ai4math-owner-archive-v1",
+        "-f",
+        key.to_str().unwrap(),
+        msg.to_str().unwrap(),
+    ])?;
+    let sig = root.join("approval.sig");
+    let input = || SignedArchive {
+        fact: &facts,
+        breaker: B,
+        reason: REASON,
+        base: &base,
+        adr_sha256: digest,
+        request_id: "request-1",
+        expires_unix: expires,
+        signature: &sig,
+    };
+    assert!(
+        apply_signed_archive(root, &repo, input()).is_err(),
+        "not enabled without fixed trust anchor"
+    );
+    assert!(
+        StateStore::open_readonly(&db)?
+            .owner_archive_request("request-1")?
+            .is_none()
+    );
+    let anchor = root.join(".runtime/owner-archive.pub");
+    fs::copy(root.join("fixture-key.pub"), &anchor)?;
+    fs::set_permissions(&anchor, fs::Permissions::from_mode(0o600))?;
+    let mut mismatched = input();
+    mismatched.request_id = "request-2";
+    assert!(apply_signed_archive(root, &repo, mismatched).is_err());
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), base);
+    let commit = prepare_signed_archive(root, &repo, input(), |_store, git, _, intent| {
+        git.advance_adr(
+            &intent.plan.base_commit,
+            &intent.new_commit,
+            &intent.adr_id,
+            &markdown(&intent.plan)?,
+        )?;
+        Ok(intent.new_commit.clone())
+    })?;
+    let pending = StateStore::open_readonly(&db)?
+        .owner_archive_request("request-1")?
+        .unwrap();
+    assert_eq!(pending.status, OwnerArchiveRequestStatus::Prepared);
+    assert!(pending.result.is_none());
+    assert!(apply_signed_archive(root, &repo, input()).is_err());
+    fs::remove_file(&anchor)?; // Recovery relies on the durable consumed request, not a new approval.
+    recover_signed_archive(root, &repo, "request-1")?;
+    recover_signed_archive(root, &repo, "request-1")?;
+    let store = StateStore::open_readonly(&db)?;
+    let recorded = store.owner_archive_request("request-1")?.unwrap();
+    assert_eq!(recorded.status, OwnerArchiveRequestStatus::Applied);
+    assert_eq!(recorded.result.unwrap().git_commit, commit);
+    assert!(store.pivot_intent()?.is_none());
+    Ok(())
+}
+
+#[test]
 fn owner_archive_preview_never_creates_a_missing_lock_or_advances_state() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path();

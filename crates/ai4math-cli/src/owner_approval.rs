@@ -5,6 +5,7 @@
 use anyhow::bail;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::{
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
@@ -15,14 +16,15 @@ const MAX_PATH_BYTES: usize = 4096;
 const MAX_REQUEST_BYTES: usize = 128;
 const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 const MAX_KEY_BYTES: usize = 4 * 1024;
+const MAX_REMAINING_SECONDS: u64 = 10 * 60;
 
 /// All fields must describe the expected local operation, not merely echo an
-/// untrusted submission. The caller checks current Git/ledger state and takes
+/// untrusted submission. The caller checks current Git/ledger state, takes
 /// `adr_sha256` from the expected canonical Pivot plan hash (`ADR-PIVOT` suffix),
-/// not from the human-readable Markdown. A future consumer should enforce a
-/// short maximum approval lifetime in addition to atomic request consumption.
+/// not from human-readable Markdown, and is responsible for atomic consumption.
 pub(crate) struct ArchiveApproval {
     bytes: Vec<u8>,
+    project_root: String,
     expires_unix: u64,
 }
 
@@ -78,6 +80,7 @@ impl ArchiveApproval {
         })?;
         Ok(Self {
             bytes,
+            project_root,
             expires_unix,
         })
     }
@@ -85,6 +88,47 @@ impl ArchiveApproval {
     /// Compact UTF-8 JSON in struct field order, no terminal LF.
     pub(crate) fn signing_bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Lowercase hexadecimal SHA-256 of the exact signed JSON bytes.
+    pub(crate) fn message_sha256(&self) -> String {
+        sha256_hex(self.signing_bytes())
+    }
+
+    /// Managed submission verification; a diagnostic path-loaded key cannot
+    /// be used here. Check the full expiry window on both sides of verification.
+    pub(crate) fn verify_fresh(&self, key: &ManagedOwnerKey, signature: &[u8]) -> Result<()> {
+        self.verify_fresh_at(key, signature, unix_seconds)
+    }
+
+    fn verify_fresh_at(
+        &self,
+        key: &ManagedOwnerKey,
+        signature: &[u8],
+        mut now: impl FnMut() -> Result<u64>,
+    ) -> Result<()> {
+        ensure!(
+            self.project_root == key.project_root,
+            "trusted Owner public key belongs to a different managed root"
+        );
+        self.check_fresh_at(now()?)?;
+        self.verify_signature(&key.key, signature)?;
+        self.check_fresh_at(now()?)
+    }
+
+    /// Call as close to the durable submission as possible, even if
+    /// `verify_fresh` already succeeded.
+    pub(crate) fn check_fresh(&self) -> Result<()> {
+        self.check_fresh_at(unix_seconds()?)
+    }
+
+    fn check_fresh_at(&self, now: u64) -> Result<()> {
+        self.check_expiry(now)?;
+        ensure!(
+            self.expires_unix - now <= MAX_REMAINING_SECONDS,
+            "Owner archive approval has more than 10 minutes remaining"
+        );
+        Ok(())
     }
 
     /// Checks against the caller's independently provisioned key. A verified
@@ -103,6 +147,10 @@ impl ArchiveApproval {
         now: impl FnOnce() -> Result<u64>,
     ) -> Result<()> {
         self.check_expiry(now()?)?;
+        self.verify_signature(trusted_key, signature)
+    }
+
+    fn verify_signature(&self, trusted_key: &TrustedOwnerKey, signature: &[u8]) -> Result<()> {
         ensure!(
             !signature.is_empty() && signature.len() <= MAX_SIGNATURE_BYTES,
             "signature must be nonempty and at most 4 KiB"
@@ -132,6 +180,10 @@ fn unix_seconds() -> Result<u64> {
         .as_secs())
 }
 
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 fn lowercase_hex(s: &str) -> bool {
     s.bytes()
         .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
@@ -157,9 +209,48 @@ fn canonical_dir(path: &Path, name: &str) -> Result<String> {
 /// allowed-signers syntax, principals or options are read from an approval.
 pub(crate) struct TrustedOwnerKey(String);
 
+/// A key admitted exclusively from the fixed trust anchor of one managed root.
+pub(crate) struct ManagedOwnerKey {
+    key: TrustedOwnerKey,
+    project_root: String,
+}
+
+impl ManagedOwnerKey {
+    /// Lowercase hexadecimal SHA-256 of the canonical ASCII SSH base64 token,
+    /// not the comment, algorithm prefix, or decoded wire bytes.
+    pub(crate) fn fingerprint(&self) -> String {
+        sha256_hex(self.key.0.as_bytes())
+    }
+}
+
 impl TrustedOwnerKey {
+    /// Diagnostic-only key loading: not trusted for managed submissions.
     pub(crate) fn read(path: &Path) -> Result<Self> {
         Self::parse(&read_bounded(path, MAX_KEY_BYTES).context("read trusted Owner public key")?)
+    }
+
+    /// Load a deployer-provisioned trust anchor at `.runtime/owner-archive.pub`.
+    /// The managed root must already be canonical; no override or fallback exists.
+    pub(crate) fn read_managed(root: &Path) -> Result<ManagedOwnerKey> {
+        #[cfg(unix)]
+        {
+            let project_root = root.to_str().context("managed root is not UTF-8")?;
+            ensure!(
+                project_root.len() <= MAX_PATH_BYTES,
+                "managed root path is too long"
+            );
+            let bytes = managed_anchor::read(root)
+                .context("read fixed Owner public key at .runtime/owner-archive.pub")?;
+            Ok(ManagedOwnerKey {
+                key: Self::parse(&bytes)?,
+                project_root: project_root.to_owned(),
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = root;
+            bail!("Managed Owner trust anchors are unavailable on this platform")
+        }
     }
 
     fn parse(bytes: &[u8]) -> Result<Self> {
@@ -213,6 +304,9 @@ fn read_bounded(path: &Path, cap: usize) -> Result<Vec<u8>> {
         bail!("Owner archive signature verification is unavailable on this platform")
     }
 }
+
+#[cfg(unix)]
+mod managed_anchor;
 
 #[cfg(unix)]
 mod unix {

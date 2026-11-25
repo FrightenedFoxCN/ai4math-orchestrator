@@ -41,6 +41,9 @@ ai4math pivot-archive-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
 ai4math owner-archive-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
 ai4math owner-archive-signing-message ROOT BARE_REPO BASE ADR_SHA256 REQUEST_ID EXPIRES_UNIX
 ai4math owner-archive-verify ROOT BARE_REPO BASE ADR_SHA256 REQUEST_ID EXPIRES_UNIX TRUSTED_PUBLIC_KEY_FILE SIGNATURE_FILE
+ai4math owner-archive-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON BASE ADR_SHA256 REQUEST_ID EXPIRES_UNIX SIGNATURE_FILE
+ai4math owner-archive-status ROOT REQUEST_ID
+ai4math owner-archive-recover ROOT BARE_REPO REQUEST_ID
 ai4math pivot-archive-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID
 ai4math pivot-routes-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON PLAN...
 ai4math pivot-routes-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID PLAN...
@@ -1101,6 +1104,36 @@ fn run() -> Result<()> {
             print_json(
                 serde_json::json!({"signature_valid":true,"diagnostic_only":true,"applied":false}),
             )
+        }
+        [
+            "owner-archive-apply",
+            root,
+            repo,
+            fact,
+            breaker,
+            reason,
+            base,
+            adr,
+            id,
+            expires,
+            signature,
+        ] => pivot::apply_signed_archive(
+            Path::new(root),
+            Path::new(repo),
+            pivot::SignedArchive {
+                fact,
+                breaker,
+                reason,
+                base,
+                adr_sha256: adr,
+                request_id: id,
+                expires_unix: expires.parse()?,
+                signature: Path::new(signature),
+            },
+        ),
+        ["owner-archive-status", root, id] => pivot::owner_archive_status(Path::new(root), id),
+        ["owner-archive-recover", root, repo, id] => {
+            pivot::recover_signed_archive(Path::new(root), Path::new(repo), id)
         }
         ["owner-archive-preview", root, repo, fact, breaker, reason] => {
             pivot::owner_archive_preview(Path::new(root), Path::new(repo), fact, breaker, reason)

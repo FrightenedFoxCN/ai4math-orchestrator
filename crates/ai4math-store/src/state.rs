@@ -46,8 +46,9 @@ pub use graph_replay::GraphReplay;
 pub use infra_rfc::{INFRA_RFC_MAX_BYTES, InfraRfcRecord, InfraRfcStatus, parse_infra_rfc_draft};
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{
-    BreakerTripReport, PivotAction, PivotArchivePlan, PivotIntent, PivotLessonDraft,
-    PivotLessonPage, PivotLessonWarning, PivotPlan, PivotResult,
+    BreakerTripReport, OwnerArchiveRequest, OwnerArchiveRequestRecord, OwnerArchiveRequestStatus,
+    PivotAction, PivotArchivePlan, PivotIntent, PivotLessonDraft, PivotLessonPage,
+    PivotLessonWarning, PivotPlan, PivotResult,
 };
 pub use plan_replay::{PlanReplay, ReplayedPlan, ReplayedPlanDependency};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
@@ -496,6 +497,7 @@ impl StateStore {
         store.initialize_route_projection()?;
         store.initialize_refutation_outbox()?;
         migrations::initialize_model_dispatch(&mut store.db)?;
+        migrations::initialize_owner_archive_requests(&mut store.db)?;
         Ok(store)
     }
 

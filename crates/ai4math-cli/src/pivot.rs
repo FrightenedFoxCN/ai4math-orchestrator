@@ -281,6 +281,16 @@ fn prepare(
     pin: &PendingRef<'_>,
     p: PivotPlan,
 ) -> Result<PivotIntent> {
+    prepare_with(store, git, pin, p, StateStore::prepare_pivot)
+}
+
+fn prepare_with(
+    store: &mut StateStore,
+    git: &PromotionRepo,
+    pin: &PendingRef<'_>,
+    p: PivotPlan,
+    persist: impl FnOnce(&mut StateStore, &PivotIntent) -> Result<()>,
+) -> Result<PivotIntent> {
     let adr_id = p.adr_id()?;
     let new_commit = git.prepare_adr(&p.base_commit, &adr_id, &markdown(&p)?)?;
     let intent = PivotIntent {
@@ -289,7 +299,7 @@ fn prepare(
         new_commit,
     };
     pin.ensure_pinned(&intent.new_commit)?;
-    if let Err(err) = store.prepare_pivot(&intent) {
+    if let Err(err) = persist(store, &intent) {
         if let Ok(current) = store.pivot_intent()
             && current.as_ref() != Some(&intent)
         {
@@ -461,6 +471,153 @@ fn apply_with(
     pin.clear()?;
     let intent = prepare(&mut store, &git, &pin, p)?;
     print_json(land(&mut store, &git, &pin, &intent)?)
+}
+
+pub(crate) struct SignedArchive<'a> {
+    pub fact: &'a str,
+    pub breaker: &'a str,
+    pub reason: &'a str,
+    pub base: &'a str,
+    pub adr_sha256: &'a str,
+    pub request_id: &'a str,
+    pub expires_unix: u64,
+    pub signature: &'a Path,
+}
+
+/// Only for the independently protected operator CLI, never a remote endpoint.
+pub(crate) fn apply_signed_archive(root: &Path, repo: &Path, q: SignedArchive<'_>) -> Result<()> {
+    print_json(prepare_signed_archive(root, repo, q, land)?)
+}
+
+fn prepare_signed_archive<T>(
+    root: &Path,
+    repo: &Path,
+    q: SignedArchive<'_>,
+    after_prepare: impl FnOnce(
+        &mut StateStore,
+        &PromotionRepo,
+        &PendingRef<'_>,
+        &PivotIntent,
+    ) -> Result<T>,
+) -> Result<T> {
+    use crate::owner_approval::{ArchiveApproval, TrustedOwnerKey, read_signature};
+    use ai4math_store::OwnerArchiveRequest;
+    let project = ManagedProject::new(root)?;
+    let git = PromotionRepo::try_lock_existing(repo)?;
+    let mut store = open_managed_state(project.root(), true)?;
+    ensure!(
+        store.owner_archive_request(q.request_id)?.is_none(),
+        "Owner request ID was already used; query or recover that request by ID"
+    );
+    let p = plan(
+        project.root(),
+        &git,
+        &mut store,
+        q.fact,
+        q.breaker,
+        q.reason,
+        Selection::just(PivotAction::ArchiveBreaker),
+    )?;
+    let adr_id = p.adr_id()?;
+    ensure!(
+        p.base_commit == q.base && adr_id.strip_prefix("ADR-PIVOT-") == Some(q.adr_sha256),
+        "signed approval does not match the current archive preview"
+    );
+    let approval = ArchiveApproval::new(
+        project.root(),
+        git.path(),
+        q.base,
+        q.adr_sha256,
+        q.request_id,
+        q.expires_unix,
+    )?;
+    let key = TrustedOwnerKey::read_managed(project.root())?;
+    let key_fingerprint = key.fingerprint();
+    approval.verify_fresh(&key, &read_signature(q.signature)?)?;
+    let request = OwnerArchiveRequest {
+        request_id: q.request_id.into(),
+        message_sha256: approval.message_sha256(),
+        public_key_fingerprint: key_fingerprint,
+        repo: repo_name(&git)?.into(),
+        base_commit: q.base.into(),
+        adr_id,
+    };
+    ensure!(
+        git.main_head()? == q.base,
+        "archive base moved before execution"
+    );
+    drop(store);
+    let mut store = project.open_state()?;
+    ensure!(
+        store.pivot_intent()?.is_none() && store.promotion_intent()?.is_none(),
+        "recover the pending Git transaction before consuming the Owner request"
+    );
+    let pin = git.pivot_pending_ref(project.state_path())?;
+    pin.clear()?;
+    let intent = prepare_with(&mut store, &git, &pin, p, |store, intent| {
+        store.prepare_owner_archive_pivot_with_check(&request, intent, || {
+            ensure!(
+                TrustedOwnerKey::read_managed(project.root())?.fingerprint()
+                    == request.public_key_fingerprint,
+                "Owner trust anchor changed before request consumption"
+            );
+            ensure!(
+                git.main_head()? == q.base,
+                "archive base moved before request consumption"
+            );
+            approval.check_fresh()
+        })
+    })?;
+    after_prepare(&mut store, &git, &pin, &intent)
+}
+
+pub(crate) fn owner_archive_status(root: &Path, id: &str) -> Result<()> {
+    let store = open_managed_state(root, true)?;
+    let record = store
+        .owner_archive_request(id)?
+        .context("unknown Owner archive request")?;
+    print_json(json!({"request":record.request,"status":record.status,"result":record.result}))
+}
+
+pub(crate) fn recover_signed_archive(root: &Path, repo: &Path, id: &str) -> Result<()> {
+    use ai4math_store::OwnerArchiveRequestStatus;
+    let project = ManagedProject::new(root)?;
+    let git = PromotionRepo::try_lock_existing(repo)?;
+    let mut store = project.open_state()?;
+    let record = store
+        .owner_archive_request(id)?
+        .context("unknown Owner archive request")?;
+    ensure!(
+        record.request.repo == repo_name(&git)?,
+        "Owner archive request belongs to another repository"
+    );
+    match record.status {
+        OwnerArchiveRequestStatus::Prepared => {
+            let pin = git.pivot_pending_ref(project.state_path())?;
+            pin.ensure_pinned(&record.intent.new_commit)?;
+            print_json(land(&mut store, &git, &pin, &record.intent)?)
+        }
+        OwnerArchiveRequestStatus::Applied => {
+            let result = record
+                .result
+                .context("missing applied Owner archive result")?;
+            let p = &record.intent.plan;
+            git.validate_adr(
+                &p.base_commit,
+                &result.git_commit,
+                &record.request.adr_id,
+                &markdown(p)?,
+            )?;
+            ensure!(
+                git.is_ungrafted_ancestor(&result.git_commit, &git.main_head()?)?,
+                "recorded Owner archive no longer belongs to main"
+            );
+            print_json(result)
+        }
+        OwnerArchiveRequestStatus::Abandoned => {
+            bail!("abandoned Owner archive cannot be recovered")
+        }
+    }
 }
 
 pub(crate) fn recover(root: &Path, repo: &Path) -> Result<()> {
