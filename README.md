@@ -44,4 +44,6 @@
 - [x] **Phase 2（本机守护进程）**：`ai4math-daemon`（UDS NDJSON JSON-RPC 2.0 + 实时生命体征推流 + 确定性 Fact Pack 编译器）
 - [x] **Phase 3（DSH 原生插件实现）**：`plugins/dsh-ai4math`（Host Cordis 角色工具面 + `TypertRemoteService` 桥接 + Client `shell.bottom` Live HUD 与 `sidebarRightTabs` 面板）
 
-Phase 2 / 3 已通过本机 daemon 与 DSH SDK 集成测试；实际 GUI 安装、认证/布局冲突、生产 preset 生命周期和可写的人机决策闭环尚未验收。当前实现状态见 [implementation-status.md](docs/implementation-status.md)，完整架构的后续实现与证据见[验收矩阵](docs/architecture-acceptance.md)。
+以上勾选表示阶段基础实现已落地，不表示生产交付。当前交接基线为 `0d2b6d1`：本机 daemon 与安装版 DSH SDK 集成测试已通过；现用 GUI 未安装验收。Owner 归档只开放本地签名 CLI，不开放远程写入口。Linux 验证后端仍禁用；Rocq 独立 T2 原生复核未通过，Agda 独立 T2 和 Lean 全仓发布门禁仍待完成。
+
+当前验证结果和恢复顺序见[交接快照](docs/implementation-status.md#交接快照)与[交付清单](docs/delivery-roadmap.md)；历史证据见[验收矩阵](docs/architecture-acceptance.md)。
