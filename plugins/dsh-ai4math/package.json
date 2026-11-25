@@ -31,9 +31,9 @@
     "test:package": "node --test test/bundle-package.test.mjs",
     "test": "node client/build.mjs --check && node --test host/test/*.test.mjs client/test/*.test.mjs test/*.test.mjs"
   },
-  "peerDependencies": {
-    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.5",
+  "dependencies": {
     "@deepseek-ai/dsh-scope": "0.2.2-rc.5",
+    "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.5",
     "@deepseek-ai/schemastery": "~3.19.0",
     "zod": "^4.6.6"
   },

@@ -26,4 +26,5 @@ __pycache__/
 *.pyc
 .venv/
 node_modules/
+.pnpm-store/
 .DS_Store

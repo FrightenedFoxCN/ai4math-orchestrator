@@ -78,12 +78,19 @@ function render(View) {
   };
 }
 
+// Cordis runs an effect, or a generator yielding its cleanup callbacks.
+function generatorCleanups(setup) {
+  const cleanups = [];
+  const iterator = setup();
+  for (let step = iterator.next(); !step.done; step = iterator.next()) cleanups.push(step.value);
+  return cleanups;
+}
+
 export async function browser(t, remote) {
   const tabs = new Map();
   const slots = new Map();
   const styles = new Set();
   const mountedViews = new Set();
-  const disposers = [];
   const registrations = [];
   const imports = [];
   const timers = new Map();
@@ -126,6 +133,33 @@ export async function browser(t, remote) {
   assert.ok(imports.length > 0);
   assert.deepEqual([...plugin.inject], ['remote', 'slots', 'sidebarRight', 'sidebarRightTabs']);
 
+  // --- Cordis stand-in ------------------------------------------------------
+  // The real context gates every Service property, not only the Service:
+  // `ctx.remote.ai4math` needs the dotted `remote.ai4math` inject even though
+  // `ctx.remote` is already injected. This fixture models that gate so a plugin
+  // that skips the dotted inject fails here instead of only in a real browser.
+  const namespaces = new Set();
+  const waiting = new Set();
+  const provided = new Set(['slots', 'sidebarRight', 'sidebarRightTabs']);
+  const state = {
+    async $mount(contribution) {
+      registrations.push(contribution);
+      namespaces.add('ai4math');
+      state.ai4math = remote;
+      for (const record of [...waiting]) record.tryActivate();
+    },
+  };
+  const gate = allowed => new Proxy(state, {
+    get(target, property, receiver) {
+      if (typeof property === 'symbol' || property === 'then') return Reflect.get(target, property, receiver);
+      if (property === '$mount' || allowed.has(property)) return Reflect.get(target, property, receiver);
+      throw new Error('cannot get property "remote.' + String(property) + '" without inject');
+    },
+  });
+  const satisfied = dep => dep.startsWith('remote.')
+    ? namespaces.has(dep.slice('remote.'.length))
+    : dep === 'remote' || provided.has(dep);
+
   const opened = [];
   const targetElements = [];
   const navigation = { target: undefined };
@@ -135,14 +169,7 @@ export async function browser(t, remote) {
     registry.set(key, value);
     return () => registry.delete(key);
   };
-  const ctx = {
-    remote: {
-      async $mount(contribution) {
-        registrations.push(contribution);
-        ctx.remote.ai4math = remote;
-      },
-    },
-    effect(setup) { disposers.push(setup()); },
+  const surface = {
     slots: {
       inject(name, setup) {
         injectedSlot = name;
@@ -159,13 +186,63 @@ export async function browser(t, remote) {
     },
     sidebarRightTabs: { register(tab) { return add(tabs, tab.id, tab); } },
   };
+  const handle = (promise, dispose) => ({
+    then: promise.then.bind(promise),
+    catch: promise.catch.bind(promise),
+    finally: promise.finally.bind(promise),
+    dispose,
+  });
+  function context(allowed) {
+    const disposers = [];
+    function effect(setup) {
+      if (setup.constructor?.name === 'GeneratorFunction') {
+        const cleanups = generatorCleanups(setup);
+        const cleanup = () => { for (const fn of cleanups.toReversed()) fn?.(); };
+        disposers.push(cleanup);
+        return cleanup;
+      }
+      const cleanup = setup();
+      disposers.push(() => cleanup?.());
+      return () => cleanup?.();
+    }
+    const ctx = {
+      remote: gate(allowed),
+      effect,
+      ...surface,
+      plugin(callback) {
+        const child = context(allowed);
+        const promise = (async () => { await callback(child); })();
+        return handle(promise, async () => { for (const dispose of disposers.toReversed()) dispose?.(); child.dispose(); });
+      },
+      inject(deps, callback) {
+        const record = { deps };
+        const widened = new Set([...allowed, ...deps.filter(dep => dep.startsWith('remote.')).map(dep => dep.slice('remote.'.length))]);
+        const scoped = context(widened);
+        let settle;
+        let fail;
+        const promise = new Promise((resolve, reject) => { settle = resolve; fail = reject; });
+        record.tryActivate = () => {
+          if (record.done || !deps.every(satisfied)) return;
+          record.done = true;
+          waiting.delete(record);
+          try { callback(scoped); settle(); } catch (error) { fail(error); }
+        };
+        waiting.add(record);
+        queueMicrotask(() => record.tryActivate());
+        return handle(promise, async () => { record.done = true; waiting.delete(record); scoped.dispose(); });
+      },
+      dispose() { for (const dispose of disposers.splice(0).toReversed()) dispose?.(); },
+    };
+    return ctx;
+  }
+  const ctx = context(new Set());
 
   function close(view) {
     if (mountedViews.delete(view)) view.dispose();
   }
   function dispose() {
     for (const view of mountedViews) close(view);
-    for (const cleanup of disposers.splice(0).reverse()) cleanup?.();
+    ctx.dispose();
   }
   t.after(dispose);
   await plugin.apply(ctx);
