@@ -77,6 +77,23 @@ fn init_status_and_wiki_index() {
     assert!(!ai(&["init", root, "lean4"]).status.success());
 }
 
+#[cfg(unix)]
+#[test]
+fn wiki_rebuild_refuses_index_symlink_without_touching_target() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_str().unwrap();
+    success(ai(&["init", root, "lean4"]));
+    let index = tmp.path().join(".mathwiki/.index.sqlite");
+    let unrelated = tmp.path().join("sentinel");
+    std::fs::rename(&index, &unrelated).unwrap();
+    let before = fs::read(&unrelated).unwrap();
+    std::os::unix::fs::symlink(&unrelated, &index).unwrap();
+    let output = ai(&["wiki-rebuild", root]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("unsafe managed Wiki index file"));
+    assert_eq!(fs::read(unrelated).unwrap(), before);
+}
+
 #[test]
 fn refuses_unlisted_modules_without_advancing_main() {
     let tmp = tempfile::tempdir().unwrap();

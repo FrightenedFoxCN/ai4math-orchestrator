@@ -7,13 +7,13 @@ use rusqlite::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs,
-    io::ErrorKind,
-    path::{Path, PathBuf},
+    path::Path,
     time::Duration,
 };
 
 mod managed_core;
+mod scan;
+mod scan_acl;
 mod sediment;
 pub use managed_core::{WikiManagedCoreEntry, WikiManagedGeneration};
 pub use sediment::{
@@ -46,6 +46,13 @@ fn positive_statuses(stratum: WikiStratum) -> Option<&'static [&'static str]> {
 
 pub struct Wiki {
     db: Connection,
+}
+
+/// Opaque, single-use input for [`Wiki::publish_rebuild`]. This is a bounded
+/// observation of the Markdown tree, not an atomic filesystem snapshot.
+pub struct WikiPreparedRebuild {
+    markdown: Vec<PreparedEntry>,
+    managed: Option<(String, i64, Vec<WikiManagedCoreEntry>)>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -168,7 +175,7 @@ impl Wiki {
     /// Missing strata are empty (Git does not track empty directories). Invalid input leaves
     /// the previously published index intact. This never writes or deletes a Markdown file.
     pub fn rebuild(&mut self, root: impl AsRef<Path>) -> Result<usize> {
-        self.rebuild_index(root.as_ref(), None, &[])
+        self.publish_rebuild(Self::prepare_rebuild(root)?)
     }
 
     /// Replace Markdown and managed Core metadata in one transaction, returning the total
@@ -180,25 +187,64 @@ impl Wiki {
         generation: WikiManagedGeneration<'_>,
         entries: &[WikiManagedCoreEntry],
     ) -> Result<usize> {
-        self.rebuild_index(root.as_ref(), Some(generation), entries)
+        self.publish_rebuild(Self::prepare_rebuild_with_managed_core(
+            root, generation, entries,
+        )?)
     }
 
-    fn rebuild_index(
-        &mut self,
+    /// Scan and parse Markdown without opening or writing the index. The scan is
+    /// bounded to 16,384 directory entries, 4,096 Markdown files, 8 MiB per
+    /// file, 64 MiB combined, and 64 directory levels below the Wiki root.
+    pub fn prepare_rebuild(root: impl AsRef<Path>) -> Result<WikiPreparedRebuild> {
+        Self::prepare_index(root.as_ref(), None, &[])
+    }
+
+    /// Prepare Markdown and its managed projection without touching the index.
+    /// Callers must validate managed evidence and guard that generation through
+    /// publication. Filesystem drift checks are best-effort and finish here.
+    pub fn prepare_rebuild_with_managed_core(
+        root: impl AsRef<Path>,
+        generation: WikiManagedGeneration<'_>,
+        entries: &[WikiManagedCoreEntry],
+    ) -> Result<WikiPreparedRebuild> {
+        Self::prepare_index(root.as_ref(), Some(generation), entries)
+    }
+
+    fn prepare_index(
         root: &Path,
         generation: Option<WikiManagedGeneration<'_>>,
         managed_entries: &[WikiManagedCoreEntry],
-    ) -> Result<usize> {
-        // Normalize trailing local components so symlink_metadata checks the final directory.
-        let root: PathBuf = root.components().collect();
-        ensure!(
-            fs::symlink_metadata(&root)
-                .with_context(|| format!("inspect Wiki root {}", root.display()))?
-                .is_dir(),
-            "Wiki root is not a regular directory: {}",
-            root.display()
-        );
+    ) -> Result<WikiPreparedRebuild> {
         let mut archives = managed_core::Archives::new(managed_entries)?;
+        let mut markdown = Vec::new();
+        scan::stage(root, |stratum, path, source| {
+            let relative = path.to_str().context("Wiki path is not UTF-8")?;
+            let (entry, body) = frontmatter(source)?;
+            ensure!(
+                entry.stratum == stratum,
+                "frontmatter stratum does not match the directory"
+            );
+            archives.observe(&entry.id, stratum, source)?;
+            markdown.push(PreparedEntry::new(entry, body, relative)?);
+            Ok(())
+        })?;
+        let managed = if let Some(generation) = generation {
+            archives.validate(generation, managed_entries)?;
+            Some((
+                generation.head.to_owned(),
+                generation.event_seq,
+                managed_entries.to_vec(),
+            ))
+        } else {
+            None
+        };
+        Ok(WikiPreparedRebuild { markdown, managed })
+    }
+
+    /// Publish the prepared replacement with a single SQLite immediate
+    /// transaction. Does not scan or re-read source paths; publish promptly
+    /// after preparation. Failure leaves the previous index intact.
+    pub fn publish_rebuild(&mut self, prepared: WikiPreparedRebuild) -> Result<usize> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -206,40 +252,19 @@ impl Wiki {
             "DELETE FROM managed_core_generation; DELETE FROM managed_core_fts;
              DELETE FROM entries_fts; DELETE FROM entries;",
         )?;
-        let mut indexed = 0;
-        for stratum in STRATA {
-            let dir = root.join(stratum.as_str());
-            match fs::symlink_metadata(&dir) {
-                Ok(meta) => ensure!(
-                    meta.is_dir(),
-                    "invalid Wiki stratum directory: {}",
-                    dir.display()
-                ),
-                Err(err) if err.kind() == ErrorKind::NotFound => continue,
-                Err(err) => return Err(err).with_context(|| format!("inspect {}", dir.display())),
-            }
-            for path in markdown_files(&dir)? {
-                let relative = path
-                    .strip_prefix(&root)?
-                    .to_str()
-                    .context("Wiki path is not UTF-8")?;
-                (|| -> Result<()> {
-                    let source = fs::read_to_string(&path)?;
-                    let (entry, body) = frontmatter(&source)?;
-                    ensure!(
-                        entry.stratum == stratum,
-                        "frontmatter stratum does not match the directory"
-                    );
-                    archives.observe(&entry.id, stratum, &source)?;
-                    insert_entry(&tx, &entry, body, relative)
-                })()
-                .with_context(|| format!("index {}", path.display()))?;
-                indexed += 1;
-            }
+        let mut indexed = prepared.markdown.len();
+        for entry in &prepared.markdown {
+            entry
+                .insert(&tx)
+                .with_context(|| format!("index Wiki Markdown {}", entry.relative))?;
         }
-        if let Some(generation) = generation {
-            archives.install(&tx, generation, managed_entries)?;
-            indexed += managed_entries.len();
+        if let Some((head, event_seq, entries)) = prepared.managed {
+            let generation = WikiManagedGeneration {
+                head: &head,
+                event_seq,
+            };
+            managed_core::install(&tx, generation, &entries)?;
+            indexed += entries.len();
         }
         tx.commit()?;
         Ok(indexed)
@@ -468,33 +493,6 @@ struct Edge {
     metadata: BTreeMap<String, serde_json::Value>,
 }
 
-fn markdown_files(dir: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    let mut dirs = vec![dir.to_path_buf()];
-    while let Some(dir) = dirs.pop() {
-        for entry in fs::read_dir(&dir).with_context(|| format!("read {}", dir.display()))? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
-            let path = entry.path();
-            if kind.is_dir() {
-                dirs.push(path);
-            } else if path
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-            {
-                ensure!(
-                    kind.is_file(),
-                    "Wiki Markdown entry is not a regular file: {}",
-                    path.display()
-                );
-                files.push(path);
-            }
-        }
-    }
-    files.sort_unstable();
-    Ok(files)
-}
-
 fn frontmatter(source: &str) -> Result<(Frontmatter, &str)> {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let mut lines = source.split_inclusive('\n');
@@ -577,102 +575,138 @@ impl Body {
     }
 }
 
-fn insert_entry(
-    tx: &Transaction<'_>,
-    entry: &Frontmatter,
-    markdown: &str,
-    relative: &str,
-) -> Result<()> {
-    ensure!(!entry.id.trim().is_empty(), "Wiki entry ID cannot be blank");
-    ensure!(
-        !managed_core::reserved_id(&entry.id),
-        "Wiki Markdown entry {} uses the reserved Core ID namespace",
-        entry.id
-    );
-    if let Some(claim) = &entry.origin_claim {
-        ensure!(
-            !managed_core::reserved_id(claim),
-            "Wiki Markdown origin claim uses the reserved Core ID namespace"
-        );
-    }
-    if let Some(statuses) = positive_statuses(entry.stratum) {
-        ensure!(
-            entry.trust_level != Trust::L2b && statuses.contains(&entry.status.as_str()),
-            "Wiki entry {} with trust {} and status {} is not valid in stratum {}",
-            entry.id,
-            entry.trust_level.as_str(),
-            entry.status,
-            entry.stratum.as_str(),
-        );
-    }
-    let body = Body::parse(markdown);
-    let title = entry
-        .title
-        .as_deref()
-        .or(body.title.as_deref())
-        .unwrap_or(&entry.id);
-    let gloss = entry
-        .informal_gloss
-        .as_deref()
-        .unwrap_or(body.informal.trim());
-    let created = entry.created_at.as_deref().unwrap_or(UNKNOWN_DATE);
-    let updated = entry.updated_at.as_deref().unwrap_or(created);
-    tx.execute("INSERT INTO entries (id,stratum,trust_level,engine,status,pinned,title,informal_gloss,
-        formal_signature,tags_json,verified_at_commit,origin_branch,origin_claim,def_fingerprints_json,
-        compat_status,created_at,updated_at,file_path)
-        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-        params![entry.id,entry.stratum.as_str(),entry.trust_level.as_str(),entry.engine.as_str(),entry.status,
-            entry.pinned,title,gloss,entry.formal_signature,serde_json::to_string(&entry.tags)?,entry.verified_at_commit,
-            entry.origin_branch,entry.origin_claim,serde_json::to_string(&entry.def_fingerprints)?,
-            entry.compat_status.as_deref().unwrap_or("unknown"),created,updated,relative])?;
-    tx.execute("INSERT INTO entries_fts (entry_id,stratum,title,informal_gloss,tags,formal_signature,notes)
-        VALUES (?1,?2,?3,?4,?5,?6,?7)", params![entry.id,entry.stratum.as_str(),title,gloss,entry.tags.join(" "),
-            entry.formal_signature,format!("{}\n{}",body.artifact,body.notes)])?;
+struct PreparedEntry {
+    entry: Frontmatter,
+    relative: String,
+    title: String,
+    gloss: String,
+    tags_json: String,
+    fingerprints_json: String,
+    fts_tags: String,
+    fts_notes: String,
+    edges: Vec<(String, String, String)>,
+}
 
-    let mut symbols = tx.prepare_cached(
-        "INSERT INTO entry_symbols (entry_id,role,symbol) VALUES (?1,?2,?3)
-        ON CONFLICT(entry_id,role,symbol) DO NOTHING",
-    )?;
-    for (role, values) in [
+fn symbol_groups(entry: &Frontmatter) -> [(&'static str, &[String]); 4] {
+    [
         ("conclusion_head", entry.symbols.conclusion_head.as_slice()),
         ("hypothesis_head", &entry.symbols.hypothesis_heads),
         ("typeclass", &entry.symbols.typeclasses),
         ("const", &entry.symbols.constants),
-    ] {
-        for symbol in values {
-            ensure!(!symbol.trim().is_empty(), "blank Wiki {role} symbol");
-            symbols.execute(params![entry.id, role, symbol])?;
+    ]
+}
+
+impl PreparedEntry {
+    fn new(mut entry: Frontmatter, markdown: &str, relative: &str) -> Result<Self> {
+        ensure!(!entry.id.trim().is_empty(), "Wiki entry ID cannot be blank");
+        ensure!(
+            !managed_core::reserved_id(&entry.id),
+            "Wiki Markdown entry {} uses the reserved Core ID namespace",
+            entry.id
+        );
+        if let Some(claim) = &entry.origin_claim {
+            ensure!(
+                !managed_core::reserved_id(claim),
+                "Wiki Markdown origin claim uses the reserved Core ID namespace"
+            );
         }
+        if let Some(statuses) = positive_statuses(entry.stratum) {
+            ensure!(
+                entry.trust_level != Trust::L2b && statuses.contains(&entry.status.as_str()),
+                "Wiki entry {} with trust {} and status {} is not valid in stratum {}",
+                entry.id,
+                entry.trust_level.as_str(),
+                entry.status,
+                entry.stratum.as_str(),
+            );
+        }
+        for (role, values) in symbol_groups(&entry) {
+            for symbol in values {
+                ensure!(!symbol.trim().is_empty(), "blank Wiki {role} symbol");
+            }
+        }
+        let mut edges = Vec::new();
+        for edge in std::mem::take(&mut entry.edges) {
+            ensure!(
+                !edge.dst_id.trim().is_empty(),
+                "blank Wiki edge destination"
+            );
+            ensure!(
+                !managed_core::reserved_id(&edge.dst_id),
+                "Wiki Markdown edge destination {} uses the reserved Core ID namespace",
+                edge.dst_id
+            );
+            edges.push((
+                edge.dst_id,
+                edge.edge_type,
+                serde_json::to_string(&edge.metadata)?,
+            ));
+        }
+        if let Some(claim) = &entry.origin_claim
+            && !edges
+                .iter()
+                .any(|(dst, kind, _)| kind == "born_from_claim" && dst == claim)
+        {
+            edges.push((claim.clone(), "born_from_claim".to_owned(), "{}".to_owned()));
+        }
+        let body = Body::parse(markdown);
+        let title = entry
+            .title
+            .take()
+            .or(body.title)
+            .unwrap_or_else(|| entry.id.clone());
+        let gloss = entry
+            .informal_gloss
+            .take()
+            .unwrap_or_else(|| body.informal.trim().to_owned());
+        let tags = std::mem::take(&mut entry.tags);
+        let fingerprints = std::mem::take(&mut entry.def_fingerprints);
+        Ok(Self {
+            entry,
+            relative: relative.to_owned(),
+            title,
+            gloss,
+            tags_json: serde_json::to_string(&tags)?,
+            fingerprints_json: serde_json::to_string(&fingerprints)?,
+            fts_tags: tags.join(" "),
+            fts_notes: format!("{}\n{}", body.artifact, body.notes),
+            edges,
+        })
     }
-    let mut edges = tx.prepare_cached(
-        "INSERT INTO entry_edges (src_id,dst_id,edge_type,metadata_json) VALUES (?1,?2,?3,?4)",
-    )?;
-    for edge in &entry.edges {
-        ensure!(
-            !edge.dst_id.trim().is_empty(),
-            "blank Wiki edge destination"
-        );
-        ensure!(
-            !managed_core::reserved_id(&edge.dst_id),
-            "Wiki Markdown edge destination {} uses the reserved Core ID namespace",
-            edge.dst_id
-        );
-        edges.execute(params![
-            entry.id,
-            edge.dst_id,
-            edge.edge_type,
-            serde_json::to_string(&edge.metadata)?
-        ])?;
+
+    fn insert(&self, tx: &Transaction<'_>) -> Result<()> {
+        let entry = &self.entry;
+        let created = entry.created_at.as_deref().unwrap_or(UNKNOWN_DATE);
+        let updated = entry.updated_at.as_deref().unwrap_or(created);
+        tx.execute("INSERT INTO entries (id,stratum,trust_level,engine,status,pinned,title,informal_gloss,
+            formal_signature,tags_json,verified_at_commit,origin_branch,origin_claim,def_fingerprints_json,
+            compat_status,created_at,updated_at,file_path)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+            params![entry.id,entry.stratum.as_str(),entry.trust_level.as_str(),entry.engine.as_str(),entry.status,
+                entry.pinned,self.title,self.gloss,entry.formal_signature,self.tags_json,entry.verified_at_commit,
+                entry.origin_branch,entry.origin_claim,self.fingerprints_json,
+                entry.compat_status.as_deref().unwrap_or("unknown"),created,updated,self.relative])?;
+        tx.execute("INSERT INTO entries_fts (entry_id,stratum,title,informal_gloss,tags,formal_signature,notes)
+            VALUES (?1,?2,?3,?4,?5,?6,?7)", params![entry.id,entry.stratum.as_str(),self.title,self.gloss,
+                self.fts_tags,entry.formal_signature,self.fts_notes])?;
+
+        let mut symbols = tx.prepare_cached(
+            "INSERT INTO entry_symbols (entry_id,role,symbol) VALUES (?1,?2,?3)
+            ON CONFLICT(entry_id,role,symbol) DO NOTHING",
+        )?;
+        for (role, values) in symbol_groups(entry) {
+            for symbol in values {
+                symbols.execute(params![entry.id, role, symbol])?;
+            }
+        }
+        let mut edges = tx.prepare_cached(
+            "INSERT INTO entry_edges (src_id,dst_id,edge_type,metadata_json) VALUES (?1,?2,?3,?4)",
+        )?;
+        for (dst, kind, metadata) in &self.edges {
+            edges.execute(params![entry.id, dst, kind, metadata])?;
+        }
+        Ok(())
     }
-    if let Some(claim) = &entry.origin_claim
-        && !entry
-            .edges
-            .iter()
-            .any(|edge| edge.edge_type == "born_from_claim" && edge.dst_id == *claim)
-    {
-        edges.execute(params![entry.id, claim, "born_from_claim", "{}"])?;
-    }
-    Ok(())
 }
 
 struct Search<'a> {

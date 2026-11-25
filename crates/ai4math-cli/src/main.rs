@@ -702,11 +702,13 @@ fn run() -> Result<()> {
             print_json(replay_store(Path::new(root))?.replay_graph(through)?)
         }
         ["wiki-rebuild", root] => {
-            let wiki = Path::new(root).join(".mathwiki");
-            ensure!(wiki.is_dir(), "initialize the project first");
-            print_json(
-                serde_json::json!({"indexed_entries": Wiki::open(wiki.join(".index.sqlite"))?.rebuild(&wiki)?}),
-            )
+            let root = Path::new(root);
+            let wiki = wiki_archive::core_projection::wiki_root(root)
+                .context("initialize the project first and verify its Wiki paths")?;
+            let prepared = Wiki::prepare_rebuild(&wiki)?;
+            let wiki = wiki_archive::core_projection::wiki_root(root)?;
+            let count = Wiki::open(wiki.join(".index.sqlite"))?.publish_rebuild(prepared)?;
+            print_json(serde_json::json!({"indexed_entries": count}))
         }
         ["wiki-core-rebuild", root, repo, head] => {
             wiki_archive::core_projection::rebuild_command(Path::new(root), Path::new(repo), head)

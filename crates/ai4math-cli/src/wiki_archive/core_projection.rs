@@ -2,7 +2,7 @@
 //! The pair (reviewed Git HEAD, ledger event sequence) is a visibility gate, not proof authority.
 use super::{prefix, require_reviewed_main, sha};
 use crate::{print_json, promotion::PromotionRepo, reviewed_spec};
-use ai4math_project::open_managed_state;
+use ai4math_project::{managed_state_path, open_managed_state};
 use ai4math_store::{
     SedimentLineage, StateStore, Wiki, WikiManagedCoreEntry, WikiManagedGeneration, WikiQuery,
 };
@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-fn wiki_root(root: &Path) -> Result<PathBuf> {
+pub(crate) fn wiki_root(root: &Path) -> Result<PathBuf> {
     let wiki = root.join(".mathwiki");
     let uid = unsafe { libc::geteuid() };
     let dir = fs::symlink_metadata(&wiki)?;
@@ -181,9 +181,7 @@ pub(crate) fn rebuild(root: &Path, repo: &Path, head: &str) -> Result<usize> {
     let seq = state.status()?.last_event_seq;
     let wiki = wiki_root(root)?;
     let entries = entries(&state, &git, head)?;
-    require_generation(&state, &git, head, seq)?;
-    let mut index = Wiki::open(wiki.join(".index.sqlite"))?;
-    let count = index.rebuild_with_managed_core(
+    let prepared = Wiki::prepare_rebuild_with_managed_core(
         &wiki,
         WikiManagedGeneration {
             head,
@@ -191,10 +189,20 @@ pub(crate) fn rebuild(root: &Path, repo: &Path, head: &str) -> Result<usize> {
         },
         &entries,
     )?;
-    // Any publish raced by an external Git or ledger writer is unusable through
-    // generation-checked readers, even if the older disposable build committed.
-    require_generation(&state, &git, head, seq)?;
-    Ok(count)
+    let state_path = managed_state_path(root)?;
+    let repo = git
+        .path()
+        .to_str()
+        .context("managed repository path is not UTF-8")?;
+    StateStore::with_managed_generation_reservation(&state_path, repo, seq, || {
+        // The project Git lock covers cooperating operators. An external ref
+        // update is not locked, so readers must still check the generation.
+        require_generation(&state, &git, head, seq)?;
+        let mut index = Wiki::open(wiki_root(root)?.join(".index.sqlite"))?;
+        let count = index.publish_rebuild(prepared)?;
+        require_generation(&state, &git, head, seq)?;
+        Ok(count)
+    })
 }
 
 pub(super) fn checked_read<T>(

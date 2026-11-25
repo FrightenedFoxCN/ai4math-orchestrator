@@ -20,7 +20,7 @@ use std::{
 // Match the Phase 1 rendered proof limit in ai4math-core's proof.rs. The archive
 // needs a separate cap: two Markdown fences can each be longer than the source.
 const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024;
+pub(super) const MAX_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024;
 const BODY_PREAMBLE: &str = concat!(
     "\n# Historical proof archive\n\n",
     "This is an L5 historical archive, not current proof evidence or authorization.\n",
@@ -449,7 +449,7 @@ fn archive_dir(parent: &File, name: &CStr, uid: libc::uid_t, mode: DirMode) -> R
     Ok(dir)
 }
 
-fn open_at(parent: &File, name: &CStr, flags: libc::c_int) -> io::Result<File> {
+pub(super) fn open_at(parent: &File, name: &CStr, flags: libc::c_int) -> io::Result<File> {
     // SAFETY: valid live parent descriptor and NUL-terminated name. The mode
     // variadic argument has C int width, including on platforms with a narrower mode_t.
     let fd = unsafe {
@@ -467,7 +467,7 @@ fn open_at(parent: &File, name: &CStr, flags: libc::c_int) -> io::Result<File> {
     Ok(unsafe { File::from_raw_fd(fd) })
 }
 
-fn stat_at(parent: &File, name: &CStr) -> io::Result<libc::stat> {
+pub(super) fn stat_at(parent: &File, name: &CStr) -> io::Result<libc::stat> {
     let mut stat = MaybeUninit::uninit();
     // SAFETY: valid descriptor and NUL-terminated name; stat points to writable storage.
     let rc = unsafe {

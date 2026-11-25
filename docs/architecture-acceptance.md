@@ -41,7 +41,7 @@ Wiki 的来源边浏览和反例提示已通过 daemon、实际安装的 DSH SDK
 
 登记可证伪命题为已提交、公开、闭合的 Lean `def target : Prop := ...`。操作者用 `declare-claim ROOT CLAIM MODULE PROPOSITION TITLE STATEMENT [--critical]` 注册，再用 `bind-witness-spec ROOT BARE_REPO CLAIM MODULE PROPOSITION APPROVED_COMMIT` 同时锁定仓库、主干和完整提交；旧 Claim 不允许悄然改绑到同名的新命题。然后运行 `refute-managed ROOT BARE_REPO CLAIM MODULE PROPOSITION NATIVE_LEAN PROOF_BODY_FILE`，仅提交求证否定命题的证明体。这个保守版本要求当前主干仍等于批准的快照；其他提交（即使未改该文件）需作为新 Claim 经人工确认，暂不做依赖闭包等价判定。
 
-Broker 在独立 Seatbelt 中构造内核否定类型并审计公理；成功后先持久化可回放的 Graveyard Markdown，再原子记录回执、L2b、依赖路线变化和关键 P0。磁盘失败不升级，不产生告警；同一见证重试不重复记账。Wiki 可通过 `wiki-rebuild` 再检索。当前未自动提交 Wiki Git 归档，也未实现 Agda/Rocq 见证、自动派发，或从 Oracle 输出自动转交内核见证。Broker 内部 Heavy Lane 有单进程 FIFO（最多 8 个等待、单次排队上限 30 秒）；后文接入的项目级跨进程门禁不排队，主机总体内存约束仍待接入。
+Broker 在独立 Seatbelt 中构造内核否定类型并审计公理。现行流程先持久化归档配方并私下暂存 Markdown，再原子记录回执、L2b、依赖路线变化和关键 P0，最后把 Markdown 无覆盖地发布到 Graveyard。账本提交前失败不会升级；提交后归档发布失败不会撤销已入账的证伪和告警，可用 `refute-pending ROOT` 检查并用 `refute-reconcile ROOT [CLAIM]` 补发。重复执行不重复记账，冲突文件不覆盖。归档发布后，可用 `wiki-rebuild` 更新可重建索引。当前未自动提交 Wiki Git 归档，也未实现 Agda/Rocq 见证、自动派发，或从 Oracle 输出自动转交内核见证。Broker 内部 Heavy Lane 有单进程 FIFO（最多 8 个等待、单次排队上限 30 秒）；后文接入的项目级跨进程门禁不排队，主机总体内存约束仍待接入。
 
 截至本批，实际 macOS Lean/Agda 主机原生测试共 74 项，Host/Client 仍为 18 项。
 

@@ -106,9 +106,8 @@ impl<'a> Archives<'a> {
         Ok(())
     }
 
-    pub(super) fn install(
+    pub(super) fn validate(
         &self,
-        tx: &Transaction<'_>,
         generation: WikiManagedGeneration<'_>,
         entries: &[WikiManagedCoreEntry],
     ) -> Result<()> {
@@ -131,15 +130,25 @@ impl<'a> Archives<'a> {
                 entry.archive_id,
                 entry.origin_claim
             );
-            insert(tx, entry)
-                .with_context(|| format!("project managed Wiki Core entry {}", entry.id))?;
         }
-        tx.execute(
-            "INSERT INTO managed_core_generation (singleton,head,event_seq) VALUES (1,?1,?2)",
-            params![generation.head, generation.event_seq],
-        )?;
         Ok(())
     }
+}
+
+pub(super) fn install(
+    tx: &Transaction<'_>,
+    generation: WikiManagedGeneration<'_>,
+    entries: &[WikiManagedCoreEntry],
+) -> Result<()> {
+    for entry in entries {
+        insert(tx, entry)
+            .with_context(|| format!("project managed Wiki Core entry {}", entry.id))?;
+    }
+    tx.execute(
+        "INSERT INTO managed_core_generation (singleton,head,event_seq) VALUES (1,?1,?2)",
+        params![generation.head, generation.event_seq],
+    )?;
+    Ok(())
 }
 
 fn insert(tx: &Transaction<'_>, entry: &WikiManagedCoreEntry) -> Result<()> {
