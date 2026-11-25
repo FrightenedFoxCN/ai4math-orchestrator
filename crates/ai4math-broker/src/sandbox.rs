@@ -20,6 +20,32 @@ impl std::fmt::Display for ChildExit {
 }
 impl std::error::Error for ChildExit {}
 
+/// A launcher that could not be spawned never yields a verifier exit.
+#[cfg(any(target_os = "macos", test))]
+#[derive(Debug)]
+struct LauncherStartError {
+    launcher: &'static str,
+    source: std::io::Error,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl std::fmt::Display for LauncherStartError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "starting {}; no unsandboxed fallback: {}",
+            self.launcher, self.source
+        )
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl std::error::Error for LauncherStartError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ProcessGroup {
     #[default]
@@ -222,18 +248,8 @@ fn run_inner(
     max_stdout: Option<usize>,
     deadline: Option<Instant>,
 ) -> Result<Vec<u8>> {
-    use anyhow::Context;
-    use std::{
-        fs, io,
-        os::unix::process::CommandExt,
-        process::{Child, Command, Stdio},
-        thread,
-    };
+    use std::{fs, process::Command};
 
-    // Capture through anonymous regular files, not pipes that a stuck process could keep open.
-    const LOG_CAP: usize = 256 * 1024;
-    const LOG_OVERFLOW: &str = "sandbox diagnostic output exceeded limit";
-    const STDOUT_OVERFLOW: &str = "sandbox stdout exceeded limit";
     const SEATBELT: &str = "/usr/bin/sandbox-exec";
     deadline_remaining(deadline)?;
     let executable = fs::canonicalize(spec.executable)?;
@@ -275,12 +291,6 @@ fn run_inner(
         &data_reads,
         &literal_data_reads,
     )?;
-    let mut log = tempfile::tempfile()?;
-    let mut stdout = match max_stdout {
-        Some(max) => Some((tempfile::tempfile()?, max)),
-        None => None,
-    };
-    let output = stdout.as_ref().map_or(&log, |(file, _)| file);
     let mut command = Command::new(SEATBELT);
     command
         .arg("-p")
@@ -292,12 +302,51 @@ fn run_inner(
         .env("TMPDIR", &writable)
         .env("LANG", "en_US.UTF-8")
         .envs(spec.env.iter().copied())
-        .current_dir(&room)
+        .current_dir(&room);
+    supervise(
+        command,
+        spec.timeout,
+        group,
+        max_stdout,
+        deadline,
+        "Seatbelt",
+    )
+}
+
+// This function is intentionally private. Backends must construct a trusted
+// sandbox launcher first, and ensure that killing the launcher stops the
+// payload even in Supervisor mode (where we cannot kill the caller's group).
+#[cfg(any(target_os = "macos", all(test, target_os = "linux")))]
+fn supervise(
+    mut command: std::process::Command,
+    timeout: Duration,
+    group: ProcessGroup,
+    max_stdout: Option<usize>,
+    deadline: Option<Instant>,
+    launcher: &'static str,
+) -> Result<Vec<u8>> {
+    use std::{
+        io,
+        os::unix::process::CommandExt,
+        process::{Child, Stdio},
+        thread,
+    };
+
+    // Capture through anonymous regular files, not pipes that a stuck process could keep open.
+    const LOG_CAP: usize = 256 * 1024;
+    const LOG_OVERFLOW: &str = "sandbox diagnostic output exceeded limit";
+    const STDOUT_OVERFLOW: &str = "sandbox stdout exceeded limit";
+    let mut log = tempfile::tempfile()?;
+    let mut stdout = match max_stdout {
+        Some(max) => Some((tempfile::tempfile()?, max)),
+        None => None,
+    };
+    let output = stdout.as_ref().map_or(&log, |(file, _)| file);
+    command
         .stdin(Stdio::null())
         .stdout(output.try_clone()?)
         .stderr(log.try_clone()?);
-    let cpu_budget =
-        deadline_remaining(deadline)?.map_or(spec.timeout, |left| left.min(spec.timeout));
+    let cpu_budget = deadline_remaining(deadline)?.map_or(timeout, |left| left.min(timeout));
     let cpu = cpu_budget.as_secs().saturating_add(1);
     let own_session = group == ProcessGroup::OwnSession;
     ensure!(
@@ -343,7 +392,7 @@ fn run_inner(
                     }
                 }
                 // In supervisor mode the child shares the CLI group; do not kill
-                // that group for an individual timeout. Seatbelt denies child forks.
+                // that group for an individual timeout. The backend must contain descendants.
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -356,7 +405,7 @@ fn run_inner(
         Some(
             command
                 .spawn()
-                .context("starting Seatbelt; no unsandboxed fallback")?,
+                .map_err(|source| LauncherStartError { launcher, source })?,
         ),
         own_session,
     );
@@ -366,9 +415,9 @@ fn run_inner(
         }
         deadline_remaining(deadline)?;
         ensure!(
-            start.elapsed() < spec.timeout,
+            start.elapsed() < timeout,
             "sandbox timeout after {:?}",
-            spec.timeout
+            timeout
         );
         check_capture_size(&log, LOG_CAP, LOG_OVERFLOW)?;
         if let Some((file, max)) = &stdout {
@@ -377,11 +426,11 @@ fn run_inner(
         let poll_interval = Duration::from_millis(10);
         let sleep_for = deadline_remaining(deadline)?.map_or(poll_interval, |left| {
             left.min(poll_interval)
-                .min(spec.timeout.saturating_sub(start.elapsed()))
+                .min(timeout.saturating_sub(start.elapsed()))
         });
         thread::sleep(sleep_for);
     };
-    // The sandbox denies every fork, so successful leader exit leaves no descendants.
+    // The backend guarantees that leader exit leaves no descendants.
     running.0 = None;
     deadline_remaining(deadline)?;
     let diagnostics = read_capture(&mut log, LOG_CAP, LOG_OVERFLOW)?;
@@ -406,6 +455,22 @@ fn run_inner(
 }
 
 #[cfg(not(target_os = "macos"))]
+#[derive(Debug)]
+struct BackendUnavailable;
+
+#[cfg(not(target_os = "macos"))]
+impl std::fmt::Display for BackendUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "native verification sandbox unavailable on this platform; no unsandboxed fallback",
+        )
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+impl std::error::Error for BackendUnavailable {}
+
+#[cfg(not(target_os = "macos"))]
 fn run_inner(
     spec: Invocation<'_>,
     _data_reads: &[PathBuf],
@@ -424,7 +489,7 @@ fn run_inner(
         timeout,
     } = spec;
     let _ = (executable, args, room, writable, reads, env, timeout);
-    anyhow::bail!("Seatbelt verification is unavailable outside macOS; no unsandboxed fallback")
+    Err(BackendUnavailable.into())
 }
 
 /// Checks a successful in-room action, denied out-of-room reads/writes, denied
@@ -555,6 +620,25 @@ mod tests {
                 Ok(String::new())
             },
         )?;
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn launcher_spawn_failure_is_not_a_verifier_exit() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let missing = std::process::Command::new(dir.path().join("absent-launcher"));
+        let error = supervise(
+            missing,
+            Duration::from_secs(1),
+            ProcessGroup::OwnSession,
+            None,
+            None,
+            "test launcher",
+        )
+        .unwrap_err();
+        assert!(error.downcast_ref::<LauncherStartError>().is_some());
+        assert!(error.downcast_ref::<ChildExit>().is_none());
         Ok(())
     }
 

@@ -253,7 +253,61 @@ pub(crate) fn host_pressure() -> Result<Pressure> {
     ))
 }
 
-#[cfg(not(target_os = "macos"))]
+// Linux MemAvailable is the kernel's estimate of reclaimable memory without
+// swapping. This measures the host view, not a delegated cgroup quota.
+#[cfg(target_os = "linux")]
+pub(crate) fn host_pressure() -> Result<Pressure> {
+    use std::io::Read;
+    const CAP: u64 = 64 * 1024;
+    let mut text = String::new();
+    std::fs::File::open("/proc/meminfo")?
+        .take(CAP + 1)
+        .read_to_string(&mut text)?;
+    ensure!(text.len() as u64 <= CAP, "oversize Linux memory counters");
+    linux_memory_pressure(&text)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn linux_memory_pressure(text: &str) -> Result<Pressure> {
+    let mut total = None;
+    let mut available = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let slot = match key {
+            "MemTotal" => &mut total,
+            "MemAvailable" => &mut available,
+            _ => continue,
+        };
+        let mut words = value.split_ascii_whitespace();
+        let value = words.next().context("missing Linux memory counter")?;
+        ensure!(
+            slot.is_none()
+                && value.bytes().all(|b| b.is_ascii_digit())
+                && words.next() == Some("kB")
+                && words.next().is_none(),
+            "invalid Linux memory counter {key}"
+        );
+        *slot = Some(
+            value
+                .parse::<u64>()
+                .context("invalid Linux memory quantity")?,
+        );
+    }
+    let total = total.context("missing MemTotal")?;
+    let available = available.context("missing MemAvailable")?;
+    ensure!(
+        total > 0 && available <= total,
+        "inconsistent Linux memory counters"
+    );
+    let used = u128::from(total - available) * 100;
+    Ok(Pressure::from_used_percent(
+        used.div_ceil(u128::from(total)) as u64,
+    ))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 pub(crate) fn host_pressure() -> Result<Pressure> {
     anyhow::bail!("fast lane memory admission is unavailable on this platform")
 }
@@ -264,6 +318,35 @@ mod tests {
     use std::{sync::mpsc, thread};
 
     const TEST_GUARD: Duration = Duration::from_secs(5);
+
+    #[test]
+    fn linux_pressure_never_guesses_missing_or_malformed_counters() {
+        for (available, pressure) in [
+            (300, Pressure::Yellow),
+            (301, Pressure::Yellow),
+            (310, Pressure::Green),
+            (150, Pressure::Yellow),
+            (149, Pressure::Red),
+        ] {
+            let text = format!("MemTotal: 1000 kB\nMemFree: 42 kB\nMemAvailable: {available} kB\n");
+            assert_eq!(linux_memory_pressure(&text).unwrap(), pressure);
+        }
+        for invalid in [
+            "MemTotal: 1000 kB\n",
+            "MemTotal: 0 kB\nMemAvailable: 0 kB\n",
+            "MemTotal: 10 kB\nMemAvailable: 11 kB\n",
+            "MemTotal: 30 MB\nMemAvailable: 10 kB\n",
+            "MemTotal: 30 kB\nMemAvailable: 10 kB\nMemAvailable: 11 kB\n",
+            "MemTotal: 30 kB\nMemAvailable: +10 kB\n",
+        ] {
+            assert!(linux_memory_pressure(invalid).is_err(), "{invalid:?}");
+        }
+        assert_eq!(
+            linux_memory_pressure("MemTotal: 18446744073709551615 kB\nMemAvailable: 0 kB\n")
+                .unwrap(),
+            Pressure::Red
+        );
+    }
 
     fn assert_heavy_load(resources: &Resources, running: usize, queued: usize) {
         let load = resources.snapshot().unwrap();

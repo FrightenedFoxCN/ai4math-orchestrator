@@ -112,6 +112,11 @@
 - 本地操作者可用固定项目公钥验证签署的单熔断归档，完成即时计划比较、短有效期复核、永久请求 ID 和 Pivot 意图的原子记录。恢复沿用原 Git pin/CAS/SQLite 协议，按请求 ID 查询已准备、已执行或已放弃；不重放旧签名，也不为 DSH 提供写入口。
 - 合成密钥测试实际执行 Git CAS 后模拟响应丢失，重开项目恢复同一提交；重复应用拒绝，重复恢复读回同一回执。固定信任锚和 Store 迁移、回滚、冲突另有回归。实际人工签署设备、生产项目权限隔离和浏览器接线仍未验收，详见 [Owner 审批边界](owner-approval-boundary.md)。
 
+## 后续批次：Linux 隔离准备
+
+- 将原生验证策略与进程监督分离；launcher 无法启动时不返回 verifier 退出回执。增加 Linux `/proc/meminfo` 有界解析，缺计数、单位不符或值不一致时拒绝采样；这不是 cgroup 配额。
+- 非 macOS 验证仍默认拒绝，不存在未隔离回退。本机无运行中的 Linux 容器引擎；外层沙箱拒绝本轮 Seatbelt 原生用例启动。见 [Linux 启用与验收门禁](linux-sandbox-acceptance.md)。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。
