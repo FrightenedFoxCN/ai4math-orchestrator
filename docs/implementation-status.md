@@ -122,6 +122,10 @@
 - 新增 `linux-cgroup-preflight`，仅检查操作者指定的实际 cgroup v2 叶节点：空、非冻结、domain，读取有限内存/PID/CPU 上限，探测 `cgroup.kill` 是否存在。以 Linux `openat2` 防止符号链接和控制文件跨挂载；不启动后端、不写控制文件、不声称委派。普通文件夹不能冒充 cgroup。
 - 本机仅验收可移植解析和 CLI 的拒绝路径。真实 Linux 成功路径与控制文件约束需在预置主机上运行 [原生预检用例](linux-sandbox-acceptance.md)；cgroup 实际入组和回收未接入。
 
+## 后续批次：Linux 挂载计划
+
+- 已加入确定性的纯策略编译器，划分主程序、runtime 文件、数据、合成目录和可写 scratch，拒绝冲突及超限。macOS 只验证计划和失败分支；不执行 mount、没有新增可用 Linux verifier。见 [Linux 挂载计划与验收要求](linux-sandbox-acceptance.md)。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。

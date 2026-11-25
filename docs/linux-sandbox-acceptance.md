@@ -14,6 +14,12 @@ AI4MATH_TEST_CGROUP_LEAF=/sys/fs/cgroup/your-delegated-leaf \
   native_cgroup_preflight_reports_limits_without_enabling_verification -- --ignored --exact
 ```
 
+## 挂载计划编译器
+
+[Linux mount plan](../crates/ai4math-broker/src/linux_mount_plan.rs) 是纯策略层，既不访问源路径也不启动进程。它将唯一 verifier、逐文件许可的动态库、递归/单文件数据、只读工作目录和唯一可写 scratch 分开。Literal 目录及隐式父节点在空根内合成，不挂载宿主目录。重复、重叠、保留路径和超限输入拒绝；唯一允许的物理重叠是工作目录下独立的直接子目录 scratch。
+
+计划要求所有数据和 scratch 为 `noexec`，所有挂载为 `nosuid,nodev`，只有 scratch 可写。动态库所在挂载允许可执行映射，不等于允许将库作为程序执行。后端尚未接线：未来 launcher 须独立固定和验明源路径/文件类型、排除子挂载和别名、落实最终内核挂载属性及唯一可执行入口；不能仅凭计划输出启动 verifier 或签发回执。
+
 ## 启用一个 Linux verifier 前
 
 1. 从空根建立强制隔离的 namespace，固定受管 launcher 与可信工具链清单；不整棵挂载宿主 `/`、`/usr`、`/proc` 或 `/sys`。普通 `ro-bind` 的只读属性不意味着 `noexec`。数据、房间和 scratch 须独立、不可执行，可信动态加载器及库的映射与允许执行程序的授权须分别核验。scratch 还需总容量上限。
