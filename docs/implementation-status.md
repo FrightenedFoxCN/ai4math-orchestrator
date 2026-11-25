@@ -117,6 +117,11 @@
 - 将原生验证策略与进程监督分离；launcher 无法启动时不返回 verifier 退出回执。增加 Linux `/proc/meminfo` 有界解析，缺计数、单位不符或值不一致时拒绝采样；这不是 cgroup 配额。
 - 非 macOS 验证仍默认拒绝，不存在未隔离回退。本机无运行中的 Linux 容器引擎；外层沙箱拒绝本轮 Seatbelt 原生用例启动。见 [Linux 启用与验收门禁](linux-sandbox-acceptance.md)。
 
+## 后续批次：Linux cgroup v2 只读预检
+
+- 新增 `linux-cgroup-preflight`，仅检查操作者指定的实际 cgroup v2 叶节点：空、非冻结、domain，读取有限内存/PID/CPU 上限，探测 `cgroup.kill` 是否存在。以 Linux `openat2` 防止符号链接和控制文件跨挂载；不启动后端、不写控制文件、不声称委派。普通文件夹不能冒充 cgroup。
+- 本机仅验收可移植解析和 CLI 的拒绝路径。真实 Linux 成功路径与控制文件约束需在预置主机上运行 [原生预检用例](linux-sandbox-acceptance.md)；cgroup 实际入组和回收未接入。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。

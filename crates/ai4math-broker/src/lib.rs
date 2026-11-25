@@ -14,6 +14,7 @@ mod lean_objects;
 use lean_objects::LeanObjects;
 mod lean_spec;
 pub use lean_spec::VerifiedLeanComparison;
+pub mod linux_cgroup;
 mod oracle;
 pub use oracle::{
     MAX_ORACLE_QUERY_BYTES, OracleObservation, OracleOutcome, OracleQuery, OracleSolvers,

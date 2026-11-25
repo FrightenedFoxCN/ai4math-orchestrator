@@ -2,6 +2,18 @@
 
 当前 Linux 验证入口仍拒绝启动，不降级为裸进程。已有 `/proc/meminfo` 的有界解析可为快速通道提供宿主压力估计；这不是容器或 cgroup 配额，也不会启用验证后端。macOS 保留 Seatbelt 权限和监督行为。进程监督与平台授权已分开，无法启动 launcher 的错误不进入数学验证拒绝分支。
 
+## 只读配额预检
+
+`ai4math linux-cgroup-preflight ABSOLUTE_LEAF` 接受由操作者预备的真实 cgroup v2 空叶节点，检查 domain、有限内存/PID/CPU 上限以及 `cgroup.kill` 是否存在（缺失时报告 `false`）。路径核验依赖 Linux `openat2`（5.6 起）；接口不可用时拒绝。不会创建 cgroup、写入任何控制文件、移动进程或发信号。输出固定包含 `backend_enabled: false` 和 `delegation_verified: false`。这仅是诊断采样，不证明可写委派、祖先限额、swap 上限、实际进程已入组，也不能保证报告后限额不变。
+
+在已有准备好的 Linux 宿主上，可运行下面的只读集成用例；测试本身不会配置主机：
+
+```sh
+AI4MATH_TEST_CGROUP_LEAF=/sys/fs/cgroup/your-delegated-leaf \
+  cargo test --locked -p ai4math-cli --test linux_cgroup \
+  native_cgroup_preflight_reports_limits_without_enabling_verification -- --ignored --exact
+```
+
 ## 启用一个 Linux verifier 前
 
 1. 从空根建立强制隔离的 namespace，固定受管 launcher 与可信工具链清单；不整棵挂载宿主 `/`、`/usr`、`/proc` 或 `/sys`。普通 `ro-bind` 的只读属性不意味着 `noexec`。数据、房间和 scratch 须独立、不可执行，可信动态加载器及库的映射与允许执行程序的授权须分别核验。scratch 还需总容量上限。
