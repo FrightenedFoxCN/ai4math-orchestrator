@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AI4Math workspace",
+    "description": "View your local AI4Math project in the bottom status bar and the Briefing, Frontier, Inbox, and Wiki tabs. Disabled by default. To use it, configure an absolute path to the local ai4mathd Unix socket and explicitly enable the plugin. The UI is for authenticated Owners to inspect project state, not to approve or execute project changes. Pull and retain saves a local Fact Pack without advancing the review checkpoint. No agent tools or proof slots are granted by default."
+  }
+}

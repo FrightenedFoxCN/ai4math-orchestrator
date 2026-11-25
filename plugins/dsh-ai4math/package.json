@@ -1,17 +1,35 @@
 {
   "name": "dsh-ai4math",
   "version": "0.1.0",
-  "description": "AI4Math local daemon bridge and mathematical workspace for DeepSeek Harness",
+  "description": "Opt-in AI4Math workspace and local daemon bridge for DeepSeek Harness",
+  "private": true,
   "type": "module",
+  "engines": {
+    "dsh": "0.2.2-rc.5"
+  },
   "exports": {
     ".": "./host/index.mjs",
     "./client": "./client/client.js",
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
   },
+  "files": [
+    "README.md",
+    "cordis.patch.yml",
+    "icon.svg",
+    "locale/*.json",
+    "host/*.mjs",
+    "client/client.js",
+    "client/build.mjs",
+    "client/*.cjs",
+    "client/style.css"
+  ],
   "scripts": {
     "build": "node client/build.mjs",
     "check:bundle": "node client/build.mjs --check",
-    "test": "node client/build.mjs --check && node --test host/test/*.test.mjs client/test/*.test.mjs"
+    "test:package": "node --test test/bundle-package.test.mjs",
+    "test": "node client/build.mjs --check && node --test host/test/*.test.mjs client/test/*.test.mjs test/*.test.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.5",
@@ -20,6 +38,9 @@
     "zod": "^4.6.6"
   },
   "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
     "client": {
       "platform": "web",
       "inject": [

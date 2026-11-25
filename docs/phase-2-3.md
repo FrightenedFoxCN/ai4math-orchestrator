@@ -4,7 +4,7 @@
 
 1. 在目标项目的宿主机终端执行 `cargo run --locked -p ai4math-daemon -- --project /absolute/project`。启用实际证明检查时，daemon 自身不应处在 DSH 工具沙箱内；验证子进程仍必须由 Broker 的 Seatbelt 隔离。默认每 2 秒采样，`--tick-ms N` 可在 100–60000 毫秒间调整。
 2. Daemon 在该项目使用 `.runtime/ai4mathd.sock` 和原有 SQLite、Wiki 索引。Socket 为 `0600`，父目录 `0700`，仅接同 UID Unix peer；没有 TCP 监听端口。建议先停止 daemon 再清理；若上次退出留下节点，确认没有运行实例和连接后再由操作者清理，不自动覆盖、跟随或移除已有路径。macOS 上若绝对路径超出 Unix socket 长度，使用物理路径更短的项目目录。
-3. 在 DSH 的本地插件加载器将 [dsh-ai4math](../plugins/dsh-ai4math/package.json) 作为项目插件加载。通过插件配置指定 `socketPath` 为绝对路径（或在 DSH Host 进程设置 `AI4MATH_SOCKET`）。Host 需要 DSH 0.2.2-rc.5 的 Typert Registry/Gateway；Client 使用 Remote、layout slots 和 sidebar。Web 复用 DSH 自身网关，不新增 WebSocket 路由或鉴权层。此实现不会自行安装、启动新 DSH GUI 或更改现有 profile。
+3. 经明确授权后，在 DSH 的 **插件 → 添加插件** 选择 [dsh-ai4math 包目录](../plugins/dsh-ai4math)。Bundle 插入默认关闭的插件行；先配置绝对 `socketPath`，再启用。首次只验收 Owner 工作台时保留空的 `rolePresets` 与 `proofSlots`。Host 需要 DSH 0.2.2-rc.5；Web 复用 DSH 的 Typert 网关，不新增监听或鉴权层。此实现不自行安装、不启动替代 GUI，也不修改现有 profile。
 4. 角色工具默认不注册。受信任操作者可配置 `rolePresets`，将 `chief / regional / explorer / builder / prover / automation / reviewer` 映射到互不重复的已组合 Agent preset ID；授权源是实时 Agent 绑定而不是工具参数。普通角色没有任意读写文件或命令执行入口。Reviewer 不读全局简报/Inbox；其上下文装配由上游编排器负责，不应在同一个混合权限 Agent 中启用。
 
 ## 接口及约定
@@ -20,7 +20,7 @@ Socket 接受 NDJSON JSON-RPC 2.0 对象参数：`status`、`frontier.list`、`i
 
 - `cargo fmt --all -- --check`；`cargo test --workspace --locked`。宿主机上按 [Phase 1](phase-1.md) 的环境变量补齐工具链，可运行 `cargo test --workspace --locked -- --include-ignored`；macOS 原生 Seatbelt 用例必须在非外层沙箱终端执行。历史验收数量以[验收矩阵](architecture-acceptance.md)对应批次为准，当前实现状态见 [implementation-status.md](implementation-status.md)。
 - `npm --prefix plugins/dsh-ai4math test`：Host/Client 标准测试，并先执行 `node plugins/dsh-ai4math/client/build.mjs --check` 验证发布 bundle 与源码一致。Browser VM 确认 `shell.bottom`、四个侧栏标签注册/销毁，穿过 Host 的实际 UDS 通知、重连、P0 补读和取消。
-- 已用本机安装的 DSH Cordis + Typert Registry/Gateway，运行 [installed-dsh.mjs](../plugins/dsh-ai4math/host/test/installed-dsh.mjs)，验证 Owner unary、非 Owner 拒绝、严格参数及从真实 Rust UDS 向 Gateway 流式转发。这是独立进程内的集成测试，不是对当前用户 GUI 的装载测试。
+- 已用本机安装的 DSH Cordis + Typert Registry/Gateway，运行 [installed-dsh.mjs](../plugins/dsh-ai4math/host/test/installed-dsh.mjs)，验证合成 Owner/Guest peer 的角色门禁、严格参数、从真实 Rust UDS 流式转发、真实 daemon 重启重连及 Cordis 卸载后释放 stream 和服务注册。这是独立进程内的真实 SDK 集成测试；不测试浏览器登录、当前 profile 或真实 GUI 布局。
 
 ```sh
 APP='/Applications/DeepSeek Harness.app'
@@ -50,6 +50,8 @@ env -i PATH=/usr/bin:/bin ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/DeepSeek H
 
 ## 尚未覆盖的完整产品设计
 
-当前 GUI 插件未安装；真实 Web/Electron 界面的认证、布局冲突及生产 preset 生命周期仍需部署验收。标准 Unix UID 是 daemon 的信任边界，不隔离同 UID 的其他本机进程；如给模型启用其他 shell/文件工具，部署者还需禁止其直接访问 UDS/状态库。角色授权是 preset 级别，不是完整任务租约。
+现用 GUI 尚未安装本插件。实装验收应依次检查：启用后底栏 AI4Math 状态和会话侧栏 Briefing/Frontier/Inbox/Wiki；Owner 登录可以读取，退出或 Guest 不可以；daemon 断开时显示重连或旧数据提示，不把旧计数当现状；再启用或重连后正常恢复；禁用和卸载后面板消失、订阅停止，不停止外部 daemon，也不删除账本或留存。遇到不可用先检查插件启用状态、`socketPath`、daemon 进程和同 UID。布局、明暗主题和生产 preset 生命周期仍待真实页面验收。
 
-当前未接自动排程器/worker 生命周期、其他三类 P0 的生产信号源、外部桌面/Webhook 通知、任意历史简报窗口、LLM 叙事与 Pivot/熔断恢复/ADR 事务。面板只读观察或留存，不会模拟这些操作成功。
+标准 Unix UID 是 daemon 的信任边界，不隔离同 UID 的其他本机进程；如给模型启用其他 shell/文件工具，部署者还需禁止其直接访问 UDS/状态库。角色授权是 preset 级别，不是完整任务租约。
+
+GUI 未接任务调度控制面、外部桌面/Webhook 通知、任意历史简报窗口、LLM 叙事，也未暴露 Pivot/熔断恢复/ADR 写事务；这些不等同于 CLI 或独立 Host 功能不存在。工作台可观察和留存 Fact Pack，但不会批准、解决 Inbox 或推进 checkpoint。后续写入口必须满足 [Owner 人工确认边界](owner-approval-boundary.md)。

@@ -1,0 +1,8 @@
+# Selecting the bundle makes the row visible; it does not start the plugin.
+- insert:
+    - id: dsh-ai4math
+      name: dsh-ai4math
+      disabled: true
+      config:
+        rolePresets: {}
+        proofSlots: {}

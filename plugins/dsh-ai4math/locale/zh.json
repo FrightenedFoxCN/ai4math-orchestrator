@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "AI4Math 工作台",
+    "description": "从底部状态栏及 Briefing（简报）、Frontier（前沿）、Inbox（收件箱）和 Wiki 标签查看本地 AI4Math 项目。插件默认禁用；请先配置本机 ai4mathd Unix socket 的绝对路径，再显式启用。界面供通过认证的 Owner 查看状态，不提供审批或执行项目变更的操作。Pull and retain 会在本地留存 Fact Pack，但不推进人工审阅检查点。默认不授予 Agent 工具或证明槽位。"
+  }
+}

@@ -5,9 +5,8 @@ import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { execFileSync, spawn } from 'node:child_process';
-import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { once } from 'node:events';
 
 const [dshRoot, daemon, cli] = process.argv.slice(2);
 assert.ok(dshRoot && daemon, 'usage: installed-dsh.mjs DSH_SDK_ROOT AI4MATHD_BINARY [AI4MATH_BINARY]');
@@ -25,18 +24,47 @@ const {TypertRegistry}=lookup('@deepseek-ai/dsh-typert-registry');
 const {TypertGatewayService}=lookup('@deepseek-ai/dsh-api-gateway');
 const dir=await mkdtemp(join(tmpdir(),'ai4-'));
 const socket=join(dir,'.runtime','ai4mathd.sock');
-const processHandle=spawn(daemon,['--project',dir,'--tick-ms','100'],{stdio:['ignore','ignore','inherit']});
-const closed=once(processHandle,'exit');
+const daemons = new Set();
+function startDaemon() {
+  const child = spawn(daemon, ['--project', dir, '--tick-ms', '100'], { stdio: ['ignore', 'ignore', 'inherit'] });
+  let error;
+  child.once('error', (err) => { error = err; });
+  const closed = new Promise((resolve) => child.once('close', (code, signal) => resolve({ code, signal, error })));
+  const run = { child, closed };
+  daemons.add(run);
+  return run;
+}
+async function bounded(promise, label, ms = 5000) {
+  const stop = new AbortController();
+  try {
+    return await Promise.race([promise, delay(ms, undefined, { signal: stop.signal }).then(() => { throw new Error(label + ' timed out'); })]);
+  } finally { stop.abort(); }
+}
+async function stopDaemon(run) {
+  if (run.child.exitCode === null && run.child.signalCode === null) run.child.kill();
+  let result;
+  try { result = await bounded(run.closed, 'daemon shutdown', 1000); }
+  catch {
+    run.child.kill('SIGKILL');
+    result = await bounded(run.closed, 'daemon reaping', 2000);
+  }
+  daemons.delete(run);
+  if (result.error) throw result.error;
+}
+const initialDaemon = startDaemon();
+let fiber;
 try {
   const ctx=new Context();
-  // Anonymous and non-owner peers cannot acquire app access in this fixture.
-  // A separate call below verifies the business service itself rejects a non-owner.
+  // Exercise the installed dispatcher with synthetic peer identities. Admission
+  // is deliberately permissive here to exercise the plugin's own role check;
+  // this is not a browser login, credential or live-profile assertion.
   ctx.reflect.provide('remoteAccess',{decide:()=>({kind:'allow'})});
   new TypertRegistry(ctx);
   const gateway=new TypertGatewayService(ctx,{ websocketHeartbeatIntervalMs: 30000, streamInboxBytes: 1024 * 1024, websocketCompression: "none" });
-  plugin.apply(ctx,{socketPath:socket,timeoutMs:1000});
+  fiber = ctx.plugin((scoped) => plugin.apply(scoped,{socketPath:socket,timeoutMs:1000}));
+  await bounded(fiber, 'plugin mount');
   assert.ok(ctx.typert.local.get('ai4math/status'));
-  const signal=new AbortController().signal;
+  const signal=AbortSignal.timeout(20_000);
   const request=(method,params={},principal={kind:'owner'})=>({namespace:'ai4math',method,args:{params},peer:{principal,signal},signal});
   let result;
   for (let attempt=0;attempt<30;attempt++) {
@@ -153,9 +181,51 @@ try {
       await observations.return();
     }
   }
+  const reconnectSignal = AbortSignal.timeout(10_000);
+  const reqTick = request('subscribe', {topics: ['vital_signs.tick']});
+  const reconnectStream = await gateway.stream({...reqTick,signal:reconnectSignal,peer:{...reqTick.peer,signal:reconnectSignal}});
+  const follow = reconnectStream[Symbol.asyncIterator]();
+  async function nextMatching(predicate) {
+    for (;;) {
+      const item = await bounded(follow.next(), 'installed stream event');
+      assert.ok(!item.done, 'stream expired before the expected lifecycle event');
+      if (predicate(item.value)) return item.value;
+    }
+  }
+  const transition = (expected) => (e) => e.topic === 'ai4math.connection' && e.data.state === expected;
+  try {
+    await nextMatching(transition('connected'));
+    const before = await nextMatching((e) => e.topic === 'vital_signs.tick');
+    const inode = await lstat(socket);
+    assert.ok(inode.isSocket() && inode.uid === process.getuid());
+    await stopDaemon(initialDaemon);
+    await nextMatching(transition('reconnecting'));
+    // The actual daemon refuses stale socket names. Only retire our unique
+    // fixture socket after its process is collected and inode is confirmed.
+    const stale = await lstat(socket).catch((err) => { if (err.code !== 'ENOENT') throw err; });
+    if (stale) {
+      assert.ok(stale.isSocket() && stale.dev === inode.dev && stale.ino === inode.ino);
+      await unlink(socket);
+    }
+    startDaemon();
+    await nextMatching(transition('connected'));
+    const after = await nextMatching((e) => e.topic === 'vital_signs.tick');
+    assert.ok(after.data.event_seq >= before.data.event_seq);
+
+    await bounded(fiber.dispose(), 'plugin unload');
+    fiber = undefined;
+    for (;;) {
+      if ((await bounded(follow.next(), 'disposed stream termination')).done) break;
+    }
+    assert.equal(ctx.typert.local.get('ai4math/status'), undefined);
+    await assert.rejects(gateway.invoke(request('status')));
+    console.log('Installed Cordis + Typert: reconnect after actual daemon restart and scoped unload passed');
+  } finally { await bounded(follow.return(), 'close installed stream'); }
 } finally {
-  hook.deregister();
-  if (processHandle.exitCode===null && processHandle.signalCode===null) processHandle.kill();
-  await closed;
-  await rm(dir,{recursive:true,force:true});
+  try { if (fiber) await bounded(fiber.dispose(), 'fixture unload'); }
+  finally {
+    hook.deregister();
+    for (const run of daemons) await stopDaemon(run);
+    await rm(dir,{recursive:true,force:true});
+  }
 }

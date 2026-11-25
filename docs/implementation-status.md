@@ -96,6 +96,12 @@
 - `model-dispatch-cancel-running ROOT ID` 与候选提交在 SQLite 中仲裁；运行中取消或熔断作废租约后，保持打开的协调管道也会被主动断开，推动本地 worker 回收。这不是远端 HTTP 服务承诺中止或撤销已开始的调用。乱序、确认丢失、断开与晚到结果不提升信任。
 - 本机已安装 Electron 用合成凭据和 localhost 夹具完成驻留审批派发与重启后零额外请求。未验证生产凭据、远端服务、Linux 宿主或系统服务部署。Rust 工作区 538 通过、0 失败、75 默认忽略；插件 111 通过；fmt、diff 与 Clippy 通过（仍有既有警告）。
 
+## 后续批次：DSH Bundle 与安装版 SDK 验收
+
+- 本地包新增默认禁用的 Cordis entry、版本约束和中英文元信息。默认不为任何 Agent 注册项目工具或证明槽。观察工作台可显式留存事实包，不代表批准或推进项目状态；可按[部署与验收步骤](phase-2-3.md)复跑。
+- 本机安装版 Electron/Cordis/Typert 实测合成 Owner/Guest 的门禁、实际 daemon 重启重连，以及插件卸载后服务注销和订阅结束。没有安装到现用 profile 或完成浏览器认证、布局和视觉验收。Rust 538 项、插件 113 项通过（Rust 75 项默认忽略）。
+- 已核对 [Owner 审批边界](owner-approval-boundary.md)：DSH Owner peer 本身不证明人在场或签署了精确计划。公开预览与状态不授权写入；未建立独立操作者确认前保持无远程 Pivot 写入口。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。
