@@ -308,7 +308,47 @@ pub(crate) fn at_snapshot_generation_then<T, B, F>(
     build: impl FnOnce(Engine, &Promotion<'_>, &[(&str, &str)]) -> Result<B>,
     finish: impl FnOnce(&PromotionRepo, &Path, i64, &B, &T) -> Result<F>,
 ) -> Result<(B, T, i64, Engine, F)> {
-    with_generation(root, repo, anchor, reviewed, |generation| {
+    at_snapshot_generation_for_engine(
+        root,
+        repo,
+        (Engine::Lean4, anchor),
+        reviewed,
+        observe,
+        build,
+        finish,
+    )
+}
+
+pub(crate) fn at_engine_snapshot_generation<T>(
+    root: &Path,
+    repo: &Path,
+    target: (Engine, &str),
+    reviewed: &str,
+    build: impl FnOnce(&Promotion<'_>, &[(&str, &str)]) -> Result<T>,
+) -> Result<(T, i64)> {
+    let (result, (), seq, _, ()) = at_snapshot_generation_for_engine(
+        root,
+        repo,
+        target,
+        reviewed,
+        |_, _| Ok(()),
+        |_, pinned, files| build(pinned, files),
+        |_, _, _, _, _| Ok(()),
+    )?;
+    Ok((result, seq))
+}
+
+fn at_snapshot_generation_for_engine<T, B, F>(
+    root: &Path,
+    repo: &Path,
+    target: (Engine, &str),
+    reviewed: &str,
+    observe: impl FnOnce(&StateStore, i64) -> Result<T>,
+    build: impl FnOnce(Engine, &Promotion<'_>, &[(&str, &str)]) -> Result<B>,
+    finish: impl FnOnce(&PromotionRepo, &Path, i64, &B, &T) -> Result<F>,
+) -> Result<(B, T, i64, Engine, F)> {
+    let (engine, anchor) = target;
+    with_engine_generation(root, repo, anchor, reviewed, engine, |generation| {
         let observation = observe(generation.state, generation.seq())?;
         generation.check_current("managed main or ledger changed before T2 build; retry")?;
         let pinned = generation.git.snapshot(anchor, Some(reviewed))?;
@@ -368,12 +408,23 @@ fn with_generation<R>(
     reviewed: &str,
     run: impl FnOnce(&ManagedGeneration<'_>) -> Result<R>,
 ) -> Result<R> {
+    with_engine_generation(root, repo, anchor, reviewed, Engine::Lean4, run)
+}
+
+fn with_engine_generation<R>(
+    root: &Path,
+    repo: &Path,
+    anchor: &str,
+    reviewed: &str,
+    required_engine: Engine,
+    run: impl FnOnce(&ManagedGeneration<'_>) -> Result<R>,
+) -> Result<R> {
     let project = ManagedProject::new(root)?;
     let path = project.state_path().to_path_buf();
     let engine = bound_engine(root, anchor)?;
     ensure!(
-        engine == Engine::Lean4,
-        "T2 clean build currently requires the primary Lean engine"
+        engine == required_engine,
+        "T2 clean build requires primary engine {required_engine:?}"
     );
     let state = project.open_state_readonly()?;
     let stamp = state.managed_wiki_stamp()?.context(

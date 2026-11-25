@@ -1093,6 +1093,61 @@ impl Broker {
         })
     }
 
+    /// Advisory observation over fresh objects only. No receipt or trust transition.
+    pub fn check_rocq_t2(
+        &self,
+        tool: &Toolchain,
+        modules: &[(&str, &str)],
+        target: (&str, &str),
+        compiler_sha256: &str,
+        checker: (&Path, &str),
+    ) -> Result<usize> {
+        ensure!(
+            tool.engine == Engine::Rocq,
+            "Rocq T2 needs the native Rocq toolchain"
+        );
+        ensure!(
+            tool.compiler_sha256() == compiler_sha256
+                && file_digest(&tool.executable)? == compiler_sha256,
+            "Rocq compiler does not match the pinned SHA-256"
+        );
+        let (relative, theorem) = target;
+        ensure!(
+            modules.iter().any(|(path, _)| *path == relative),
+            "Rocq T2 target missing from the source set"
+        );
+        validate_modules_for_tool(tool, modules, None)?;
+        let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let room = tempfile::tempdir()?;
+        let build = ModuleBuild::new(tool, room.path())?;
+        let paths: Vec<_> = modules.iter().map(|(path, _)| *path).collect();
+        for &(path, source) in modules {
+            ensure!(
+                Instant::now() < deadline,
+                "Rocq T2 exhausted the build budget"
+            );
+            stage_source(Engine::Rocq, room.path(), &build.output, path, source)?;
+            rocq::compile_until(tool, room.path(), &build.output, path, true, Some(deadline))?;
+        }
+        let checked =
+            rocq::recheck_generated_objects(&build, &paths, checker.0, checker.1, Some(deadline))?;
+        ensure!(
+            checked.checker_sha256() == checker.1,
+            "Rocq checker evidence pin mismatch"
+        );
+        rocq::audit_target(tool, &build.output, relative, theorem, Some(deadline))?;
+        ensure!(
+            file_digest(&tool.executable)? == compiler_sha256,
+            "pinned Rocq compiler changed during audit"
+        );
+        ensure!(
+            Instant::now() < deadline,
+            "Rocq T2 exhausted the build budget"
+        );
+        Ok(modules.len())
+    }
+
     pub fn check_modules(&self, tool: &Toolchain, modules: &[(&str, &str)]) -> Result<()> {
         ensure!(!modules.is_empty(), "empty local regression slice");
         validate_modules_for_tool(tool, modules, None)?;

@@ -1,12 +1,16 @@
-//! Native Rocq 9.3 compiler, scoped to the committed proof-slot source profile.
+//! Native Rocq 9.3 tools, scoped to the committed proof-slot source profile.
 
 use super::{TIMEOUT, Toolchain, golden, path_for, sandbox};
+pub(super) use recheck::recheck_generated_objects;
+
+mod recheck;
 use ai4math_core::{Engine, FrozenTarget, PreFlightSeverity, scan_source};
 use anyhow::{Context, Result, ensure};
 use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    time::Instant,
 };
 
 const PROJECT: &str = "Ai4mathProject";
@@ -15,6 +19,7 @@ pub(super) const AUDIT_MODULE: &str = "Ai4mathRocqAudit";
 const AUDIT_SOURCE: &str = "Ai4mathRocqAudit.v";
 
 pub(super) struct Install {
+    prefix: PathBuf,
     data: PathBuf,
     runtime: PathBuf,
 }
@@ -70,7 +75,14 @@ impl Install {
                     && runtime.join("plugins").is_dir(),
                 "expected one complete native Rocq 9.3 installation"
             );
-            return Ok((Self { data, runtime }, worker));
+            return Ok((
+                Self {
+                    prefix: prefix.to_owned(),
+                    data,
+                    runtime,
+                },
+                worker,
+            ));
         }
         anyhow::bail!("Rocq data does not match the native driver's installation")
     }
@@ -96,6 +108,7 @@ fn invoke(
     scratch: &Path,
     relative: &str,
     module: &str,
+    deadline: Option<Instant>,
 ) -> Result<String> {
     let install = tool
         .rocq_install
@@ -140,7 +153,7 @@ fn invoke(
         source.to_str().context("non-UTF8 Rocq source path")?,
     ]
     .map(str::to_owned);
-    sandbox::run_with_data(
+    sandbox::run_grouped_until(
         sandbox::Invocation {
             executable: &tool.executable,
             args: &args,
@@ -162,6 +175,8 @@ fn invoke(
                 .to_path_buf(),
             install.runtime.join("kernel"),
         ],
+        tool.sandbox_group,
+        deadline,
     )
 }
 
@@ -172,16 +187,45 @@ pub(super) fn compile(
     relative: &str,
     save_object: bool,
 ) -> Result<String> {
+    compile_until(tool, room, objects, relative, save_object, None)
+}
+
+fn require_time(deadline: Option<Instant>) -> Result<()> {
+    ensure!(
+        deadline.is_none_or(|end| Instant::now() < end),
+        "Rocq absolute wall-clock budget exhausted"
+    );
+    Ok(())
+}
+
+pub(super) fn compile_until(
+    tool: &Toolchain,
+    room: &Path,
+    objects: &Path,
+    relative: &str,
+    save_object: bool,
+    deadline: Option<Instant>,
+) -> Result<String> {
+    require_time(deadline)?;
     let module = path_for(Engine::Rocq, relative)?;
     let scratch = tempfile::tempdir_in(room)?;
-    let log = invoke(tool, room, objects, scratch.path(), relative, module)
-        .with_context(|| format!("compile Rocq module {relative:?}"))?;
+    let log = invoke(
+        tool,
+        room,
+        objects,
+        scratch.path(),
+        relative,
+        module,
+        deadline,
+    )
+    .with_context(|| format!("compile Rocq module {relative:?}"))?;
     if save_object {
         // Copy only the expected regular object out of the child's writable
         // scratch. All predecessor objects are read-only in every later step.
         let name = format!("{module}.vo");
         let bytes = golden::bounded_file(&scratch.path().join(&name), golden::ARTIFACT_CAP)
             .context("read fresh Rocq compiler object")?;
+        require_time(deadline)?;
         ensure!(!bytes.is_empty(), "Rocq compiler produced an empty object");
         fs::OpenOptions::new()
             .write(true)
@@ -189,6 +233,7 @@ pub(super) fn compile(
             .open(objects.join(name))?
             .write_all(&bytes)?;
     }
+    require_time(deadline)?;
     Ok(log)
 }
 
@@ -218,8 +263,19 @@ fn require_closed(log: &str) -> Result<()> {
 }
 
 pub(super) fn audit(tool: &Toolchain, objects: &Path, target: &FrozenTarget) -> Result<()> {
-    let module = path_for(Engine::Rocq, &target.file_path)?;
-    let source = audit_source(module, &target.target_id)?;
+    audit_target(tool, objects, &target.file_path, &target.target_id, None)
+}
+
+pub(super) fn audit_target(
+    tool: &Toolchain,
+    objects: &Path,
+    relative: &str,
+    theorem: &str,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    require_time(deadline)?;
+    let module = path_for(Engine::Rocq, relative)?;
+    let source = audit_source(module, theorem)?;
     let room = tempfile::tempdir()?;
     let scratch = tempfile::tempdir_in(room.path())?;
     // Only approved, read-only compiled objects enter this invocation. The
@@ -234,6 +290,7 @@ pub(super) fn audit(tool: &Toolchain, objects: &Path, target: &FrozenTarget) -> 
         scratch.path(),
         AUDIT_SOURCE,
         AUDIT_MODULE,
+        deadline,
     )
     .context("run standalone Rocq assumptions audit")?;
     require_closed(&log)
