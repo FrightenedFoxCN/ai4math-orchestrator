@@ -4,6 +4,7 @@ use super::{
     SOURCE_CAP, Toolchain, dependencies_digest, digest, lean_axioms, path_for, render_proof_body,
     stage_source, t3, validate_modules,
 };
+use ai4math_evidence::WitnessEvidence;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{
@@ -118,6 +119,61 @@ impl VerifiedWitness {
             &self.compiler_sha256,
             &self.observed_axioms,
         ))?))
+    }
+}
+
+// SAFETY: Production values are constructed only after the committed proposition
+// and generated witness pass native Lean kernel and axiom verification. Fields
+// remain private and the wire type has no deserializer.
+unsafe impl WitnessEvidence for VerifiedWitness {
+    fn base_commit(&self) -> &str {
+        self.base_commit()
+    }
+
+    fn file_path(&self) -> &str {
+        self.file_path()
+    }
+
+    fn proposition_id(&self) -> &str {
+        self.proposition_id()
+    }
+
+    fn source_sha256(&self) -> &str {
+        self.source_sha256()
+    }
+
+    fn proof_body_sha256(&self) -> &str {
+        self.proof_body_sha256()
+    }
+
+    fn witness_sha256(&self) -> &str {
+        self.witness_sha256()
+    }
+
+    fn source(&self) -> &str {
+        self.source()
+    }
+
+    fn matches(
+        &self,
+        base_commit: &str,
+        file_path: &str,
+        proposition_id: &str,
+        committed_source: &[u8],
+        proof_body: &[u8],
+    ) -> bool {
+        VerifiedWitness::matches(
+            self,
+            base_commit,
+            file_path,
+            proposition_id,
+            committed_source,
+            proof_body,
+        )
+    }
+
+    fn receipt_json(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
     }
 }
 

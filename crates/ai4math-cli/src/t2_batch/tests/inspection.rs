@@ -1,6 +1,7 @@
 use super::*;
+use crate::worker_dispatch::private_state_path;
 use ai4math_core::Engine;
-use ai4math_store::Change;
+use ai4math_store::{Change, StateStore};
 use std::process::{Command, Stdio};
 
 const SOURCE: &str = "prelude\nnamespace N\ntheorem x {P : Prop} : P → P := fun h => h\ntheorem y {P : Prop} : P → P := fun h => h\nend N\n";

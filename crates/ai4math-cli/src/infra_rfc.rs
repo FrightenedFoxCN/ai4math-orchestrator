@@ -1,14 +1,10 @@
 //! Operator-only RFC lifecycle commands. Draft/approval never grant proof trust;
 //! freezing and completion require sealed native Lean broker verification.
-use crate::{
-    bound_engine, managed_native, print_json, promotion::PromotionRepo, trusted_toolchain,
-    worker_dispatch::private_state_path,
-};
+use crate::{bound_engine, print_json, promotion::PromotionRepo, trusted_toolchain};
 use ai4math_broker::Broker;
 use ai4math_core::{Engine, InfraRFC};
-use ai4math_store::{
-    INFRA_RFC_MAX_BYTES, InfraRfcRecord, InfraRfcStatus, StateStore, parse_infra_rfc_draft,
-};
+use ai4math_project::ManagedProject;
+use ai4math_store::{INFRA_RFC_MAX_BYTES, InfraRfcRecord, InfraRfcStatus, parse_infra_rfc_draft};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::{fs, io::Read, path::Path};
@@ -105,11 +101,10 @@ pub(crate) fn submit(
     input: &Path,
 ) -> Result<()> {
     let draft = read_draft(input)?;
-    let state = private_state_path(root)
-        .context("InfraRFC intake requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
     let git = PromotionRepo::try_lock_existing(repo)?;
     check_tracked(root, &git, module, reviewed, draft.engine)?;
-    let mut store = StateStore::open(&state)?;
+    let mut store = project.open_state()?;
     print_json(
         store.submit_infra_rfc(repo_name(&git)?, reviewed, module, &draft, || {
             at_head(&git, reviewed)
@@ -118,11 +113,10 @@ pub(crate) fn submit(
 }
 
 pub(crate) fn approve(root: &Path, repo: &Path, id: &str, reviewed: &str, sha: &str) -> Result<()> {
-    let state = private_state_path(root)
-        .context("InfraRFC approval requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
     let git = PromotionRepo::try_lock_existing(repo)?;
     at_head(&git, reviewed)?;
-    let mut store = StateStore::open(&state)?;
+    let mut store = project.open_state()?;
     let name = repo_name(&git)?;
     let stored = store.infra_rfc(name, id)?.context("unknown InfraRFC")?;
     check_tracked(
@@ -142,11 +136,10 @@ pub(crate) fn smoke_start(
     reviewed: &str,
     sha: &str,
 ) -> Result<()> {
-    let state = private_state_path(root)
-        .context("InfraRFC smoke stage requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
     let git = PromotionRepo::try_lock_existing(repo)?;
     at_head(&git, reviewed)?;
-    let mut store = StateStore::open(&state)?;
+    let mut store = project.open_state()?;
     let name = repo_name(&git)?;
     let stored = store.infra_rfc(name, id)?.context("unknown InfraRFC")?;
     ensure!(
@@ -172,12 +165,11 @@ pub(crate) fn freeze(
     executable: &Path,
     smoke_lemmas: &[&str],
 ) -> Result<()> {
-    let _native = managed_native(root)?;
-    let state = private_state_path(root)
-        .context("InfraRFC smoke freeze requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
+    let _native = project.try_native_heavy()?;
     let git = PromotionRepo::try_lock_existing(repo)?;
     at_head(&git, reviewed)?;
-    let mut store = StateStore::open(&state)?;
+    let mut store = project.open_state()?;
     let name = repo_name(&git)?;
     let stored = store.infra_rfc(name, id)?.context("unknown InfraRFC")?;
     ensure!(
@@ -233,12 +225,11 @@ pub(crate) fn complete(
     sha: &str,
     executable: &Path,
 ) -> Result<()> {
-    let _native = managed_native(root)?;
-    let state = private_state_path(root)
-        .context("InfraRFC completion requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
+    let _native = project.try_native_heavy()?;
     let git = PromotionRepo::try_lock_existing(repo)?;
     at_head(&git, reviewed)?;
-    let mut store = StateStore::open(&state)?;
+    let mut store = project.open_state()?;
     let name = repo_name(&git)?;
     let stored = store.infra_rfc(name, id)?.context("unknown InfraRFC")?;
     ensure!(
@@ -307,11 +298,10 @@ pub(crate) fn reject(
     sha: &str,
     reason: &str,
 ) -> Result<()> {
-    let state = private_state_path(root)
-        .context("InfraRFC rejection requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
     let git = PromotionRepo::try_lock_existing(repo)?;
     at_head(&git, reviewed)?;
-    let mut store = StateStore::open(&state)?;
+    let mut store = project.open_state()?;
     let name = repo_name(&git)?;
     let stored = store.infra_rfc(name, id)?.context("unknown InfraRFC")?;
     require_ancestor_or_eq(&git, &stored.reviewed_commit, reviewed, "InfraRFC review")?;
@@ -327,11 +317,10 @@ pub(crate) fn supersede(
     replacement: &str,
     reason: &str,
 ) -> Result<()> {
-    let state = private_state_path(root)
-        .context("InfraRFC supersession requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
     let git = PromotionRepo::try_lock_existing(repo)?;
     at_head(&git, reviewed)?;
-    let mut store = StateStore::open(&state)?;
+    let mut store = project.open_state()?;
     let name = repo_name(&git)?;
     let stored = store.infra_rfc(name, id)?.context("unknown InfraRFC")?;
     require_ancestor_or_eq(&git, &stored.reviewed_commit, reviewed, "InfraRFC review")?;
@@ -351,11 +340,10 @@ struct Inspection {
 }
 
 pub(crate) fn inspect(root: &Path, repo: &Path, id: &str) -> Result<()> {
-    let state = private_state_path(root)
-        .context("InfraRFC inspection requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
     let git = PromotionRepo::try_lock_existing(repo)?;
     let current_main = git.main_head()?;
-    let store = StateStore::open_readonly(&state)?;
+    let store = project.open_state_readonly()?;
     let record = store
         .infra_rfc(repo_name(&git)?, id)?
         .context("unknown InfraRFC")?;

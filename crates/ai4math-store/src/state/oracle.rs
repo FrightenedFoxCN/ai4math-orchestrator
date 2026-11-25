@@ -1,8 +1,8 @@
 //! Advisory Oracle evidence. Neither approval context nor observations confer trust.
 use super::{Change, StateStore, event};
 use crate::retained::valid_id;
-use ai4math_broker::{OracleObservation, OracleQuery};
 use ai4math_core::{Engine, validate_source_path};
+use ai4math_evidence::{OracleObservationEvidence, OracleQuery};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
@@ -357,7 +357,7 @@ impl StateStore {
     pub fn record_oracle_observation(
         &mut self,
         approval: &OracleApproval,
-        observation: &OracleObservation,
+        observation: &dyn OracleObservationEvidence,
     ) -> Result<RetainedOracleObservation> {
         let solver_sha256s = observation.solver_sha256s();
         ensure!(
@@ -371,7 +371,7 @@ impl StateStore {
         );
         ensure!(valid_id(observation.id()), "invalid broker observation ID");
         let id = record_id(&approval.approval_sha256, observation.id())?;
-        let body = serde_json::to_value(observation)?;
+        let body = observation.raw_json()?;
         let encoded = serde_json::to_string(&body)?;
         ensure!(
             encoded.len() <= MAX_OBSERVATION,

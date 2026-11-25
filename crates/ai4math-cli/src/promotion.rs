@@ -118,6 +118,27 @@ fn git(repo: &Path, args: &[&str], index: Option<&Path>, input: Option<&[u8]>) -
     git_success(args, run_git(repo, args, index, input)?)
 }
 
+fn require_commit(repo: &Path, commit: &str) -> Result<()> {
+    ensure!(valid_commit(commit), "provide a full Git object ID");
+    let spec = format!("{commit}^{{commit}}");
+    let found = text(git(repo, &["rev-parse", "--verify", &spec], None, None)?)?;
+    ensure!(found == commit, "Git object is not the requested commit");
+    Ok(())
+}
+
+fn is_physical_ancestor(repo: &Path, old: &str, new: &str) -> Result<bool> {
+    require_commit(repo, old)?;
+    require_commit(repo, new)?;
+    let mut command = git_command(repo, &[], None, false);
+    command.env("GIT_ALLOW_PROTOCOL", "");
+    let output = ai4math_broker::git_policy::physical_ancestry(&mut command, old, new).output()?;
+    if output.status.code() == Some(1) {
+        return Ok(false);
+    }
+    git_success(&["merge-base"], output)?;
+    Ok(true)
+}
+
 fn reject_symbolic_ref(repo: &Path, name: &str) -> Result<()> {
     let args = ["symbolic-ref", "--no-recurse", "-q", name];
     let out = run_git(repo, &args, None, None)?;
@@ -631,42 +652,13 @@ impl PromotionRepo {
     }
 
     pub fn require_commit(&self, commit: &str) -> Result<()> {
-        ensure!(valid_commit(commit), "provide a full Git object ID");
-        let spec = format!("{commit}^{{commit}}");
-        let found = text(git(
-            &self.path,
-            &["rev-parse", "--verify", &spec],
-            None,
-            None,
-        )?)?;
-        ensure!(found == commit, "Git object is not the requested commit");
-        Ok(())
+        require_commit(self.path(), commit)
     }
 
-    pub fn is_ancestor(&self, old: &str, new: &str) -> Result<bool> {
-        self.require_commit(old)?;
-        self.require_commit(new)?;
-        let args = ["merge-base", "--is-ancestor", old, new];
-        let output = run_git(&self.path, &args, None, None)?;
-        if output.status.code() == Some(1) {
-            return Ok(false);
-        }
-        git_success(&args, output)?;
-        Ok(true)
-    }
-
+    /// Evidence ancestry is physical: local replace refs, grafts and commit graphs
+    /// must never invent or hide an edge in a proof, trust or provenance decision.
     pub(crate) fn is_ungrafted_ancestor(&self, old: &str, new: &str) -> Result<bool> {
-        self.require_commit(old)?;
-        self.require_commit(new)?;
-        let mut command = git_command(&self.path, &[], None, false);
-        command.env("GIT_ALLOW_PROTOCOL", "");
-        let output =
-            ai4math_broker::git_policy::physical_ancestry(&mut command, old, new).output()?;
-        if output.status.code() == Some(1) {
-            return Ok(false);
-        }
-        git_success(&["merge-base"], output)?;
-        Ok(true)
+        is_physical_ancestor(self.path(), old, new)
     }
 
     pub fn pending_ref(&self, state_path: &Path) -> Result<PendingRef<'_>> {
@@ -783,20 +775,8 @@ impl PromotionRepo {
         module_extension(module).context("invalid managed proof module")?;
         let mut before = self.project_tree(base)?;
         self.require_commit(commit)?;
-        let raw = read_object(self.path(), "commit", commit, MAX_TREE_BYTES)?;
-        let mut headers = raw
-            .split(|&b| b == b'\n')
-            .take_while(|line| !line.is_empty());
-        let tree = headers
-            .next()
-            .and_then(|line| line.strip_prefix(b"tree "))
-            .context("missing promoted proof tree")?;
-        ensure!(
-            headers.next() == Some(format!("parent {base}").as_bytes())
-                && !headers.any(|line| line.starts_with(b"parent ") || line.starts_with(b"tree ")),
-            "managed proof must have the exact approved base as its only parent"
-        );
-        let mut after = ProjectTree::read(self.path(), std::str::from_utf8(tree)?)?;
+        let tree = exact_parent_tree(self.path(), commit, base)?;
+        let mut after = ProjectTree::read(self.path(), &tree)?;
         let old = before
             .files
             .remove(module)
@@ -837,21 +817,8 @@ impl PromotionRepo {
         markdown: &str,
     ) -> Result<()> {
         self.require_commit(commit)?;
-        // Inspect raw headers: the parent must be exact, not a history view via a graft.
-        let raw = read_object(self.path(), "commit", commit, MAX_TREE_BYTES)?;
-        let mut headers = raw
-            .split(|&b| b == b'\n')
-            .take_while(|line| !line.is_empty());
-        let tree = headers
-            .next()
-            .and_then(|line| line.strip_prefix(b"tree "))
-            .context("missing prepared ADR tree")?;
-        ensure!(
-            headers.next() == Some(format!("parent {base}").as_bytes())
-                && !headers.any(|line| line.starts_with(b"parent ") || line.starts_with(b"tree ")),
-            "prepared ADR must have the exact base as its only parent"
-        );
-        let mut after = ProjectTree::read(self.path(), std::str::from_utf8(tree)?)?;
+        let tree = exact_parent_tree(self.path(), commit, base)?;
+        let mut after = ProjectTree::read(self.path(), &tree)?;
         let added = after
             .adrs
             .remove(name)
@@ -969,6 +936,28 @@ fn read_object(repo: &Path, kind: &str, oid: &str, max_bytes: usize) -> Result<V
     let bytes = git(repo, &["cat-file", kind, oid], None, None)?;
     ensure!(bytes.len() == size, "Git {kind} size changed while reading");
     Ok(bytes)
+}
+
+/// Read the serialized commit itself, never a parent view rewritten by a graft
+/// or replacement object. Every prepared promotion/ADR must have one exact parent.
+fn exact_parent_tree(repo: &Path, commit: &str, parent: &str) -> Result<String> {
+    ensure!(valid_commit(parent), "invalid expected parent commit ID");
+    let raw = read_object(repo, "commit", commit, MAX_TREE_BYTES)?;
+    let mut headers = raw
+        .split(|&b| b == b'\n')
+        .take_while(|line| !line.is_empty());
+    let tree = headers
+        .next()
+        .and_then(|line| line.strip_prefix(b"tree "))
+        .context("missing prepared commit tree")?;
+    ensure!(
+        headers.next() == Some(format!("parent {parent}").as_bytes())
+            && !headers.any(|line| line.starts_with(b"parent ") || line.starts_with(b"tree ")),
+        "prepared commit must have the exact approved base as its only parent"
+    );
+    let tree = std::str::from_utf8(tree)?;
+    ensure!(valid_commit(tree), "invalid prepared commit tree ID");
+    Ok(tree.to_owned())
 }
 
 #[derive(PartialEq, Eq)]
@@ -1278,15 +1267,9 @@ impl Promotion<'_> {
 
     pub fn assert_prepared_commit(&self, commit: &str, source: &[u8]) -> Result<()> {
         ensure!(valid_commit(commit), "invalid prepared commit ID");
-        let info = text(git(
-            self.repo,
-            &["show", "-s", "--format=%T %P", commit],
-            None,
-            None,
-        )?)?;
-        let expected = format!("{} {}", self.candidate_tree(source)?, self.base);
+        let tree = exact_parent_tree(self.repo, commit, &self.base)?;
         ensure!(
-            info == expected,
+            tree == self.candidate_tree(source)?,
             "prepared commit no longer matches the re-verified source and exact parent tree"
         );
         Ok(())
@@ -1309,13 +1292,7 @@ impl Promotion<'_> {
 
     fn includes_commit(&self, head: &str, commit: &str) -> Result<bool> {
         ensure!(valid_commit(commit), "invalid prepared commit ID");
-        let args = ["merge-base", "--is-ancestor", commit, head];
-        let out = run_git(self.repo, &args, None, None)?;
-        if out.status.code() == Some(1) {
-            return Ok(false);
-        }
-        git_success(&args, out)?;
-        Ok(true)
+        is_physical_ancestor(self.repo, commit, head)
     }
 
     pub fn advance(&self, commit: &str) -> Result<()> {
@@ -1415,6 +1392,33 @@ mod tests {
         Ok(commit)
     }
 
+    fn ordinary_git(repo: &PromotionRepo, args: &[&str]) -> Result<Output> {
+        // Deliberately retain Git's local metadata view to prove the fixture is effective.
+        Command::new("/usr/bin/git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .arg("--git-dir")
+            .arg(repo.path())
+            .args(args)
+            .output()
+            .map_err(Into::into)
+    }
+
+    fn ordinary_is_ancestor(repo: &PromotionRepo, old: &str, new: &str) -> Result<bool> {
+        let output = ordinary_git(repo, &["merge-base", "--is-ancestor", old, new])?;
+        if output.status.code() == Some(1) {
+            return Ok(false);
+        }
+        ensure!(
+            output.status.success(),
+            "fixture Git ancestry: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(true)
+    }
+
     fn commit_tree(repo: &PromotionRepo, tree: &str, parent: &str) -> Result<String> {
         text(git(
             repo.path(),
@@ -1465,8 +1469,10 @@ mod tests {
             format!("{unrelated} {base}\n{child}\n"),
         )?;
         // The graft invents one edge and hides another from ordinary Git.
-        assert!(repo.is_ancestor(&base, &unrelated)?);
-        assert!(!repo.is_ancestor(&base, &child)?);
+        assert!(ordinary_is_ancestor(&repo, &base, &unrelated)?);
+        assert!(!ordinary_is_ancestor(&repo, &base, &child)?);
+        assert!(!repo.is_ungrafted_ancestor(&base, &unrelated)?);
+        assert!(repo.is_ungrafted_ancestor(&base, &child)?);
         assert!(!repo.is_ungrafted_ancestor(&base, &unrelated)?);
         assert!(repo.is_ungrafted_ancestor(&base, &child)?);
         assert!(
@@ -1476,6 +1482,117 @@ mod tests {
                 .contains("explicit descendant")
         );
         assert_eq!(plan(&child)?.plan_sha256, digest);
+        Ok(())
+    }
+
+    #[test]
+    fn promotion_publication_and_prepared_parent_ignore_local_grafts() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let base = branch(&repo)?;
+        let source = b"import B\n-- physically promoted proof\n";
+        let tx = repo.snapshot("A.lean", None)?;
+        let tree = tx.candidate_tree(source)?;
+        let prepared = commit_tree(&repo, &tree, &base)?;
+        tx.assert_prepared_commit(&prepared, source)?;
+
+        let unrelated = text(git(
+            repo.path(),
+            &["commit-tree", &tree, "-m", "unrelated main"],
+            None,
+            None,
+        )?)?;
+        git(
+            repo.path(),
+            &["update-ref", MAIN, &unrelated, &base],
+            None,
+            None,
+        )?;
+        let tx = repo.snapshot("A.lean", Some(&base))?;
+        std::fs::write(
+            repo.path().join("info/grafts"),
+            format!("{unrelated} {prepared}\n{prepared}\n"),
+        )?;
+        // A graft can fabricate publication and hide the real parent at once.
+        assert!(ordinary_is_ancestor(&repo, &prepared, &unrelated)?);
+        assert!(!repo.is_ungrafted_ancestor(&prepared, &unrelated)?);
+        assert!(!tx.published(&prepared)?);
+        assert!(!tx.currently_published(&prepared)?);
+        // Recovery validation still reads the actual sole parent from raw headers.
+        tx.assert_prepared_commit(&prepared, source)?;
+
+        let later = commit_tree(&repo, &tree, &prepared)?;
+        git(
+            repo.path(),
+            &["update-ref", MAIN, &later, &unrelated],
+            None,
+            None,
+        )?;
+        std::fs::write(
+            repo.path().join("info/grafts"),
+            format!("{later}\n{unrelated} {prepared}\n{prepared}\n"),
+        )?;
+        assert!(!ordinary_is_ancestor(&repo, &prepared, &later)?);
+        let tx = repo.snapshot("A.lean", Some(&base))?;
+        assert!(tx.published(&prepared)?);
+        assert!(tx.currently_published(&prepared)?);
+        tx.assert_prepared_commit(&prepared, source)?;
+        Ok(())
+    }
+
+    #[test]
+    fn physical_ancestry_and_prepared_parent_ignore_replace_refs_and_commit_graph() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let base = branch(&repo)?;
+        let source = b"import B\n-- physically promoted proof\n";
+        let tx = repo.snapshot("A.lean", None)?;
+        let tree = tx.candidate_tree(source)?;
+        let prepared = commit_tree(&repo, &tree, &base)?;
+        let unrelated = text(git(
+            repo.path(),
+            &["commit-tree", &tree, "-m", "unrelated root"],
+            None,
+            None,
+        )?)?;
+        let forged_parent = commit_tree(&repo, &tree, &unrelated)?;
+        git(
+            repo.path(),
+            &["replace", "--graft", &unrelated, &base],
+            None,
+            None,
+        )?;
+        git(
+            repo.path(),
+            &["replace", &prepared, &forged_parent],
+            None,
+            None,
+        )?;
+        git(
+            repo.path(),
+            &["update-ref", "refs/heads/unrelated", &unrelated],
+            None,
+            None,
+        )?;
+        git(
+            repo.path(),
+            &["config", "core.commitGraph", "true"],
+            None,
+            None,
+        )?;
+        git(
+            repo.path(),
+            &["commit-graph", "write", "--reachable"],
+            None,
+            None,
+        )?;
+
+        assert!(ordinary_is_ancestor(&repo, &base, &unrelated)?);
+        assert!(!repo.is_ungrafted_ancestor(&base, &unrelated)?);
+        assert!(!repo.is_ungrafted_ancestor(&base, &unrelated)?);
+        assert!(repo.is_ungrafted_ancestor(&base, &prepared)?);
+        let shown = ordinary_git(&repo, &["show", "-s", "--format=%P", &prepared])?;
+        ensure!(shown.status.success());
+        assert_eq!(text(shown.stdout)?, unrelated);
+        tx.assert_prepared_commit(&prepared, source)?;
         Ok(())
     }
 
@@ -2165,7 +2282,7 @@ mod tests {
         let next = repo.prepare_adr(&commit, &second, "# Next decision\n")?;
         repo.advance_adr(&commit, &next, &second, "# Next decision\n")?;
         repo.validate_adr(&base, &commit, &approved, markdown)?;
-        assert!(repo.is_ancestor(&commit, &next)?);
+        assert!(repo.is_ungrafted_ancestor(&commit, &next)?);
         Ok(())
     }
 

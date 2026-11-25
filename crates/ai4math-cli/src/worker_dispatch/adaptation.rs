@@ -1,14 +1,14 @@
 //! An explicitly selected sediment approval can run one local ProverWorker.
 //! No scheduler discovery, promotion, or model-host route is provided here.
 use super::{
-    Prepared, RESULT_CAP, WORKER_ACTOR, check_lease, check_result, prepare, private_state_path,
-    validate_native_worker,
+    Prepared, RESULT_CAP, WORKER_ACTOR, check_lease, check_result, prepare, validate_native_worker,
 };
 use crate::{
     managed_native, print_json, promotion::PromotionRepo, wiki_archive::adapt::revalidate,
 };
 use ai4math_broker::run_task_process;
 use ai4math_core::Role;
+use ai4math_project::open_managed_state;
 use ai4math_store::{SedimentAdaptationPlan, StateStore, TaskRunOutcome};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
@@ -66,7 +66,7 @@ pub(crate) fn run_adaptation(
     validate_native_worker(exe, sha, seconds)?;
     let task_id = StateStore::sediment_adaptation_task_id(approval)?;
     let _native = managed_native(root)?;
-    let mut state = StateStore::open(private_state_path(root)?)?;
+    let mut state = open_managed_state(root, false)?;
     let (subject, plan, lease) = {
         let git = PromotionRepo::try_lock(repo)?;
         let (subject, plan) = prepare_adaptation(root, &git, &state, approval, &task_id, seconds)?;

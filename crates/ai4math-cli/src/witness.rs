@@ -2,7 +2,8 @@
 use super::{bound_engine, print_json, promotion::PromotionRepo, read_proof, trusted_toolchain};
 use ai4math_broker::Broker;
 use ai4math_core::{Engine, ProofBodySubmission};
-use ai4math_store::{RefutationRecord, StateStore, WitnessInput, WitnessSpecBinding};
+use ai4math_project::open_managed_state;
+use ai4math_store::{RefutationRecord, WitnessInput, WitnessSpecBinding};
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
 
@@ -35,9 +36,22 @@ pub(crate) fn bind(
         file_path: module.into(),
         proposition_name: proposition.into(),
     };
-    let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, false)?;
     store.bind_witness_spec(id, &binding)?;
     print_json(binding)
+}
+
+pub(crate) fn pending(root: &Path) -> Result<()> {
+    let store = open_managed_state(root, true)?;
+    print_json(serde_json::json!({"pending":store.pending_refutation()?}))
+}
+
+pub(crate) fn reconcile(root: &Path, claim_id: Option<&str>) -> Result<()> {
+    let mut store = open_managed_state(root, false)?;
+    match claim_id {
+        Some(claim_id) => print_json(store.reconcile_refutation(claim_id)?),
+        None => print_json(store.reconcile_refutations()?),
+    }
 }
 
 pub(crate) fn run(
@@ -70,7 +84,7 @@ fn verify_and_record(
     );
     let locked = PromotionRepo::lock(repo)?;
     let snapshot = locked.snapshot(module, None)?;
-    let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, false)?;
     if let Some(registered) = store.managed_repo()? {
         ensure!(
             Path::new(&registered) == locked.path(),

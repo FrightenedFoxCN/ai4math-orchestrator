@@ -1,8 +1,8 @@
 //! Managed downstream regression alerts. Sealed observations do not confer trust.
 use super::{Change, StateStore, event, tasks::now_ms};
 use crate::retained::valid_id;
-use ai4math_broker::RegressionFailure;
 use ai4math_core::{Engine, validate_source_path};
+use ai4math_evidence::RegressionFailureEvidence;
 use anyhow::{Result, ensure};
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde_json::json;
@@ -49,7 +49,7 @@ impl StateStore {
         &mut self,
         repo: &str,
         claim_id: &str,
-        failure: &RegressionFailure,
+        failure: &dyn RegressionFailureEvidence,
     ) -> Result<Option<i64>> {
         let fields = FailureFields {
             base_commit: failure.base_commit(),

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{enroll_claim, init, managed_tests::git};
-use ai4math_store::{Change, Trust, Wiki, WikiQuery, WikiStratum};
+use ai4math_store::{Change, StateStore, Trust, Wiki, WikiQuery, WikiStratum};
 use serde_json::json;
 use std::{env, fs};
 

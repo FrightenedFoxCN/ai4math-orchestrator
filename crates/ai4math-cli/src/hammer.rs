@@ -4,6 +4,7 @@ use ai4math_broker::{
     Broker, HammerCandidate, HammerPremises, MAX_HAMMER_DEPENDENCIES, MAX_HAMMER_PREMISES_BYTES,
 };
 use ai4math_core::{Engine, FrozenTarget};
+use ai4math_project::open_managed_state;
 use ai4math_store::{StateStore, Trust};
 use anyhow::{Context, Result, ensure};
 use std::{fs, io::Read, path::Path};
@@ -66,7 +67,7 @@ fn ensure_context(
 
 fn capture(root: &Path, repo: &Path, claim: &str, commit: &str) -> Result<Snapshot> {
     let lock = PromotionRepo::lock(repo)?;
-    let store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let store = open_managed_state(root, true)?;
     let (module, target) = ensure_context(root, &lock, &store, claim, commit)?;
     let tx = lock.snapshot(&module, None)?;
     ensure!(
@@ -140,7 +141,7 @@ fn reconstruct(
     let result =
         Broker::new().reconstruct_lean_hammer(&tool, &snap.target, &premises, commit, &deps)?;
     let lock = PromotionRepo::lock(repo)?;
-    let store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let store = open_managed_state(root, true)?;
     let (module, decl) = ensure_context(root, &lock, &store, claim, commit)?;
     ensure!(
         module == snap.target.file_path && decl == snap.target.target_id,

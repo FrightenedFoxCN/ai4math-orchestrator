@@ -1,6 +1,7 @@
 //! Sealed evidence of a narrowly attributable native downstream regression.
 use crate::{ReceiptTier, VerifiedCandidate, sandbox::ChildExit, t3};
 use ai4math_core::Engine;
+use ai4math_evidence::RegressionFailureEvidence;
 
 /// This can only come from a native Lean T1 candidate's tracked regression,
 /// after the candidate itself verified. It is not a receipt or trust evidence.
@@ -36,6 +37,39 @@ impl RegressionFailure {
     }
     pub fn compiler_sha256(&self) -> &str {
         &self.compiler_sha256
+    }
+}
+
+// SAFETY: Production values come only from `classify` after a native Lean T1
+// candidate verified and its tracked downstream regression failed with an
+// attributable compiler diagnostic. Fields are private and no deserializer is exposed.
+unsafe impl RegressionFailureEvidence for RegressionFailure {
+    fn base_commit(&self) -> &str {
+        self.base_commit()
+    }
+
+    fn engine(&self) -> Engine {
+        self.engine()
+    }
+
+    fn target_module(&self) -> &str {
+        self.target_module()
+    }
+
+    fn target_decl(&self) -> &str {
+        self.target_decl()
+    }
+
+    fn failed_module(&self) -> &str {
+        self.failed_module()
+    }
+
+    fn candidate_sha256(&self) -> &str {
+        self.candidate_sha256()
+    }
+
+    fn compiler_sha256(&self) -> &str {
+        self.compiler_sha256()
     }
 }
 

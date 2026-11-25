@@ -696,8 +696,11 @@ pub fn run(
     };
     ensure!(root.is_dir(), "project root must be a directory");
     let runtime = root.join(".runtime");
-    let wiki = root.join(".mathwiki");
     private_dir(&runtime)?;
+    // A losing instance must stop before creating Wiki/briefings directories or
+    // opening either database, both of which can apply schema migrations.
+    let singleton = transport::acquire_singleton(&runtime)?;
+    let wiki = root.join(".mathwiki");
     // Preserve a Git-authored Wiki root's existing mode, but do not follow aliases.
     match DirBuilder::new().mode(0o700).create(&wiki) {
         Ok(()) => (),
@@ -718,6 +721,8 @@ pub fn run(
             ordinary_path(&dir.join(format!("{db}{suffix}")))?;
         }
     }
+    let store = StateStore::open(runtime.join("state.sqlite"))?;
+    let wiki_index = Wiki::open(wiki.join(".index.sqlite"))?;
     let discovery_state = discovery
         .as_ref()
         .map(|_| Arc::new(Mutex::new(DiscoveryState::Starting)));
@@ -725,8 +730,8 @@ pub fn run(
         .as_ref()
         .map(|_| Arc::new(Mutex::new(AuditState::starting())));
     let service = Arc::new(Project {
-        store: Mutex::new(StateStore::open(runtime.join("state.sqlite"))?),
-        wiki: Mutex::new(Wiki::open(wiki.join(".index.sqlite"))?),
+        store: Mutex::new(store),
+        wiki: Mutex::new(wiki_index),
         retained_dir,
         probes: Probes::open(&root, catalog)?,
         t3_discovery: discovery_state.clone(),
@@ -737,6 +742,7 @@ pub fn run(
     let backend = service.clone();
     transport::serve(
         &runtime.join("ai4mathd.sock"),
+        singleton,
         hub,
         move || {
             thread::Builder::new()

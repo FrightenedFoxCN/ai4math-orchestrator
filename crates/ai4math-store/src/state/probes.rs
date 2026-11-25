@@ -1,6 +1,6 @@
 //! Durable coordinator-only half-open probe workflow. Only native sealed evidence closes a breaker.
 use super::*;
-use ai4math_broker::VerifiedBreakerProbes;
+use ai4math_evidence::BreakerProbeEvidence;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -260,7 +260,7 @@ impl StateStore {
         &mut self,
         attempt: &BreakerProbeAttempt,
         current_main: &str,
-        evidence: Option<&VerifiedBreakerProbes>,
+        evidence: Option<&dyn BreakerProbeEvidence>,
     ) -> Result<i64> {
         self.write(|tx|{
             let b=&attempt.batch;

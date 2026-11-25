@@ -4,8 +4,8 @@ use super::{
     require_claim, reviewed_lean,
 };
 use crate::retained::valid_id;
-use ai4math_broker::{ReceiptTier, VerifiedCandidate, VerifiedLeanComparison};
 use ai4math_core::Engine;
+use ai4math_evidence::{CandidateEvidence, LeanComparisonEvidence, ReceiptTier};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
@@ -102,8 +102,8 @@ fn full_commit(value: &str) -> bool {
 fn validate_binding(
     db: &Connection,
     scope: SedimentReplayScope<'_>,
-    candidate: &VerifiedCandidate,
-    comparison: Option<&VerifiedLeanComparison>,
+    candidate: &dyn CandidateEvidence,
+    comparison: Option<&dyn LeanComparisonEvidence>,
 ) -> Result<()> {
     ensure!(
         read_intent(db)?.is_none() && pivot::read_pending(db)?.is_none(),
@@ -271,8 +271,8 @@ impl StateStore {
     pub fn retain_sediment_replay(
         &mut self,
         scope: SedimentReplayScope<'_>,
-        candidate: &VerifiedCandidate,
-        comparison: Option<&VerifiedLeanComparison>,
+        candidate: &dyn CandidateEvidence,
+        comparison: Option<&dyn LeanComparisonEvidence>,
     ) -> Result<RetainedSedimentReplay> {
         ensure!(
             Path::new(scope.repo).is_absolute() && !scope.repo.chars().any(char::is_control),
@@ -306,7 +306,7 @@ impl StateStore {
                 tx,
                 scope,
                 receipt.receipt_sha256(),
-                comparison.map(VerifiedLeanComparison::receipt_sha256),
+                comparison.map(|comparison| comparison.receipt_sha256()),
             )
         })
     }

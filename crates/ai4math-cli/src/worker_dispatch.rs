@@ -6,6 +6,9 @@ use ai4math_core::{
     Engine, FrozenTarget, ProofBodySubmission, Role, Trust, proof::lean_frozen_header,
     render_proof_body,
 };
+#[cfg(test)]
+use ai4math_project::managed_state_path;
+use ai4math_project::open_managed_state;
 use ai4math_store::{Change, StateStore, TaskLease, TaskRunOutcome, TaskTrack};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -97,38 +100,11 @@ fn role_track(role: Role) -> Result<TaskTrack> {
 fn repo_name(git: &PromotionRepo) -> Result<&str> {
     git.path().to_str().context("repository path is not UTF-8")
 }
-/// The owner-only runtime path protects private suggestions from other OS
-/// accounts. The worker has a separate Seatbelt boundary, not this UID check.
-#[cfg(unix)]
+/// Compatibility helper for test fixtures that only need the validated state path.
+/// Production code uses `open_managed_state` or `ManagedProject` directly.
+#[cfg(test)]
 pub(crate) fn private_state_path(root: &Path) -> Result<std::path::PathBuf> {
-    use std::{fs, os::unix::fs::MetadataExt};
-    let runtime = root.join(".runtime");
-    let owner = unsafe { libc::geteuid() };
-    let info = fs::symlink_metadata(&runtime)?;
-    ensure!(
-        info.is_dir() && info.uid() == owner && info.mode() & 0o077 == 0,
-        "managed task operations require an owner-only .runtime directory (mode 0700), not a symlink"
-    );
-    for name in ["state.sqlite", "state.sqlite-wal", "state.sqlite-shm"] {
-        let path = runtime.join(name);
-        match fs::symlink_metadata(path) {
-            Ok(info) => ensure!(
-                info.is_file()
-                    && info.uid() == owner
-                    && info.nlink() == 1
-                    && info.mode() & 0o022 == 0,
-                "managed task operations require private owner-controlled SQLite files"
-            ),
-            Err(e) if name != "state.sqlite" && e.kind() == std::io::ErrorKind::NotFound => (),
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Ok(runtime.join("state.sqlite"))
-}
-
-#[cfg(not(unix))]
-pub(crate) fn private_state_path(_: &Path) -> Result<std::path::PathBuf> {
-    bail!("managed task operations require an owner-only Unix runtime")
+    managed_state_path(root)
 }
 
 fn require_available(git: &PromotionRepo, store: &StateStore) -> Result<()> {
@@ -151,7 +127,7 @@ pub(crate) fn bind(root: &Path, repo: &Path, module: &str, reviewed: &str) -> Re
         snap.base() == reviewed && git.main_head()? == reviewed,
         "binding requires the exact reviewed main OID"
     );
-    let mut store = StateStore::open(private_state_path(root)?)?;
+    let mut store = open_managed_state(root, false)?;
     store.bind_task_repository(repo_name(&git)?, reviewed)?;
     print_json(json!({"bound":true,"base_commit":reviewed}))
 }
@@ -352,7 +328,7 @@ pub(crate) fn run(
     validate_native_worker(exe, sha, seconds)?;
     let track = role_track(role)?;
     let _native = crate::managed_native(root)?;
-    let mut store = StateStore::open(private_state_path(root)?)?;
+    let mut store = open_managed_state(root, false)?;
     let (subject, lease) = {
         let git = PromotionRepo::lock(repo)?;
         let subject = prepare(root, &git, &store, task_id, claim_id, role, seconds)?;
@@ -407,7 +383,7 @@ pub(crate) fn run(
 }
 
 pub(crate) fn result(root: &Path, id: &str) -> Result<()> {
-    let store = StateStore::open_readonly(private_state_path(root)?)?;
+    let store = open_managed_state(root, true)?;
     let row = store
         .task_candidate(id)?
         .context("no retained suggestion for this task")?;
@@ -421,7 +397,7 @@ pub(crate) fn promote(
     exe: &Path,
     data: Option<&str>,
 ) -> Result<()> {
-    let store = StateStore::open_readonly(private_state_path(root)?)?;
+    let store = open_managed_state(root, true)?;
     let row = store
         .task_candidate(id)?
         .context("no retained suggestion for this task")?;

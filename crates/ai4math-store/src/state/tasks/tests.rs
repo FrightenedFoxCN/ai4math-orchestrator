@@ -392,3 +392,75 @@ fn registry_cap_preserves_completed_identities() -> Result<()> {
     assert_eq!(status.infrastructure.ready, 1);
     Ok(())
 }
+
+#[test]
+fn freeze_counts_only_live_leases_and_leaves_expired_rows_for_ttl_recovery() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    store.register_task(task("expired", Exploration, &[]), ACTOR)?;
+    store.register_task(task("live", Exploration, &[]), ACTOR)?;
+    let expired = take(&mut store, Some(Exploration))?;
+    let live = take(&mut store, Some(Exploration))?;
+    store.db.execute(
+        "UPDATE scheduler_tasks SET lease_expires_at_ms=0 WHERE task_id='expired'",
+        [],
+    )?;
+    store.db.execute(
+        "INSERT INTO circuit_breakers(breaker_id,target_definition_id,module_path,engine,state,updated_at)
+         VALUES('fixture','Defs.name',?1,'lean4','TRIPPED','now')",
+        [BLOCKED_MODULE],
+    )?;
+    let invalidated = store.write(|tx| freeze_module_leases(tx, "lean4", BLOCKED_MODULE, ACTOR))?;
+    assert_eq!(invalidated, 1);
+    let leases: Vec<(String, Option<i64>)> = store
+        .db
+        .prepare("SELECT task_id,lease_expires_at_ms FROM scheduler_tasks ORDER BY queue_seq")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    assert_eq!(
+        leases,
+        vec![("expired".into(), Some(0)), ("live".into(), None)]
+    );
+    let frozen = store
+        .events_after(0, 100)?
+        .into_iter()
+        .find(|event| event.event_type == "TASK_LEASES_FROZEN")
+        .context("missing freeze event")?;
+    assert_eq!(frozen.payload["count"], 1);
+    assert!(store.complete_task(&expired, ACTOR).is_err());
+    assert!(store.complete_task(&live, ACTOR).is_err());
+    Ok(())
+}
+
+#[test]
+fn legacy_readonly_scheduler_without_retry_table_keeps_normal_semantics() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("legacy.sqlite");
+    let mut store = StateStore::open(&path)?;
+    store.register_task(task("legacy", Exploration, &[]), ACTOR)?;
+    store.db.execute("DROP TABLE scheduler_task_retries", [])?;
+    drop(store);
+
+    let readonly = StateStore::open_readonly(&path)?;
+    let status = readonly.task_scheduler_status()?.exploration;
+    assert_eq!(
+        (status.ready, status.retrying, status.quarantined),
+        (1, 0, 0)
+    );
+    let serialized = serde_json::to_value(readonly.task_scheduler_status()?)?;
+    assert!(serialized["exploration"].get("retrying").is_none());
+    assert!(serialized["exploration"].get("quarantined").is_none());
+    drop(readonly);
+
+    // Writable open adds only the new table; the pre-existing task is treated
+    // as pending and can advance retry state on its first explicit failure.
+    let mut store = StateStore::open(&path)?;
+    assert_eq!(store.task_scheduler_status()?.exploration.ready, 1);
+    let lease = take(&mut store, Some(Exploration))?;
+    store.finish_task_run(&lease, TaskRunOutcome::Failed, ACTOR)?;
+    let state: String =
+        store
+            .db
+            .query_row("SELECT state FROM scheduler_task_retries", [], |r| r.get(0))?;
+    assert_eq!(state, "backoff");
+    Ok(())
+}

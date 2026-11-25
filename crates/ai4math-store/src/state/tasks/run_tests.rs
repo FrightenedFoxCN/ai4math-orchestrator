@@ -1,5 +1,6 @@
 use super::{
     TaskTrack::*,
+    runs::{DEFAULT_MAX_ATTEMPTS, INITIAL_RETRY_BACKOFF_MS},
     tests::{ACTOR, BASE, BLOCKED_MODULE, LEASE, take, task},
     *,
 };
@@ -79,6 +80,60 @@ fn expected_claim_matches_fifo_and_alternation_without_side_effects() -> Result<
         .context("expected e0")?;
     assert_eq!((next.id.as_str(), next.fence.generation), ("e0", 2));
     assert_eq!(take(&mut store, None)?.id, "i1");
+    Ok(())
+}
+
+#[test]
+fn submission_grace_extends_only_the_persisted_lease_ttl() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    store.register_task(task("model", Exploration, &[]), ACTOR)?;
+    let execution = Duration::from_secs(5);
+    let grace = Duration::from_secs(7);
+    let before = now_ms(&store.db)?;
+    let lease = store
+        .claim_expected_task_with_submission_grace(
+            Some(Exploration),
+            "model",
+            execution,
+            grace,
+            ACTOR,
+        )?
+        .context("expected model task")?;
+    let after = now_ms(&store.db)?;
+    let total_ms = (execution + grace).as_millis() as i64;
+    assert!(lease.expires_at_ms >= before + total_ms);
+    assert!(lease.expires_at_ms <= after + total_ms);
+    assert_eq!(lease.fence.generation, 1);
+    assert_eq!(
+        store.db.query_row(
+            "SELECT lease_expires_at_ms FROM scheduler_tasks WHERE task_id='model'",
+            [],
+            |r| r.get::<_, i64>(0),
+        )?,
+        lease.expires_at_ms
+    );
+
+    let events = store.events_after(0, 100)?.len();
+    for (execution, grace) in [
+        (Duration::ZERO, Duration::from_secs(1)),
+        (MAX_LEASE, Duration::from_millis(1)),
+        (Duration::from_secs(1), MAX_LEASE + Duration::from_millis(1)),
+    ] {
+        assert!(
+            store
+                .claim_expected_task_with_submission_grace(
+                    Some(Exploration),
+                    "model",
+                    execution,
+                    grace,
+                    ACTOR,
+                )
+                .is_err()
+        );
+    }
+    assert_eq!(store.events_after(0, 100)?.len(), events);
+    store.complete_task(&lease, ACTOR)?;
+    assert!(store.complete_task(&lease, ACTOR).is_err());
     Ok(())
 }
 
@@ -206,8 +261,10 @@ fn failed_run_releases_for_retry_but_expired_reclaimed_and_foreign_runs_fail() -
             status.completed,
             status.expired
         ),
-        (0, 1, 0, 0)
+        (0, 0, 0, 0)
     );
+    assert_eq!(status.retrying, 1);
+    assert_eq!(status.quarantined, 0);
     assert!(store.task_candidate("a")?.is_none());
     let failures: Vec<_> = store
         .events_after(0, 100)?
@@ -215,10 +272,158 @@ fn failed_run_releases_for_retry_but_expired_reclaimed_and_foreign_runs_fail() -
         .filter(|e| e.event_type == "TASK_RUN_FAILED")
         .collect();
     assert_eq!(failures.len(), 1);
-    assert_eq!(failures[0].payload, json!({}));
+    assert_eq!(failures[0].payload["state"], "backoff");
+    assert_eq!(failures[0].payload["attempt"], 1);
+    assert_eq!(failures[0].payload["max_attempts"], DEFAULT_MAX_ATTEMPTS);
+    assert_eq!(failures[0].payload["backoff_ms"], INITIAL_RETRY_BACKOFF_MS);
+    assert!(failures[0].payload["retry_at_ms"].as_i64().is_some());
+    // Advance the durable deadline without sleeping; FIFO resumes unchanged.
+    store.db.execute(
+        "UPDATE scheduler_task_retries SET retry_at_ms=0 WHERE task_seq=(SELECT queue_seq FROM scheduler_tasks WHERE task_id='a')",
+        [],
+    )?;
     let newest = take(&mut store, None)?;
     assert_eq!(newest.id, "a");
     store.finish_task_run(&newest, candidate("null"), ACTOR)?;
+    Ok(())
+}
+
+#[test]
+fn explicit_expected_retry_bypasses_backoff_but_not_quarantine() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    store.register_task(task("retry", Exploration, &[]), ACTOR)?;
+    let first = take(&mut store, Some(Exploration))?;
+    store.finish_task_run(&first, TaskRunOutcome::Failed, ACTOR)?;
+    assert!(store.claim_task(Some(Exploration), LEASE, ACTOR)?.is_none());
+
+    let explicit = store
+        .claim_expected_task(Some(Exploration), "retry", LEASE, ACTOR)?
+        .context("explicit operator retry should bypass backoff")?;
+    store.finish_task_run(&explicit, TaskRunOutcome::Failed, ACTOR)?;
+    let explicit = store
+        .claim_expected_task(Some(Exploration), "retry", LEASE, ACTOR)?
+        .context("second explicit retry should bypass backoff")?;
+    store.finish_task_run(&explicit, TaskRunOutcome::Failed, ACTOR)?;
+    assert!(
+        store
+            .claim_expected_task(Some(Exploration), "retry", LEASE, ACTOR)?
+            .is_none(),
+        "quarantine must also block explicit retries"
+    );
+    Ok(())
+}
+
+#[test]
+fn failed_task_rotates_fifo_then_persists_backoff_and_quarantines() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("retry.sqlite");
+    let mut store = StateStore::open(&path)?;
+    store.register_task(task("bad", Exploration, &[]), ACTOR)?;
+    store.register_task(task("good", Exploration, &[]), ACTOR)?;
+
+    let first = take(&mut store, Some(Exploration))?;
+    assert_eq!(first.id, "bad");
+    store.finish_task_run(&first, TaskRunOutcome::Failed, ACTOR)?;
+    let now = now_ms(&store.db)?;
+    let retry: (String, i64, i64, i64, Option<i64>, Option<i64>, i64) = store.db.query_row(
+        "SELECT state,attempt_count,max_attempts,backoff_ms,retry_at_ms,quarantined_at_ms,last_failure_event_seq
+         FROM scheduler_task_retries r JOIN scheduler_tasks t ON t.queue_seq=r.task_seq WHERE t.task_id='bad'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+    )?;
+    assert_eq!(retry.0, "backoff");
+    assert_eq!(
+        (retry.1, retry.2, retry.3),
+        (1, DEFAULT_MAX_ATTEMPTS, INITIAL_RETRY_BACKOFF_MS)
+    );
+    assert!(
+        retry
+            .4
+            .is_some_and(|deadline| deadline > now && deadline <= now + INITIAL_RETRY_BACKOFF_MS)
+    );
+    assert_eq!(retry.5, None);
+    assert!(retry.6 > 0);
+    let status = store.task_scheduler_status()?.exploration;
+    assert_eq!(
+        (status.ready, status.retrying, status.quarantined),
+        (1, 1, 0)
+    );
+
+    // Backoff and its audit binding survive a writable reopen and readonly use.
+    drop(store);
+    let readonly = StateStore::open_readonly(&path)?;
+    assert_eq!(readonly.task_scheduler_status()?.exploration, status);
+    let persisted: (String, i64, i64, i64, Option<i64>, Option<i64>, i64) = readonly.db.query_row(
+        "SELECT state,attempt_count,max_attempts,backoff_ms,retry_at_ms,quarantined_at_ms,last_failure_event_seq
+         FROM scheduler_task_retries r JOIN scheduler_tasks t ON t.queue_seq=r.task_seq WHERE t.task_id='bad'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
+    )?;
+    assert_eq!(persisted, retry);
+    drop(readonly);
+
+    let mut store = StateStore::open(&path)?;
+    // The failed FIFO head no longer blocks a normal task during backoff.
+    let good = take(&mut store, Some(Exploration))?;
+    assert_eq!(good.id, "good");
+    store.complete_task(&good, ACTOR)?;
+    assert!(store.claim_task(Some(Exploration), LEASE, ACTOR)?.is_none());
+
+    store.db.execute(
+        "UPDATE scheduler_task_retries SET retry_at_ms=0
+         WHERE task_seq=(SELECT queue_seq FROM scheduler_tasks WHERE task_id='bad')",
+        [],
+    )?;
+    let second = take(&mut store, Some(Exploration))?;
+    assert_eq!(second.id, "bad");
+    store.finish_task_run(&second, TaskRunOutcome::Failed, ACTOR)?;
+    let second_backoff: (i64, i64) = store.db.query_row(
+        "SELECT attempt_count,backoff_ms FROM scheduler_task_retries",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    assert_eq!(second_backoff, (2, INITIAL_RETRY_BACKOFF_MS * 2));
+
+    store.db.execute(
+        "UPDATE scheduler_task_retries SET retry_at_ms=0
+         WHERE task_seq=(SELECT queue_seq FROM scheduler_tasks WHERE task_id='bad')",
+        [],
+    )?;
+    let third = take(&mut store, Some(Exploration))?;
+    assert_eq!(third.id, "bad");
+    store.finish_task_run(&third, TaskRunOutcome::Failed, ACTOR)?;
+    let exhausted: (String, i64, i64, i64, Option<i64>, Option<i64>) = store.db.query_row(
+        "SELECT state,attempt_count,max_attempts,backoff_ms,retry_at_ms,quarantined_at_ms FROM scheduler_task_retries",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+    )?;
+    assert_eq!(exhausted.0, "quarantined");
+    assert_eq!(
+        (exhausted.1, exhausted.2, exhausted.3),
+        (DEFAULT_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS, 0)
+    );
+    assert_eq!(exhausted.4, None);
+    assert!(exhausted.5.is_some());
+    assert!(
+        store
+            .finish_task_run(&third, TaskRunOutcome::Failed, ACTOR)
+            .is_err()
+    );
+    assert!(store.claim_task(Some(Exploration), LEASE, ACTOR)?.is_none());
+    let status = store.task_scheduler_status()?.exploration;
+    assert_eq!(
+        (status.ready, status.retrying, status.quarantined),
+        (0, 0, 1)
+    );
+    let failures: Vec<_> = store
+        .events_after(0, 100)?
+        .into_iter()
+        .filter(|event| event.event_type == "TASK_RUN_FAILED")
+        .collect();
+    assert_eq!(failures.len(), 3);
+    assert_eq!(failures[2].payload["state"], "quarantined");
+    assert_eq!(failures[2].payload["attempt"], DEFAULT_MAX_ATTEMPTS);
+    assert!(store.task_candidate("bad")?.is_none());
     Ok(())
 }
 

@@ -18,8 +18,8 @@ Socket 接受 NDJSON JSON-RPC 2.0 对象参数：`status`、`frontier.list`、`i
 
 ## 验收与复现
 
-- `cargo fmt --all -- --check`；`cargo test --workspace --locked`。宿主机上按 [Phase 1](phase-1.md) 的环境变量补齐工具链，运行 `cargo test --workspace --locked -- --include-ignored`，macOS arm64 **36 项全部通过**（含 Lean、Agda、T3 和 daemon 冻结槽）；随后新增的三类可信 P0 信号路由测试单独通过。Seatbelt 自检通过。
-- `npm --prefix plugins/dsh-ai4math test`：Host/Client 共 **13 项**。Browser VM 确认 `shell.bottom`、四个侧栏标签注册/销毁，穿过 Host 的实际 UDS 通知、重连、P0 补读和取消。部署前 `node plugins/dsh-ai4math/client/build.mjs --check` 检查发布包是否匹配源码。
+- `cargo fmt --all -- --check`；`cargo test --workspace --locked`。宿主机上按 [Phase 1](phase-1.md) 的环境变量补齐工具链，可运行 `cargo test --workspace --locked -- --include-ignored`；macOS 原生 Seatbelt 用例必须在非外层沙箱终端执行。历史验收数量以[验收矩阵](architecture-acceptance.md)对应批次为准，当前实现状态见 [implementation-status.md](implementation-status.md)。
+- `npm --prefix plugins/dsh-ai4math test`：Host/Client 标准测试，并先执行 `node plugins/dsh-ai4math/client/build.mjs --check` 验证发布 bundle 与源码一致。Browser VM 确认 `shell.bottom`、四个侧栏标签注册/销毁，穿过 Host 的实际 UDS 通知、重连、P0 补读和取消。
 - 已用本机安装的 DSH Cordis + Typert Registry/Gateway，运行 [installed-dsh.mjs](../plugins/dsh-ai4math/host/test/installed-dsh.mjs)，验证 Owner unary、非 Owner 拒绝、严格参数及从真实 Rust UDS 向 Gateway 流式转发。这是独立进程内的集成测试，不是对当前用户 GUI 的装载测试。
 
 ```sh

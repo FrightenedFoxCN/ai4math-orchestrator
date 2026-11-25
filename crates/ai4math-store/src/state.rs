@@ -2,8 +2,8 @@ use crate::{
     Trust, open_db,
     refutation::{self, RefutationRecord, WitnessInput, WitnessSpecBinding},
 };
-use ai4math_broker::VerifiedWitness;
 use ai4math_core::{aggregate_plan, best_proof_plan};
+use ai4math_evidence::{CandidateEvidence, RegressionEvidence, WitnessEvidence};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{
     Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
@@ -13,6 +13,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fs,
     path::Path,
     time::Duration,
 };
@@ -88,6 +89,83 @@ pub struct PromotionIntent {
     pub file_path: String,
     pub target_decl: String,
     pub proof_body: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefutationOutboxPhase {
+    /// Intent committed; no private staged recipe is acknowledged yet.
+    PendingFile,
+    /// Exact Markdown is durable outside every Wiki stratum; DB is not authoritative yet.
+    Staged,
+    /// verified_refutations/trust/events committed; final Markdown publication is pending.
+    DbCommitted,
+    /// Authoritative DB and verified final archive agree; the recipe is retained for repair.
+    Complete,
+}
+
+impl RefutationOutboxPhase {
+    fn sql(self) -> &'static str {
+        match self {
+            Self::PendingFile => "PENDING_FILE",
+            Self::Staged => "STAGED",
+            Self::DbCommitted => "DB_COMMITTED",
+            Self::Complete => "COMPLETE",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self> {
+        match value {
+            "PENDING_FILE" => Ok(Self::PendingFile),
+            "STAGED" => Ok(Self::Staged),
+            "DB_COMMITTED" => Ok(Self::DbCommitted),
+            "COMPLETE" => Ok(Self::Complete),
+            _ => anyhow::bail!("invalid refutation outbox phase"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PendingRefutation {
+    pub claim_id: String,
+    pub wiki_id: String,
+    pub witness_sha256: String,
+    pub phase: RefutationOutboxPhase,
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct RefutationReconcileFailure {
+    pub claim_id: String,
+    pub wiki_id: String,
+    pub error: String,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct RefutationReconcileReport {
+    /// Includes newly completed and already-complete/repaired recipes.
+    pub records: Vec<RefutationRecord>,
+    /// Failures leave the durable recipe in place for a later targeted retry.
+    pub failures: Vec<RefutationReconcileFailure>,
+}
+
+#[derive(Debug, Clone)]
+struct RefutationOutboxRow {
+    claim_id: String,
+    wiki_id: String,
+    witness_sha256: String,
+    commit_id: String,
+    file_path: String,
+    proposition_name: String,
+    source_sha256: String,
+    repo: String,
+    project_root: String,
+    proof_body: String,
+    receipt_json: String,
+    markdown: String,
+    markdown_sha256: String,
+    phase: RefutationOutboxPhase,
+    completed_event_seq: Option<i64>,
 }
 
 /// Operator-only replay input. Use Git and Broker to establish fresh evidence; this row is not a receipt.
@@ -247,19 +325,19 @@ pub struct VerifiedReceipt {
 impl VerifiedReceipt {
     /// Project a sealed in-process broker result, not a caller-supplied JSON receipt.
     pub fn from_promotion(
-        candidate: &ai4math_broker::VerifiedCandidate,
-        artifacts: &ai4math_broker::RegressionArtifacts,
+        candidate: &dyn CandidateEvidence,
+        artifacts: &dyn RegressionEvidence,
     ) -> Result<Self> {
         ensure!(
-            artifacts.matches(candidate),
+            artifacts.matches_candidate(candidate),
             "regression did not check this candidate"
         );
-        let mut receipt = Self::from_broker(candidate)?;
+        let mut receipt = Self::from_candidate(candidate)?;
         receipt.regression_checked = true;
         Ok(receipt)
     }
 
-    pub fn from_broker(candidate: &ai4math_broker::VerifiedCandidate) -> Result<Self> {
+    pub fn from_candidate(candidate: &dyn CandidateEvidence) -> Result<Self> {
         let r = candidate.receipt();
         ensure!(
             r.matches(
@@ -290,11 +368,16 @@ impl VerifiedReceipt {
             compile_seconds: r.compile_seconds(),
             max_heartbeats: None,
             receipt_sha256: r.receipt_sha256().into(),
-            raw: serde_json::to_value(r)?,
+            raw: r.raw_json()?,
             regression_checked: false,
             broker_assessed_t3: candidate.is_assessed_t3(),
             lean_comparison: None,
         })
+    }
+
+    /// Compatibility alias for callers migrating from the broker concrete type.
+    pub fn from_broker(candidate: &dyn CandidateEvidence) -> Result<Self> {
+        Self::from_candidate(candidate)
     }
 }
 
@@ -410,6 +493,7 @@ impl StateStore {
         let mut store = Self { db };
         migrations::permit_distinct_same_head_t3_plans(&mut store.db)?;
         store.initialize_route_projection()?;
+        store.initialize_refutation_outbox()?;
         Ok(store)
     }
 
@@ -538,6 +622,26 @@ impl StateStore {
         Ok(())
     }
 
+    /// The outbox table/index are additive DDL executed by `open_db`. Record the
+    /// migration only on a writable open; `open_readonly` never performs DDL.
+    fn initialize_refutation_outbox(&mut self) -> Result<()> {
+        let missing = self.db.query_row(
+            "SELECT NOT EXISTS(SELECT 1 FROM state_migrations WHERE version=3)",
+            [],
+            |r| r.get::<_, bool>(0),
+        )?;
+        if missing {
+            self.write(|tx| {
+                tx.execute(
+                    "INSERT OR IGNORE INTO state_migrations(version) VALUES(3)",
+                    [],
+                )?;
+                Ok(())
+            })?;
+        }
+        Ok(())
+    }
+
     /// Older promotions may have no recipe. Do not silently fall back to a different claim or commit.
     pub fn managed_proof_recipe(&self, claim: &str) -> Result<Option<ManagedProofRecipe>> {
         read_managed_proof_recipe(&self.db, claim, None)
@@ -589,14 +693,7 @@ impl StateStore {
     ) -> Result<i64> {
         self.write(|tx| {
             reviewed_lean::check_comparison(tx,intent,receipt)?;
-            if let Some((claim,base,patch,seq)) = tx.query_row("SELECT p.claim_id,p.base_commit,r.patch_sha256,p.event_seq
-                FROM recorded_promotions p JOIN verification_receipts r USING(receipt_id) WHERE p.git_commit=?1",
-                [&intent.new_commit], |r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?))).optional()? {
-                ensure!(claim==intent.claim_id && base==intent.base_commit && patch==receipt.patch_sha256,"conflicting promotion replay");
-                if receipt.lean_comparison.is_some() {
-                    ensure!(reviewed_lean::read_comparison(tx,&intent.new_commit)?.is_some(),
-                        "recorded promotion is missing reviewed Lean comparison evidence");
-                }
+            if let Some(seq)=finish_recorded_promotion(tx,intent,receipt)? {
                 return Ok(seq);
             }
             ensure!(read_intent(tx)?.as_ref()==Some(intent),"promotion intent changed or is missing");
@@ -907,12 +1004,131 @@ impl StateStore {
         })
     }
 
+    /// Return the one active durable refutation intent, if any. Completed recipes
+    /// remain queryable through reconciliation but do not block new work.
+    pub fn pending_refutation(&self) -> Result<Option<PendingRefutation>> {
+        if !refutation_outbox_exists(&self.db)? {
+            return Ok(None);
+        }
+        Ok(self
+            .db
+            .query_row(
+                "SELECT claim_id,wiki_id,witness_sha256,phase,created_at FROM refutation_outbox
+                 WHERE phase<>'COMPLETE' ORDER BY created_at,claim_id LIMIT 1",
+                [],
+                |r| {
+                    let phase: String = r.get(3)?;
+                    Ok(PendingRefutation {
+                        claim_id: r.get(0)?,
+                        wiki_id: r.get(1)?,
+                        witness_sha256: r.get(2)?,
+                        phase: RefutationOutboxPhase::parse(&phase)
+                            .map_err(|_| rusqlite::Error::InvalidQuery)?,
+                        created_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    /// Reconcile every retained refutation recipe. New intents are staged and
+    /// finalized; DB-committed missing files are rebuilt; completed files are
+    /// verified/repaired without appending duplicate events. Conflicts are reported
+    /// per row and never replace an existing archive.
+    pub fn reconcile_refutations(&mut self) -> Result<RefutationReconcileReport> {
+        let mut report = RefutationReconcileReport::default();
+        if !refutation_outbox_exists(&self.db)? {
+            return Ok(report);
+        }
+        let rows = read_refutation_outboxes(&self.db)?;
+        for row in rows {
+            match self.reconcile_refutation_row(&row) {
+                Ok(record) => report.records.push(record),
+                Err(error) => report.failures.push(RefutationReconcileFailure {
+                    claim_id: row.claim_id,
+                    wiki_id: row.wiki_id,
+                    error: format!("{error:#}"),
+                }),
+            }
+        }
+        Ok(report)
+    }
+
+    /// Retry one exact durable recipe. This is the Store entry point an operator
+    /// CLI can call without re-running the broker or trusting Markdown as evidence.
+    pub fn reconcile_refutation(&mut self, claim_id: &str) -> Result<RefutationRecord> {
+        let row = read_refutation_outbox(&self.db, claim_id)?
+            .with_context(|| format!("no durable refutation recipe for claim {claim_id}"))?;
+        self.reconcile_refutation_row(&row)
+    }
+
+    fn reconcile_refutation_row(&mut self, row: &RefutationOutboxRow) -> Result<RefutationRecord> {
+        match row.phase {
+            RefutationOutboxPhase::PendingFile | RefutationOutboxPhase::Staged => {
+                refutation::stage(Path::new(&row.project_root), &row.wiki_id, &row.markdown)
+                    .with_context(|| format!("stage refutation {}", row.wiki_id))?;
+                self.write(|tx| mark_refutation_staged(tx, row))?;
+                let (seq, already_recorded) = self.write(|tx| finish_refutation(tx, row))?;
+                self.publish_committed_refutation(row, seq, already_recorded)
+            }
+            RefutationOutboxPhase::DbCommitted => {
+                let (seq, already_recorded) = self.write(|tx| finish_refutation(tx, row))?;
+                self.publish_committed_refutation(row, seq, already_recorded)
+            }
+            RefutationOutboxPhase::Complete => {
+                let seq = row
+                    .completed_event_seq
+                    .context("complete refutation has no event")?;
+                self.write(|tx| verify_completed_refutation(tx, row, seq))?;
+                refutation::publish(Path::new(&row.project_root), &row.wiki_id, &row.markdown)
+                    .with_context(|| {
+                        format!(
+                            "repair completed refutation archive {} for claim {}; reconcile required",
+                            row.wiki_id, row.claim_id
+                        )
+                    })?;
+                Ok(RefutationRecord {
+                    wiki_id: row.wiki_id.clone(),
+                    witness_sha256: row.witness_sha256.clone(),
+                    event_seq: seq,
+                    already_recorded: true,
+                })
+            }
+        }
+    }
+
+    fn publish_committed_refutation(
+        &mut self,
+        row: &RefutationOutboxRow,
+        seq: i64,
+        already_recorded: bool,
+    ) -> Result<RefutationRecord> {
+        let result = (|| -> Result<()> {
+            refutation::publish(Path::new(&row.project_root), &row.wiki_id, &row.markdown)?;
+            self.write(|tx| mark_refutation_complete(tx, row, seq))
+        })();
+        if let Err(error) = result {
+            return Err(error).context(format!(
+                "refutation ledger committed; reconcile required: claim {} wiki {}",
+                row.claim_id, row.wiki_id
+            ));
+        }
+        Ok(RefutationRecord {
+            wiki_id: row.wiki_id.clone(),
+            witness_sha256: row.witness_sha256.clone(),
+            event_seq: seq,
+            already_recorded,
+        })
+    }
+
     /// The witness is sealed by the broker; the operator coordinator checks the physical Git ref.
-    /// Match registered proposition and bytes, archive first, then publish the kernel transition.
+    /// A durable outbox recipe is committed before any filesystem work. The authoritative
+    /// refutation transaction commits before final Markdown publication, so Wiki rebuilds
+    /// can never index an L2b archive that has no verified ledger row.
     pub fn record_refutation(
         &mut self,
         input: WitnessInput<'_>,
-        witness: &VerifiedWitness,
+        witness: &dyn WitnessEvidence,
     ) -> Result<RefutationRecord> {
         let id = input.claim_id;
         ensure!(
@@ -931,10 +1147,27 @@ impl StateStore {
             .repository
             .to_str()
             .context("managed repository path is not UTF-8")?;
+        let project_root = fs::canonicalize(input.project_root)
+            .with_context(|| format!("resolve project root {}", input.project_root.display()))?;
+        let project_root = project_root
+            .to_str()
+            .context("managed project root is not UTF-8")?;
         let base = witness.base_commit();
         let path = witness.file_path();
-        let proposition = witness.proposition_name();
+        let proposition = witness.proposition_id();
         let stable = witness.witness_sha256();
+        ensure!(
+            matches!(stable.len(), 64)
+                && stable
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+                && matches!(witness.source_sha256().len(), 64)
+                && witness
+                    .source_sha256()
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "invalid sealed witness digest"
+        );
         ensure!(
             witness.matches(
                 base,
@@ -946,35 +1179,43 @@ impl StateStore {
             "witness bytes do not match sealed proof"
         );
         let wiki_id = refutation::wiki_id(id, stable);
-        let change = Change {
-            actor: "broker:witness",
-            git_commit: Some(base),
+        let rendered = refutation::render(
+            &input,
+            &wiki_id,
+            base,
+            path,
+            proposition,
+            witness.source_sha256(),
+            stable,
+            witness.source(),
+        )?;
+        ensure!(
+            rendered.markdown.len() <= 2 * 1024 * 1024,
+            "rendered Graveyard archive exceeds the durable outbox limit"
+        );
+        let receipt_json = witness.receipt_json()?;
+        serde_json::from_str::<Value>(&receipt_json)
+            .context("sealed witness receipt is not valid JSON")?;
+        let row = RefutationOutboxRow {
+            claim_id: id.into(),
+            wiki_id,
+            witness_sha256: stable.into(),
+            commit_id: base.into(),
+            file_path: path.into(),
+            proposition_name: proposition.into(),
+            source_sha256: witness.source_sha256().into(),
+            repo: repo.into(),
+            project_root: project_root.into(),
+            proof_body: input.proof_body.into(),
+            receipt_json,
+            markdown: rendered.markdown,
+            markdown_sha256: rendered.markdown_sha256,
+            phase: RefutationOutboxPhase::PendingFile,
+            completed_event_seq: None,
         };
-        self.write(|tx| {
-            ensure!(read_intent(tx)?.is_none(), "recover pending promotion before recording refutation");
-            let c=require_claim(tx,id)?;
-            let expected_binding=WitnessSpecBinding{repo:repo.into(),commit_id:base.into(),file_path:path.into(),proposition_name:proposition.into()};
-            ensure!(read_witness_binding(tx,id)?.as_ref()==Some(&expected_binding),"witness lacks an approved exact Git spec binding");
-            let expected=format!("{path}#{proposition}");
-            ensure!(c.engine=="lean4" && c.formal_target.as_deref()==Some(expected.as_str())
-                && c.module_path.as_deref().is_none_or(|m|m==path),"witness does not target the registered Lean claim");
-            tx.execute("INSERT OR IGNORE INTO managed_repo(singleton,repo) VALUES(1,?1)",[repo])?;
-            let bound:String=tx.query_row("SELECT repo FROM managed_repo WHERE singleton=1",[],|r|r.get(0))?;
-            ensure!(bound==repo,"project is bound to a different Git repository");
-            let old=tx.query_row("SELECT wiki_id,witness_sha256,event_seq FROM verified_refutations WHERE claim_id=?1",[id],|r|
-                Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,i64>(2)?))).optional()?;
-            if let Some((old_id,old_digest,event_seq))=old {
-                ensure!(old_id==wiki_id && old_digest==stable && c.local_trust==Trust::L2b,"claim already has a different verified refutation");
-                refutation::materialize(&input,&wiki_id,base,path,proposition,witness.source_sha256(),stable,witness.source())?;
-                return Ok(RefutationRecord{wiki_id,witness_sha256:stable.into(),event_seq,already_recorded:true});
-            }
-            ensure!(!matches!(c.local_trust,Trust::L2b|Trust::L5) && !c.stale,"existing L5, refutation, or stale claim requires operator review");
-            refutation::materialize(&input,&wiki_id,base,path,proposition,witness.source_sha256(),stable,witness.source())?;
-            let seq=event(tx,change,"WITNESS_VERIFIED","claim",id,json!({"wiki_id":wiki_id,"witness_sha256":stable,"file_path":path,"target_decl":proposition}))?;
-            tx.execute("INSERT INTO verified_refutations VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
-                params![id,wiki_id,stable,base,path,proposition,witness.source_sha256(),input.proof_body,serde_json::to_string(witness)?,seq])?;
-            apply_refutation(tx,id,&wiki_id,change)?;
-            Ok(RefutationRecord{wiki_id,witness_sha256:stable.into(),event_seq:seq,already_recorded:false})
+        self.write(|tx| prepare_refutation(tx, &row))?;
+        self.reconcile_refutation(id).with_context(|| {
+            format!("record refutation for claim {id}; inspect pending_refutation/reconcile API")
         })
     }
 
@@ -1461,14 +1702,21 @@ impl StateStore {
 }
 
 fn read_managed_wiki_stamp(db: &Connection) -> Result<Option<(String, i64)>> {
+    // Any active phase may still need to publish or repair the final Markdown.
+    // Do not let a Wiki rebuild cache that generation: COMPLETE exposes the stamp
+    // only after the archive matching the authoritative ledger is durable.
+    let archive_pending = if refutation_outbox_exists(db)? {
+        "AND NOT EXISTS (SELECT 1 FROM refutation_outbox WHERE phase<>'COMPLETE')"
+    } else {
+        ""
+    };
+    let sql = format!(
+        "SELECT repo,(SELECT coalesce(max(event_seq),0) FROM events) FROM managed_repo
+         WHERE singleton=1 AND NOT EXISTS (SELECT 1 FROM promotion_intent)
+         AND NOT EXISTS (SELECT 1 FROM pivot_resume_intent) {archive_pending}"
+    );
     Ok(db
-        .query_row(
-            "SELECT repo,(SELECT coalesce(max(event_seq),0) FROM events) FROM managed_repo
-             WHERE singleton=1 AND NOT EXISTS (SELECT 1 FROM promotion_intent)
-             AND NOT EXISTS (SELECT 1 FROM pivot_resume_intent)",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
+        .query_row(&sql, [], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?)
 }
 
@@ -1483,6 +1731,259 @@ fn read_managed_proof_recipe(
         let file=r.get::<_,Option<String>>(3)?;
         Ok(if let Some(file_path)=file {Some(ManagedProofRecipe {claim_id:r.get(0)?,base_commit:r.get(1)?,promoted_commit:r.get(2)?,file_path,target_decl:r.get(4)?,proof_body:r.get(5)?,source_sha256:r.get(6)?})} else {None})
     }).optional()?.flatten())
+}
+
+/// Recover a finalized promotion only when every durable identity still matches.
+/// An identical pending intent is retired in this same transaction; a conflict is
+/// fatal before that row is touched.
+fn finish_recorded_promotion(
+    tx: &Transaction<'_>,
+    intent: &PromotionIntent,
+    receipt: &VerifiedReceipt,
+) -> Result<Option<i64>> {
+    let Some((claim, base, receipt_id, seq)) = tx
+        .query_row(
+            "SELECT claim_id,base_commit,receipt_id,event_seq
+             FROM recorded_promotions WHERE git_commit=?1",
+            [&intent.new_commit],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?
+    else {
+        return Ok(None);
+    };
+    ensure!(
+        claim == intent.claim_id && base == intent.base_commit && receipt_id == receipt.id,
+        "conflicting promotion replay identity"
+    );
+    let repo: String = tx
+        .query_row("SELECT repo FROM managed_repo WHERE singleton=1", [], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .context("recorded promotion has no managed repository binding")?;
+    ensure!(
+        repo == intent.repo,
+        "conflicting promotion replay repository"
+    );
+    validate_promotion_receipt_context(&require_claim(tx, &intent.claim_id)?, intent, receipt)?;
+    let expected_recipe = ManagedProofRecipe {
+        claim_id: intent.claim_id.clone(),
+        base_commit: intent.base_commit.clone(),
+        promoted_commit: intent.new_commit.clone(),
+        file_path: intent.file_path.clone(),
+        target_decl: intent.target_decl.clone(),
+        proof_body: intent.proof_body.clone(),
+        source_sha256: receipt.patch_sha256.clone(),
+    };
+    ensure!(
+        read_managed_proof_recipe(tx, &intent.claim_id, Some(&intent.new_commit))?.as_ref()
+            == Some(&expected_recipe),
+        "conflicting promotion replay recipe"
+    );
+    ensure!(
+        recorded_receipt_matches(tx, &receipt_id, receipt)?,
+        "conflicting promotion replay receipt"
+    );
+    validate_recorded_comparison(tx, intent, receipt)?;
+    validate_recorded_promotion_event(tx, intent, receipt, seq)?;
+    if let Some(pending) = read_intent(tx)? {
+        ensure!(
+            pending == *intent,
+            "conflicting promotion replay pending intent"
+        );
+        ensure!(
+            tx.execute("DELETE FROM promotion_intent WHERE singleton=1", [])? == 1,
+            "failed to retire identical pending promotion intent"
+        );
+    }
+    Ok(Some(seq))
+}
+
+fn recorded_receipt_matches(
+    db: &Connection,
+    receipt_id: &str,
+    receipt: &VerifiedReceipt,
+) -> Result<bool> {
+    let stored: Option<(
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        String,
+        bool,
+        String,
+        Option<bool>,
+        f64,
+        Option<i64>,
+        String,
+        String,
+    )> = db
+        .query_row(
+            "SELECT receipt_id,issued_at,tier,engine,base_commit,patch_sha256,target_decl,
+                allowlist_passed,axioms_used_json,external_checker_passed,compile_seconds,
+                max_heartbeats,receipt_sha256,raw_receipt_json
+             FROM verification_receipts WHERE receipt_id=?1",
+            [receipt_id],
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                    r.get(10)?,
+                    r.get(11)?,
+                    r.get(12)?,
+                    r.get(13)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        id,
+        issued_at,
+        tier,
+        engine,
+        base_commit,
+        patch_sha256,
+        target_decl,
+        allowlist_passed,
+        axioms_json,
+        external_checker_passed,
+        compile_seconds,
+        max_heartbeats,
+        receipt_sha256,
+        raw_json,
+    )) = stored
+    else {
+        return Ok(false);
+    };
+    let axioms: Vec<String> = serde_json::from_str(&axioms_json)
+        .context("recorded promotion receipt has invalid axioms")?;
+    let raw: Value = serde_json::from_str(&raw_json)
+        .context("recorded promotion receipt has invalid raw JSON")?;
+    Ok(id == receipt.id
+        && issued_at == receipt.issued_at
+        && tier == receipt.tier
+        && engine == receipt.engine
+        && base_commit == receipt.base_commit
+        && patch_sha256 == receipt.patch_sha256
+        && target_decl == receipt.target_decl
+        && allowlist_passed == receipt.allowlist_passed
+        && axioms == receipt.axioms_used
+        && external_checker_passed == receipt.external_checker_passed
+        && compile_seconds == receipt.compile_seconds
+        && max_heartbeats == receipt.max_heartbeats
+        && receipt_sha256 == receipt.receipt_sha256
+        && raw == receipt.raw)
+}
+
+fn validate_recorded_comparison(
+    tx: &Transaction<'_>,
+    intent: &PromotionIntent,
+    receipt: &VerifiedReceipt,
+) -> Result<()> {
+    let recorded = reviewed_lean::read_comparison(tx, &intent.new_commit)?;
+    match (&receipt.lean_comparison, recorded) {
+        (None, None) => Ok(()),
+        (Some(comparison), Some(recorded)) => {
+            let expected = LeanSpecComparison {
+                promoted_commit: intent.new_commit.clone(),
+                claim_id: intent.claim_id.clone(),
+                base_commit: intent.base_commit.clone(),
+                spec_file: comparison.spec_file.clone(),
+                spec_decl: comparison.spec_decl.clone(),
+                spec_prefix_sha256: comparison.spec_prefix_sha256.clone(),
+                candidate_receipt_sha256: comparison.candidate_receipt_sha256.clone(),
+                receipt_sha256: comparison.receipt_sha256.clone(),
+            };
+            ensure!(
+                recorded == expected,
+                "conflicting promotion replay comparison"
+            );
+            Ok(())
+        }
+        _ => anyhow::bail!("conflicting promotion replay comparison"),
+    }
+}
+
+fn validate_recorded_promotion_event(
+    tx: &Transaction<'_>,
+    intent: &PromotionIntent,
+    receipt: &VerifiedReceipt,
+    event_seq: i64,
+) -> Result<()> {
+    let (kind, entity_type, entity_id, git_commit, actor, payload_json): (
+        String,
+        String,
+        String,
+        Option<String>,
+        String,
+        String,
+    ) = tx.query_row(
+        "SELECT event_type,entity_type,entity_id,git_commit,actor,payload_json
+         FROM events WHERE event_seq=?1",
+        [event_seq],
+        |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        },
+    )?;
+    ensure!(
+        kind == "PROMOTION_COMMITTED"
+            && entity_type == "claim"
+            && entity_id == intent.claim_id
+            && git_commit.as_deref() == Some(intent.new_commit.as_str())
+            && actor == "broker",
+        "conflicting promotion replay event"
+    );
+    let payload: Value = serde_json::from_str(&payload_json)
+        .context("recorded promotion event has invalid payload JSON")?;
+    ensure!(
+        payload.get("base_commit").and_then(Value::as_str) == Some(intent.base_commit.as_str())
+            && payload.get("receipt_id").and_then(Value::as_str) == Some(receipt.id.as_str())
+            && payload.get("patch_sha256").and_then(Value::as_str)
+                == Some(receipt.patch_sha256.as_str())
+            && payload.get("file_path").and_then(Value::as_str) == Some(intent.file_path.as_str())
+            && payload.get("target_decl").and_then(Value::as_str)
+                == Some(intent.target_decl.as_str()),
+        "conflicting promotion replay event payload"
+    );
+    match &receipt.lean_comparison {
+        Some(comparison) => ensure!(
+            payload
+                .get("comparison_receipt_sha256")
+                .and_then(Value::as_str)
+                == Some(comparison.receipt_sha256.as_str()),
+            "conflicting promotion replay comparison event"
+        ),
+        None => ensure!(
+            payload.get("comparison_receipt_sha256").is_none(),
+            "conflicting promotion replay comparison event"
+        ),
+    }
+    Ok(())
 }
 
 fn read_t3_plan(db: &Connection, hash: &str) -> Result<Option<T3PlanApproval>> {
@@ -1597,6 +2098,13 @@ fn apply_taint(
     Ok(impact)
 }
 
+fn effective_claim_module(c: &ClaimState) -> Option<&str> {
+    c.module_path.as_deref().or_else(|| {
+        let (path, _) = c.formal_target.as_deref()?.rsplit_once('#')?;
+        (!path.is_empty()).then_some(path)
+    })
+}
+
 fn compute_taint_impact(
     db: &Connection,
     claim_ids: &[&str],
@@ -1613,9 +2121,9 @@ fn compute_taint_impact(
     }
     for &id in claim_ids {
         let c = require_claim(db, id)?;
-        if let Some(m) = c.module_path {
-            graph.add_node(&m);
-            seeds.insert(m);
+        if let Some(m) = effective_claim_module(&c) {
+            graph.add_node(m);
+            seeds.insert(m.to_owned());
         }
     }
     let affected_modules = graph.closure(seeds);
@@ -1629,8 +2137,7 @@ fn compute_taint_impact(
         .iter()
         .map(|s| (*s).to_owned())
         .chain(claims.values().filter_map(|c| {
-            c.module_path
-                .as_ref()
+            effective_claim_module(c)
                 .filter(|m| affected_modules.contains(*m))
                 .map(|_| c.id.clone())
         }))
@@ -1722,7 +2229,7 @@ fn update_trust(
     Ok(())
 }
 
-fn validate_promotion_receipt(
+fn validate_promotion_receipt_context(
     c: &ClaimState,
     intent: &PromotionIntent,
     r: &VerifiedReceipt,
@@ -1735,11 +2242,20 @@ fn validate_promotion_receipt(
             && r.target_decl == intent.target_decl,
         "promotion receipt does not match its prepared context"
     );
+    validate_target(c, r)
+}
+
+fn validate_promotion_receipt(
+    c: &ClaimState,
+    intent: &PromotionIntent,
+    r: &VerifiedReceipt,
+) -> Result<()> {
+    validate_promotion_receipt_context(c, intent, r)?;
     ensure!(
         !c.stale && c.local_trust != Trust::L2b,
         "stale or refuted claim cannot be promoted"
     );
-    validate_target(c, r)
+    Ok(())
 }
 
 fn validate_target(c: &ClaimState, r: &VerifiedReceipt) -> Result<()> {
@@ -1748,7 +2264,7 @@ fn validate_target(c: &ClaimState, r: &VerifiedReceipt) -> Result<()> {
         .as_deref()
         .context("claim has no formal target")?;
     let (path, decl) = target.rsplit_once('#').unwrap_or(("", target));
-    let expected = c.module_path.as_deref().unwrap_or(path);
+    let expected = effective_claim_module(c).unwrap_or(path);
     ensure!(
         r.target_decl == decl && r.engine == c.engine && !decl.is_empty(),
         "receipt target/engine does not match claim"
@@ -1803,6 +2319,441 @@ fn persist_receipt(
         &r.id,
         json!({"claim_id": c.id, "tier": r.tier}),
     )?;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct VerifiedRefutationRow {
+    claim_id: String,
+    wiki_id: String,
+    witness_sha256: String,
+    commit_id: String,
+    file_path: String,
+    proposition_name: String,
+    source_sha256: String,
+    proof_body: String,
+    receipt_json: String,
+    event_seq: i64,
+}
+
+fn refutation_outbox_exists(db: &Connection) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='refutation_outbox')",
+        [],
+        |r| r.get(0),
+    )?)
+}
+
+fn read_refutation_outbox(db: &Connection, claim_id: &str) -> Result<Option<RefutationOutboxRow>> {
+    if !refutation_outbox_exists(db)? {
+        return Ok(None);
+    }
+    Ok(db
+        .query_row(
+            "SELECT claim_id,wiki_id,witness_sha256,commit_id,file_path,proposition_name,
+                source_sha256,repo,project_root,proof_body,receipt_json,markdown,markdown_sha256,
+                phase,completed_event_seq FROM refutation_outbox WHERE claim_id=?1",
+            [claim_id],
+            read_refutation_outbox_row,
+        )
+        .optional()?)
+}
+
+fn read_refutation_outboxes(db: &Connection) -> Result<Vec<RefutationOutboxRow>> {
+    if !refutation_outbox_exists(db)? {
+        return Ok(Vec::new());
+    }
+    Ok(db
+        .prepare(
+            "SELECT claim_id,wiki_id,witness_sha256,commit_id,file_path,proposition_name,
+                source_sha256,repo,project_root,proof_body,receipt_json,markdown,markdown_sha256,
+                phase,completed_event_seq FROM refutation_outbox ORDER BY claim_id",
+        )?
+        .query_map([], read_refutation_outbox_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+fn read_refutation_outbox_row(r: &Row<'_>) -> rusqlite::Result<RefutationOutboxRow> {
+    let phase: String = r.get(13)?;
+    Ok(RefutationOutboxRow {
+        claim_id: r.get(0)?,
+        wiki_id: r.get(1)?,
+        witness_sha256: r.get(2)?,
+        commit_id: r.get(3)?,
+        file_path: r.get(4)?,
+        proposition_name: r.get(5)?,
+        source_sha256: r.get(6)?,
+        repo: r.get(7)?,
+        project_root: r.get(8)?,
+        proof_body: r.get(9)?,
+        receipt_json: r.get(10)?,
+        markdown: r.get(11)?,
+        markdown_sha256: r.get(12)?,
+        phase: RefutationOutboxPhase::parse(&phase).map_err(|_| rusqlite::Error::InvalidQuery)?,
+        completed_event_seq: r.get(14)?,
+    })
+}
+
+fn read_verified_refutation(
+    db: &Connection,
+    claim_id: &str,
+) -> Result<Option<VerifiedRefutationRow>> {
+    Ok(db
+        .query_row(
+            "SELECT claim_id,wiki_id,witness_sha256,commit_id,file_path,proposition_name,
+                source_sha256,proof_body,receipt_json,event_seq FROM verified_refutations
+             WHERE claim_id=?1",
+            [claim_id],
+            |r| {
+                Ok(VerifiedRefutationRow {
+                    claim_id: r.get(0)?,
+                    wiki_id: r.get(1)?,
+                    witness_sha256: r.get(2)?,
+                    commit_id: r.get(3)?,
+                    file_path: r.get(4)?,
+                    proposition_name: r.get(5)?,
+                    source_sha256: r.get(6)?,
+                    proof_body: r.get(7)?,
+                    receipt_json: r.get(8)?,
+                    event_seq: r.get(9)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+fn same_json(left: &str, right: &str) -> bool {
+    match (
+        serde_json::from_str::<Value>(left),
+        serde_json::from_str::<Value>(right),
+    ) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => left == right,
+    }
+}
+
+fn same_refutation_identity(row: &RefutationOutboxRow, old: &VerifiedRefutationRow) -> bool {
+    row.claim_id == old.claim_id
+        && row.wiki_id == old.wiki_id
+        && row.witness_sha256 == old.witness_sha256
+        && row.commit_id == old.commit_id
+        && row.file_path == old.file_path
+        && row.proposition_name == old.proposition_name
+        && row.source_sha256 == old.source_sha256
+        && row.proof_body == old.proof_body
+        && same_json(&row.receipt_json, &old.receipt_json)
+}
+
+fn same_refutation_recipe(left: &RefutationOutboxRow, right: &RefutationOutboxRow) -> bool {
+    left.claim_id == right.claim_id
+        && left.wiki_id == right.wiki_id
+        && left.witness_sha256 == right.witness_sha256
+        && left.commit_id == right.commit_id
+        && left.file_path == right.file_path
+        && left.proposition_name == right.proposition_name
+        && left.source_sha256 == right.source_sha256
+        && left.repo == right.repo
+        && left.project_root == right.project_root
+        && left.proof_body == right.proof_body
+        && same_json(&left.receipt_json, &right.receipt_json)
+        && left.markdown == right.markdown
+        && left.markdown_sha256 == right.markdown_sha256
+}
+
+fn validate_refutation_context(tx: &Transaction<'_>, row: &RefutationOutboxRow) -> Result<()> {
+    ensure!(
+        read_intent(tx)?.is_none(),
+        "recover pending promotion before recording refutation"
+    );
+    let claim = require_claim(tx, &row.claim_id)?;
+    let expected_binding = WitnessSpecBinding {
+        repo: row.repo.clone(),
+        commit_id: row.commit_id.clone(),
+        file_path: row.file_path.clone(),
+        proposition_name: row.proposition_name.clone(),
+    };
+    ensure!(
+        read_witness_binding(tx, &row.claim_id)?.as_ref() == Some(&expected_binding),
+        "witness lacks an approved exact Git spec binding"
+    );
+    let expected = format!("{}#{}", row.file_path, row.proposition_name);
+    ensure!(
+        claim.engine == "lean4"
+            && claim.formal_target.as_deref() == Some(expected.as_str())
+            && claim
+                .module_path
+                .as_deref()
+                .is_none_or(|m| m == row.file_path),
+        "witness does not target the registered Lean claim"
+    );
+    let bound: String =
+        tx.query_row("SELECT repo FROM managed_repo WHERE singleton=1", [], |r| {
+            r.get(0)
+        })?;
+    ensure!(
+        bound == row.repo,
+        "project is bound to a different Git repository"
+    );
+    Ok(())
+}
+
+fn insert_refutation_outbox(
+    tx: &Transaction<'_>,
+    row: &RefutationOutboxRow,
+    phase: RefutationOutboxPhase,
+    completed_event_seq: Option<i64>,
+) -> Result<()> {
+    tx.execute(
+        "INSERT INTO refutation_outbox (claim_id,wiki_id,witness_sha256,commit_id,file_path,
+            proposition_name,source_sha256,repo,project_root,proof_body,receipt_json,markdown,
+            markdown_sha256,phase,created_at,completed_event_seq)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,strftime('%Y-%m-%dT%H:%M:%fZ','now'),?15)",
+        params![
+            row.claim_id,
+            row.wiki_id,
+            row.witness_sha256,
+            row.commit_id,
+            row.file_path,
+            row.proposition_name,
+            row.source_sha256,
+            row.repo,
+            row.project_root,
+            row.proof_body,
+            row.receipt_json,
+            row.markdown,
+            row.markdown_sha256,
+            phase.sql(),
+            completed_event_seq
+        ],
+    )?;
+    Ok(())
+}
+
+// Re-verifying the exact witness can change its issuance time, which is not
+// part of the broker's witness identity. Preserve the first durable receipt;
+// all other fields must match, and internal replay still compares the full JSON.
+fn retain_first_witness_receipt(
+    row: &RefutationOutboxRow,
+    original: &str,
+) -> Result<RefutationOutboxRow> {
+    let without_issuance = |text: &str| -> Result<Value> {
+        let mut value: Value = serde_json::from_str(text)?;
+        let object = value
+            .as_object_mut()
+            .context("invalid witness receipt object")?;
+        if let Some(issued) = object.remove("issued_unix_seconds") {
+            ensure!(issued.is_u64(), "invalid witness issuance time");
+        }
+        Ok(value)
+    };
+    ensure!(
+        without_issuance(&row.receipt_json)? == without_issuance(original)?,
+        "conflicting refutation replay recipe: witness receipt differs"
+    );
+    let mut row = row.clone();
+    row.receipt_json = original.into();
+    Ok(row)
+}
+
+fn prepare_refutation(tx: &Transaction<'_>, row: &RefutationOutboxRow) -> Result<()> {
+    validate_refutation_context(tx, row)?;
+    let claim = require_claim(tx, &row.claim_id)?;
+    let old = read_verified_refutation(tx, &row.claim_id)?;
+    if let Some(existing) = read_refutation_outbox(tx, &row.claim_id)? {
+        let row = retain_first_witness_receipt(row, &existing.receipt_json)?;
+        ensure!(
+            same_refutation_recipe(&row, &existing),
+            "conflicting refutation replay recipe for claim {}",
+            row.claim_id
+        );
+        return match (existing.phase, old) {
+            (RefutationOutboxPhase::Complete, Some(old)) => {
+                ensure!(
+                    same_refutation_identity(&existing, &old)
+                        && existing.completed_event_seq == Some(old.event_seq)
+                        && claim.local_trust == Trust::L2b,
+                    "conflicting completed refutation replay identity"
+                );
+                Ok(())
+            }
+            (RefutationOutboxPhase::DbCommitted, Some(old)) => {
+                ensure!(
+                    same_refutation_identity(&existing, &old),
+                    "conflicting DB-committed refutation replay identity"
+                );
+                Ok(())
+            }
+            (RefutationOutboxPhase::PendingFile | RefutationOutboxPhase::Staged, None) => Ok(()),
+            _ => anyhow::bail!(
+                "inconsistent refutation outbox/ledger state for claim {}",
+                row.claim_id
+            ),
+        };
+    }
+    let active: Option<String> = tx
+        .query_row(
+            "SELECT claim_id FROM refutation_outbox WHERE phase<>'COMPLETE' LIMIT 1",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    ensure!(
+        active.is_none(),
+        "recover pending refutation for claim {} before recording another",
+        active.unwrap_or_default()
+    );
+    if let Some(old) = old {
+        let row = retain_first_witness_receipt(row, &old.receipt_json)?;
+        ensure!(
+            same_refutation_identity(&row, &old) && claim.local_trust == Trust::L2b,
+            "claim already has a different verified refutation"
+        );
+        // Additive adoption of a legacy finalized row. Its existing event is not
+        // replayed. Start at PENDING_FILE so archive publication is acknowledged
+        // before COMPLETE; reconcile's finish step adopts the old ledger identity.
+        insert_refutation_outbox(tx, &row, RefutationOutboxPhase::PendingFile, None)?;
+        return Ok(());
+    }
+    ensure!(
+        !matches!(claim.local_trust, Trust::L2b | Trust::L5) && !claim.stale,
+        "existing L5, refutation, or stale claim requires operator review"
+    );
+    insert_refutation_outbox(tx, row, RefutationOutboxPhase::PendingFile, None)
+}
+
+fn mark_refutation_staged(tx: &Transaction<'_>, row: &RefutationOutboxRow) -> Result<()> {
+    let current = read_refutation_outbox(tx, &row.claim_id)?
+        .context("refutation recipe disappeared before staging acknowledgement")?;
+    ensure!(
+        same_refutation_recipe(row, &current),
+        "conflicting refutation recipe changed during staging"
+    );
+    if current.phase == RefutationOutboxPhase::PendingFile {
+        tx.execute(
+            "UPDATE refutation_outbox SET phase='STAGED' WHERE claim_id=?1 AND phase='PENDING_FILE'",
+            [&row.claim_id],
+        )?;
+    }
+    Ok(())
+}
+
+fn finish_refutation(tx: &Transaction<'_>, row: &RefutationOutboxRow) -> Result<(i64, bool)> {
+    let current = read_refutation_outbox(tx, &row.claim_id)?
+        .context("refutation recipe disappeared before ledger finalization")?;
+    ensure!(
+        same_refutation_recipe(row, &current),
+        "conflicting refutation recipe changed before ledger finalization"
+    );
+    if current.phase == RefutationOutboxPhase::Complete {
+        let seq = current
+            .completed_event_seq
+            .context("complete refutation has no event")?;
+        verify_completed_refutation(tx, &current, seq)?;
+        return Ok((seq, true));
+    }
+    if let Some(old) = read_verified_refutation(tx, &row.claim_id)? {
+        ensure!(
+            same_refutation_identity(&current, &old)
+                && matches!(
+                    current.phase,
+                    RefutationOutboxPhase::Staged | RefutationOutboxPhase::DbCommitted
+                ),
+            "conflicting refutation ledger finalization identity"
+        );
+        tx.execute(
+            "UPDATE refutation_outbox SET phase='DB_COMMITTED' WHERE claim_id=?1",
+            [&row.claim_id],
+        )?;
+        return Ok((old.event_seq, true));
+    }
+    ensure!(
+        matches!(
+            current.phase,
+            RefutationOutboxPhase::PendingFile | RefutationOutboxPhase::Staged
+        ),
+        "DB-committed refutation is missing its authoritative ledger row"
+    );
+    validate_refutation_context(tx, &current)?;
+    let claim = require_claim(tx, &row.claim_id)?;
+    ensure!(
+        !matches!(claim.local_trust, Trust::L2b | Trust::L5) && !claim.stale,
+        "existing L5, refutation, or stale claim requires operator review"
+    );
+    let change = Change {
+        actor: "broker:witness",
+        git_commit: Some(&row.commit_id),
+    };
+    let seq = event(
+        tx,
+        change,
+        "WITNESS_VERIFIED",
+        "claim",
+        &row.claim_id,
+        json!({"wiki_id":row.wiki_id,"witness_sha256":row.witness_sha256,"file_path":row.file_path,"target_decl":row.proposition_name}),
+    )?;
+    tx.execute(
+        "INSERT INTO verified_refutations (claim_id,wiki_id,witness_sha256,commit_id,file_path,
+            proposition_name,source_sha256,proof_body,receipt_json,event_seq)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        params![
+            row.claim_id,
+            row.wiki_id,
+            row.witness_sha256,
+            row.commit_id,
+            row.file_path,
+            row.proposition_name,
+            row.source_sha256,
+            row.proof_body,
+            row.receipt_json,
+            seq
+        ],
+    )?;
+    apply_refutation(tx, &row.claim_id, &row.wiki_id, change)?;
+    tx.execute(
+        "UPDATE refutation_outbox SET phase='DB_COMMITTED' WHERE claim_id=?1",
+        [&row.claim_id],
+    )?;
+    Ok((seq, false))
+}
+
+fn mark_refutation_complete(
+    tx: &Transaction<'_>,
+    row: &RefutationOutboxRow,
+    seq: i64,
+) -> Result<()> {
+    let current = read_refutation_outbox(tx, &row.claim_id)?
+        .context("refutation recipe disappeared after publication")?;
+    ensure!(
+        same_refutation_recipe(row, &current),
+        "conflicting refutation recipe changed after publication"
+    );
+    verify_completed_refutation(tx, &current, seq)?;
+    if current.phase != RefutationOutboxPhase::Complete {
+        tx.execute(
+            "UPDATE refutation_outbox SET phase='COMPLETE',completed_event_seq=?2
+             WHERE claim_id=?1 AND phase='DB_COMMITTED'",
+            params![row.claim_id, seq],
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_completed_refutation(
+    tx: &Transaction<'_>,
+    row: &RefutationOutboxRow,
+    seq: i64,
+) -> Result<()> {
+    let old = read_verified_refutation(tx, &row.claim_id)?
+        .context("completed refutation has no authoritative ledger row")?;
+    ensure!(
+        same_refutation_identity(row, &old) && old.event_seq == seq,
+        "conflicting completed refutation ledger identity"
+    );
+    ensure!(
+        row.completed_event_seq
+            .is_none_or(|completed| completed == seq),
+        "conflicting completed refutation event sequence"
+    );
     Ok(())
 }
 
@@ -2231,7 +3182,5 @@ fn recompute_graph(
     Ok(())
 }
 
-#[cfg(all(test, target_os = "macos"))]
-mod native_t3;
 #[cfg(test)]
 mod tests;

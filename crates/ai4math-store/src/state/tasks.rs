@@ -34,6 +34,10 @@ const MODULE_GATED: &str = "EXISTS(SELECT 1 FROM circuit_breakers b
 const DEPENDENCY_BLOCKED: &str = "EXISTS(SELECT 1 FROM scheduler_task_dependencies d
     LEFT JOIN scheduler_tasks parent ON parent.queue_seq=d.dep_seq
     WHERE d.task_seq=t.queue_seq AND parent.completed_at_ms IS NULL)";
+const RETRY_READY: &str = "(coalesce(r.state,'pending') <> 'quarantined'
+    AND (r.retry_at_ms IS NULL OR r.retry_at_ms <= ?1))";
+const RETRYING: &str = "coalesce(r.state='backoff' AND r.retry_at_ms > ?1,0)";
+const QUARANTINED: &str = "coalesce(r.state='quarantined',0)";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -116,6 +120,12 @@ pub struct TaskTrackStatus {
     /// from JSON to preserve the legacy facts projection for unheld queues.
     #[serde(skip_serializing_if = "is_zero")]
     pub held_for_oracle: i64,
+    /// Failed ordinary tasks waiting for their durable retry deadline.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub retrying: i64,
+    /// Ordinary tasks whose explicit retry budget is exhausted.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub quarantined: i64,
     pub active_limit: i64,
 }
 
@@ -133,6 +143,8 @@ impl Default for TaskTrackStatus {
             breaker_blocked: 0,
             dependency_blocked: 0,
             held_for_oracle: 0,
+            retrying: 0,
+            quarantined: 0,
             active_limit: TRACK_ACTIVE_LIMIT,
         }
     }
@@ -235,6 +247,7 @@ impl StateStore {
             tx.execute("INSERT INTO scheduler_tasks(task_id,track,engine,module_path,target) VALUES(?1,?2,?3,?4,?5)",
                 params![task.id, task.track.as_str(), task.engine, task.module_path, task.target])?;
             let seq = tx.last_insert_rowid();
+            tx.execute("INSERT INTO scheduler_task_retries(task_seq) VALUES(?1)", [seq])?;
             for dep_seq in dep_seqs {
                 tx.execute("INSERT INTO scheduler_task_dependencies(task_seq,dep_seq) VALUES(?1,?2)", [seq, dep_seq])?;
             }
@@ -269,6 +282,22 @@ impl StateStore {
         self.claim_task_inner(track, Some(expected_id), lease_for, change)
     }
 
+    /// Claim an expected task with separate execution and post-run persistence
+    /// budgets. Only the summed lease TTL is persisted; the caller still owns
+    /// the execution deadline. Capacity, FIFO, alternation and fences are the
+    /// same as `claim_expected_task`, and the total remains at most one hour.
+    pub fn claim_expected_task_with_submission_grace(
+        &mut self,
+        track: Option<TaskTrack>,
+        expected_id: &str,
+        execution_for: Duration,
+        submission_grace: Duration,
+        change: Change<'_>,
+    ) -> Result<Option<TaskLease>> {
+        let lease_for = lease_duration_with_submission_grace(execution_for, submission_grace)?;
+        self.claim_task_inner(track, Some(expected_id), lease_for, change)
+    }
+
     fn claim_task_inner(
         &mut self,
         track: Option<TaskTrack>,
@@ -299,14 +328,26 @@ impl StateStore {
                 .query_row(
                     &format!(
                         "SELECT t.queue_seq,t.task_id,t.track,t.engine,t.module_path,t.target
-                FROM scheduler_tasks t WHERE t.completed_at_ms IS NULL
+                FROM scheduler_tasks t
+                LEFT JOIN scheduler_task_retries r ON r.task_seq=t.queue_seq
+                WHERE t.completed_at_ms IS NULL
                 AND (t.lease_expires_at_ms IS NULL OR t.lease_expires_at_ms <= ?1)
                 AND ((?2 AND t.track='exploration') OR (?3 AND t.track='infrastructure'))
                 AND NOT {HELD_FOR_ORACLE} AND NOT {MODULE_GATED} AND NOT {DEPENDENCY_BLOCKED}
                 AND NOT {ADAPTATION_LINKED}
+                AND (coalesce(r.state,'pending') <> 'quarantined'
+                     AND (r.retry_at_ms IS NULL OR r.retry_at_ms <= ?1
+                          OR (?5 AND t.task_id=?6)))
                 ORDER BY CASE WHEN t.track=?4 THEN 1 ELSE 0 END,t.queue_seq LIMIT 1"
                     ),
-                    params![now, can_explore, can_build, last_track],
+                    params![
+                        now,
+                        can_explore,
+                        can_build,
+                        last_track,
+                        expected_id.is_some(),
+                        expected_id
+                    ],
                     |r| {
                         Ok((
                             r.get::<_, i64>(0)?,
@@ -379,6 +420,29 @@ fn validate_lease_duration(lease_for: Duration) -> Result<()> {
     Ok(())
 }
 
+fn lease_duration_with_submission_grace(
+    execution_for: Duration,
+    submission_grace: Duration,
+) -> Result<Duration> {
+    ensure!(
+        execution_for.as_millis() > 0 && execution_for <= MAX_LEASE,
+        "task execution duration must be between 1 ms and 1 hour"
+    );
+    ensure!(
+        submission_grace <= MAX_LEASE,
+        "task submission grace must be between 0 ms and 1 hour"
+    );
+    let total_ms = execution_for
+        .as_millis()
+        .checked_add(submission_grace.as_millis())
+        .context("task lease duration overflow")?;
+    ensure!(
+        total_ms <= MAX_LEASE.as_millis(),
+        "task execution duration plus submission grace must be at most 1 hour"
+    );
+    Ok(Duration::from_millis(total_ms as u64))
+}
+
 fn active_counts(db: &Connection, now: i64) -> Result<(i64, i64)> {
     Ok(db.query_row(
         "SELECT count(*) FILTER (WHERE track='exploration'),
@@ -449,21 +513,39 @@ fn scheduler_snapshot_at(db: &Connection, now: i64) -> Result<TaskSchedulerStatu
     } else {
         "0"
     };
+    let has_retries: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scheduler_task_retries')",
+        [],
+        |r| r.get(0),
+    )?;
+    let (retry_join, retry_ready, retrying, quarantined) = if has_retries {
+        (
+            "LEFT JOIN scheduler_task_retries r ON r.task_seq=t.queue_seq",
+            RETRY_READY,
+            RETRYING,
+            QUARANTINED,
+        )
+    } else {
+        ("", "1", "0", "0")
+    };
     let mut stmt = db.prepare(&format!(
         "WITH task_flags AS (
         SELECT t.track, t.completed_at_ms IS NOT NULL AS completed,
             coalesce(t.lease_expires_at_ms > ?1,0) AS active,
             coalesce(t.lease_expires_at_ms <= ?1,0) AS expired,
-            {MODULE_GATED} AS gated, {DEPENDENCY_BLOCKED} AS waiting, {held} AS held
-        FROM scheduler_tasks t
+            {MODULE_GATED} AS gated, {DEPENDENCY_BLOCKED} AS waiting, {held} AS held,
+            {retry_ready} AS retry_ready, {retrying} AS retrying, {quarantined} AS quarantined
+        FROM scheduler_tasks t {retry_join}
         WHERE t.completed_at_ms IS NOT NULL OR t.lease_expires_at_ms > ?1 OR NOT {scoped}
     ) SELECT track,
-        count(*) FILTER (WHERE NOT completed AND NOT active AND NOT held AND NOT gated AND NOT waiting),
+        count(*) FILTER (WHERE NOT completed AND NOT active AND NOT held AND NOT gated AND NOT waiting AND retry_ready),
         count(*) FILTER (WHERE active), count(*) FILTER (WHERE completed),
         count(*) FILTER (WHERE expired),
         count(*) FILTER (WHERE NOT completed AND NOT active AND NOT held AND gated),
         count(*) FILTER (WHERE NOT completed AND NOT active AND NOT held AND NOT gated AND waiting),
-        count(*) FILTER (WHERE NOT completed AND NOT active AND held)
+        count(*) FILTER (WHERE NOT completed AND NOT active AND held),
+        count(*) FILTER (WHERE NOT completed AND NOT active AND retrying),
+        count(*) FILTER (WHERE NOT completed AND NOT active AND quarantined)
     FROM task_flags GROUP BY track"
     ))?;
     let by_track = stmt.query_map([now], |r| {
@@ -477,6 +559,8 @@ fn scheduler_snapshot_at(db: &Connection, now: i64) -> Result<TaskSchedulerStatu
                 breaker_blocked: r.get(5)?,
                 dependency_blocked: r.get(6)?,
                 held_for_oracle: r.get(7)?,
+                retrying: r.get(8)?,
+                quarantined: r.get(9)?,
                 active_limit: TRACK_ACTIVE_LIMIT,
             },
         ))
@@ -506,7 +590,7 @@ pub(super) fn freeze_module_leases(
     change: Change<'_>,
 ) -> Result<usize> {
     let invalidated = tx.execute(&format!("UPDATE scheduler_tasks AS t SET lease_expires_at_ms=NULL
-        WHERE t.engine=?1 AND t.module_path=?2 AND t.lease_expires_at_ms IS NOT NULL AND {MODULE_GATED}"),
+        WHERE t.engine=?1 AND t.module_path=?2 AND t.lease_expires_at_ms>({CLOCK_MS}) AND {MODULE_GATED}"),
         params![engine, module_path])?;
     if invalidated != 0 {
         event(

@@ -1,12 +1,12 @@
 //! Operator-only T2 clean build of a pinned managed Lean snapshot, without proof authority.
 use crate::{
-    bound_engine, managed_native,
+    bound_engine,
     promotion::{Promotion, PromotionRepo},
     trusted_toolchain,
-    worker_dispatch::private_state_path,
 };
 use ai4math_broker::{Broker, LeanBuildAudit, LeanHeartbeatAudit, ManagedLeanTheoremAudit};
 use ai4math_core::Engine;
+use ai4math_project::ManagedProject;
 use ai4math_store::{StateStore, TrustDebtScan};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -368,14 +368,14 @@ fn with_generation<R>(
     reviewed: &str,
     run: impl FnOnce(&ManagedGeneration<'_>) -> Result<R>,
 ) -> Result<R> {
-    let path =
-        private_state_path(root).context("T2 build requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
+    let path = project.state_path().to_path_buf();
     let engine = bound_engine(root, anchor)?;
     ensure!(
         engine == Engine::Lean4,
         "T2 clean build currently requires the primary Lean engine"
     );
-    let state = StateStore::open_readonly(&path)?;
+    let state = project.open_state_readonly()?;
     let stamp = state.managed_wiki_stamp()?.context(
         "bind the managed repository and recover pending Git transactions before T2 build",
     )?;
@@ -385,7 +385,7 @@ fn with_generation<R>(
         "project is not bound to the supplied managed repository"
     );
     // Native consumers take the project gate before the managed Git coordination lock.
-    let _native = managed_native(root)?;
+    let _native = project.try_native_heavy()?;
     let git = PromotionRepo::try_lock_existing(&canonical)?;
     ensure!(
         git.path() == canonical,

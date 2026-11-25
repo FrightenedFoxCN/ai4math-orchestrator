@@ -42,6 +42,6 @@
 - [x] **架构与工程选型设计完成（Docs 01–08、ADR-0001–0006、4 份 JSON Schema 与 2 份 SQLite DDL）**
 - [x] **Phase 1（Rust 核心底座 + Red-Team 闭环）**：`ai4math-core` + `ai4math-store`（`rusqlite`）+ `ai4math-broker`（Seatbelt 规范化 + APFS 黄金快照 + Lean 4/Agda/Rocq 受限洁净室 `VerificationReceipt`）+ `ai4math-cli`
 - [x] **Phase 2（本机守护进程）**：`ai4math-daemon`（UDS NDJSON JSON-RPC 2.0 + 实时生命体征推流 + 确定性 Fact Pack 编译器）
-- [x] **Phase 3（DSH 原生插件，集成验收）**：`plugins/dsh-ai4math`（Host Cordis 角色工具面 + `TypertRemoteService` 桥接 + Client `shell.bottom` Live HUD 与 `sidebarRightTabs` 面板）
+- [x] **Phase 3（DSH 原生插件实现）**：`plugins/dsh-ai4math`（Host Cordis 角色工具面 + `TypertRemoteService` 桥接 + Client `shell.bottom` Live HUD 与 `sidebarRightTabs` 面板）
 
-Phase 2 / 3 已通过本机 daemon 与 DSH SDK 集成测试；实际 GUI 安装、完整调度器信号源和可写的人机决策闭环未包含在本次验收。完整架构的后续实现与证据见[验收矩阵](docs/architecture-acceptance.md)。
+Phase 2 / 3 已通过本机 daemon 与 DSH SDK 集成测试；实际 GUI 安装、认证/布局冲突、生产 preset 生命周期和可写的人机决策闭环尚未验收。当前实现状态见 [implementation-status.md](docs/implementation-status.md)，完整架构的后续实现与证据见[验收矩阵](docs/architecture-acceptance.md)。

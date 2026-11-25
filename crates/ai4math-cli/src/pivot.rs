@@ -3,6 +3,7 @@ use crate::{
     bound_engine, print_json,
     promotion::{PendingRef, PromotionRepo},
 };
+use ai4math_project::{ManagedProject, open_managed_state};
 use ai4math_store::{
     PivotAction, PivotIntent, PivotLessonDraft, PivotPlan, PivotResult, StateStore,
     retained::read_retained_review,
@@ -31,7 +32,7 @@ pub(crate) fn trip(
         git.main_head()? == snap.base(),
         "Git main changed while recording the breaker"
     );
-    let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, false)?;
     let report = store.register_tripped_breaker_report(
         repo_name(&git)?,
         snap.base(),
@@ -106,7 +107,7 @@ fn plan(
     };
     if let Some(c) = plan.checkpoint.as_ref() {
         ensure!(
-            git.is_ancestor(&c.git_commit, &base)?,
+            git.is_ungrafted_ancestor(&c.git_commit, &base)?,
             "last human checkpoint is not in current main history"
         );
     }
@@ -222,7 +223,7 @@ fn preview_with(
     selection: Selection<'_>,
 ) -> Result<()> {
     let git = PromotionRepo::lock(repo)?;
-    let mut store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, true)?;
     let p = plan(root, &git, &mut store, fact, breaker, reason, selection)?;
     let action = p.action;
     let mut preview = json!({"adr_id":p.adr_id()?,"action":action.as_str(),"to_state":action.target_state(),"probe_tasks":[],"stopped_tasks":[],"tainted_claims":[],"archived_claims":[],"new_tasks":[],"plan":p,"adr_markdown":markdown(&p)?});
@@ -386,9 +387,10 @@ fn apply_with(
     approved_id: &str,
     selection: Selection<'_>,
 ) -> Result<()> {
+    let project = ManagedProject::new(root)?;
     let git = PromotionRepo::lock(repo)?;
-    let state_path = root.join(".runtime/state.sqlite");
-    let mut store = StateStore::open(&state_path)?;
+    let state_path = project.state_path().to_path_buf();
+    let mut store = project.open_state()?;
     if let Some((p, r)) = store.recorded_pivot(approved_id)? {
         let identical_selection = if matches!(
             selection.action,
@@ -412,7 +414,7 @@ fn apply_with(
         );
         git.validate_adr(&p.base_commit, &r.git_commit, approved_id, &markdown(&p)?)?;
         ensure!(
-            git.is_ancestor(&r.git_commit, &git.main_head()?)?,
+            git.is_ungrafted_ancestor(&r.git_commit, &git.main_head()?)?,
             "recorded ADR no longer belongs to main"
         );
         return print_json(r);
@@ -429,9 +431,10 @@ fn apply_with(
 }
 
 pub(crate) fn recover(root: &Path, repo: &Path) -> Result<()> {
+    let project = ManagedProject::new(root)?;
     let git = PromotionRepo::lock(repo)?;
-    let state = root.join(".runtime/state.sqlite");
-    let mut store = StateStore::open(&state)?;
+    let state = project.state_path().to_path_buf();
+    let mut store = project.open_state()?;
     let pin = git.pivot_pending_ref(&state)?;
     let Some(intent) = store.pivot_intent()? else {
         pin.clear()?;
@@ -446,9 +449,10 @@ pub(crate) fn recover(root: &Path, repo: &Path) -> Result<()> {
 }
 
 pub(crate) fn abandon(root: &Path, repo: &Path, approved_id: &str) -> Result<()> {
+    let project = ManagedProject::new(root)?;
     let git = PromotionRepo::lock(repo)?;
-    let state = root.join(".runtime/state.sqlite");
-    let mut store = StateStore::open(&state)?;
+    let state = project.state_path().to_path_buf();
+    let mut store = project.open_state()?;
     let Some(intent) = store.pivot_intent()? else {
         bail!("no pending Pivot");
     };
@@ -457,7 +461,7 @@ pub(crate) fn abandon(root: &Path, repo: &Path, approved_id: &str) -> Result<()>
         "pending Pivot approval identity mismatch"
     );
     ensure!(
-        !git.is_ancestor(&intent.new_commit, &git.main_head()?)?,
+        !git.is_ungrafted_ancestor(&intent.new_commit, &git.main_head()?)?,
         "main adopted this ADR; cannot abandon"
     );
     store.abandon_unadopted_pivot(&intent)?;

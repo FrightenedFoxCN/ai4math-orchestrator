@@ -1,14 +1,13 @@
 //! Sandboxed cold replay: an operator observation, not ledger evidence or promotion.
 use super::{Compatibility, WakePreview, prepare_wake};
 use crate::{
-    managed_native, print_json, promotion::PromotionRepo, reviewed_spec, t3::validate_recipe,
-    trusted_toolchain,
+    print_json, promotion::PromotionRepo, reviewed_spec, t3::validate_recipe, trusted_toolchain,
 };
 use ai4math_broker::{Broker, RecheckAssessment};
 use ai4math_core::Engine;
-use ai4math_store::{
-    RetainedSedimentReplay, SedimentReplayScope, StateStore, Trust, read_sediment,
-};
+use ai4math_evidence::LeanComparisonEvidence;
+use ai4math_project::{ManagedProject, open_managed_state};
+use ai4math_store::{RetainedSedimentReplay, SedimentReplayScope, Trust, read_sediment};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 use std::path::Path;
@@ -73,10 +72,10 @@ fn run_with_retention(
     executable: &Path,
     retain: bool,
 ) -> Result<Report> {
-    let _native = managed_native(root)?;
+    let managed = ManagedProject::new(root)?;
+    let _native = managed.try_native_heavy()?;
     let git = PromotionRepo::try_lock(repo)?;
-    let db_path = root.join(".runtime/state.sqlite");
-    let state = StateStore::open_readonly(&db_path)?;
+    let state = managed.open_state_readonly()?;
     let seq = state.status()?.last_event_seq;
     let still_current = || -> Result<()> {
         ensure!(
@@ -222,7 +221,7 @@ fn run_with_retention(
         // A report or a digest is never input to retention. Keep both real broker
         // values and both project locks alive through the SQLite write CAS.
         read_sediment(root, id).context("archive changed before observation retention")?;
-        let mut writable = StateStore::open(&db_path)?;
+        let mut writable = managed.open_state()?;
         still_current()?;
         report.observation = Some(
             writable.retain_sediment_replay(
@@ -238,7 +237,9 @@ fn run_with_retention(
                     expected_event_seq: seq,
                 },
                 &candidate,
-                comparison.as_ref(),
+                comparison
+                    .as_ref()
+                    .map(|c| c as &dyn LeanComparisonEvidence),
             )?,
         );
         report.persisted = true;
@@ -255,7 +256,7 @@ pub(crate) fn retain(root: &Path, repo: &Path, id: &str, head: &str, exec: &Path
 }
 
 pub(crate) fn result(root: &Path, id: &str) -> Result<()> {
-    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let state = open_managed_state(root, true)?;
     let observation = state
         .sediment_replay(id)?
         .context("no retained sediment replay observation")?;

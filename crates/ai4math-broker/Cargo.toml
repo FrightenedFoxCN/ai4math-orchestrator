@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 ai4math-core.workspace = true
+ai4math-evidence.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -172,13 +172,72 @@ impl Hub {
     }
 }
 
-/// Listen in a pre-existing, private (0700), effective-user-owned directory.
-/// Accepts only peers with the same effective UID. The endpoint must not
-/// already exist: after a crash, confirm the daemon is stopped before removing
-/// a stale socket manually. The private directory is locked for the server's
-/// lifetime so cooperating instances cannot race startup.
+/// Exclusive lease on a private runtime directory. Acquire this before opening
+/// or migrating any databases, and keep it through bind/listen and serving.
+/// Closing the lease (or exiting the process) releases the nonblocking flock.
+pub struct SingletonLease {
+    _directory: File,
+    metadata: Metadata,
+    owner: u32,
+}
+
+/// Lock a pre-existing, private (0700), effective-user-owned runtime directory.
+/// Cooperating instances cannot race database startup: a second instance gets
+/// `AddrInUse` before it can open or migrate the StateStore or Wiki index.
+pub fn acquire_singleton(runtime: &Path) -> io::Result<SingletonLease> {
+    let absolute = std::path::absolute(runtime)?;
+    // SAFETY: geteuid has no arguments or memory requirements.
+    let owner = unsafe { libc::geteuid() };
+    validate_ancestors(&absolute, owner)?;
+    let real_runtime = fs::canonicalize(&absolute)?;
+    validate_ancestors(&real_runtime, owner)?;
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(&real_runtime)?;
+    let metadata = directory.metadata()?;
+    if !same_inode(&metadata, &fs::symlink_metadata(&real_runtime)?)
+        || metadata.uid() != owner
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(path_error(
+            io::ErrorKind::PermissionDenied,
+            &real_runtime,
+            "runtime directory changed during startup",
+        ));
+    }
+    // SAFETY: flock receives the valid directory FD held by the lease. Closing
+    // that FD releases the lock, including on every startup error path.
+    loop {
+        if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            break;
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Err(path_error(
+                    io::ErrorKind::AddrInUse,
+                    &real_runtime,
+                    "runtime directory is locked by another daemon",
+                ));
+            }
+            return Err(path_error(error.kind(), &real_runtime, error));
+        }
+    }
+    Ok(SingletonLease {
+        _directory: directory,
+        metadata,
+        owner,
+    })
+}
+
+/// Listen using a runtime lease acquired before database startup. Accepts only
+/// peers with the same effective UID. The endpoint must not already exist:
+/// after a crash, confirm the daemon is stopped before removing a stale socket
+/// manually. The lease is held for the server's lifetime.
 pub fn serve(
     socket_path: &Path,
+    lease: SingletonLease,
     hub: Hub,
     ready: impl FnOnce() -> io::Result<()>,
     handler: impl Fn(&Connection, &str, Map<String, Value>) -> Result<Value, RpcError>
@@ -186,7 +245,7 @@ pub fn serve(
     + Sync
     + 'static,
 ) -> io::Result<()> {
-    let socket = bind_socket(socket_path)?;
+    let socket = bind_with_lease(lease, socket_path)?;
     ready()?;
     let handler = Arc::new(handler);
     let active = Arc::new(AtomicUsize::new(0));
@@ -484,11 +543,11 @@ impl Drop for SocketPath {
     }
 }
 
-struct BoundSocket {
+pub(crate) struct BoundSocket {
     // Unlink while our inode is still live, then close the socket and unlock.
     _path: SocketPath,
     listener: UnixListener,
-    _directory: File,
+    _lease: SingletonLease,
     owner: u32,
 }
 
@@ -541,7 +600,7 @@ fn validate_ancestors(parent: &Path, uid: u32) -> io::Result<()> {
     Ok(())
 }
 
-fn bind_socket(path: &Path) -> io::Result<BoundSocket> {
+pub(crate) fn bind_with_lease(lease: SingletonLease, path: &Path) -> io::Result<BoundSocket> {
     if path.as_os_str().as_bytes().ends_with(b"/")
         || path.as_os_str().as_bytes().ends_with(b"/.")
         || path.components().any(|part| part == Component::ParentDir)
@@ -559,11 +618,10 @@ fn bind_socket(path: &Path) -> io::Result<BoundSocket> {
     let parent = absolute
         .parent()
         .expect("absolute socket filename has a parent");
-    // SAFETY: geteuid has no arguments or memory requirements.
-    let uid = unsafe { libc::geteuid() };
-    validate_ancestors(parent, uid)?;
+    let owner = lease.owner;
+    validate_ancestors(parent, owner)?;
     let real_parent = fs::canonicalize(parent)?;
-    validate_ancestors(&real_parent, uid)?;
+    validate_ancestors(&real_parent, owner)?;
     let endpoint = real_parent.join(name);
     let addr = SocketAddress::new(&endpoint)?;
     let directory = OpenOptions::new()
@@ -572,28 +630,17 @@ fn bind_socket(path: &Path) -> io::Result<BoundSocket> {
         .open(&real_parent)?;
     let directory_metadata = directory.metadata()?;
     if !same_inode(&directory_metadata, &fs::symlink_metadata(&real_parent)?)
-        || directory_metadata.uid() != uid
+        || !same_inode(&directory_metadata, &lease.metadata)
+        || directory_metadata.uid() != owner
         || directory_metadata.mode() & 0o7777 != 0o700
     {
         return Err(path_error(
             io::ErrorKind::PermissionDenied,
             &real_parent,
-            "socket directory changed during startup",
+            "socket directory changed after the runtime lease was acquired",
         ));
     }
-    // SAFETY: flock receives the valid directory FD held by BoundSocket.
-    if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            return Err(path_error(
-                io::ErrorKind::AddrInUse,
-                &real_parent,
-                "socket directory is locked by another daemon",
-            ));
-        }
-        return Err(path_error(error.kind(), &real_parent, error));
-    }
-    require_absent_endpoint(&endpoint, uid)?;
+    require_absent_endpoint(&endpoint, owner)?;
     let fd = new_socket()?;
     // SAFETY: addr stores an initialized sockaddr_un of the supplied length; fd is valid.
     if unsafe { libc::bind(fd.as_raw_fd(), addr.as_ptr(), addr.len) } == -1 {
@@ -601,7 +648,7 @@ fn bind_socket(path: &Path) -> io::Result<BoundSocket> {
         return Err(path_error(error.kind(), &endpoint, error));
     }
     let meta = fs::symlink_metadata(&endpoint)?;
-    if !meta.file_type().is_socket() || meta.uid() != uid || meta.nlink() != 1 {
+    if !meta.file_type().is_socket() || meta.uid() != owner || meta.nlink() != 1 {
         return Err(path_error(
             io::ErrorKind::PermissionDenied,
             &endpoint,
@@ -624,8 +671,8 @@ fn bind_socket(path: &Path) -> io::Result<BoundSocket> {
     Ok(BoundSocket {
         listener: fd.into(),
         _path: cleanup,
-        _directory: directory,
-        owner: uid,
+        _lease: lease,
+        owner,
     })
 }
 
@@ -752,6 +799,11 @@ mod tests {
             .unwrap()
     }
 
+    fn bind(path: &Path) -> io::Result<BoundSocket> {
+        let parent = path.parent().expect("fixture socket has a parent");
+        bind_with_lease(acquire_singleton(parent)?, path)
+    }
+
     fn request(stream: &mut UnixStream, id: u64, method: &str) {
         let frame = encode_frame(&json!({"jsonrpc":"2.0", "id":id, "method":method})).unwrap();
         stream.write_all(&frame).unwrap();
@@ -764,33 +816,49 @@ mod tests {
     }
 
     #[test]
+    fn singleton_lease_is_exclusive_before_socket_bind() {
+        let dir = private_dir();
+        let lease = acquire_singleton(dir.path()).unwrap();
+        assert_eq!(
+            acquire_singleton(dir.path()).err().unwrap().kind(),
+            io::ErrorKind::AddrInUse
+        );
+        assert!(!dir.path().join("rpc.sock").exists());
+        drop(lease);
+        let rebound = acquire_singleton(dir.path()).unwrap();
+        drop(rebound);
+    }
+
+    #[test]
     fn socket_mode_lock_and_active_endpoint() {
         let dir = private_dir();
         let path = dir.path().join("rpc.sock");
         let existing = UnixListener::bind(&path).unwrap();
-        assert_eq!(
-            bind_socket(&path).err().unwrap().kind(),
-            io::ErrorKind::AddrInUse
-        );
+        assert_eq!(bind(&path).err().unwrap().kind(), io::ErrorKind::AddrInUse);
         assert!(path.exists());
         drop(existing);
-        let stale = bind_socket(&path).err().unwrap();
+        let stale = bind(&path).err().unwrap();
         assert_eq!(stale.kind(), io::ErrorKind::AddrInUse);
         assert!(stale.to_string().contains("confirm the daemon is stopped"));
         assert!(fs::symlink_metadata(&path).unwrap().file_type().is_socket());
         fs::remove_file(&path).unwrap();
 
-        let owned = bind_socket(&path).unwrap();
+        let owned = bind(&path).unwrap();
         assert_eq!(fs::symlink_metadata(&path).unwrap().mode() & 0o7777, 0o600);
         assert_eq!(
-            bind_socket(&path).err().unwrap().kind(),
+            acquire_singleton(dir.path()).err().unwrap().kind(),
             io::ErrorKind::AddrInUse
         );
+        assert_eq!(bind(&path).err().unwrap().kind(), io::ErrorKind::AddrInUse);
         let _peer = UnixStream::connect(&path).unwrap();
         let (peer, _) = owned.listener.accept().unwrap();
         assert!(peer_is_owner(&peer, owned.owner));
         assert!(!peer_is_owner(&peer, owned.owner.wrapping_add(1)));
         drop(owned);
+        assert!(!path.exists());
+        // Normal teardown releases both the endpoint and the directory lease.
+        let rebound = bind(&path).unwrap();
+        drop(rebound);
         assert!(!path.exists());
     }
 
@@ -800,13 +868,13 @@ mod tests {
         let path = dir.path().join("rpc.sock");
         fs::write(&path, b"keep").unwrap();
         assert_eq!(
-            bind_socket(&path).err().unwrap().kind(),
+            bind(&path).err().unwrap().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(fs::read(&path).unwrap(), b"keep");
         let link = dir.path().join("endpoint-link");
         symlink(&path, &link).unwrap();
-        assert!(bind_socket(&link).is_err());
+        assert!(bind(&link).is_err());
         assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
         let real_parent = dir.path().join("real");
         fs::DirBuilder::new()
@@ -815,24 +883,46 @@ mod tests {
             .unwrap();
         let link_parent = dir.path().join("parent-link");
         symlink(&real_parent, &link_parent).unwrap();
-        assert!(bind_socket(&link_parent.join("socket")).is_err());
+        assert!(bind(&link_parent.join("socket")).is_err());
         let unsafe_parent = dir.path().join("shared");
         fs::create_dir(&unsafe_parent).unwrap();
         fs::set_permissions(&unsafe_parent, Permissions::from_mode(0o755)).unwrap();
-        assert!(bind_socket(&unsafe_parent.join("socket")).is_err());
+        assert!(bind(&unsafe_parent.join("socket")).is_err());
         assert!(!unsafe_parent.join("socket").exists());
-        assert!(bind_socket(&real_parent.join("wrong/../socket")).is_err());
+        assert!(bind(&real_parent.join("wrong/../socket")).is_err());
     }
 
     #[test]
     fn cleanup_does_not_unlink_replacement() {
         let dir = private_dir();
         let path = dir.path().join("socket");
-        let owned = bind_socket(&path).unwrap();
+        let owned = bind(&path).unwrap();
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"different inode").unwrap();
         drop(owned);
         assert_eq!(fs::read(&path).unwrap(), b"different inode");
+    }
+
+    #[test]
+    fn ready_failure_cleans_own_socket_and_releases_lease() {
+        let dir = private_dir();
+        let path = dir.path().join("rpc.sock");
+        let error = serve(
+            &path,
+            acquire_singleton(dir.path()).unwrap(),
+            Hub::new(),
+            || Err(io::Error::other("fixture startup failed")),
+            |_, _, _| Ok(Value::Null),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Other);
+        assert_eq!(error.to_string(), "fixture startup failed");
+        assert!(!path.exists());
+        // A failed serve must not leave the directory locked.
+        let rebound = bind(&path).unwrap();
+        assert_eq!(fs::symlink_metadata(&path).unwrap().mode() & 0o7777, 0o600);
+        drop(rebound);
+        assert!(!path.exists());
     }
 
     #[test]

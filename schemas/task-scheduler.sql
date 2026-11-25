@@ -14,6 +14,37 @@ CREATE TABLE IF NOT EXISTS scheduler_tasks (
   CHECK (completed_at_ms IS NULL OR last_fence > 0)
 ) STRICT;
 
+-- Additive retry state for ordinary tasks. A missing row is the legacy PENDING
+-- state. Explicit sediment scopes keep their native explicit-lease semantics
+-- and do not advance this policy. Backoff is durable; exhaustion quarantines
+-- the task instead of leaving it at the FIFO head forever.
+CREATE TABLE IF NOT EXISTS scheduler_task_retries (
+  task_seq INTEGER PRIMARY KEY REFERENCES scheduler_tasks(queue_seq),
+  state TEXT NOT NULL DEFAULT 'pending'
+    CHECK (state IN ('pending', 'backoff', 'quarantined')),
+  attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  max_attempts INTEGER NOT NULL DEFAULT 3 CHECK (max_attempts BETWEEN 1 AND 10),
+  backoff_ms INTEGER NOT NULL DEFAULT 1000 CHECK (backoff_ms BETWEEN 0 AND 60000),
+  retry_at_ms INTEGER CHECK (retry_at_ms >= 0),
+  quarantined_at_ms INTEGER CHECK (quarantined_at_ms >= 0),
+  last_failure_event_seq INTEGER REFERENCES events(event_seq) CHECK (last_failure_event_seq > 0),
+  CHECK (attempt_count <= max_attempts),
+  CHECK (
+    (state = 'pending' AND attempt_count = 0 AND retry_at_ms IS NULL
+      AND quarantined_at_ms IS NULL AND last_failure_event_seq IS NULL)
+    OR
+    (state = 'backoff' AND attempt_count > 0 AND attempt_count < max_attempts
+      AND backoff_ms > 0 AND retry_at_ms IS NOT NULL
+      AND quarantined_at_ms IS NULL AND last_failure_event_seq IS NOT NULL)
+    OR
+    (state = 'quarantined' AND attempt_count = max_attempts AND backoff_ms = 0
+      AND retry_at_ms IS NULL AND quarantined_at_ms IS NOT NULL
+      AND last_failure_event_seq IS NOT NULL)
+  )
+) STRICT;
+CREATE INDEX IF NOT EXISTS scheduler_task_retries_ready_idx
+  ON scheduler_task_retries (state, retry_at_ms) WHERE state = 'backoff';
+
 -- At most one untrusted candidate per enrolled task; not a proof or receipt.
 -- Completion (including its timestamp) and insertion share one transaction.
 CREATE TABLE IF NOT EXISTS scheduler_task_candidates (

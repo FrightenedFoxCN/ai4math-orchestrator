@@ -134,17 +134,19 @@ pub(crate) fn run_model(
     // Validate descriptors before acquiring a lease. No native execution here:
     // T1 promotion is a separate operator action under the native project gate.
     let mut wire = timed_io::Wire::open()?;
-    let mut store = StateStore::open(private_state_path(root)?)?;
-    let (subject, lease, deadline) = {
+    let mut store = open_managed_state(root, false)?;
+    let (subject, lease, deadline, submission_deadline) = {
         let git = PromotionRepo::try_lock(repo)?;
         let subject = prepare(root, &git, &store, task, claim, role, seconds)?;
         packet(&subject, task, claim, role, seconds)?;
         let deadline = Instant::now() + Duration::from_secs(seconds);
+        let submission_deadline = deadline + Duration::from_secs(30);
         let lease = store
-            .claim_expected_task(
+            .claim_expected_task_with_submission_grace(
                 Some(role_track(role)?),
                 task,
                 Duration::from_secs(seconds),
+                Duration::from_secs(30),
                 MODEL_ACTOR,
             )?
             .context("requested DSH model task is not next eligible in its track")?;
@@ -152,7 +154,7 @@ pub(crate) fn run_model(
             let _ = store.finish_task_run(&lease, TaskRunOutcome::Failed, MODEL_ACTOR);
             return Err(err);
         }
-        (subject, lease, deadline)
+        (subject, lease, deadline, submission_deadline)
     }; // A breaker or trusted Git update can proceed while the Host is working.
     let outcome = (|| {
         let expected = packet(&subject, task, claim, role, seconds)?;
@@ -166,8 +168,8 @@ pub(crate) fn run_model(
             "approved DSH dispatch inputs changed while model task was running"
         );
         ensure!(
-            Instant::now() < deadline,
-            "DSH model task deadline elapsed before persistence"
+            Instant::now() < submission_deadline,
+            "DSH model submission grace elapsed before persistence"
         );
         store.finish_task_run(
             &lease,

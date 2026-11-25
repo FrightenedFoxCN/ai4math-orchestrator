@@ -66,6 +66,173 @@ fn fixture_event(store: &mut StateStore) -> Result<i64> {
 }
 
 #[test]
+fn pivot_replay_and_checkpoint_reject_grafted_main_history() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let repo = setup(root)?;
+    let state = root.join(".runtime/state.sqlite");
+    let mut store = StateStore::open(&state)?;
+    let facts = retain(root, serde_json::to_value(store.briefing_facts()?)?)?;
+    let approved = {
+        let git = PromotionRepo::lock(&repo)?;
+        plan(
+            root,
+            &git,
+            &mut store,
+            &facts,
+            B,
+            REASON,
+            Selection::just(PivotAction::ResumeAsIs),
+        )?
+        .adr_id()?
+    };
+    apply(
+        root,
+        &repo,
+        &facts,
+        B,
+        REASON,
+        &approved,
+        PivotAction::ResumeAsIs,
+    )?;
+    let checkpoint = store
+        .recorded_pivot(&approved)?
+        .context("missing recorded Pivot")?
+        .1
+        .git_commit;
+    trip(
+        root,
+        &repo,
+        "B2",
+        MODULE,
+        "a_second_target",
+        "A separate decision after the human checkpoint",
+        false,
+    )?;
+    let tree = git(&repo, &["rev-parse", &format!("{checkpoint}^{{tree}}")]);
+    let unrelated = git(&repo, &["commit-tree", &tree, "-m", "unrelated main"]);
+    git(
+        &repo,
+        &["update-ref", "refs/heads/main", &unrelated, &checkpoint],
+    );
+    fs::write(
+        repo.join("info/grafts"),
+        format!("{unrelated} {checkpoint}\n{checkpoint}\n"),
+    )?;
+    git(
+        &repo,
+        &["merge-base", "--is-ancestor", &checkpoint, &unrelated],
+    );
+    // Make the unrelated main the ledger's attested Git head while retaining the
+    // previous human checkpoint, so preview reaches the ancestry gate itself.
+    store.append_event(
+        Change {
+            actor: "fixture",
+            git_commit: Some(&unrelated),
+        },
+        "NOTE_RECORDED",
+        "system",
+        "example",
+        json!({}),
+    )?;
+    let after_pivot = retain(root, serde_json::to_value(store.briefing_facts()?)?)?;
+    let seq = store.status()?.last_event_seq;
+
+    let error = apply(
+        root,
+        &repo,
+        &facts,
+        B,
+        REASON,
+        &approved,
+        PivotAction::ResumeAsIs,
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("recorded ADR no longer belongs to main")
+    );
+    let locked = PromotionRepo::lock(&repo)?;
+    let error = plan(
+        root,
+        &locked,
+        &mut store,
+        &after_pivot,
+        "B2",
+        REASON,
+        Selection::just(PivotAction::ResumeAsIs),
+    )
+    .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("last human checkpoint is not in current main history"),
+        "{error:#}"
+    );
+    assert_eq!(store.status()?.last_event_seq, seq);
+    Ok(())
+}
+
+#[test]
+fn pivot_abandon_uses_physical_adoption_not_a_grafted_edge() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let repo = setup(root)?;
+    let state = root.join(".runtime/state.sqlite");
+    let mut store = StateStore::open(&state)?;
+    let facts = retain(root, serde_json::to_value(store.briefing_facts()?)?)?;
+    let intent = {
+        let git = PromotionRepo::lock(&repo)?;
+        let p = plan(
+            root,
+            &git,
+            &mut store,
+            &facts,
+            B,
+            REASON,
+            Selection::just(PivotAction::ResumeAsIs),
+        )?;
+        let pin = git.pivot_pending_ref(&state)?;
+        prepare(&mut store, &git, &pin, p)?
+    };
+    let tree = git(
+        &repo,
+        &[
+            "rev-parse",
+            &format!("{}^{{tree}}", intent.plan.base_commit),
+        ],
+    );
+    let unrelated = git(&repo, &["commit-tree", &tree, "-m", "unrelated main"]);
+    git(
+        &repo,
+        &[
+            "update-ref",
+            "refs/heads/main",
+            &unrelated,
+            &intent.plan.base_commit,
+        ],
+    );
+    fs::write(
+        repo.join("info/grafts"),
+        format!("{unrelated} {}\n{}\n", intent.new_commit, intent.new_commit),
+    )?;
+    git(
+        &repo,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &intent.new_commit,
+            &unrelated,
+        ],
+    );
+    abandon(root, &repo, &intent.adr_id)?;
+    assert!(store.pivot_intent()?.is_none());
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), unrelated);
+    Ok(())
+}
+
+#[test]
 fn post_cas_recovery_preserves_unreviewed_events_and_finalizes_once() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();

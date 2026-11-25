@@ -1,4 +1,5 @@
 use super::{VerifiedCandidate, digest};
+use ai4math_evidence::{CandidateEvidence, RegressionEvidence};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::Read, path::Path};
@@ -36,7 +37,7 @@ impl RegressionBinding {
         }
     }
 
-    fn matches(&self, candidate: &VerifiedCandidate) -> bool {
+    fn matches_candidate(&self, candidate: &dyn CandidateEvidence) -> bool {
         let receipt = candidate.receipt();
         self.receipt_sha256 == receipt.receipt_sha256()
             && self.source_sha256 == receipt.patch_sha256()
@@ -45,6 +46,10 @@ impl RegressionBinding {
                 &self.file_path,
                 candidate.source().as_bytes(),
             )
+    }
+
+    fn matches(&self, candidate: &VerifiedCandidate) -> bool {
+        self.matches_candidate(candidate)
     }
 }
 
@@ -161,6 +166,15 @@ impl RegressionArtifacts {
         ensure!(!dest.exists(), "golden cache already exists for {commit}");
         fs::rename(staging.path(), dest)?;
         Ok(())
+    }
+}
+
+// SAFETY: In production, the broker collects these artifacts only after a fresh
+// native regression checks the exact candidate. Private fields and the absence of
+// `Deserialize` prevent caller-supplied regression evidence.
+unsafe impl RegressionEvidence for RegressionArtifacts {
+    fn matches_candidate(&self, candidate: &dyn CandidateEvidence) -> bool {
+        self.binding.matches_candidate(candidate)
     }
 }
 

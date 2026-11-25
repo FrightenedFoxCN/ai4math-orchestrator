@@ -1,14 +1,17 @@
 use super::{
-    Change, StateStore, TaskLease, TaskTrack, event, release_lease, sediment, valid_task_id,
-    valid_token,
+    Change, StateStore, TaskLease, TaskTrack, event, now_ms, release_lease, sediment,
+    valid_task_id, valid_token,
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::fmt;
 
 const RESULT_LIMIT: usize = 32 * 1024;
+pub(super) const DEFAULT_MAX_ATTEMPTS: i64 = 3;
+pub(super) const INITIAL_RETRY_BACKOFF_MS: i64 = 1_000;
+const MAX_RETRY_BACKOFF_MS: i64 = 60_000;
 const RUNNABLE_CLAIM: &str = "FROM scheduler_tasks t JOIN claims c ON c.claim_id=?3
     WHERE t.queue_seq=?1 AND c.engine=t.engine
     AND c.module_path=t.module_path AND c.formal_target=(t.module_path || '#' || t.target)
@@ -95,6 +98,93 @@ fn validate_candidate(base_commit: &str, claim_id: &str, result_json: &str) -> R
     Ok(())
 }
 
+fn record_task_failure(
+    tx: &Transaction<'_>,
+    task_seq: i64,
+    lease: &TaskLease,
+    change: Change<'_>,
+) -> Result<()> {
+    let scoped = sediment::link_table_exists(tx)?
+        && tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM scheduler_sediment_adaptations WHERE task_seq=?1)",
+            [task_seq],
+            |r| r.get::<_, bool>(0),
+        )?;
+    if scoped {
+        // Explicit scopes are leased only by their reviewed native workflow;
+        // they do not participate in ordinary FIFO retry rotation.
+        event(tx, change, "TASK_RUN_FAILED", "task", &lease.id, json!({}))?;
+        return Ok(());
+    }
+
+    let (attempt_count, max_attempts): (i64, i64) = tx
+        .query_row(
+            "SELECT attempt_count,max_attempts FROM scheduler_task_retries WHERE task_seq=?1",
+            [task_seq],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?
+        .unwrap_or((0, DEFAULT_MAX_ATTEMPTS));
+    ensure!(
+        attempt_count < max_attempts,
+        "task retry budget is already exhausted"
+    );
+    let attempt = attempt_count + 1;
+    let quarantined = attempt == max_attempts;
+    let backoff_ms = if quarantined {
+        0
+    } else {
+        INITIAL_RETRY_BACKOFF_MS
+            .checked_shl((attempt - 1) as u32)
+            .unwrap_or(MAX_RETRY_BACKOFF_MS)
+            .min(MAX_RETRY_BACKOFF_MS)
+    };
+    let now = now_ms(tx)?;
+    let retry_at_ms = if quarantined {
+        None
+    } else {
+        Some(
+            now.checked_add(backoff_ms)
+                .context("task retry deadline overflow")?,
+        )
+    };
+    let quarantined_at_ms = quarantined.then_some(now);
+    let state = if quarantined {
+        "quarantined"
+    } else {
+        "backoff"
+    };
+    let payload = json!({
+        "state": state,
+        "attempt": attempt,
+        "max_attempts": max_attempts,
+        "backoff_ms": backoff_ms,
+        "retry_at_ms": retry_at_ms,
+        "quarantined_at_ms": quarantined_at_ms,
+    });
+    let failure_seq = event(tx, change, "TASK_RUN_FAILED", "task", &lease.id, payload)?;
+    tx.execute(
+        "INSERT INTO scheduler_task_retries
+            (task_seq,state,attempt_count,max_attempts,backoff_ms,retry_at_ms,quarantined_at_ms,last_failure_event_seq)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8)
+         ON CONFLICT(task_seq) DO UPDATE SET
+            state=excluded.state,attempt_count=excluded.attempt_count,max_attempts=excluded.max_attempts,
+            backoff_ms=excluded.backoff_ms,retry_at_ms=excluded.retry_at_ms,
+            quarantined_at_ms=excluded.quarantined_at_ms,last_failure_event_seq=excluded.last_failure_event_seq",
+        params![
+            task_seq,
+            state,
+            attempt,
+            max_attempts,
+            backoff_ms,
+            retry_at_ms,
+            quarantined_at_ms,
+            failure_seq
+        ],
+    )?;
+    Ok(())
+}
+
 fn read_candidate(
     row: &Row<'_>,
     id: &str,
@@ -121,9 +211,10 @@ fn read_candidate(
 
 impl StateStore {
     /// Consume a live, unfrozen lease and atomically record the run disposition.
-    /// A candidate completes scheduler bookkeeping only. An explicit failure
-    /// releases the lease for retry; scoped tasks require another explicit lease.
-    /// A crash leaves TTL recovery intact.
+    /// A candidate completes scheduler bookkeeping only. An explicit ordinary
+    /// failure advances durable exponential backoff and eventually quarantines
+    /// the task; scoped tasks still require another explicit lease. A crash
+    /// leaves TTL recovery intact.
     /// The coordinator must validate Git and the output protocol before calling;
     /// Change is attribution, not authorization.
     pub fn finish_task_run(
@@ -212,7 +303,7 @@ impl StateStore {
                     json!({"untrusted_candidate": true}),
                 )?;
             } else {
-                event(tx, change, "TASK_RUN_FAILED", "task", &lease.id, json!({}))?;
+                record_task_failure(tx, seq, lease, change)?;
             }
             Ok(())
         })

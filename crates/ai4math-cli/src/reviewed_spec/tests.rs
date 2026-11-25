@@ -1,7 +1,24 @@
 use super::*;
 use crate::{declare_claim, init, managed_tests::git, promote_managed};
-use ai4math_store::Trust;
-use std::{fs, path::PathBuf};
+use ai4math_store::{StateStore, Trust};
+use std::{fs, path::PathBuf, process::Command};
+
+fn ordinary_is_ancestor(repo: &Path, old: &str, new: &str) -> Result<bool> {
+    let output = Command::new("/usr/bin/git")
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .arg("--git-dir")
+        .arg(repo)
+        .args(["merge-base", "--is-ancestor", old, new])
+        .output()?;
+    anyhow::ensure!(
+        output.status.success() || output.status.code() == Some(1),
+        "fixture Git ancestry failed"
+    );
+    Ok(output.status.success())
+}
 
 const ID: &str = "reviewed";
 const SPEC: &str = "TrustedSpec.lean";
@@ -93,6 +110,50 @@ fn requires_exact_current_review_and_unchanged_ordered_prefix() -> Result<()> {
     assert_eq!(git(&repo, &["rev-parse", MAIN]), new_head);
     assert!(store.promotion_intent()?.is_none());
     assert_eq!(store.status()?.last_event_seq, end);
+    Ok(())
+}
+
+#[test]
+fn reviewed_snapshot_uses_physical_ancestry_under_grafts() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let (_, repo, base) = setup(root, "1 = 1")?;
+    let tree = git(&repo, &["rev-parse", &format!("{base}^{{tree}}")]);
+    let child = git(
+        &repo,
+        &["commit-tree", &tree, "-p", &base, "-m", "physical child"],
+    );
+    let unrelated = git(&repo, &["commit-tree", &tree, "-m", "unrelated root"]);
+    let binding = ReviewedLeanSpec {
+        repo: PromotionRepo::lock(&repo)?.path().to_str().unwrap().into(),
+        claim_id: ID.into(),
+        approved_git_commit: base.clone(),
+        spec_file: SPEC.into(),
+        spec_decl: "approved".into(),
+        spec_prefix_sha256: "0".repeat(64),
+    };
+
+    git(&repo, &["update-ref", MAIN, &child, &base]);
+    fs::write(
+        repo.join("info/grafts"),
+        format!("{child}\n{unrelated} {base}\n"),
+    )?;
+    let locked = PromotionRepo::lock(&repo)?;
+    let tx = locked.snapshot(TARGET, None)?;
+    check_snapshot(&locked, &tx, &binding)?;
+    assert!(!ordinary_is_ancestor(&repo, &base, &child)?);
+    drop(locked);
+
+    git(&repo, &["update-ref", MAIN, &unrelated, &child]);
+    let locked = PromotionRepo::lock(&repo)?;
+    let tx = locked.snapshot(TARGET, None)?;
+    assert!(ordinary_is_ancestor(&repo, &base, &unrelated)?);
+    let error = check_snapshot(&locked, &tx, &binding).unwrap_err();
+    assert!(
+        error.to_string().contains(
+            "candidate base does not descend from the reviewed Lean specification snapshot"
+        )
+    );
     Ok(())
 }
 

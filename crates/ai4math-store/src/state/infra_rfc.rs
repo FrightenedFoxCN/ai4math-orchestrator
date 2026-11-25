@@ -1,8 +1,8 @@
 //! Operator-only durable RFC intake and 7-state lifecycle.
 //! Approval and lifecycle transitions record operator-verified milestones, not work admission or trust.
 use super::*;
-use ai4math_broker::{VerifiedInfraCompletion, VerifiedInfraSmoke};
 use ai4math_core::{Engine, InfraRFC, InfraStatus, validate_source_path};
+use ai4math_evidence::{InfraCompletionEvidence, InfraSmokeEvidence};
 use anyhow::bail;
 use sha2::{Digest, Sha256};
 
@@ -326,7 +326,9 @@ struct TransitionRow {
     reason: Option<String>,
 }
 
-fn fetch(db: &Connection, repo: &str, rfc_id: &str) -> Result<Option<Stored>> {
+// The caller owns the surrounding read or write transaction. Keeping every
+// projection read on that one connection snapshot prevents mixed event chains.
+fn fetch_in(db: &Connection, repo: &str, rfc_id: &str) -> Result<Option<Stored>> {
     let found = db
         .query_row(READ, params![rfc_id, repo], |r| {
             Ok((
@@ -644,6 +646,20 @@ fn fetch(db: &Connection, repo: &str, rfc_id: &str) -> Result<Option<Stored>> {
     }))
 }
 
+fn read_infra_rfc(db: &Connection, repo: &str, rfc_id: &str) -> Result<Option<InfraRfcRecord>> {
+    bound(db, repo)?;
+    let table: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='infra_rfcs')",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(if table {
+        fetch_in(db, repo, rfc_id)?.map(|stored| stored.row)
+    } else {
+        None
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_transition(
     tx: &Transaction<'_>,
@@ -691,7 +707,7 @@ fn record_transition(
             reason,
         ],
     )?;
-    let updated = fetch(tx, repo, &row.draft.rfc_id)?
+    let updated = fetch_in(tx, repo, &row.draft.rfc_id)?
         .context("updated InfraRFC disappeared")?
         .row;
     confirm_git()?;
@@ -702,17 +718,10 @@ impl StateStore {
     /// Read a historical RFC for exactly the bound repository. This is a description, not launch authorization.
     pub fn infra_rfc(&self, repo: &str, rfc_id: &str) -> Result<Option<InfraRfcRecord>> {
         ensure!(id(rfc_id, 100), "invalid InfraRFC ID");
-        bound(&self.db, repo)?;
-        let table: bool = self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='infra_rfcs')",
-            [],
-            |r| r.get(0),
-        )?;
-        Ok(if table {
-            fetch(&self.db, repo, rfc_id)?.map(|r| r.row)
-        } else {
-            None
-        })
+        let tx = self.db.unchecked_transaction()?;
+        let record = read_infra_rfc(&tx, repo, rfc_id)?;
+        tx.commit()?;
+        Ok(record)
     }
 
     /// Caller holds the Git lock and confirms the actual reviewed head immediately before SQLite commit.
@@ -731,7 +740,7 @@ impl StateStore {
             let consumer_sha = consumer(tx, draft)?;
             let digest = draft_sha(repo, review, module, draft, &consumer_sha)?;
             let rfc = &draft.rfc_id;
-            if let Some(stored) = fetch(tx, repo, rfc)? {
+            if let Some(stored) = fetch_in(tx, repo, rfc)? {
                 ensure!(
                     stored.row.draft_sha256 == digest,
                     "InfraRFC ID already identifies a different immutable draft or review scope"
@@ -754,7 +763,7 @@ impl StateStore {
                 "INSERT INTO infra_rfcs(rfc_id,repo,module_path,reviewed_commit,draft_sha256,consumer_sha256,draft_json,submitted_event_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
                 params![rfc, repo, module, review, digest, consumer_sha, body, seq],
             )?;
-            let row = fetch(tx, repo, rfc)?
+            let row = fetch_in(tx, repo, rfc)?
                 .context("submitted InfraRFC disappeared")?
                 .row;
             confirm_git()?;
@@ -777,23 +786,25 @@ impl StateStore {
         );
         self.write(|tx| {
             writing_scope(tx, repo, review)?;
-            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let stored = fetch_in(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
             let row = &stored.row;
             ensure!(
                 row.reviewed_commit == review && row.draft_sha256 == approval,
                 "InfraRFC approval does not match the exact reviewed draft"
             );
-            ensure!(
-                consumer(tx, &row.draft)? == stored.consumer_sha,
-                "InfraRFC consumer changed since submission"
-            );
             if row.status == InfraRfcStatus::Approved {
+                // Exact replay is independent of later Claim events. Only a new
+                // DRAFT -> APPROVED conversion must still match its consumer.
                 confirm_git()?;
                 return Ok(stored.row);
             }
             ensure!(
                 row.status == InfraRfcStatus::Draft && row.approved_event_seq.is_none(),
                 "InfraRFC can only be approved from DRAFT status"
+            );
+            ensure!(
+                consumer(tx, &row.draft)? == stored.consumer_sha,
+                "InfraRFC consumer changed since submission"
             );
             let seq = event(
                 tx,
@@ -813,7 +824,7 @@ impl StateStore {
                 )? == 1,
                 "InfraRFC approval row changed"
             );
-            let approved = fetch(tx, repo, rfc_id)?
+            let approved = fetch_in(tx, repo, rfc_id)?
                 .context("approved InfraRFC disappeared")?
                 .row;
             confirm_git()?;
@@ -836,7 +847,7 @@ impl StateStore {
         );
         self.write(|tx| {
             writing_scope(tx, repo, reviewed_main)?;
-            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let stored = fetch_in(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
             let row = &stored.row;
             ensure!(
                 row.reviewed_commit == reviewed_main && row.draft_sha256 == draft_sha256,
@@ -879,7 +890,7 @@ impl StateStore {
         repo: &str,
         rfc_id: &str,
         draft_sha256: &str,
-        smoke: &VerifiedInfraSmoke,
+        smoke: &dyn InfraSmokeEvidence,
         confirm_git: impl FnOnce() -> Result<()>,
     ) -> Result<InfraRfcRecord> {
         self.freeze_infra_rfc_verified(
@@ -916,7 +927,7 @@ impl StateStore {
         );
         self.write(|tx| {
             writing_scope(tx, repo, smoke_commit)?;
-            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let stored = fetch_in(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
             let row = &stored.row;
             ensure!(
                 row.draft_sha256 == draft_sha256,
@@ -968,7 +979,7 @@ impl StateStore {
         repo: &str,
         rfc_id: &str,
         draft_sha256: &str,
-        completion: &VerifiedInfraCompletion,
+        completion: &dyn InfraCompletionEvidence,
         confirm_git: impl FnOnce() -> Result<()>,
     ) -> Result<InfraRfcRecord> {
         self.complete_infra_rfc_verified(
@@ -1007,7 +1018,7 @@ impl StateStore {
         );
         self.write(|tx| {
             writing_scope(tx, repo, completion_commit)?;
-            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let stored = fetch_in(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
             let row = &stored.row;
             ensure!(
                 row.draft_sha256 == draft_sha256,
@@ -1083,7 +1094,7 @@ impl StateStore {
         );
         self.write(|tx| {
             writing_scope(tx, repo, reviewed_main)?;
-            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let stored = fetch_in(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
             let row = &stored.row;
             ensure!(
                 row.draft_sha256 == draft_sha256,
@@ -1148,7 +1159,7 @@ impl StateStore {
         );
         self.write(|tx| {
             writing_scope(tx, repo, reviewed_main)?;
-            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let stored = fetch_in(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
             let row = &stored.row;
             ensure!(
                 row.draft_sha256 == draft_sha256,
@@ -1173,7 +1184,7 @@ impl StateStore {
                 ),
                 "InfraRFC can only be superseded from APPROVED, BUILDING_SMOKE, or FROZEN_PROVING status"
             );
-            let replacement = fetch(tx, repo, replacement_rfc_id)?
+            let replacement = fetch_in(tx, repo, replacement_rfc_id)?
                 .context("replacement InfraRFC not found in this repository")?;
             ensure!(
                 replacement.row.draft.requested_by_claim == row.draft.requested_by_claim,

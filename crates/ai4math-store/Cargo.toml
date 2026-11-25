@@ -4,8 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-ai4math-broker.workspace = true
 ai4math-core.workspace = true
+ai4math-evidence.workspace = true
 anyhow.workspace = true
 libc.workspace = true
 rusqlite.workspace = true

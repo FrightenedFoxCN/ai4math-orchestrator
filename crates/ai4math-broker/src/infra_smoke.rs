@@ -7,6 +7,7 @@ use super::{
     },
     dependencies_digest, digest, path_for, sandbox, stage_source, validate_modules,
 };
+use ai4math_evidence::{InfraCompletionEvidence, InfraSmokeEvidence};
 use anyhow::{Context, Result, ensure};
 use std::{collections::HashSet, fs, time::Instant};
 
@@ -98,6 +99,26 @@ impl VerifiedInfraSmoke {
     }
 }
 
+// SAFETY: Production values are constructed only after the full Lean source
+// slice builds and the sealed native smoke checker returns the exact audit seal.
+unsafe impl InfraSmokeEvidence for VerifiedInfraSmoke {
+    fn commit(&self) -> &str {
+        self.commit()
+    }
+
+    fn module_path(&self) -> &str {
+        self.module_path()
+    }
+
+    fn definitions(&self) -> &[String] {
+        self.definitions()
+    }
+
+    fn receipt_sha256(&self) -> &str {
+        self.receipt_sha256()
+    }
+}
+
 /// Sealed, all-or-nothing evidence that an infrastructure module and its
 /// audited definitions and API lemmas compile cleanly with the full ordered
 /// project slice and pass native kernel replay and axiom checks.
@@ -134,6 +155,30 @@ impl VerifiedInfraCompletion {
     }
     pub fn receipt_sha256(&self) -> &str {
         &self.receipt_sha256
+    }
+}
+
+// SAFETY: Production values are constructed only after the full Lean source
+// slice builds and the sealed native completion checker returns the exact audit seal.
+unsafe impl InfraCompletionEvidence for VerifiedInfraCompletion {
+    fn commit(&self) -> &str {
+        self.commit()
+    }
+
+    fn module_path(&self) -> &str {
+        self.module_path()
+    }
+
+    fn definitions(&self) -> &[String] {
+        self.definitions()
+    }
+
+    fn api_lemmas(&self) -> &[String] {
+        self.api_lemmas()
+    }
+
+    fn receipt_sha256(&self) -> &str {
+        self.receipt_sha256()
     }
 }
 

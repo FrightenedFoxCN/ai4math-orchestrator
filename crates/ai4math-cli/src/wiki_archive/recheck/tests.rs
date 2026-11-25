@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::{declare_claim, init, managed_tests::git, wiki_archive};
+use ai4math_store::StateStore;
 use serde_json::Value;
 use std::{collections::BTreeMap, fs, path::PathBuf};
 

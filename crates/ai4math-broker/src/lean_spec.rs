@@ -8,6 +8,7 @@ use super::{
     },
     digest, lean_breaker_sources_sha256, path_for, sandbox, stage_source, validate_modules,
 };
+use ai4math_evidence::LeanComparisonEvidence;
 use anyhow::{Context, Result, ensure};
 use std::{fs, time::Instant};
 
@@ -62,6 +63,46 @@ impl VerifiedLeanComparison {
     /// Durable, tier-specific comparison identity, independent of candidate verification timing.
     pub fn receipt_sha256(&self) -> &str {
         &self.receipt_sha256
+    }
+}
+
+// SAFETY: Production values are constructed only after both declarations replay
+// through the native Lean kernel and the sealed comparison checker returns its exact seal.
+unsafe impl LeanComparisonEvidence for VerifiedLeanComparison {
+    fn spec_file(&self) -> &str {
+        self.spec_file()
+    }
+
+    fn spec_decl(&self) -> &str {
+        self.spec_decl()
+    }
+
+    fn spec_prefix_sha256(&self) -> &str {
+        self.spec_prefix_sha256()
+    }
+
+    fn base_commit(&self) -> &str {
+        self.base_commit()
+    }
+
+    fn candidate_file(&self) -> &str {
+        self.candidate_file()
+    }
+
+    fn candidate_decl(&self) -> &str {
+        self.candidate_decl()
+    }
+
+    fn candidate_source_sha256(&self) -> &str {
+        self.candidate_source_sha256()
+    }
+
+    fn candidate_receipt_sha256(&self) -> &str {
+        self.candidate_receipt_sha256()
+    }
+
+    fn receipt_sha256(&self) -> &str {
+        self.receipt_sha256()
     }
 }
 

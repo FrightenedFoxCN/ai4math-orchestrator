@@ -3,6 +3,7 @@ use super::{
     Broker, Engine, Lane, Pressure, TIMEOUT, Toolchain, dependencies_digest, digest, path_for,
     sandbox, stage_source, validate_modules,
 };
+use ai4math_evidence::BreakerProbeEvidence;
 use anyhow::{Context, Result, ensure};
 use std::{
     fs,
@@ -10,6 +11,8 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
+
+pub(super) use super::lean_kernel::reject_installation_shadows;
 
 const CHECKER_FILE: &str = "Ai4mathSealedBreakerProbe.lean";
 const CHECKER: &str = include_str!("breaker_probe_audit.lean");
@@ -49,6 +52,34 @@ impl VerifiedBreakerProbes {
     }
     pub fn receipt_sha256(&self) -> &str {
         &self.receipt_sha256
+    }
+}
+
+// SAFETY: Production values are constructed only after the committed Lean source
+// builds and the sealed native kernel checker returns the exact audit seal.
+unsafe impl BreakerProbeEvidence for VerifiedBreakerProbes {
+    fn base_commit(&self) -> &str {
+        self.base_commit()
+    }
+
+    fn file_path(&self) -> &str {
+        self.file_path()
+    }
+
+    fn definition(&self) -> &str {
+        self.definition()
+    }
+
+    fn cases(&self) -> &[String] {
+        self.cases()
+    }
+
+    fn sources_sha256(&self) -> &str {
+        self.sources_sha256()
+    }
+
+    fn receipt_sha256(&self) -> &str {
+        self.receipt_sha256()
     }
 }
 
@@ -122,23 +153,6 @@ fn validate_inputs<'a>(
     validate_modules(Engine::Lean4, sources, Some(CHECKER_FILE))?;
     reject_installation_shadows(tool, sources)?;
     Ok(module)
-}
-
-pub(super) fn reject_installation_shadows(
-    tool: &Toolchain,
-    sources: &[(&str, &str)],
-) -> Result<()> {
-    for &(path, _) in sources {
-        let name = path_for(Engine::Lean4, path)?;
-        ensure!(
-            !["init", "lean", "std"].contains(&name.to_ascii_lowercase().as_str())
-                && !tool.reads.iter().any(|root| {
-                    root.join(name).is_dir() || root.join(format!("{name}.olean")).is_file()
-                }),
-            "module shadows the trusted Lean installation: {path:?}"
-        );
-    }
-    Ok(())
 }
 
 /// Only collect the module named in this invocation. A later module (including

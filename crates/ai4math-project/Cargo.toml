@@ -1,0 +1,13 @@
+[package]
+name = "ai4math-project"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+ai4math-broker.workspace = true
+ai4math-store.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

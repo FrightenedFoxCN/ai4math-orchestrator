@@ -1,9 +1,10 @@
 //! One-shot advisory observation of managed main against an explicit baseline
 //! or one Claim's current managed T1 or sealed T3 receipt. Neither path confers approval.
 use super::{Plan, ProjectDelta, bound_engine, predecessors, print_json, validate_recipe};
-use crate::{promotion::PromotionRepo, reviewed_spec, worker_dispatch::private_state_path};
+use crate::{promotion::PromotionRepo, reviewed_spec};
 use ai4math_broker::lean_breaker_sources_sha256;
 use ai4math_core::Engine;
+use ai4math_project::open_managed_state;
 use ai4math_store::StateStore;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
@@ -165,7 +166,7 @@ struct DiscoverySession {
 
 impl DiscoverySession {
     fn open(root: &Path, repo: &Path, existing_lock: bool) -> Result<Self> {
-        let store = StateStore::open_readonly(private_state_path(root)?)?;
+        let store = open_managed_state(root, true)?;
         let stamp = store.managed_wiki_stamp()?.context(
             "bind the managed repository and recover pending Git transactions before T3 discovery",
         )?;
@@ -213,7 +214,7 @@ impl DiscoverySession {
             plan: None,
             advisory_only: true,
         };
-        if !git.is_ancestor(baseline, head)? {
+        if !git.is_ungrafted_ancestor(baseline, head)? {
             // Do not pick a merge base or claim an equivalent source tree after a forced rewrite.
             observed.status = Status::Diverged;
         } else if baseline != head {
@@ -237,5 +238,85 @@ impl DiscoverySession {
             "managed main or ledger changed during T3 discovery; retry"
         );
         Ok(observed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{init, managed_tests::git};
+    use std::{fs, process::Command};
+
+    fn ordinary_is_ancestor(repo: &Path, old: &str, new: &str) -> Result<bool> {
+        let output = Command::new("/usr/bin/git")
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .arg("--git-dir")
+            .arg(repo)
+            .args(["merge-base", "--is-ancestor", old, new])
+            .output()?;
+        ensure!(
+            output.status.success() || output.status.code() == Some(1),
+            "fixture Git ancestry failed"
+        );
+        Ok(output.status.success())
+    }
+
+    #[test]
+    fn discovery_classifies_physical_history_under_grafts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        init(root, Engine::Lean4)?;
+        let work = root.join("work");
+        fs::create_dir(&work)?;
+        git(&work, &["init", "--initial-branch=main"]);
+        fs::write(work.join("A.lean"), "def unchanged : Nat := 1\n")?;
+        git(&work, &["add", "A.lean"]);
+        git(&work, &["commit", "-m", "baseline"]);
+        let repo = root.join("repo.git");
+        git(root, &["clone", "--bare", "work", "repo.git"]);
+        let repo = repo.canonicalize()?;
+        let base = git(&repo, &["rev-parse", "refs/heads/main"]);
+        let tree = git(&repo, &["rev-parse", &format!("{base}^{{tree}}")]);
+        let child = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &base, "-m", "physical child"],
+        );
+        let unrelated = git(&repo, &["commit-tree", &tree, "-m", "unrelated root"]);
+        let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+        store.bind_task_repository(repo.to_str().unwrap(), &base)?;
+        let seq = store.status()?.last_event_seq;
+        drop(store);
+
+        git(&repo, &["update-ref", "refs/heads/main", &child, &base]);
+        fs::write(
+            repo.join("info/grafts"),
+            format!("{child}\n{unrelated} {base}\n"),
+        )?;
+        assert!(!ordinary_is_ancestor(&repo, &base, &child)?);
+        let unchanged =
+            DiscoverySession::open(root, &repo, false)?.observe("A.lean", &base, Engine::Lean4)?;
+        assert!(matches!(unchanged.status, Status::Unchanged));
+        assert!(unchanged.plan.is_none());
+
+        git(
+            &repo,
+            &["update-ref", "refs/heads/main", &unrelated, &child],
+        );
+        fs::write(repo.join("info/grafts"), format!("{unrelated} {base}\n"))?;
+        assert!(ordinary_is_ancestor(&repo, &base, &unrelated)?);
+        let diverged =
+            DiscoverySession::open(root, &repo, false)?.observe("A.lean", &base, Engine::Lean4)?;
+        assert!(matches!(diverged.status, Status::Diverged));
+        assert!(diverged.plan.is_none());
+        assert_eq!(
+            StateStore::open_readonly(root.join(".runtime/state.sqlite"))?
+                .status()?
+                .last_event_seq,
+            seq
+        );
+        Ok(())
     }
 }

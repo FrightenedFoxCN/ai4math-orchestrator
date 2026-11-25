@@ -51,25 +51,28 @@
 ```text
 crates/
 ├── ai4math-core/       # 零 IO 纯逻辑层
-│   ├── contracts       # 与 schemas/*.json 1:1 对应的 serde 强类型结构
+│   ├── contracts       # 与 schemas/*.json 对应的 serde 强类型结构
 │   ├── trust           # L0–L5 偏序、AND-OR effective_trust_level 聚合纯函数
 │   └── preflight       # Lean 4 / Agda / Rocq 静态禁入扫描器与 Diff 范围审计
-├── ai4math-store/      # rusqlite (bundled + fts5) WAL 持久化层
+├── ai4math-evidence/   # 零 IO 证据 wire/hash 与 unsafe 只读端口；不持有原生构造权
+├── ai4math-store/      # rusqlite (bundled + fts5) WAL 持久化层，只依赖 evidence 端口
 │   ├── state_db        # schemas/state-store.sql 初始化、Append-Only Event Log、T3 BFS 标脏传播
 │   └── math_wiki       # schemas/wiki-index.sql、.mathwiki/*.md 双向同步、符号/FTS5 混合检索与 Shadow Hint
-├── ai4math-broker/     # 单机多核验证、沙箱与洁净室准入引擎
-│   ├── sandbox         # macOS Seatbelt (canonicalize) / Linux bwrap + setpgid 整树回收
-│   ├── resources       # Fast/Heavy 双车道优先级队列 + 70%/85% 内存水位线准入控制
+├── ai4math-broker/     # 单机多核验证、沙箱与洁净室准入引擎；独占构造封印证据
+│   ├── sandbox         # macOS Seatbelt (canonicalize)；Linux bwrap 后端尚未实现
+│   ├── resources       # Fast/Heavy 双车道优先级队列与内存水位线准入控制
 │   ├── golden_cache    # Commit-keyed 黄金快照池（APFS cp -cR / clonefile + pinned 保活 + LRU GC）
 │   └── cleanroom       # Lean Comparator / Agda --safe / Rocq Print Assumptions 裁判包装器与 Receipt 签发
+├── ai4math-project/    # 项目根/runtime/SQLite 安全门禁与原生租约门面
 ├── ai4math-daemon/     # 二进制 ai4mathd：UDS JSON-RPC 2.0 + 实时生命体征流 + Fact Pack 编译器
 └── ai4math-cli/        # 二进制 ai4math：项目初始化 / 状态查询 / Wiki 索引重建 / Red-Team 安全自检
 ```
 
 ### 关键 Crate 选型
-* **SQLite**：`rusqlite`（启用 `bundled` + `fts5` 特性）+ `tokio::task::spawn_blocking` 串行写事务，消除跨系统 SQLite 动态库版本差异；
-* **异步与并发**：`tokio`（UDS 监听、双车道调度、超时与子进程监控）；
+* **SQLite**：`rusqlite`（启用 `bundled` + `fts5` 特性）；当前使用 `std::thread` 与 SQLite 写事务串行化，不依赖 tokio。
+* **异步与并发**：当前 daemon 使用 `std::thread`、UDS 与有界 channel；tokio 是早期设计目标，尚未引入。
 * **序列化与哈希**：`serde` / `serde_json` / `serde_yaml` + `sha2`（`patch_sha256`、`receipt_sha256`、`def_fingerprint`）。
+* **证据边界**：`ai4math-evidence` 只定义 wire/hash 和 `unsafe` 只读端口；Broker 独占构造封印类型，Store 不反向依赖 Broker。端口防止普通 safe Rust/JSON 伪造，不防御恶意 `unsafe` 依赖或直接篡改 SQLite。
 
 ---
 

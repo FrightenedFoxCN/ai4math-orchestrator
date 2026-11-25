@@ -3,6 +3,7 @@ use super::{bound_engine, print_json, promotion::PromotionRepo};
 use ai4math_broker::{
     Broker, MAX_ORACLE_QUERY_BYTES, OracleObservation, OracleQuery, OracleSolvers,
 };
+use ai4math_project::{ManagedProject, open_managed_state};
 use ai4math_store::{OracleApproval, RetainedOracleObservation, StateStore};
 use anyhow::{Context, Result, ensure};
 use std::{fs, io::Read, path::Path};
@@ -75,7 +76,7 @@ fn current_approval(
     solvers: &OracleSolvers,
 ) -> Result<OracleApproval> {
     let lock = PromotionRepo::lock(repo)?;
-    let store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let store = open_managed_state(root, true)?;
     prepare(
         root,
         &lock,
@@ -144,8 +145,8 @@ fn record_current(
     observation: &OracleObservation,
 ) -> Result<RetainedOracleObservation> {
     let lock = PromotionRepo::lock(repo)?;
-    let state = root.join(".runtime/state.sqlite");
-    let store = StateStore::open_readonly(&state)?;
+    let project = ManagedProject::new(root)?;
+    let store = project.open_state_readonly()?;
     let live = prepare(
         root,
         &lock,
@@ -159,7 +160,7 @@ fn record_current(
         "Oracle approval changed during the probe; evidence not retained"
     );
     drop(store);
-    let mut store = StateStore::open(&state)?;
+    let mut store = project.open_state()?;
     ensure!(
         lock.main_head()? == approval.commit,
         "main moved before the Oracle append"
@@ -172,7 +173,7 @@ fn record_current(
 
 pub(crate) fn read_retained(root: &Path, id: &str) -> Result<()> {
     validate_sha(id)?;
-    let store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let store = open_managed_state(root, true)?;
     print_json(
         store
             .oracle_observation(id)?
@@ -188,8 +189,8 @@ pub(crate) fn hold(root: &Path, repo: &Path, task: &str, id: &str, seconds: u64)
         "Oracle hold duration must be between 1 and 3600 seconds"
     );
     let lock = PromotionRepo::lock(repo)?;
-    let path = root.join(".runtime/state.sqlite");
-    let store = StateStore::open_readonly(&path)?;
+    let project = ManagedProject::new(root)?;
+    let store = project.open_state_readonly()?;
     let observation = store
         .oracle_observation(id)?
         .context("unknown retained Oracle observation")?;
@@ -207,7 +208,7 @@ pub(crate) fn hold(root: &Path, repo: &Path, task: &str, id: &str, seconds: u64)
         "Oracle observation is not from the current reviewed project context"
     );
     drop(store);
-    let mut store = StateStore::open(&path)?;
+    let mut store = project.open_state()?;
     ensure!(
         lock.main_head()? == approval.commit,
         "main moved before the Oracle hold"
@@ -217,12 +218,12 @@ pub(crate) fn hold(root: &Path, repo: &Path, task: &str, id: &str, seconds: u64)
 
 pub(crate) fn release_hold(root: &Path, task: &str, hold: &str) -> Result<()> {
     validate_sha(hold)?;
-    let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, false)?;
     print_json(store.release_oracle_task_hold(task, hold)?)
 }
 
 pub(crate) fn hold_status(root: &Path, task: &str) -> Result<()> {
-    let store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let store = open_managed_state(root, true)?;
     print_json(serde_json::json!({"hold":store.oracle_task_hold(task)?}))
 }
 

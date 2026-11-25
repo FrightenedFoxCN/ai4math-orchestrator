@@ -1424,6 +1424,111 @@ fn tamper_detection_on_transitions_and_legacy_db_compatibility() -> Result<()> {
 }
 
 #[test]
+fn approved_exact_replay_ignores_consumer_drift_but_new_approval_rechecks_it() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    enroll(&mut store)?;
+    let approved_draft = draft("RFC-replay-approved");
+    let submitted = store.submit_infra_rfc(REPO, BASE, MODULE, &approved_draft, || Ok(()))?;
+    let approved = store.approve_infra_rfc(
+        REPO,
+        BASE,
+        &approved_draft.rfc_id,
+        &submitted.draft_sha256,
+        || Ok(()),
+    )?;
+    let pending_draft = draft("RFC-replay-pending");
+    let pending = store.submit_infra_rfc(REPO, BASE, MODULE, &pending_draft, || Ok(()))?;
+
+    store.append_event(
+        Change {
+            actor: "fixture",
+            git_commit: Some(BASE),
+        },
+        "CLAIM_NOTE",
+        "claim",
+        "Consumer",
+        json!({"note": "consumer changed after approval"}),
+    )?;
+    let seq = store.status()?.last_event_seq;
+    let confirmed = std::cell::Cell::new(false);
+    assert_eq!(
+        store.approve_infra_rfc(
+            REPO,
+            BASE,
+            &approved_draft.rfc_id,
+            &submitted.draft_sha256,
+            || {
+                confirmed.set(true);
+                Ok(())
+            },
+        )?,
+        approved
+    );
+    assert!(confirmed.get());
+    assert_eq!(store.status()?.last_event_seq, seq);
+
+    // Exact replay still rejects a different review scope or approval digest.
+    assert!(
+        store
+            .approve_infra_rfc(
+                REPO,
+                MAIN2,
+                &approved_draft.rfc_id,
+                &submitted.draft_sha256,
+                || Ok(()),
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .approve_infra_rfc(REPO, BASE, &approved_draft.rfc_id, &"0".repeat(64), || Ok(
+                ()
+            ),)
+            .is_err()
+    );
+    let error = store
+        .approve_infra_rfc(
+            REPO,
+            BASE,
+            &pending_draft.rfc_id,
+            &pending.draft_sha256,
+            || Ok(()),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("consumer changed"));
+    assert_eq!(store.status()?.last_event_seq, seq);
+    Ok(())
+}
+
+#[test]
+fn infra_rfc_read_projection_uses_one_snapshot_across_committed_transition() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let db = tmp.path().join("snapshot.sqlite");
+    let mut store = StateStore::open(&db)?;
+    enroll(&mut store)?;
+    let d = draft("RFC-snapshot");
+    let submitted = store.submit_infra_rfc(REPO, BASE, MODULE, &d, || Ok(()))?;
+    let approved =
+        store.approve_infra_rfc(REPO, BASE, &d.rfc_id, &submitted.draft_sha256, || Ok(()))?;
+    let mut writer = StateStore::open(&db)?;
+    let readonly = StateStore::open_readonly(&db)?;
+
+    let tx = readonly.db.unchecked_transaction()?;
+    assert_eq!(
+        read_infra_rfc(&tx, REPO, &d.rfc_id)?,
+        Some(approved.clone())
+    );
+    let building =
+        writer.start_infra_rfc_smoke(REPO, BASE, &d.rfc_id, &submitted.draft_sha256, || Ok(()))?;
+    // The already-open read snapshot cannot mix the old approval projection
+    // with the newly committed BUILDING_SMOKE transition.
+    assert_eq!(read_infra_rfc(&tx, REPO, &d.rfc_id)?, Some(approved));
+    tx.commit()?;
+    assert_eq!(readonly.infra_rfc(REPO, &d.rfc_id)?, Some(building));
+    Ok(())
+}
+
+#[test]
 fn fresh_smoke_start_rechecks_consumer_fingerprint_while_retry_stays_idempotent() -> Result<()> {
     let tmp = tempfile::tempdir()?;
     let mut store = StateStore::open(tmp.path().join("consumer_drift.sqlite"))?;
@@ -1665,56 +1770,5 @@ fn live_telemetry_counts_all_seven_states_accurately() -> Result<()> {
         || Ok(()),
     )?;
     check(&mut store, 1, 1, 1, 1, 1)?;
-    Ok(())
-}
-
-#[test]
-#[cfg(target_os = "macos")]
-#[ignore = "requires a native host (no outer Seatbelt) and AI4MATH_TEST_LEAN"]
-fn native_broker_smoke_and_completion_end_to_end() -> Result<()> {
-    let lean = std::env::var_os("AI4MATH_TEST_LEAN").expect("set native Lean binary");
-    let tool = ai4math_broker::Toolchain::lean(lean)?;
-    let broker = ai4math_broker::Broker::new();
-    let tmp = tempfile::tempdir()?;
-    let mut store = StateStore::open(tmp.path().join("native.sqlite"))?;
-    enroll(&mut store)?;
-    let d = draft("RFC-native");
-    let r = store.submit_infra_rfc(REPO, BASE, MODULE, &d, || Ok(()))?;
-    store.approve_infra_rfc(REPO, BASE, &d.rfc_id, &r.draft_sha256, || Ok(()))?;
-    store.start_infra_rfc_smoke(REPO, BASE, &d.rfc_id, &r.draft_sha256, || Ok(()))?;
-
-    let src = "namespace Basis\ndef bound (n : Nat) : Nat := n + 1\ntheorem bound_smoke : bound 0 = 1 := rfl\ntheorem bound_spec (n : Nat) : bound n = n + 1 := rfl\nend Basis\n";
-    let smoke = broker.verify_lean_infra_smoke(
-        &tool,
-        MAIN3,
-        MODULE,
-        &["Basis.bound"],
-        &["Basis.bound_smoke"],
-        &[(MODULE, src)],
-    )?;
-    let frozen = store.freeze_infra_rfc(REPO, &d.rfc_id, &r.draft_sha256, &smoke, || Ok(()))?;
-    assert_eq!(frozen.status, InfraRfcStatus::FrozenProving);
-    assert_eq!(frozen.smoke_commit.as_deref(), Some(MAIN3));
-    assert_eq!(
-        frozen.smoke_receipt_sha256.as_deref(),
-        Some(smoke.receipt_sha256())
-    );
-
-    let completion = broker.verify_lean_infra_completion(
-        &tool,
-        MAIN3,
-        MODULE,
-        &["Basis.bound"],
-        &["Basis.bound_spec"],
-        &[(MODULE, src)],
-    )?;
-    let completed =
-        store.complete_infra_rfc(REPO, &d.rfc_id, &r.draft_sha256, &completion, || Ok(()))?;
-    assert_eq!(completed.status, InfraRfcStatus::Completed);
-    assert_eq!(completed.completion_commit.as_deref(), Some(MAIN3));
-    assert_eq!(
-        completed.completion_receipt_sha256.as_deref(),
-        Some(completion.receipt_sha256())
-    );
     Ok(())
 }

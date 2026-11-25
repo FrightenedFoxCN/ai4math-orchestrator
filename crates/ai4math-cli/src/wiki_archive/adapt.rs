@@ -3,6 +3,7 @@
 use super::{Compatibility, prepare_wake, sha};
 use crate::{HOLE, bound_engine, print_json, promotion::PromotionRepo, reviewed_spec};
 use ai4math_core::{Engine, FrozenTarget, proof::lean_frozen_header};
+use ai4math_project::{ManagedProject, open_managed_state};
 use ai4math_store::{SedimentAdaptationApproval, SedimentAdaptationPlan, StateStore, Trust};
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
@@ -160,7 +161,7 @@ pub(crate) fn preview(
     target_claim: &str,
 ) -> Result<()> {
     let git = PromotionRepo::try_lock(repo)?;
-    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let state = open_managed_state(root, true)?;
     let plan = prepare(root, &git, &state, id, head, target_claim)?;
     print_json(
         serde_json::json!({"approval_sha256":plan.approval_sha256()?,"plan":plan,
@@ -177,14 +178,14 @@ fn apply(
     approval: &str,
 ) -> Result<SedimentAdaptationApproval> {
     let git = PromotionRepo::try_lock(repo)?;
-    let path = crate::worker_dispatch::private_state_path(root)?;
-    let readonly = StateStore::open_readonly(&path)?;
+    let project = ManagedProject::new(root)?;
+    let readonly = project.open_state_readonly()?;
     let plan = prepare(root, &git, &readonly, id, head, target_claim)?;
     ensure!(
         plan.approval_sha256()? == approval,
         "adaptation approval differs from current preview"
     );
-    let mut state = StateStore::open(&path)?;
+    let mut state = project.open_state()?;
     ensure!(
         git.main_head()? == head,
         "main changed before recording adaptation approval"
@@ -244,7 +245,7 @@ pub(crate) fn revalidate(
 }
 
 pub(crate) fn result(root: &Path, id: &str) -> Result<()> {
-    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let state = open_managed_state(root, true)?;
     let approval = state
         .sediment_adaptation(id)?
         .context("no retained sediment adaptation approval")?;

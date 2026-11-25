@@ -215,6 +215,77 @@ fn managed_git_cas_rejects_concurrent_main_update_without_unpinning() -> Result<
 
 #[test]
 #[ignore = "requires native host without outer Seatbelt and AI4MATH_TEST_LEAN"]
+fn managed_grafted_history_neither_accounts_nor_recovers_fake_publication() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let repo = setup(root)?;
+    let exec = PathBuf::from(env::var_os("AI4MATH_TEST_LEAN").context("set AI4MATH_TEST_LEAN")?);
+    let (intent, source_sha256, receipt) = {
+        let mut store = StateStore::open(root.join(STATE))?;
+        let locked = PromotionRepo::lock(&repo)?;
+        let tx = locked.snapshot(MODULE, None)?;
+        let pin = locked.pending_ref(&root.join(STATE))?;
+        let (intent, result, artifacts) = prepare_native(&tx, &exec)?;
+        let receipt = VerifiedReceipt::from_promotion(&result, &artifacts)?;
+        journal_promotion(&mut store, &pin, &intent, &receipt)?;
+        let tree = git(&repo, &["rev-parse", &format!("{}^{{tree}}", tx.base())]);
+        let competing = git(&repo, &["commit-tree", &tree, "-m", "unrelated main"]);
+        git(&repo, &["update-ref", MAIN, &competing, tx.base()]);
+        fs::write(
+            repo.join("info/grafts"),
+            format!("{competing} {}\n{}\n", intent.new_commit, intent.new_commit),
+        )?;
+        // Ordinary Git believes the candidate was published; physical history does not.
+        git(
+            &repo,
+            &[
+                "merge-base",
+                "--is-ancestor",
+                &intent.new_commit,
+                &competing,
+            ],
+        );
+        assert_unpromoted(&store, Some(&intent))?;
+        (intent, result.receipt().patch_sha256().to_owned(), receipt)
+    };
+
+    {
+        let locked = PromotionRepo::lock(&repo)?;
+        let tx = locked.snapshot(MODULE, Some(&intent.base_commit))?;
+        let pin = locked.pending_ref(&root.join(STATE))?;
+        let mut store = StateStore::open(root.join(STATE))?;
+        let error = finish_promotion(&tx, &mut store, &pin, &intent, &receipt).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("prepared commit no longer on main")
+        );
+        assert_unpromoted(&store, Some(&intent))?;
+    }
+    let error = recover_promotion(root, &repo, &exec, None).unwrap_err();
+    assert!(error.to_string().contains("main diverged"), "{error:#}");
+    assert_unpromoted(&StateStore::open(root.join(STATE))?, Some(&intent))?;
+
+    // A real descendant is still recoverable even when a graft hides that edge.
+    let competing = git(&repo, &["rev-parse", MAIN]);
+    let later = child_commit(&repo, &intent.new_commit, "physical descendant");
+    git(&repo, &["update-ref", MAIN, &later, &competing]);
+    fs::write(repo.join("info/grafts"), format!("{later}\n"))?;
+    assert!(
+        !git_output(
+            &repo,
+            &["merge-base", "--is-ancestor", &intent.new_commit, &later]
+        )
+        .status
+        .success()
+    );
+    recover_promotion(root, &repo, &exec, None)?;
+    assert_eq!(git(&repo, &["rev-parse", MAIN]), later);
+    assert_promoted(root, &repo, &intent, &source_sha256)
+}
+
+#[test]
+#[ignore = "requires native host without outer Seatbelt and AI4MATH_TEST_LEAN"]
 fn managed_promotion_recovers_after_git_publication_and_is_idempotent() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
@@ -318,6 +389,45 @@ fn managed_promotion_respects_primary_engine_before_git() -> Result<()> {
     )
     .unwrap_err();
     assert!(error.to_string().contains("primary engine"));
+    Ok(())
+}
+
+#[test]
+fn managed_file_promotion_respects_breaker_before_compiler_launch() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let repo = setup(root)?;
+    let repo = repo.canonicalize()?;
+    let base = git(&repo, &["rev-parse", MAIN]);
+    let mut store = StateStore::open(root.join(STATE))?;
+    store.register_tripped_breaker(
+        repo.to_str().context("fixture repository path")?,
+        &base,
+        "breaker",
+        "target",
+        MODULE,
+        "lean4",
+        "definition incident",
+        false,
+    )?;
+    let seq = store.status()?.last_event_seq;
+
+    let error = promote_managed(
+        root,
+        &repo,
+        "C",
+        MODULE,
+        "target",
+        Path::new("not-a-toolchain"),
+        Path::new("not-a-proof-body"),
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("breaker"), "{error:#}");
+    assert_eq!(store.status()?.last_event_seq, seq);
+    assert!(store.promotion_intent()?.is_none());
+    assert_eq!(git(&repo, &["rev-parse", MAIN]), base);
+    assert_unpromoted(&store, None)?;
     Ok(())
 }
 

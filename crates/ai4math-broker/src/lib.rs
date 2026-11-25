@@ -8,6 +8,8 @@ mod lean_hammer;
 pub use lean_hammer::{
     HammerCandidate, HammerPremises, MAX_HAMMER_DEPENDENCIES, MAX_HAMMER_PREMISES_BYTES,
 };
+mod lean_kernel;
+use lean_kernel::LeanKernelPolicy;
 mod lean_spec;
 pub use lean_spec::VerifiedLeanComparison;
 mod oracle;
@@ -40,6 +42,7 @@ use resources::{Lane, Pressure, Resources};
 pub use task_process::run_task_process;
 pub use witness::VerifiedWitness;
 
+pub use ai4math_evidence::ReceiptTier;
 pub use resources::BrokerLoad;
 pub use sandbox::sandbox_self_test;
 
@@ -224,22 +227,6 @@ impl Toolchain {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
-pub enum ReceiptTier {
-    T1Promotion,
-    T3TaintRebuild,
-}
-
-impl ReceiptTier {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::T1Promotion => "T1_PROMOTION",
-            Self::T3TaintRebuild => "T3_TAINT_REBUILD",
-        }
-    }
-}
-
 #[derive(Debug, Serialize)]
 pub struct VerificationReceipt {
     tier: ReceiptTier,
@@ -298,6 +285,67 @@ impl VerificationReceipt {
     }
 }
 
+// SAFETY: Production receipts are created only by `verify_at_tier` after the
+// native compiler and axiom/audit checks succeed. Fields remain private and no
+// deserializer is exposed, so callers cannot fabricate receipt evidence.
+unsafe impl ai4math_evidence::ReceiptEvidence for VerificationReceipt {
+    fn tier(&self) -> ReceiptTier {
+        self.tier()
+    }
+
+    fn issued_unix_seconds(&self) -> u64 {
+        self.issued_unix_seconds()
+    }
+
+    fn compile_seconds(&self) -> f64 {
+        self.compile_seconds()
+    }
+
+    fn engine(&self) -> Engine {
+        self.engine()
+    }
+
+    fn target_id(&self) -> &str {
+        self.target_id()
+    }
+
+    fn file_path(&self) -> &str {
+        self.file_path()
+    }
+
+    fn base_commit(&self) -> &str {
+        self.base_commit()
+    }
+
+    fn patch_sha256(&self) -> &str {
+        self.patch_sha256()
+    }
+
+    fn dependencies_sha256(&self) -> &str {
+        self.dependencies_sha256()
+    }
+
+    fn compiler_sha256(&self) -> &str {
+        &self.compiler_sha256
+    }
+
+    fn observed_axioms(&self) -> &[String] {
+        self.observed_axioms()
+    }
+
+    fn receipt_sha256(&self) -> &str {
+        self.receipt_sha256()
+    }
+
+    fn matches(&self, base_commit: &str, file_path: &str, candidate_bytes: &[u8]) -> bool {
+        VerificationReceipt::matches(self, base_commit, file_path, candidate_bytes)
+    }
+
+    fn raw_json(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+}
+
 #[derive(Debug)]
 pub struct VerifiedCandidate {
     source: String,
@@ -316,6 +364,22 @@ impl VerifiedCandidate {
     }
     pub fn receipt(&self) -> &VerificationReceipt {
         &self.receipt
+    }
+}
+
+// SAFETY: Production candidates are returned only after `verify_at_tier`
+// completes native verification of the exact source and private T3 mode.
+unsafe impl ai4math_evidence::CandidateEvidence for VerifiedCandidate {
+    fn source(&self) -> &str {
+        self.source()
+    }
+
+    fn receipt(&self) -> &dyn ai4math_evidence::ReceiptEvidence {
+        self.receipt()
+    }
+
+    fn is_assessed_t3(&self) -> bool {
+        self.is_assessed_t3()
     }
 }
 
@@ -422,6 +486,20 @@ fn validate_modules(engine: Engine, modules: &[(&str, &str)], target: Option<&st
     Ok(())
 }
 
+/// Validate the complete source set, including a reserved target, and apply the
+/// engine-specific installation policy before any source is staged.
+fn validate_modules_for_tool(
+    tool: &Toolchain,
+    modules: &[(&str, &str)],
+    target: Option<&str>,
+) -> Result<()> {
+    validate_modules(tool.engine, modules, target)?;
+    if tool.engine == Engine::Lean4 {
+        LeanKernelPolicy::validate_modules(tool, modules, target)?;
+    }
+    Ok(())
+}
+
 fn stage_source(
     engine: Engine,
     room: &Path,
@@ -441,21 +519,12 @@ fn stage_source(
 
 /// Bind ordered paths and exact bytes using the broker's dependency hash format.
 pub fn ordered_source_set_sha256(modules: &[(&str, &str)]) -> String {
-    dependencies_digest(modules)
+    ai4math_evidence::ordered_source_set_sha256(modules)
 }
 
 /// Bind ordered paths and exact bytes without concatenation ambiguity.
 fn dependencies_digest(modules: &[(&str, &str)]) -> String {
-    let mut hash = Sha256::new();
-    hash.update(b"ai4math:ordered-source-dependencies:v1");
-    hash.update((modules.len() as u64).to_be_bytes());
-    for &(path, source) in modules {
-        hash.update((path.len() as u64).to_be_bytes());
-        hash.update(path.as_bytes());
-        hash.update((source.len() as u64).to_be_bytes());
-        hash.update(source.as_bytes());
-    }
-    format!("{:x}", hash.finalize())
+    ai4math_evidence::ordered_source_set_sha256(modules)
 }
 
 fn check_regression_binding(candidate: &VerifiedCandidate, modules: &[(&str, &str)]) -> Result<()> {
@@ -712,6 +781,9 @@ impl Broker {
         path_for(tool.engine, &target.file_path)?;
         let source = render_proof_body(target, submission)?;
         ensure!(source.len() <= SOURCE_CAP, "module source exceeds limit");
+        if tool.engine == Engine::Lean4 {
+            lean_kernel::reject_installation_shadows(tool, &[(&target.file_path, &source)])?;
+        }
         let pressure = resources::host_pressure()?;
         let _lease = match tool.engine {
             Engine::Lean4 => self.resources.acquire_lean_advisory(pressure)?,
@@ -847,7 +919,7 @@ impl Broker {
             tool.engine == target.engine,
             "compiler/target engine mismatch"
         );
-        validate_modules(tool.engine, dependencies, Some(&target.file_path))?;
+        validate_modules_for_tool(tool, dependencies, Some(&target.file_path))?;
         let source = render_proof_body(target, submission)?;
         ensure!(source.len() <= SOURCE_CAP, "module source exceeds limit");
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
@@ -879,7 +951,7 @@ impl Broker {
                 room.path(),
                 &output,
                 &target.file_path,
-                false,
+                true,
                 DiagnosticOutput::LeanJson,
             ) {
                 Ok(log) => t3::axiom_report(&log, target, &source)?,
@@ -899,7 +971,7 @@ impl Broker {
                 room.path(),
                 &output,
                 &target.file_path,
-                tool.engine == Engine::Rocq,
+                matches!(tool.engine, Engine::Lean4 | Engine::Rocq),
             )?
         };
         let observed_axioms = match tool.engine {
@@ -910,6 +982,15 @@ impl Broker {
                 vec![]
             }
         };
+        if tool.engine == Engine::Lean4 {
+            LeanKernelPolicy::replay_matching_report(
+                tool,
+                &output,
+                path_for(Engine::Lean4, &target.file_path)?,
+                &target.target_id,
+                &observed_axioms,
+            )?;
+        }
         let mut receipt = VerificationReceipt {
             tier,
             issued_unix_seconds: SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs(),
@@ -934,12 +1015,20 @@ impl Broker {
 
     pub fn check_modules(&self, tool: &Toolchain, modules: &[(&str, &str)]) -> Result<()> {
         ensure!(!modules.is_empty(), "empty local regression slice");
-        validate_modules(tool.engine, modules, None)?;
+        validate_modules_for_tool(tool, modules, None)?;
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
         let room = tempfile::tempdir()?;
         let output = room.path().join("output");
         fs::create_dir(&output)?;
-        self.build_modules(tool, room.path(), &output, modules)
+        self.build_modules(tool, room.path(), &output, modules)?;
+        if tool.engine == Engine::Lean4 {
+            let modules = modules
+                .iter()
+                .map(|(path, _)| path_for(Engine::Lean4, path))
+                .collect::<Result<Vec<_>>>()?;
+            LeanKernelPolicy::replay_modules(tool, &output, &modules)?;
+        }
+        Ok(())
     }
 
     pub fn regress(
@@ -953,18 +1042,20 @@ impl Broker {
                 && candidate.receipt.compiler_sha256 == tool.binary_sha256,
             "regression toolchain does not match receipt"
         );
-        validate_modules(tool.engine, modules, None)?;
+        validate_modules_for_tool(tool, modules, None)?;
         check_regression_binding(candidate, modules)?;
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
         let room = tempfile::tempdir()?;
         let output = room.path().join("output");
         fs::create_dir(&output)?;
         let mut downstream = false;
+        let mut downstream_modules = Vec::new();
         for &(relative, source) in modules {
+            let is_downstream = downstream;
             stage_source(tool.engine, room.path(), &output, relative, source)?;
             if tool.engine == Engine::Lean4
                 && candidate.receipt.tier == ReceiptTier::T1Promotion
-                && downstream
+                && is_downstream
             {
                 self.check_with_output(
                     tool,
@@ -979,6 +1070,21 @@ impl Broker {
                 self.check(tool, room.path(), &output, relative, true)?;
             }
             downstream |= relative == candidate.receipt.file_path;
+            if tool.engine == Engine::Lean4 && is_downstream {
+                downstream_modules.push(path_for(Engine::Lean4, relative)?);
+            }
+        }
+        if tool.engine == Engine::Lean4 {
+            LeanKernelPolicy::replay_matching_report(
+                tool,
+                &output,
+                path_for(Engine::Lean4, candidate.receipt.file_path())?,
+                candidate.receipt.target_id(),
+                candidate.receipt.observed_axioms(),
+            )?;
+            if !downstream_modules.is_empty() {
+                LeanKernelPolicy::replay_modules(tool, &output, &downstream_modules)?;
+            }
         }
         let extension = match tool.engine {
             Engine::Lean4 => "olean",
@@ -1002,9 +1108,13 @@ impl Broker {
         modules: &[(&str, &str)],
     ) -> Result<()> {
         // All callers validate the complete set (including any reserved target)
-        // before acquiring resources or creating the clean room.
+        // before acquiring resources or creating the clean room. Keep the Lean
+        // installation check here as defense in depth for internal callers.
         // A module sees only its predecessors; later regression modules must
         // not widen the verified target's original import closure (notably in Agda).
+        if tool.engine == Engine::Lean4 {
+            lean_kernel::reject_installation_shadows(tool, modules)?;
+        }
         for &(relative, source) in modules {
             stage_source(tool.engine, room, output, relative, source)?;
             self.check(tool, room, output, relative, true)?;
@@ -1026,6 +1136,61 @@ mod tests {
         assert!(lean_axioms("'p' depends on axioms: [sorryAx]", "p").is_err());
         assert!(lean_axioms("'other' does not depend on any axioms", "p").is_err());
     }
+    #[test]
+    fn receipt_wire_and_identity_golden_survive_tier_migration() -> Result<()> {
+        let receipt = VerificationReceipt {
+            tier: ReceiptTier::T1Promotion,
+            issued_unix_seconds: 0,
+            compile_seconds: 0.0,
+            engine: Engine::Lean4,
+            target_id: "fixture".into(),
+            base_commit: "a".repeat(40),
+            file_path: "Fixture.lean".into(),
+            patch_sha256: "1".repeat(64),
+            dependencies_sha256: "2".repeat(64),
+            compiler_sha256: "3".repeat(64),
+            observed_axioms: vec!["propext".into()],
+            receipt_sha256: String::new(),
+        };
+        let expected = concat!(
+            r#"{"tier":"T1_PROMOTION","issued_unix_seconds":0,"compile_seconds":0.0,"engine":"lean4","target_id":"fixture","base_commit":""#,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            r#"","file_path":"Fixture.lean","patch_sha256":""#,
+            "1111111111111111111111111111111111111111111111111111111111111111",
+            r#"","dependencies_sha256":""#,
+            "2222222222222222222222222222222222222222222222222222222222222222",
+            r#"","compiler_sha256":""#,
+            "3333333333333333333333333333333333333333333333333333333333333333",
+            r#"","observed_axioms":["propext"],"receipt_sha256":""}"#,
+        );
+        assert_eq!(serde_json::to_string(&receipt)?, expected);
+        assert_eq!(
+            digest(expected.as_bytes()),
+            "26105b36aab72daba198800a3b9ebe2c120e3225ff183b3181ec3600fe187a5b"
+        );
+        let evidence: &dyn ai4math_evidence::ReceiptEvidence = &receipt;
+        assert_eq!(evidence.compiler_sha256(), &"3".repeat(64));
+        assert_eq!(evidence.raw_json()?, serde_json::to_value(&receipt)?);
+        Ok(())
+    }
+
+    #[test]
+    fn source_digest_delegation_preserves_the_historical_hash() {
+        let modules = [("First.lean", "x"), ("Second.lean", "yz")];
+        assert_eq!(
+            dependencies_digest(&modules),
+            ordered_source_set_sha256(&modules)
+        );
+        assert_eq!(
+            ordered_source_set_sha256(&modules),
+            ai4math_evidence::ordered_source_set_sha256(&modules)
+        );
+        assert_eq!(
+            ordered_source_set_sha256(&[]),
+            "53d6c8644575b13a8814f4cd42c27f935ea28d030d4da4cebbb9eb80d4b060c0"
+        );
+    }
+
     pub(super) fn candidate_fixture(dependencies: &[(&str, &str)]) -> VerifiedCandidate {
         let source = "theorem fixture : True := True.intro\n".to_owned();
         VerifiedCandidate {

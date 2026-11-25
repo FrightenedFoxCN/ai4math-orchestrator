@@ -1,5 +1,6 @@
 //! Reviewed, source-only archival; never removes a module or promotes an artifact.
 use crate::{bound_engine, print_json, promotion::PromotionRepo, t3::validate_recipe};
+use ai4math_project::open_managed_state;
 use ai4math_store::{
     ManagedProofRecipe, SedimentArtifact, SedimentInput, StateStore, Trust, publish_sediment,
     read_sediment, render_sediment,
@@ -163,7 +164,7 @@ fn prepare(
 
 pub(crate) fn preview(root: &Path, repo: &Path, claim_id: &str, reviewed_main: &str) -> Result<()> {
     let git = PromotionRepo::try_lock(repo)?;
-    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let state = open_managed_state(root, true)?;
     print_json(prepare(root, &git, &state, claim_id, reviewed_main)?.0)
 }
 
@@ -175,7 +176,7 @@ pub(crate) fn archive(
     approval: &str,
 ) -> Result<()> {
     let git = PromotionRepo::try_lock(repo)?;
-    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let state = open_managed_state(root, true)?;
     let (expected, artifact) = prepare(root, &git, &state, claim_id, reviewed_main)?;
     ensure!(
         approval == expected.approval_sha256,
@@ -318,7 +319,7 @@ fn prepare_wake(
 
 pub(crate) fn wake_preview(root: &Path, repo: &Path, id: &str, reviewed_main: &str) -> Result<()> {
     let git = PromotionRepo::try_lock(repo)?;
-    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let state = open_managed_state(root, true)?;
     print_json(prepare_wake(root, &git, &state, id, reviewed_main)?)
 }
 

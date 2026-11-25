@@ -3,7 +3,7 @@ use crate::{
     Change, NewClaim, PromotionIntent, RecheckOutcome, ReviewedLeanSpec, T3PlanApproval,
     VerifiedReceipt,
 };
-use ai4math_broker::lean_breaker_sources_sha256;
+use ai4math_evidence::ordered_source_set_sha256;
 use rusqlite::params;
 use serde_json::json;
 
@@ -57,7 +57,7 @@ fn receipt(tier: &str, base: &str, nonce: u32) -> VerifiedReceipt {
         raw: json!({
             "engine": "lean4", "tier": tier, "base_commit": base,
             "file_path": FILE, "target_id": DECL, "patch_sha256": patch_sha256,
-            "receipt_sha256": receipt_sha256, "dependencies_sha256": lean_breaker_sources_sha256(&[]),
+            "receipt_sha256": receipt_sha256, "dependencies_sha256": ordered_source_set_sha256(&[]),
         }),
         regression_checked: tier == "T1_PROMOTION",
         broker_assessed_t3: tier == "T3_TAINT_REBUILD",
@@ -114,7 +114,7 @@ fn exact_latest_t1_is_claim_scoped_and_read_only() -> Result<()> {
             source_sha256: latest.patch_sha256.clone(),
         },
         receipt_sha256: latest.receipt_sha256.clone(),
-        dependencies_sha256: lean_breaker_sources_sha256(&[]),
+        dependencies_sha256: ordered_source_set_sha256(&[]),
         verified_at_commit: SECOND.into(),
         baseline_scope: "claim_t1",
     };

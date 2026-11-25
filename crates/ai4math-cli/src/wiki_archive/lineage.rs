@@ -1,12 +1,10 @@
 //! Record a historical replacement edge only after the reviewed adaptation's
 //! separate managed promotion. This does not create or publish a CORE entry.
 use super::{prepare_wake, require_reviewed_main, sha};
-use crate::{
-    print_json, promotion::PromotionRepo, reviewed_spec, t3::validate_recipe,
-    worker_dispatch::private_state_path,
-};
+use crate::{print_json, promotion::PromotionRepo, reviewed_spec, t3::validate_recipe};
 use ai4math_core::Engine;
-use ai4math_store::{SedimentLineage, SedimentLineageInput, StateStore};
+use ai4math_project::{ManagedProject, open_managed_state};
+use ai4math_store::{SedimentLineage, SedimentLineageInput};
 use anyhow::{Context, Result, ensure};
 use serde_json::json;
 use std::path::Path;
@@ -18,8 +16,8 @@ pub(crate) fn retain(
     head: &str,
 ) -> Result<SedimentLineage> {
     let git = PromotionRepo::try_lock(repo)?;
-    let path = private_state_path(root)?;
-    let state = StateStore::open_readonly(&path)?;
+    let project = ManagedProject::new(root)?;
+    let state = project.open_state_readonly()?;
     let saved = state
         .sediment_adaptation(approval)?
         .context("no retained sediment adaptation approval")?
@@ -86,7 +84,7 @@ pub(crate) fn retain(
         git.main_head()? == head && state.status()?.last_event_seq == seq,
         "main or ledger changed while validating sediment adaptation lineage"
     );
-    let mut writable = StateStore::open(&path)?;
+    let mut writable = project.open_state()?;
     ensure!(
         git.main_head()? == head,
         "main changed before retention of sediment adaptation lineage"
@@ -111,7 +109,7 @@ pub(crate) fn retain_command(root: &Path, repo: &Path, approval: &str, head: &st
 }
 
 pub(crate) fn result(root: &Path, approval: &str) -> Result<()> {
-    let state = StateStore::open_readonly(private_state_path(root)?)?;
+    let state = open_managed_state(root, true)?;
     let lineage = state
         .sediment_lineage(approval)?
         .context("no retained sediment adaptation lineage")?;

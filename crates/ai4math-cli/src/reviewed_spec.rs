@@ -5,7 +5,8 @@ use super::{
 };
 use ai4math_broker::lean_breaker_sources_sha256;
 use ai4math_core::Engine;
-use ai4math_store::{ReviewedLeanSpec, StateStore};
+use ai4math_project::open_managed_state;
+use ai4math_store::ReviewedLeanSpec;
 use anyhow::{Context, Result, ensure};
 use std::path::Path;
 
@@ -37,7 +38,7 @@ pub(crate) fn bind(
     );
     let locked = PromotionRepo::lock(repo)?;
     locked.require_commit(commit)?;
-    let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, false)?;
     let claim = store.claim(id)?.context("unknown claim")?;
     let (module, _) = claim
         .formal_target
@@ -90,7 +91,7 @@ pub(crate) fn check_snapshot(
         "reviewed Lean specification belongs to a different repository"
     );
     ensure!(
-        locked.is_ancestor(&binding.approved_git_commit, tx.base())?,
+        locked.is_ungrafted_ancestor(&binding.approved_git_commit, tx.base())?,
         "candidate base does not descend from the reviewed Lean specification snapshot"
     );
     Ok(())
@@ -115,7 +116,7 @@ pub(crate) fn read_comparison(root: &Path, commit: &str) -> Result<()> {
                 .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "expected a full lowercase Git commit hash"
     );
-    let store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let store = open_managed_state(root, true)?;
     let row = store
         .lean_spec_comparison(commit)?
         .context("no retained Lean specification comparison for this commit")?;
@@ -134,7 +135,7 @@ pub(crate) fn read_recheck(root: &Path, claim: &str, plan: &str) -> Result<()> {
                 .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
         "expected a lowercase T3 plan SHA-256"
     );
-    let store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let store = open_managed_state(root, true)?;
     let row = store
         .lean_spec_recheck(claim, plan)?
         .context("no retained Lean specification recheck for this Claim and T3 plan")?;

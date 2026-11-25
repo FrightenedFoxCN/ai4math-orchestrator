@@ -1,7 +1,7 @@
 //! Operator-approved statement identity and sealed Lean comparison evidence.
 use super::*;
-use ai4math_broker::VerifiedLeanComparison;
 use ai4math_core::{Engine, validate_source_path};
+use ai4math_evidence::{CandidateEvidence, LeanComparisonEvidence, RegressionEvidence};
 
 /// An operator-approved exact Git snapshot, not proof evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -340,22 +340,26 @@ pub(super) fn matches_managed_t1(
 impl VerifiedReceipt {
     /// Attach the sealed comparison from this exact Lean T1 candidate receipt.
     pub fn from_compared_promotion(
-        candidate: &ai4math_broker::VerifiedCandidate,
-        artifacts: &ai4math_broker::RegressionArtifacts,
-        comparison: &VerifiedLeanComparison,
+        candidate: &dyn CandidateEvidence,
+        artifacts: &dyn RegressionEvidence,
+        comparison: &dyn LeanComparisonEvidence,
     ) -> Result<Self> {
         Self::from_promotion(candidate, artifacts)?.with_comparison(comparison, "T1_PROMOTION")
     }
 
     /// Attach the sealed comparison from this exact Lean T3 candidate receipt.
     pub fn from_compared_recheck(
-        candidate: &ai4math_broker::VerifiedCandidate,
-        comparison: &VerifiedLeanComparison,
+        candidate: &dyn CandidateEvidence,
+        comparison: &dyn LeanComparisonEvidence,
     ) -> Result<Self> {
-        Self::from_broker(candidate)?.with_comparison(comparison, "T3_TAINT_REBUILD")
+        Self::from_candidate(candidate)?.with_comparison(comparison, "T3_TAINT_REBUILD")
     }
 
-    fn with_comparison(mut self, comparison: &VerifiedLeanComparison, tier: &str) -> Result<Self> {
+    fn with_comparison(
+        mut self,
+        comparison: &dyn LeanComparisonEvidence,
+        tier: &str,
+    ) -> Result<Self> {
         ensure!(
             self.engine == "lean4"
                 && self.tier == tier

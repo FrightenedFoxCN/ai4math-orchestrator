@@ -18,6 +18,7 @@ use super::{
 };
 use ai4math_broker::{Broker, RecheckAssessment};
 use ai4math_core::{Engine, FrozenTarget, ProofBodySubmission, render_proof_body};
+use ai4math_project::{ManagedProject, open_managed_state};
 use ai4math_store::{
     ClaimState, ManagedProofRecipe, RecheckOutcome, ReviewedLeanSpec, StateStore, T3PlanApproval,
     Trust, VerifiedReceipt,
@@ -74,7 +75,7 @@ pub(crate) fn dry_run(
 ) -> Result<()> {
     let engine = bound_engine(root, anchor)?;
     let locked = PromotionRepo::lock(repo)?;
-    let mut state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let mut state = open_managed_state(root, true)?;
     ensure!(
         state.managed_repo()?.as_deref().map(Path::new) == Some(locked.path()),
         "project is not bound to the supplied managed repository"
@@ -92,7 +93,7 @@ pub(crate) fn apply(
 ) -> Result<()> {
     let engine = bound_engine(root, anchor)?;
     let locked = PromotionRepo::lock(repo)?;
-    let mut state = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut state = open_managed_state(root, false)?;
     ensure!(
         state.managed_repo()?.as_deref().map(Path::new) == Some(locked.path()),
         "project is not bound to the supplied managed repository"
@@ -145,7 +146,7 @@ pub(crate) fn worklist(
     after: Option<&str>,
 ) -> Result<()> {
     let locked = PromotionRepo::try_lock(repo)?;
-    let mut state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let mut state = open_managed_state(root, true)?;
     let approval = current_approval(&state, &locked, hash)?;
     let page = state.t3_worklist(hash, limit, after)?;
     ensure!(
@@ -244,7 +245,7 @@ fn sweep_options<'a>(args: &[&'a str]) -> Result<(Option<&'a str>, bool)> {
 /// Administrative readback; never advances a checkpoint or opens a verifier.
 pub(crate) fn sweep_status(root: &Path, repo: &Path, hash: &str) -> Result<()> {
     let locked = PromotionRepo::try_lock(repo)?;
-    let state = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let state = open_managed_state(root, true)?;
     let approval = current_approval(&state, &locked, hash)?;
     let progress = state.t3_sweep_status(hash)?;
     ensure!(
@@ -323,22 +324,17 @@ fn recheck_selected(
     exec: &Path,
     data: Option<&str>,
 ) -> Result<()> {
-    let _native = crate::managed_native(root)?;
-    let locked = if matches!(replay, Replay::Batch { .. } | Replay::Sweep { .. }) {
-        PromotionRepo::try_lock(repo)?
-    } else {
-        PromotionRepo::lock(repo)?
-    };
-    let path = root.join(".runtime/state.sqlite");
-    let mut state = StateStore::open(&path)?;
-    let approval = current_approval(&state, &locked, hash)?;
-    let at = &approval.reviewed_commit;
+    let project = ManagedProject::new(root)?;
     if matches!(replay, Replay::Sweep { restart: false, .. }) {
+        // A completed sweep is a status read, not native work. Do not let a
+        // busy Heavy lane hide an already durable completion.
+        let git = PromotionRepo::try_lock(repo)?;
+        let state = project.open_state_readonly()?;
+        let approval = current_approval(&state, &git, hash)?;
         let progress = state.t3_sweep_status(hash)?;
         if progress.status == ai4math_store::T3SweepState::Complete {
-            // A completed checkpoint does not need a toolchain or a proof run.
             ensure!(
-                locked.main_head()? == *at,
+                git.main_head()? == approval.reviewed_commit,
                 "approved T3 plan no longer matches main"
             );
             return print_json(ai4math_store::T3SweepStep {
@@ -348,6 +344,11 @@ fn recheck_selected(
             });
         }
     }
+    let _native = project.try_native_heavy()?;
+    let locked = PromotionRepo::try_lock(repo)?;
+    let mut state = project.open_state()?;
+    let approval = current_approval(&state, &locked, hash)?;
+    let at = &approval.reviewed_commit;
     let engine = bound_engine(root, &approval.anchor_module)?;
     let tool = trusted_toolchain(engine, exec, data)?;
     #[cfg(unix)]
@@ -364,7 +365,7 @@ fn recheck_selected(
     };
     let repo_snapshot = locked.snapshot(&approval.anchor_module, Some(at))?;
     let files = repo_snapshot.project()?;
-    let provenance = StateStore::open_readonly(&path)?;
+    let provenance = project.open_state_readonly()?;
     let broker = Broker::new();
     let check = |claim: &ClaimState| {
         let defer = |reason: &str| {
@@ -462,9 +463,21 @@ fn recheck_selected(
         }
     };
     match replay {
-        Replay::All => print_json(state.recheck_stale_for_plan(hash, "broker:t3", check)?),
+        Replay::All => {
+            let report = state.recheck_stale_for_plan(hash, "broker:t3", check)?;
+            ensure!(
+                locked.main_head()? == *at,
+                "main changed during T3 recheck; do not reuse its results"
+            );
+            print_json(report)
+        }
         Replay::One(id) => {
-            print_json(state.recheck_one_stale_for_plan(hash, id, "broker:t3", check)?)
+            let report = state.recheck_one_stale_for_plan(hash, id, "broker:t3", check)?;
+            ensure!(
+                locked.main_head()? == *at,
+                "main changed during T3 recheck; do not reuse its results"
+            );
+            print_json(report)
         }
         Replay::Batch { limit, after } => {
             let batch =
@@ -687,8 +700,8 @@ pub(crate) fn validate_recipe(
     old: &str,
 ) -> Result<(FrozenTarget, ProofBodySubmission, String)> {
     ensure!(
-        repo.is_ancestor(&recipe.promoted_commit, old)?
-            && repo.is_ancestor(&recipe.base_commit, &recipe.promoted_commit)?,
+        repo.is_ungrafted_ancestor(&recipe.promoted_commit, old)?
+            && repo.is_ungrafted_ancestor(&recipe.base_commit, &recipe.promoted_commit)?,
         "managed recipe does not belong to the approved history"
     );
     let baseline = repo.snapshot(&recipe.file_path, Some(&recipe.base_commit))?;

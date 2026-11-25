@@ -227,6 +227,65 @@ fn t3_marks_both_graphs_and_rechecks_only_previous_l5_in_order() -> Result<()> {
 }
 
 #[test]
+fn t3_uses_formal_target_module_when_module_path_is_null() -> Result<()> {
+    use Trust::*;
+    let mut store = StateStore::open(":memory:")?;
+    for (id, target, module) in [
+        ("dependent", "Uses.lean#Dependent.proof", Some("Uses.lean")),
+        ("fallback", "Spec.lean#Candidate.proof", None),
+        ("peer", "Spec.lean#Peer.proof", None),
+        ("unrelated", "Outside.lean#Other.proof", None),
+    ] {
+        store.create_claim(
+            NewClaim {
+                id,
+                title: id,
+                informal_statement: "fixture",
+                engine: "lean4",
+                formal_target: Some(target),
+                module_path: module,
+                critical: false,
+            },
+            change(BASE),
+        )?;
+    }
+    store.add_module_dependency(
+        "Uses.lean",
+        "Spec.lean",
+        "lean4",
+        "leaf_proof",
+        change(BASE),
+    )?;
+    // Receipt validation uses the same effective module fallback as T3.
+    store.record_verified("fallback", &receipt(PROOF_DECL, BASE, 1), change(BASE))?;
+    store.set_local_trust("dependent", L4a, change(BASE))?;
+    store.set_local_trust("peer", L3, change(BASE))?;
+    let seq = store.status()?.last_event_seq;
+    let preview = store.preview_t3(&["fallback"], &[])?;
+    assert_eq!(preview.event_seq, seq);
+    assert_eq!(preview.impact.modules, ["Spec.lean", "Uses.lean"]);
+    assert_eq!(preview.impact.claims, ["dependent", "fallback", "peer"]);
+    assert_eq!(
+        store.preview_t3(&[], &["Spec.lean"])?.impact,
+        preview.impact
+    );
+    assert_eq!(store.status()?.last_event_seq, seq);
+    assert!(!store.claim("fallback")?.unwrap().stale);
+
+    let impact = store.mark_t3(&["fallback"], &[], change(T3_HEAD))?;
+    assert_eq!(impact, preview.impact);
+    for (id, prior) in [("dependent", L4a), ("fallback", L5), ("peer", L3)] {
+        let state = store.claim(id)?.unwrap();
+        assert!(state.stale && state.effective_stale);
+        assert_eq!(state.prior_trust, Some(prior));
+        assert_eq!(state.taint_root_commit.as_deref(), Some(T3_HEAD));
+    }
+    assert!(!store.claim("unrelated")?.unwrap().stale);
+    assert_eq!(store.status()?.stale_claims, 3);
+    Ok(())
+}
+
+#[test]
 fn t3_restore_requires_broker_provenance_in_every_recheck_mode() -> Result<()> {
     let mut store = StateStore::open(":memory:")?;
     claim(&mut store, "C", Some("Spec.lean"), false)?;
@@ -1218,6 +1277,205 @@ fn compared_receipt(binding: &ReviewedLeanSpec, nonce: u32) -> VerifiedReceipt {
     r
 }
 
+fn finished_managed_promotion_fixture(
+    store: &mut StateStore,
+) -> Result<(PromotionIntent, VerifiedReceipt, i64)> {
+    store.create_claim(
+        NewClaim {
+            id: "C",
+            title: "C",
+            informal_statement: "fixture",
+            engine: "lean4",
+            formal_target: Some("Spec.lean#Candidate.proof"),
+            module_path: Some("Spec.lean"),
+            critical: false,
+        },
+        change(BASE),
+    )?;
+    let intent = PromotionIntent {
+        repo: "/managed/project".into(),
+        claim_id: "C".into(),
+        base_commit: BASE.into(),
+        new_commit: T3_OLD.into(),
+        file_path: "Spec.lean".into(),
+        target_decl: PROOF_DECL.into(),
+        proof_body: "exact True.intro".into(),
+    };
+    let receipt = receipt(PROOF_DECL, BASE, 1);
+    store.prepare_promotion(&intent, &receipt)?;
+    let seq = store.finish_promotion(&intent, &receipt)?;
+    Ok((intent, receipt, seq))
+}
+
+#[test]
+fn promotion_replay_retires_only_an_identical_pending_intent() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    let (intent, receipt, recorded) = finished_managed_promotion_fixture(&mut store)?;
+    let event_seq = store.status()?.last_event_seq;
+    assert_eq!(store.finish_promotion(&intent, &receipt)?, recorded);
+    assert_eq!(store.status()?.last_event_seq, event_seq);
+
+    // A coordinator may prepare again before learning that its Git CAS succeeded.
+    store.prepare_promotion(&intent, &receipt)?;
+    assert_eq!(store.promotion_intent()?, Some(intent.clone()));
+    store.db.execute_batch(
+        "CREATE TEMP TRIGGER stop_intent_delete BEFORE DELETE ON promotion_intent
+         BEGIN SELECT RAISE(ABORT,'injected pending intent delete failure'); END;",
+    )?;
+    assert!(store.finish_promotion(&intent, &receipt).is_err());
+    assert_eq!(store.promotion_intent()?, Some(intent.clone()));
+    assert_eq!(store.status()?.last_event_seq, event_seq);
+    store.db.execute_batch("DROP TRIGGER stop_intent_delete")?;
+    assert_eq!(store.finish_promotion(&intent, &receipt)?, recorded);
+    assert!(store.promotion_intent()?.is_none());
+    assert_eq!(store.status()?.last_event_seq, event_seq);
+
+    let conflicting = PromotionIntent {
+        proof_body: "exact False.elim".into(),
+        ..intent.clone()
+    };
+    store.prepare_promotion(&conflicting, &receipt)?;
+    let error = store.finish_promotion(&intent, &receipt).unwrap_err();
+    assert!(error.to_string().contains("pending intent"));
+    assert_eq!(store.promotion_intent()?, Some(conflicting));
+    assert_eq!(store.status()?.last_event_seq, event_seq);
+    store
+        .db
+        .execute("DELETE FROM promotion_intent WHERE singleton=1", [])?;
+
+    store.prepare_promotion(&intent, &receipt)?;
+    let mut unchecked = self::receipt(PROOF_DECL, BASE, 1);
+    unchecked.regression_checked = false;
+    let error = store.finish_promotion(&intent, &unchecked).unwrap_err();
+    assert!(error.to_string().contains("prepared context"));
+    assert_eq!(store.promotion_intent()?, Some(intent));
+    assert_eq!(store.status()?.last_event_seq, event_seq);
+    Ok(())
+}
+
+#[test]
+fn promotion_replay_rejects_tampered_recipe_receipt_and_repository() -> Result<()> {
+    for (name, sql, receipt_key) in [
+        (
+            "recipe file",
+            "UPDATE managed_proof_recipes SET file_path='Other.lean' WHERE git_commit=?1",
+            false,
+        ),
+        (
+            "recipe target",
+            "UPDATE managed_proof_recipes SET target_decl='Other.proof' WHERE git_commit=?1",
+            false,
+        ),
+        (
+            "recipe body",
+            "UPDATE managed_proof_recipes SET proof_body='tampered' WHERE git_commit=?1",
+            false,
+        ),
+        (
+            "missing recipe",
+            "DELETE FROM managed_proof_recipes WHERE git_commit=?1",
+            false,
+        ),
+        (
+            "recorded base",
+            "UPDATE recorded_promotions SET base_commit='dddddddddddddddddddddddddddddddddddddddd' WHERE git_commit=?1",
+            false,
+        ),
+        (
+            "receipt target",
+            "UPDATE verification_receipts SET target_decl='Other.proof' WHERE receipt_id=?1",
+            true,
+        ),
+        (
+            "receipt file",
+            "UPDATE verification_receipts SET raw_receipt_json=json_set(raw_receipt_json,'$.file_path','Other.lean') WHERE receipt_id=?1",
+            true,
+        ),
+        (
+            "receipt digest",
+            "UPDATE verification_receipts SET receipt_sha256='eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' WHERE receipt_id=?1",
+            true,
+        ),
+        (
+            "receipt tier",
+            "UPDATE verification_receipts SET tier='T2_AUDIT' WHERE receipt_id=?1",
+            true,
+        ),
+        (
+            "receipt patch",
+            "UPDATE verification_receipts SET patch_sha256='eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' WHERE receipt_id=?1",
+            true,
+        ),
+        (
+            "repository",
+            "UPDATE managed_repo SET repo='/tampered/project' WHERE singleton=?1",
+            false,
+        ),
+    ] {
+        let mut store = StateStore::open(":memory:")?;
+        let (intent, receipt, recorded) = finished_managed_promotion_fixture(&mut store)?;
+        store.prepare_promotion(&intent, &receipt)?;
+        let event_seq = store.status()?.last_event_seq;
+        assert_eq!(event_seq, recorded, "{name}");
+        let key = if receipt_key {
+            receipt.id.as_str()
+        } else if name == "repository" {
+            "1"
+        } else {
+            intent.new_commit.as_str()
+        };
+        assert_eq!(store.db.execute(sql, [key])?, 1, "{name}");
+        let error = store.finish_promotion(&intent, &receipt).unwrap_err();
+        assert!(error.to_string().contains("replay"), "{name}: {error:#}");
+        assert_eq!(store.promotion_intent()?, Some(intent.clone()), "{name}");
+        assert_eq!(store.status()?.last_event_seq, event_seq, "{name}");
+    }
+    Ok(())
+}
+
+#[test]
+fn reviewed_promotion_replay_requires_the_exact_receipt_and_comparison() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    reviewed_claim(&mut store, "C")?;
+    let binding = reviewed_binding("C");
+    store.bind_lean_spec(&binding)?;
+    let intent = reviewed_intent("C");
+    let exact = compared_receipt(&binding, 1);
+    store.prepare_promotion(&intent, &exact)?;
+    let recorded = store.finish_promotion(&intent, &exact)?;
+    assert_eq!(store.finish_promotion(&intent, &exact)?, recorded);
+
+    let mut different_receipt = compared_receipt(&binding, 2);
+    different_receipt.id = exact.id.clone();
+    different_receipt.patch_sha256 = exact.patch_sha256.clone();
+    store.prepare_promotion(&intent, &different_receipt)?;
+    let error = store
+        .finish_promotion(&intent, &different_receipt)
+        .unwrap_err();
+    assert!(error.to_string().contains("replay receipt"));
+    assert_eq!(store.promotion_intent()?, Some(intent.clone()));
+    store
+        .db
+        .execute("DELETE FROM promotion_intent WHERE singleton=1", [])?;
+
+    store
+        .db
+        .execute_batch("DROP TRIGGER lean_spec_comparisons_no_update")?;
+    assert_eq!(
+        store.db.execute(
+            "UPDATE lean_spec_comparisons
+             SET receipt_sha256='eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'
+             WHERE git_commit=?1",
+            [&intent.new_commit],
+        )?,
+        1
+    );
+    let error = store.finish_promotion(&intent, &exact).unwrap_err();
+    assert!(error.to_string().contains("replay comparison"));
+    assert!(store.promotion_intent()?.is_none());
+    Ok(())
+}
+
 #[test]
 fn reviewed_lean_binding_is_durable_idempotent_and_has_no_trust_effect() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -1489,7 +1747,8 @@ fn reviewed_lean_promotion_requires_matching_comparison_and_records_it_atomicall
     assert!(store.promotion_intent()?.is_none());
     assert_eq!(store.claim("C")?.unwrap().local_trust, Trust::L5);
     assert!(store.finish_promotion(&intent, &ordinary).is_err());
-    assert_eq!(store.finish_promotion(&intent, &compared)?, recorded);
+    assert!(store.finish_promotion(&intent, &compared).is_err());
+    assert_eq!(store.finish_promotion(&intent, &fresh)?, recorded);
     store.bind_lean_spec(&binding)?;
     drop(store);
     let mut store = StateStore::open(&db)?;

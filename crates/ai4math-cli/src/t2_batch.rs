@@ -4,13 +4,12 @@ use crate::{
     promotion::{PromotionRepo, validate_release_label},
     t2_build::{at_generation, at_snapshot_generation_then},
     trusted_toolchain,
-    worker_dispatch::private_state_path,
 };
 use ai4math_broker::{
     Broker, MAX_MANAGED_T2_THEOREMS, ManagedLeanBatchAudit, ordered_source_set_sha256,
     validate_managed_lean_targets,
 };
-use ai4math_store::StateStore;
+use ai4math_project::ManagedProject;
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Deserializer, Serialize, de};
 use sha2::{Digest, Sha256};
@@ -370,10 +369,9 @@ pub(crate) fn inspect_release(
     expected_oid: Option<&str>,
 ) -> Result<ReleaseInspection> {
     validate_release_label(label)?;
-    let path = private_state_path(root)
-        .context("release inspection requires an initialized private project")?;
+    let project = ManagedProject::new(root)?;
     bound_engine(root, "Release.lean").context("release inspection requires a Lean project")?;
-    let state = StateStore::open_readonly(&path)?;
+    let state = project.open_state_readonly()?;
     let stamp = state
         .managed_wiki_stamp()?
         .context("release inspection requires a bound ledger without pending Git work")?;

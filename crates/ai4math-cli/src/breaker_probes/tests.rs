@@ -111,6 +111,38 @@ fn approval(root: &Path, repo: &Path, store: &mut StateStore, cases: &[&str]) ->
 }
 
 #[test]
+fn breaker_reviewed_snapshot_rejects_grafted_adr_ancestry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let (repo, mut store) = setup(root)?;
+    let locked = PromotionRepo::lock(&repo)?;
+    let scope = store.breaker_probe_scope(locked.path().to_str().unwrap(), ID)?;
+    let main = git(&repo, &["rev-parse", "refs/heads/main"]);
+    let tree = git(&repo, &["rev-parse", &format!("{main}^{{tree}}")]);
+    let unrelated = git(&repo, &["commit-tree", &tree, "-m", "unrelated main"]);
+    git(&repo, &["update-ref", "refs/heads/main", &unrelated, &main]);
+    fs::write(
+        repo.join("info/grafts"),
+        format!("{unrelated} {}\n", scope.adr_commit),
+    )?;
+    // The local metadata view invents the approved ADR edge.
+    git(
+        &repo,
+        &["merge-base", "--is-ancestor", &scope.adr_commit, &unrelated],
+    );
+    let error = reviewed_snapshot(&locked, root, &scope)
+        .err()
+        .context("grafted ADR ancestry was accepted")?;
+    assert!(
+        error
+            .to_string()
+            .contains("approved ADR does not belong to current main")
+    );
+    assert_eq!(store.live_telemetry()?.half_open_breakers, 1);
+    Ok(())
+}
+
+#[test]
 fn supersession_and_interrupted_attempt_never_unfreeze_tasks() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let root = dir.path();

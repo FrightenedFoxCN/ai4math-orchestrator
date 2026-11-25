@@ -456,7 +456,8 @@ CREATE TABLE IF NOT EXISTS witness_spec_bindings (
   proposition_name TEXT NOT NULL
 );
 
--- Kernel-verified exact counterexamples; the matching Markdown archive is written before this transaction commits.
+-- Kernel-verified exact counterexamples. The authoritative row is committed only
+-- after private outbox staging, and before the matching Markdown becomes visible.
 CREATE TABLE IF NOT EXISTS verified_refutations (
   claim_id TEXT PRIMARY KEY REFERENCES claims(claim_id),
   wiki_id TEXT NOT NULL UNIQUE,
@@ -469,6 +470,41 @@ CREATE TABLE IF NOT EXISTS verified_refutations (
   receipt_json TEXT NOT NULL,
   event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq)
 );
+
+-- Durable refutation outbox and archive recipe. Private staged Markdown is not a
+-- Wiki stratum. The state machine is:
+--   PENDING_FILE -> STAGED -> DB_COMMITTED -> COMPLETE
+-- DB_COMMITTED means verified_refutations/trust/events are already authoritative;
+-- reconcile may rebuild a missing Graveyard file from markdown. COMPLETE retains
+-- the recipe so a later missing/corrupt archive is identifiable and repairable.
+CREATE TABLE IF NOT EXISTS refutation_outbox (
+  claim_id TEXT PRIMARY KEY REFERENCES claims(claim_id),
+  wiki_id TEXT NOT NULL UNIQUE CHECK(length(wiki_id)=68 AND substr(wiki_id,1,4)='GRV-'
+    AND substr(wiki_id,5) NOT GLOB '*[^0-9a-f]*'),
+  witness_sha256 TEXT NOT NULL CHECK(length(witness_sha256)=64 AND witness_sha256 NOT GLOB '*[^0-9a-f]*'),
+  commit_id TEXT NOT NULL CHECK(length(commit_id) IN (40,64) AND commit_id NOT GLOB '*[^0-9a-f]*'),
+  file_path TEXT NOT NULL,
+  proposition_name TEXT NOT NULL,
+  source_sha256 TEXT NOT NULL CHECK(length(source_sha256)=64 AND source_sha256 NOT GLOB '*[^0-9a-f]*'),
+  repo TEXT NOT NULL CHECK(length(CAST(repo AS BLOB)) BETWEEN 1 AND 4096),
+  project_root TEXT NOT NULL CHECK(length(CAST(project_root AS BLOB)) BETWEEN 1 AND 4096),
+  proof_body TEXT NOT NULL CHECK(length(CAST(proof_body AS BLOB))<=262144),
+  receipt_json TEXT NOT NULL CHECK(json_valid(receipt_json)),
+  markdown TEXT NOT NULL CHECK(length(CAST(markdown AS BLOB))<=2097152),
+  markdown_sha256 TEXT NOT NULL CHECK(length(markdown_sha256)=64 AND markdown_sha256 NOT GLOB '*[^0-9a-f]*'),
+  phase TEXT NOT NULL CHECK(phase IN ('PENDING_FILE','STAGED','DB_COMMITTED','COMPLETE')),
+  created_at TEXT NOT NULL,
+  completed_event_seq INTEGER UNIQUE REFERENCES events(event_seq),
+  CHECK(
+    (phase IN ('PENDING_FILE','STAGED','DB_COMMITTED') AND completed_event_seq IS NULL)
+    OR (phase='COMPLETE' AND completed_event_seq IS NOT NULL)
+  )
+) STRICT;
+
+-- Serialize refutation finalization while retaining any number of completed recipes.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_refutation_outbox_single_active
+  ON refutation_outbox ((1)) WHERE phase IN ('PENDING_FILE','STAGED','DB_COMMITTED');
+CREATE INDEX IF NOT EXISTS idx_refutation_outbox_phase ON refutation_outbox(phase, claim_id);
 
 -- Immutable replay material for managed promotions. It is never exposed via the daemon.
 CREATE TABLE IF NOT EXISTS managed_proof_recipes (

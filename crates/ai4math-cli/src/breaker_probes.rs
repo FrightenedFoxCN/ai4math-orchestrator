@@ -5,6 +5,7 @@ use crate::{
 };
 use ai4math_broker::{Broker, Toolchain, lean_breaker_sources_sha256};
 use ai4math_core::Engine;
+use ai4math_project::{ManagedProject, open_managed_state};
 use ai4math_store::{BreakerProbePlan, BreakerProbeScope, Change, NewTask, StateStore, TaskTrack};
 use anyhow::{Context, Result, ensure};
 use serde_json::json;
@@ -34,7 +35,7 @@ fn reviewed_snapshot<'a>(
     );
     let snap = git.snapshot(&scope.module_path, None)?;
     ensure!(
-        git.is_ancestor(&scope.adr_commit, snap.base())?,
+        git.is_ungrafted_ancestor(&scope.adr_commit, snap.base())?,
         "approved ADR does not belong to current main"
     );
     let reviewed_snapshot = git.snapshot(&scope.module_path, Some(&scope.adr_commit))?;
@@ -66,7 +67,7 @@ fn compile_plan(
 
 pub(crate) fn preview(root: &Path, repo: &Path, id: &str, cases: &[&str]) -> Result<()> {
     let git = PromotionRepo::lock(repo)?;
-    let mut store = StateStore::open_readonly(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, true)?;
     let plan = compile_plan(root, &git, &mut store, id, cases)?;
     print_json(
         json!({"probe_status":"AWAITING_REVIEW","approval_id":plan.approval_id()?,"plan":plan,"verification_performed":false}),
@@ -80,7 +81,7 @@ pub(crate) fn arm(
     cases: &[&str],
 ) -> Result<()> {
     let git = PromotionRepo::lock(repo)?;
-    let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, false)?;
     let p = compile_plan(root, &git, &mut store, id, cases)?;
     ensure!(
         git.main_head()? == p.git_commit,
@@ -92,11 +93,12 @@ pub(crate) fn arm(
     )
 }
 pub(crate) fn run(root: &Path, repo: &Path, id: &str, approval: &str, exe: &Path) -> Result<()> {
-    let _native = crate::managed_native(root)?;
+    let project = ManagedProject::new(root)?;
+    let _native = project.try_native_heavy()?;
     // Holding the coordinating lock across native runs prevents competing main
     // writes and allows an interrupted RUNNING batch to be retried safely.
     let git = PromotionRepo::lock(repo)?;
-    let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, false)?;
     let batch = store
         .current_breaker_probe_batch(id)?
         .context("approve a breaker probe batch first")?;
@@ -111,7 +113,7 @@ pub(crate) fn run(root: &Path, repo: &Path, id: &str, approval: &str, exe: &Path
             "wrong managed repository"
         );
         ensure!(
-            git.is_ancestor(&p.git_commit, &git.main_head()?)?,
+            git.is_ungrafted_ancestor(&p.git_commit, &git.main_head()?)?,
             "checked probe is no longer in main history"
         );
         return print_json(
@@ -178,7 +180,7 @@ pub(crate) fn enroll(
         git.main_head()? == snap.base(),
         "Git main changed during task registration"
     );
-    let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, false)?;
     // Enrolling metadata is not permission to dispatch or run a compiler.
     ensure!(
         store.managed_repo()?.as_deref() == Some(repo_name(&git)?),

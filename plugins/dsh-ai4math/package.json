@@ -10,7 +10,8 @@
   },
   "scripts": {
     "build": "node client/build.mjs",
-    "test": "node --test host/test/*.test.mjs client/test/*.test.mjs"
+    "check:bundle": "node client/build.mjs --check",
+    "test": "node client/build.mjs --check && node --test host/test/*.test.mjs client/test/*.test.mjs"
   },
   "peerDependencies": {
     "@deepseek-ai/dsh-typert-protocol": "0.2.2-rc.5",

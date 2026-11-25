@@ -21,10 +21,11 @@ mod witness;
 mod worker_dispatch;
 
 use ai4math_broker::{
-    AgdaMode, Broker, ProjectNativeGate, ProjectNativeLease, RegressionArtifacts,
-    RegressionFailure, Toolchain, VerifiedCandidate, VerifiedLeanComparison, sandbox_self_test,
+    AgdaMode, Broker, RegressionArtifacts, RegressionFailure, Toolchain, VerifiedCandidate,
+    VerifiedLeanComparison, sandbox_self_test,
 };
 use ai4math_core::{Engine, FrozenTarget, ProofBodySubmission};
+use ai4math_project::{ManagedProject, open_managed_state};
 use ai4math_store::{
     Change, NewClaim, PromotionIntent, ReviewedLeanSpec, StateStore, VerifiedReceipt, Wiki,
 };
@@ -60,6 +61,9 @@ ai4math task-bind ROOT BARE_REPO ANCHOR_MODULE REVIEWED_COMMIT
 ai4math task-run ROOT BARE_REPO ID CLAIM ROLE WORKER_EXE SHA256 WALL_SECONDS
 ai4math task-run-model ROOT BARE_REPO ID CLAIM ROLE WALL_SECONDS
 ai4math task-result ROOT ID
+ai4math refute-managed ROOT BARE_REPO ID MODULE PROPOSITION NATIVE_LEAN PROOF_BODY
+ai4math refute-pending ROOT
+ai4math refute-reconcile ROOT [CLAIM]
 ai4math promote-task-result ROOT BARE_REPO ID NATIVE_ENGINE [ENGINE_DATA]
 ai4math cache-clone BARE_REPO COMMIT NEW_DIR";
 const HOLE: &str = "{{PROOF_BODY}}";
@@ -83,9 +87,8 @@ fn replay_cursor(cursor: Option<&str>) -> Result<Option<i64>> {
 }
 
 fn replay_store(root: &Path) -> Result<StateStore> {
-    let path = worker_dispatch::private_state_path(root)
-        .context("replay requires an initialized, owner-controlled project")?;
-    StateStore::open_readonly(path)
+    open_managed_state(root, true)
+        .context("replay requires an initialized, owner-controlled project")
 }
 
 fn replay_audit(command: &str, root: &Path, id: &str, cursor: Option<&str>) -> Result<()> {
@@ -100,8 +103,8 @@ fn replay_audit(command: &str, root: &Path, id: &str, cursor: Option<&str>) -> R
 
 /// Always acquire before the coordinator Git lock and any state mutation.
 /// The guard is kept across the subprocess, postchecks, and associated commit.
-fn managed_native(root: &Path) -> Result<ProjectNativeLease> {
-    ProjectNativeGate::new(root).try_heavy()
+fn managed_native(root: &Path) -> Result<ai4math_broker::ProjectNativeLease> {
+    ManagedProject::new(root)?.try_native_heavy()
 }
 
 fn init(root: &Path, engine: Engine) -> Result<()> {
@@ -360,7 +363,7 @@ fn enroll_claim(
 ) -> Result<()> {
     let engine = bound_engine(root, module)?;
     let formal_target = format!("{module}#{target}");
-    let mut store = StateStore::open(root.join(".runtime/state.sqlite"))?;
+    let mut store = open_managed_state(root, false)?;
     store.create_claim(
         NewClaim {
             id,
@@ -421,7 +424,8 @@ fn promote_managed_body(
     input: ManagedProofInput<'_>,
     data: Option<&str>,
 ) -> Result<()> {
-    let _native = managed_native(root)?;
+    let project = ManagedProject::new(root)?;
+    let _native = project.try_native_heavy()?;
     let reviewed_base = match &input {
         ManagedProofInput::Candidate { reviewed_base, .. }
         | ManagedProofInput::ReviewedFile { reviewed_base, .. } => Some(*reviewed_base),
@@ -429,8 +433,8 @@ fn promote_managed_body(
     };
     let engine = bound_engine(root, module)?;
     let locked = PromotionRepo::lock(repo)?;
-    let state_path = root.join(".runtime/state.sqlite");
-    let mut store = StateStore::open(&state_path)?;
+    let state_path = project.state_path().to_path_buf();
+    let mut store = project.open_state()?;
     if let Some(base) = reviewed_base {
         ensure!(
             locked.main_head()? == base,
@@ -440,15 +444,15 @@ fn promote_managed_body(
             store.managed_repo()?.as_deref() == locked.path().to_str(),
             "candidate is bound to a different managed repository"
         );
-        ensure!(
-            !store.module_breaker_gated(engine.as_str(), module)?,
-            "breaker still gates this candidate's module"
-        );
-        ensure!(
-            store.pivot_intent()?.is_none(),
-            "recover pending Pivot before candidate promotion"
-        );
     }
+    ensure!(
+        !store.module_breaker_gated(engine.as_str(), module)?,
+        "breaker still gates this candidate's module"
+    );
+    ensure!(
+        store.pivot_intent()?.is_none(),
+        "recover pending Pivot before candidate promotion"
+    );
     ensure!(
         store.claim(claim)?.is_some(),
         "unknown claim; declare it first"
@@ -587,10 +591,11 @@ fn finish_promotion(
 }
 
 fn recover_promotion(root: &Path, repo: &Path, exec: &Path, data: Option<&str>) -> Result<()> {
-    let _native = managed_native(root)?;
+    let project = ManagedProject::new(root)?;
+    let _native = project.try_native_heavy()?;
     let locked = PromotionRepo::lock(repo)?;
-    let state_path = root.join(".runtime/state.sqlite");
-    let mut store = StateStore::open(&state_path)?;
+    let state_path = project.state_path().to_path_buf();
+    let mut store = project.open_state()?;
     let pin = locked.pending_ref(&state_path)?;
     let Some(intent) = store.promotion_intent()? else {
         pin.clear()?;
@@ -658,7 +663,7 @@ fn run() -> Result<()> {
             let root = Path::new(root);
             let primary_engine = fs::read_to_string(root.join(".runtime/primary_engine"))
                 .context("initialize the project first")?;
-            let state = StateStore::open(root.join(".runtime/state.sqlite"))?.status()?;
+            let state = open_managed_state(root, true)?.status()?;
             print_json(serde_json::json!({"primary_engine": primary_engine.trim(), "state": state}))
         }
         [command @ ("claim-replay" | "plan-replay"), root, id] => {
@@ -907,6 +912,9 @@ fn run() -> Result<()> {
             Path::new(exec),
             Path::new(body),
         ),
+        ["refute-pending", root] => witness::pending(Path::new(root)),
+        ["refute-reconcile", root] => witness::reconcile(Path::new(root), None),
+        ["refute-reconcile", root, claim] => witness::reconcile(Path::new(root), Some(claim)),
         ["declare-claim", root, id, module, target, title, statement] => {
             declare_claim(Path::new(root), id, module, target, title, statement)
         }
@@ -1280,10 +1288,9 @@ fn run() -> Result<()> {
             Path::new(exe),
             Some(data),
         ),
-        ["tasks-status", root] => print_json(
-            StateStore::open_readonly(Path::new(root).join(".runtime/state.sqlite"))?
-                .task_scheduler_status()?,
-        ),
+        ["tasks-status", root] => {
+            print_json(open_managed_state(Path::new(root), true)?.task_scheduler_status()?)
+        }
         [
             "t2-check-export",
             export,

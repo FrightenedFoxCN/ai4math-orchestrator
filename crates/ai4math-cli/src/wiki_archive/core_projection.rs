@@ -1,10 +1,11 @@
 //! Explicit operator projection of managed CORE entries into the disposable Wiki index.
 //! The pair (reviewed Git HEAD, ledger event sequence) is a visibility gate, not proof authority.
 use super::{prefix, require_reviewed_main, sha};
-use crate::{
-    print_json, promotion::PromotionRepo, reviewed_spec, worker_dispatch::private_state_path,
+use crate::{print_json, promotion::PromotionRepo, reviewed_spec};
+use ai4math_project::open_managed_state;
+use ai4math_store::{
+    SedimentLineage, StateStore, Wiki, WikiManagedCoreEntry, WikiManagedGeneration, WikiQuery,
 };
-use ai4math_store::{StateStore, Wiki, WikiManagedCoreEntry, WikiManagedGeneration, WikiQuery};
 use anyhow::{Context, Result, ensure};
 use serde_json::json;
 use std::{
@@ -52,6 +53,18 @@ fn require_generation(state: &StateStore, git: &PromotionRepo, head: &str, seq: 
     Ok(())
 }
 
+fn lineage_in_physical_history(
+    git: &PromotionRepo,
+    lineage: &SedimentLineage,
+    verified: &str,
+    head: &str,
+) -> Result<bool> {
+    Ok(
+        git.is_ungrafted_ancestor(&lineage.promoted_commit, verified)?
+            && git.is_ungrafted_ancestor(verified, head)?,
+    )
+}
+
 fn entries(
     state: &StateStore,
     git: &PromotionRepo,
@@ -82,8 +95,7 @@ fn entries(
             .context("managed CORE lineage lacks approval")?
             .plan;
         let module = &approval.target_module;
-        if !git.is_ancestor(&lineage.promoted_commit, verified)?
-            || !git.is_ancestor(verified, head)?
+        if !lineage_in_physical_history(git, &lineage, verified, head)?
             || !git.contains_module_at(head, module)?
         {
             continue;
@@ -164,7 +176,7 @@ fn entries(
 
 pub(crate) fn rebuild(root: &Path, repo: &Path, head: &str) -> Result<usize> {
     let git = PromotionRepo::try_lock(repo)?;
-    let state = StateStore::open_readonly(private_state_path(root)?)?;
+    let state = open_managed_state(root, true)?;
     require_reviewed_main(&state, &git, head)?;
     let seq = state.status()?.last_event_seq;
     let wiki = wiki_root(root)?;
@@ -192,7 +204,7 @@ pub(super) fn checked_read<T>(
     read: impl FnOnce(&Wiki, WikiManagedGeneration<'_>) -> Result<T>,
 ) -> Result<(T, i64)> {
     let git = PromotionRepo::try_lock(repo)?;
-    let state = StateStore::open_readonly(private_state_path(root)?)?;
+    let state = open_managed_state(root, true)?;
     require_reviewed_main(&state, &git, head)?;
     let seq = state.status()?.last_event_seq;
     let index = Wiki::open_readonly(wiki_root(root)?.join(".index.sqlite"))?;
@@ -235,4 +247,91 @@ pub(crate) fn provenance(root: &Path, repo: &Path, head: &str, id: &str) -> Resu
     print_json(
         json!({"reviewed_main":head,"event_seq":seq,"result":result,"current_proof_authority":false}),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::managed_tests::git;
+
+    #[test]
+    fn core_history_gate_ignores_both_grafted_lineage_edges() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path();
+        let work = root.join("work");
+        fs::create_dir(&work)?;
+        git(&work, &["init", "--initial-branch=main"]);
+        fs::write(work.join("A.lean"), "def unchanged : Nat := 1\n")?;
+        git(&work, &["add", "A.lean"]);
+        git(&work, &["commit", "-m", "baseline"]);
+        let repo = root.join("repo.git");
+        git(root, &["clone", "--bare", "work", "repo.git"]);
+        let locked = PromotionRepo::lock(&repo)?;
+        let base = locked.main_head()?;
+        let tree = git(&repo, &["rev-parse", &format!("{base}^{{tree}}")]);
+        let promoted = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &base, "-m", "promoted"],
+        );
+        let verified = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &promoted, "-m", "verified"],
+        );
+        let head = git(
+            &repo,
+            &["commit-tree", &tree, "-p", &verified, "-m", "head"],
+        );
+        let unrelated = git(&repo, &["commit-tree", &tree, "-m", "unrelated"]);
+        let lineage = SedimentLineage {
+            approval_sha256: "a".repeat(64),
+            archive_id: "archive".into(),
+            origin_claim: "origin".into(),
+            origin_promoted_commit: base,
+            target_claim: "target".into(),
+            repo: locked.path().to_str().unwrap().into(),
+            promoted_commit: promoted,
+            task_id: "task".into(),
+            core_entry_id: "CORE-ADAPT-fixture".into(),
+            core_entry_prospective: true,
+            origin_t1_receipt_sha256: "b".repeat(64),
+            origin_comparison_receipt_sha256: "c".repeat(64),
+            candidate_receipt_sha256: "d".repeat(64),
+            comparison_receipt_sha256: "e".repeat(64),
+            expected_event_seq: 0,
+            event_seq: 1,
+        };
+        assert!(lineage_in_physical_history(
+            &locked, &lineage, &verified, &head
+        )?);
+
+        let mut fake_origin = lineage.clone();
+        fake_origin.promoted_commit = unrelated.clone();
+        fs::write(
+            repo.join("info/grafts"),
+            format!("{verified} {unrelated}\n{unrelated}\n"),
+        )?;
+        git(
+            &repo,
+            &["merge-base", "--is-ancestor", &unrelated, &verified],
+        );
+        assert!(!lineage_in_physical_history(
+            &locked,
+            &fake_origin,
+            &verified,
+            &verified
+        )?);
+
+        fs::write(
+            repo.join("info/grafts"),
+            format!("{unrelated} {verified}\n{verified}\n"),
+        )?;
+        git(
+            &repo,
+            &["merge-base", "--is-ancestor", &verified, &unrelated],
+        );
+        assert!(!lineage_in_physical_history(
+            &locked, &lineage, &verified, &unrelated
+        )?);
+        Ok(())
+    }
 }
