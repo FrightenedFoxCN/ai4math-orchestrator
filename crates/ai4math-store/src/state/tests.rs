@@ -72,6 +72,7 @@ fn receipt(target: &str, base: &str, nonce: u32) -> VerifiedReceipt {
         receipt_sha256: format!("{nonce:064x}"),
         raw: json!({"test": true}),
         regression_checked: true,
+        broker_assessed_t3: base != BASE,
         lean_comparison: None,
     }
 }
@@ -222,6 +223,60 @@ fn t3_marks_both_graphs_and_rechecks_only_previous_l5_in_order() -> Result<()> {
                 && event.entity_id == "b-leaf"
                 && event.payload["diagnostics"] == "old proof no longer compiles")
     );
+    Ok(())
+}
+
+#[test]
+fn t3_restore_requires_broker_provenance_in_every_recheck_mode() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    claim(&mut store, "C", Some("Spec.lean"), false)?;
+    store.record_verified("C", &receipt("C", BASE, 1), change(BASE))?;
+    let approval = apply_reviewed_fixture_plan(&mut store, "Spec.lean")?;
+    let hash = &approval.plan_sha256;
+    let seq = store.status()?.last_event_seq;
+    let stale = store.claim("C")?.unwrap();
+    assert!(stale.stale && stale.effective_stale);
+    let legacy = |_: &ClaimState| {
+        let mut r = receipt("C", T3_HEAD, 2);
+        r.broker_assessed_t3 = false;
+        // Neither the correct tier nor caller-like JSON can supply the sealed bit.
+        r.raw = json!({"tier": "T3_TAINT_REBUILD", "broker_assessed_t3": true});
+        Ok(RecheckOutcome::Verified(Box::new(r)))
+    };
+    for denied in [
+        store
+            .recheck_stale_for_plan(hash, "test", legacy)
+            .unwrap_err(),
+        store
+            .recheck_one_stale_for_plan(hash, "C", "test", legacy)
+            .unwrap_err(),
+        store
+            .recheck_page_stale_for_plan(hash, 1, None, "test", legacy)
+            .unwrap_err(),
+        store.recheck_stale(T3_HEAD, "test", legacy).unwrap_err(),
+    ] {
+        assert!(denied.to_string().contains("broker-assessed T3 provenance"));
+    }
+    assert_eq!(store.status()?.last_event_seq, seq);
+    assert_eq!(
+        store.t3_worklist(hash, 1, None)?.entries[0].status,
+        T3WorklistStatus::Pending
+    );
+    let denied = store.claim("C")?.unwrap();
+    assert!(denied.stale && denied.effective_stale);
+    assert_eq!(denied.effective_trust, stale.effective_trust);
+    assert_eq!(denied.receipt_id.as_deref(), Some("receipt-1"));
+
+    // Reusing the same receipt identity demonstrates the denied result was never persisted.
+    let accepted = store.recheck_one_stale_for_plan(hash, "C", "test", |_| {
+        Ok(RecheckOutcome::Verified(Box::new(receipt("C", T3_HEAD, 2))))
+    })?;
+    assert_eq!(accepted.verified, ["C"]);
+    let restored = store.claim("C")?.unwrap();
+    assert!(!restored.stale && !restored.effective_stale);
+    assert_eq!(restored.local_trust, Trust::L5);
+    assert_eq!(restored.effective_trust, Trust::L5);
+    assert_eq!(restored.receipt_id.as_deref(), Some("receipt-2"));
     Ok(())
 }
 
@@ -1488,6 +1543,7 @@ fn apply_reviewed_fixture_plan(store: &mut StateStore, module: &str) -> Result<T
 fn compared_recheck(binding: &ReviewedLeanSpec, nonce: u32) -> VerifiedReceipt {
     let mut r = compared_receipt(binding, nonce);
     r.tier = "T3_TAINT_REBUILD".into();
+    r.broker_assessed_t3 = true;
     r.base_commit = T3_HEAD.into();
     r.regression_checked = false;
     r
@@ -1515,7 +1571,8 @@ fn reviewed_t3_recheck_refuses_mismatch_and_generic_failure() -> Result<()> {
     assert!(failed.deferred.contains_key("C"));
     assert!(failed.verified.is_empty() && failed.needs_reproof.is_empty());
 
-    let patches: [(&str, fn(&mut VerifiedReceipt)); 9] = [
+    let patches: [(&str, fn(&mut VerifiedReceipt)); 10] = [
+        ("wrong broker provenance", |r| r.broker_assessed_t3 = false),
         ("comparison missing", |r| r.lean_comparison = None),
         ("wrong spec file", |r| {
             r.lean_comparison.as_mut().unwrap().spec_file = "Other.lean".into()

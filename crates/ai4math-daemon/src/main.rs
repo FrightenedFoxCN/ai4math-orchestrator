@@ -9,6 +9,10 @@ mod facts;
 #[cfg(unix)]
 mod proofs;
 #[cfg(unix)]
+mod resident_paths;
+#[cfg(unix)]
+mod resident_process;
+#[cfg(unix)]
 mod runtime;
 #[cfg(unix)]
 mod t2_audit;

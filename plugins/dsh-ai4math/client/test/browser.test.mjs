@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
+import { EventEmitter, on, once } from 'node:events';
 import { test } from 'node:test';
 import { createBridge } from '../../host/bridge.mjs';
 import { fixture, push, reply } from '../../host/test/fixture.mjs';
@@ -833,6 +833,111 @@ const historyPage = (after, size = 64, truncated = true) => ok({
   truncated,
 });
 
+test('a silent connected HUD expires only accepted snapshots and recovers without resetting history', async t => {
+  const frames = new EventEmitter();
+  const send = (topic, data) => frames.emit('frame', { topic, data });
+  const settle = () => new Promise(resolve => setImmediate(resolve));
+  const reconnectStatus = Promise.withResolvers();
+  const requests = [];
+  const subscriptions = [];
+  const statuses = [];
+  const broker = { fast_busy: 1, fast_capacity: 8, heavy_running: 0, heavy_queued: 0,
+    lean_advisory_busy: 1, lean_advisory_capacity: 2 };
+  let status = ok(snapshot(8, { broker }));
+  const app = await browser(t, {
+    async *subscribe(params, signal) {
+      assert.deepEqual(fromWire(params), { topics });
+      subscriptions.push(signal);
+      for await (const [frame] of on(frames, 'frame', { signal })) yield frame;
+    },
+    async status(_params, signal) { statuses.push(signal); return status; },
+    async alertsList({ after, limit }) {
+      requests.push({ after, limit });
+      if (requests.length === 1) return historyPage(0, 1);
+      if (requests.length === 2) return historyPage(1, 0); // Invalid empty truncated page.
+      return historyPage(after, 1, false);
+    },
+    async frontierList() { return ok({ items: [] }); },
+  });
+  const hud = app.mount('shell.bottom');
+  const frontier = mountTab(app, 'frontier');
+  assert.match(hud.text(), /Connecting/);
+  assert.equal(app.timers.size, 0, 'there is no sample to expire yet');
+  send('ai4math.connection', { state: 'connected' });
+  await expectText(hud, /Live .*Lean advisory .*Seq 8 .*P0 alert catch-up incomplete.*Persisted P0 1/);
+  assert.deepEqual(requests, alertRequests(0, 1));
+
+  app.advanceTimersBy(9999);
+  assert.match(hud.text(), /Live .*Seq 8/);
+  send('vital_signs.tick', snapshot(8, { broker })); // Equal replay cannot postpone expiry.
+  send('vital_signs.tick', snapshot(9, { trust: null }));
+  send('vital_signs.tick', snapshot(7));
+  status = ok(snapshot(8, { observed_at: '2026-01-09T00:00:00Z' }));
+  send('breaker.state_changed', { event_seq: 9, event_type: 'breaker.tripped', entity_id: 'breaker-9' });
+  await settle();
+  assert.equal(statuses.length, 2);
+  app.advanceTimersBy(1);
+  assert.match(hud.text(), /Connected · stale .*Daemon broker fast 1\/8 busy .*Seq 8 .*Persisted P0 1/);
+  const staleStatus = hud.find('span', 'Connected · stale');
+  assert.equal(staleStatus.props.role, 'status');
+  assert.equal(staleStatus.children[0].props['data-tone'], 'warn');
+  assert.doesNotMatch(hud.text(), /Reconnecting|Lean advisory/);
+  assert.match(frontier.text(), /Live status unavailable or stale.*Latest breaker event .*breaker-9/);
+  assert.equal(app.timers.size, 0, 'the stale marker is not a polling loop');
+  assert.equal(subscriptions.length, 1);
+  assert.equal(subscriptions[0].aborted, false);
+  assert.equal(statuses[0].aborted, false);
+  assert.deepEqual(requests, alertRequests(0, 1), 'expiry does not query or reset history');
+  assert.equal(statuses.length, 2, 'expiry does not query status');
+
+  const continuation = hud.find('button', continueLabel).props;
+  assert.equal(continuation.disabled, false);
+  continuation.onClick();
+  await expectText(hud, /Last P0 Persisted P0 2/);
+  assert.deepEqual(requests, alertRequests(0, 1, 1));
+  send('vital_signs.tick', snapshot(7));
+  send('vital_signs.tick', snapshot(8, { broker }));
+  await settle();
+  assert.match(hud.text(), /Connected · stale .*Seq 8/, 'an equal replay cannot restore freshness');
+  assert.equal(app.timers.size, 0);
+  send('vital_signs.tick', snapshot(8, { broker, observed_at: '2026-01-10T00:00:01Z' }));
+  await expectText(hud, /Live .*Lean advisory .*Seq 8/);
+  assert.doesNotMatch(frontier.text(), /Live status unavailable or stale/);
+
+  app.advanceTimersBy(5000);
+  send('vital_signs.tick', snapshot(9));
+  await expectText(hud, /Live .*Seq 9/);
+  assert.equal(app.timers.size, 1, 'an accepted update replaces the old timer');
+  app.advanceTimersBy(5000);
+  assert.match(hud.text(), /Live .*Seq 9/, 'the previous snapshot deadline does not fire');
+  app.advanceTimersBy(5000);
+  assert.match(hud.text(), /Connected · stale .*Seq 9/);
+  status = ok(snapshot(10));
+  send('breaker.state_changed', { event_seq: 10, event_type: 'breaker.tripped', entity_id: 'breaker-10' });
+  await expectText(hud, /Live .*Seq 10 .*Persisted P0 2/);
+  assert.deepEqual(requests, alertRequests(0, 1, 1), 'freshness recovery does not run catch-up');
+  assert.equal(app.timers.size, 1);
+
+  const pendingTimer = app.timers.values().next().value;
+  status = reconnectStatus.promise;
+  send('ai4math.connection', { state: 'reconnecting' });
+  await expectText(hud, /Reconnecting · stale .*Seq 10/);
+  assert.equal(app.timers.size, 0, 'real reconnect cancels the deadline');
+  send('ai4math.connection', { state: 'connected' });
+  await until(() => statuses.length, count => count === 4, 'Expected returning connection status call');
+  app.advanceTimersBy(10000);
+  assert.match(hud.text(), /Reconnecting · stale .*Seq 10/);
+  reconnectStatus.resolve(ok(snapshot(11)));
+  await expectText(hud, /Live .*Seq 11 .*Persisted P0 3/);
+  assert.deepEqual(requests, alertRequests(0, 1, 1, 2));
+  pendingTimer.fn(); // A late callback from the previous connection cannot affect this one.
+  assert.match(hud.text(), /Live .*Seq 11/);
+  assert.equal(app.timers.size, 1);
+  app.dispose();
+  assert.equal(app.timers.size, 0, 'disposal cancels the current deadline');
+  assert.equal(subscriptions[0].aborted, true);
+});
+
 test('each healthy-connection P0 continuation is bounded and does not skip unvalidated gaps', async t => {
   const calls = [];
   const firstManualPage = Promise.withResolvers();
@@ -888,7 +993,8 @@ test('each healthy-connection P0 continuation is bounded and does not skip unval
   await expectText(briefing, /catch-up incomplete.*#999 .*#448\b/);
   assert.deepEqual(calls, alertRequests(0, 64, 128, 192, 256, 256, 320, 384),
     'retry resumes at the last valid cursor and stops at the next manual cap');
-  assert.equal(app.timers.size, 0, 'healthy connection does not schedule a retry loop');
+  assert.deepEqual([...app.timers.values()].map(timer => timer.ms), [10000],
+    'healthy connection schedules only the snapshot freshness deadline');
   briefing.find('button', continueLabel).props.onClick();
   await expectText(briefing, /#999 .*#449\b/);
   assert.doesNotMatch(hud.text(), /catch-up incomplete|Continue P0 alert catch-up/);

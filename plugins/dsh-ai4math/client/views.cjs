@@ -179,35 +179,36 @@ function leanAdvisoryBadge(broker) {
 function LiveHud({ live, open }) {
   const [navigationError, setNavigationError] = useState(false)
   const state = useSyncExternalStore(live.subscribe, live.getSnapshot)
-  const { phase, snapshot, recentAlerts, breaker } = state
+  const { phase, snapshot, snapshotStale, recentAlerts, breaker } = state
+  const snapshotFresh = phase === 'live' && !snapshotStale
   const latestBreaker = phase === 'live' && readBreakerEvent(breaker)
   const alert = recentAlerts[0]
   const alertText = text(alert?.headline, '')
   const memory = snapshot?.memory
   const broker = snapshot?.broker
-  const advisoryBadge = phase === 'live' ? leanAdvisoryBadge(broker) : null
+  const advisoryBadge = snapshotFresh ? leanAdvisoryBadge(broker) : null
   const workers = snapshot?.workers
   const oracleHeld = snapshot?.task_scheduler?.exploration?.held_for_oracle
   const brokerText = !broker ? NA
     : 'fast ' + count(broker.fast_busy) + '/' + count(broker.fast_capacity) + ' busy · heavy '
       + count(broker.heavy_running) + ' running / ' + count(broker.heavy_queued) + ' queued'
-  const phaseLabel = phase === 'live' ? 'Live' : phase === 'reconnecting'
-    ? (snapshot ? 'Reconnecting · stale' : 'Reconnecting') : 'Connecting'
+  const phaseLabel = phase === 'live' ? (snapshotStale ? 'Connected · stale' : 'Live')
+    : phase === 'reconnecting' ? (snapshot ? 'Reconnecting · stale' : 'Reconnecting') : 'Connecting'
   return h('section', { className: 'ai4m ai4m-hud', 'aria-label': 'AI4Math Live HUD' },
     h('div', { className: 'ai4m-hud-line' },
       h('strong', null, 'AI4Math'),
-      h('span', { role: 'status' }, badge(phaseLabel, phase === 'live' ? 'good' : 'warn')),
+      h('span', { role: 'status' }, badge(phaseLabel, snapshotFresh ? 'good' : 'warn')),
       labelValue('RAM', pct(memory?.used_percent) + (typeof memory?.pressure === 'string' ? ' · ' + memory.pressure : '')),
       h('span', { title: 'Daemon-managed work only; independent CLI processes are not counted.' },
         labelValue('Daemon broker', brokerText), advisoryBadge && ' ', advisoryBadge),
       labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active)),
       trustTape(snapshot?.trust),
       labelValue('Stale', count(snapshot?.stale_claims)),
-      phase === 'live' && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
-      phase === 'live' && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
+      snapshotFresh && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
+      snapshotFresh && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
       h(BreakerTotals, { snapshot }),
-      phase === 'live' && h(InfraRfcTotals, { snapshot }),
-      phase === 'live' && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
+      snapshotFresh && h(InfraRfcTotals, { snapshot }),
+      snapshotFresh && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
         title: 'Temporary exploration scheduling hold; not a Claim refutation.',
       }, labelValue('Oracle-held exploration', count(oracleHeld))),
       ...PRIORITIES.map(priority => h('span', { key: priority }, badge(priority + ' ' + count(snapshot?.pending_inbox?.[priority]),
@@ -478,14 +479,14 @@ function Briefing({ remote, live }) {
 
 function Frontier({ remote, live }) {
   const query = useQuery(remote)
-  const { phase, snapshot, breaker } = useSyncExternalStore(live.subscribe, live.getSnapshot)
+  const { phase, snapshot, snapshotStale, breaker } = useSyncExternalStore(live.subscribe, live.getSnapshot)
   const refresh = useCallback(() => void query.run('frontierList', { limit: 32 }), [query.run])
   useEffect(refresh, [refresh])
   return h(Panel, { title: 'Active frontier', subtitle: 'A bounded claim and dependency slice, not the full proof DAG.',
     actions: button('Refresh', refresh, query.phase === 'loading') },
     h(Section, { title: 'Circuit breakers' },
       h('p', null, h(BreakerTotals, { snapshot }),
-        phase !== 'live' && ' · Live status unavailable or stale'),
+        (phase !== 'live' || snapshotStale) && ' · Live status unavailable or stale'),
       phase === 'live' && breaker && h(BreakerSignal, { event: breaker }),
       note('Read-only. To review stored breaker records, use Briefing → Peek.')),
     queryNote(query, 'Waiting for frontier…'),

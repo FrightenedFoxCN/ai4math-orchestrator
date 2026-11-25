@@ -305,7 +305,7 @@ fn current_approval(
         .context("T3 plan has not been applied")?;
     let at = &approval.reviewed_commit;
     ensure!(
-        approval.base_commit != *at && locked.is_ancestor(&approval.base_commit, at)?,
+        approval.base_commit != *at && locked.is_ungrafted_ancestor(&approval.base_commit, at)?,
         "applied T3 plan no longer describes a descendant review commit"
     );
     ensure!(
@@ -495,7 +495,7 @@ pub(crate) fn plan(
     engine: Engine,
 ) -> Result<Plan> {
     ensure!(
-        old != reviewed && locked.is_ancestor(old, reviewed)?,
+        old != reviewed && locked.is_ungrafted_ancestor(old, reviewed)?,
         "T3 requires an explicit descendant review commit"
     );
     let before = locked.snapshot(anchor, Some(old))?;

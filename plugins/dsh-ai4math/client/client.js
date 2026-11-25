@@ -144,8 +144,10 @@ const { call } = require('./remote.cjs')
 const ALERT_PAGE_SIZE = 64
 const ALERT_PAGE_CAP = 3
 const RECENT_ALERT_LIMIT = 16
+// Five nominal daemon ticks (2 s each), allowing for scheduling and delivery jitter.
+const SNAPSHOT_STALE_MS = 10000
 const NO_ALERTS = Object.freeze([])
-const INITIAL = Object.freeze({ phase: 'connecting', snapshot: null, recentAlerts: NO_ALERTS, breaker: null,
+const INITIAL = Object.freeze({ phase: 'connecting', snapshot: null, snapshotStale: false, recentAlerts: NO_ALERTS, breaker: null,
   alertHistoryIncomplete: false, alertHistoryLoading: false })
 
 function isAlert(value) {
@@ -169,7 +171,8 @@ function isSnapshot(value) {
 }
 
 // One logical subscriber per mounted plugin, not per session, tab, or React render.
-function createLive(remote, { topics, retryMs = 1500 }) {
+function createLive(remote, { topics, retryMs = 1500,
+  schedule = (fn, ms) => setTimeout(fn, ms), cancel = timer => clearTimeout(timer) }) {
   const listeners = new Set()
   let view = INITIAL
   let lifetime
@@ -228,8 +231,20 @@ function createLive(remote, { topics, retryMs = 1500 }) {
     function delay(ms) {
       return new Promise(resolve => {
         cancelRetry = resolve
-        timeout = setTimeout(resolve, ms)
+        timeout = schedule(resolve, ms)
       }).finally(() => { timeout = undefined; cancelRetry = undefined })
+    }
+
+    function clearSnapshotTimer(conn) {
+      if (conn?.snapshotTimer === undefined) return
+      const timer = conn.snapshotTimer
+      conn.snapshotTimer = undefined
+      cancel(timer)
+    }
+    function closeConnection() {
+      clearSnapshotTimer(connection)
+      connection?.controller.abort()
+      connection = undefined
     }
 
     async function watch() {
@@ -237,16 +252,15 @@ function createLive(remote, { topics, retryMs = 1500 }) {
       while (!signal.aborted) {
         const round = new AbortController()
         const roundSignal = AbortSignal.any([signal, round.signal])
-        function closeConnection() {
-          connection?.controller.abort()
-          connection = undefined
-        }
         function accept(conn, snapshot) {
           if (!conn || conn.signal.aborted || !isSnapshot(snapshot)) return
           const prior = view.snapshot
           if (conn.ready && (snapshot.event_seq < prior.event_seq
             || (snapshot.event_seq === prior.event_seq && snapshot.observed_at < prior.observed_at))) return
           const first = !conn.ready
+          // Older servers need no new fields; an equal sample can update the
+          // display as before, but cannot prove newer telemetry arrived.
+          const advances = first || snapshot.event_seq > prior.event_seq || snapshot.observed_at > prior.observed_at
           // Only a fresh connection can establish a lower sequence, such as
           // a daemon on a newly initialized or restored project. Do not carry
           // the old project's cursor/alert into that connection.
@@ -256,7 +270,19 @@ function createLive(remote, { topics, retryMs = 1500 }) {
           conn.ready = true
           const recentAlerts = mergeAlerts(reset ? NO_ALERTS : view.recentAlerts, [...conn.pendingAlerts, snapshot.last_alert])
           conn.pendingAlerts = NO_ALERTS
-          update({ phase: 'live', snapshot, recentAlerts, ...(reset ? { alertHistoryIncomplete: false } : {}) })
+          // Use local elapsed time since acceptance, not the daemon's clock.
+          // Expiry only marks this sample stale; the stream and cursor stay live.
+          if (advances) {
+            clearSnapshotTimer(conn)
+            const timer = schedule(() => {
+              if (conn.signal.aborted || conn.snapshotTimer !== timer) return
+              conn.snapshotTimer = undefined
+              update({ snapshotStale: true })
+            }, SNAPSHOT_STALE_MS)
+            conn.snapshotTimer = timer
+          }
+          update({ phase: 'live', snapshot, snapshotStale: !advances && view.snapshotStale,
+            recentAlerts, ...(reset ? { alertHistoryIncomplete: false } : {}) })
           retry = retryMs
           // Wait for the first status or tick instead of querying with a
           // possibly wrong cursor before we can recognize a reset.
@@ -292,7 +318,9 @@ function createLive(remote, { topics, retryMs = 1500 }) {
                   const controller = new AbortController()
                   connection = { controller, signal: AbortSignal.any([roundSignal, controller.signal]),
                     ready: false, pending: false, reading: false, pendingAlerts: NO_ALERTS }
-                  if (view.breaker) update({ breaker: null })
+                  if (view.breaker || (view.snapshot && !view.snapshotStale)) {
+                    update({ breaker: null, snapshotStale: view.snapshot !== null })
+                  }
                   refresh(connection)
                 }
                 break
@@ -333,8 +361,9 @@ function createLive(remote, { topics, retryMs = 1500 }) {
     return () => {
       if (signal.aborted) return
       owner.abort()
+      closeConnection()
       activeHandle?.dispose?.()
-      if (timeout !== undefined) clearTimeout(timeout)
+      if (timeout !== undefined) cancel(timeout)
       cancelRetry?.()
       lifetime = undefined
       requestAlertCatchUp = undefined
@@ -531,35 +560,36 @@ function leanAdvisoryBadge(broker) {
 function LiveHud({ live, open }) {
   const [navigationError, setNavigationError] = useState(false)
   const state = useSyncExternalStore(live.subscribe, live.getSnapshot)
-  const { phase, snapshot, recentAlerts, breaker } = state
+  const { phase, snapshot, snapshotStale, recentAlerts, breaker } = state
+  const snapshotFresh = phase === 'live' && !snapshotStale
   const latestBreaker = phase === 'live' && readBreakerEvent(breaker)
   const alert = recentAlerts[0]
   const alertText = text(alert?.headline, '')
   const memory = snapshot?.memory
   const broker = snapshot?.broker
-  const advisoryBadge = phase === 'live' ? leanAdvisoryBadge(broker) : null
+  const advisoryBadge = snapshotFresh ? leanAdvisoryBadge(broker) : null
   const workers = snapshot?.workers
   const oracleHeld = snapshot?.task_scheduler?.exploration?.held_for_oracle
   const brokerText = !broker ? NA
     : 'fast ' + count(broker.fast_busy) + '/' + count(broker.fast_capacity) + ' busy · heavy '
       + count(broker.heavy_running) + ' running / ' + count(broker.heavy_queued) + ' queued'
-  const phaseLabel = phase === 'live' ? 'Live' : phase === 'reconnecting'
-    ? (snapshot ? 'Reconnecting · stale' : 'Reconnecting') : 'Connecting'
+  const phaseLabel = phase === 'live' ? (snapshotStale ? 'Connected · stale' : 'Live')
+    : phase === 'reconnecting' ? (snapshot ? 'Reconnecting · stale' : 'Reconnecting') : 'Connecting'
   return h('section', { className: 'ai4m ai4m-hud', 'aria-label': 'AI4Math Live HUD' },
     h('div', { className: 'ai4m-hud-line' },
       h('strong', null, 'AI4Math'),
-      h('span', { role: 'status' }, badge(phaseLabel, phase === 'live' ? 'good' : 'warn')),
+      h('span', { role: 'status' }, badge(phaseLabel, snapshotFresh ? 'good' : 'warn')),
       labelValue('RAM', pct(memory?.used_percent) + (typeof memory?.pressure === 'string' ? ' · ' + memory.pressure : '')),
       h('span', { title: 'Daemon-managed work only; independent CLI processes are not counted.' },
         labelValue('Daemon broker', brokerText), advisoryBadge && ' ', advisoryBadge),
       labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active)),
       trustTape(snapshot?.trust),
       labelValue('Stale', count(snapshot?.stale_claims)),
-      phase === 'live' && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
-      phase === 'live' && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
+      snapshotFresh && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
+      snapshotFresh && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
       h(BreakerTotals, { snapshot }),
-      phase === 'live' && h(InfraRfcTotals, { snapshot }),
-      phase === 'live' && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
+      snapshotFresh && h(InfraRfcTotals, { snapshot }),
+      snapshotFresh && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
         title: 'Temporary exploration scheduling hold; not a Claim refutation.',
       }, labelValue('Oracle-held exploration', count(oracleHeld))),
       ...PRIORITIES.map(priority => h('span', { key: priority }, badge(priority + ' ' + count(snapshot?.pending_inbox?.[priority]),
@@ -830,14 +860,14 @@ function Briefing({ remote, live }) {
 
 function Frontier({ remote, live }) {
   const query = useQuery(remote)
-  const { phase, snapshot, breaker } = useSyncExternalStore(live.subscribe, live.getSnapshot)
+  const { phase, snapshot, snapshotStale, breaker } = useSyncExternalStore(live.subscribe, live.getSnapshot)
   const refresh = useCallback(() => void query.run('frontierList', { limit: 32 }), [query.run])
   useEffect(refresh, [refresh])
   return h(Panel, { title: 'Active frontier', subtitle: 'A bounded claim and dependency slice, not the full proof DAG.',
     actions: button('Refresh', refresh, query.phase === 'loading') },
     h(Section, { title: 'Circuit breakers' },
       h('p', null, h(BreakerTotals, { snapshot }),
-        phase !== 'live' && ' · Live status unavailable or stale'),
+        (phase !== 'live' || snapshotStale) && ' · Live status unavailable or stale'),
       phase === 'live' && breaker && h(BreakerSignal, { event: breaker }),
       note('Read-only. To review stored breaker records, use Briefing → Peek.')),
     queryNote(query, 'Waiting for frontier…'),

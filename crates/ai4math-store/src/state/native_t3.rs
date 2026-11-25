@@ -1,5 +1,5 @@
 use super::{Change, NewClaim, RecheckOutcome, StateStore, Trust, VerifiedReceipt};
-use ai4math_broker::{Broker, ReceiptTier, Toolchain};
+use ai4math_broker::{Broker, ReceiptTier, RecheckAssessment, Toolchain};
 use ai4math_core::{Engine, FrozenTarget, ProofBodySubmission};
 use anyhow::Result;
 
@@ -60,12 +60,35 @@ fn native_old_proof_recheck_updates_sqlite_atomically() -> Result<()> {
     state.mark_t3(&[], &["Spec.lean"], change(HEAD))?;
     assert!(state.claim("C")?.unwrap().stale);
 
+    // A genuine legacy verification with the correct tier and snapshot is not a T3 assessment.
+    let legacy =
+        broker.recheck_with_dependencies(&toolchain, &target, &old_proof, HEAD, &new_deps)?;
+    assert_eq!(legacy.receipt().tier(), ReceiptTier::T3TaintRebuild);
+    assert!(!legacy.is_assessed_t3());
+    let denied = state
+        .recheck_stale(HEAD, "native-integration", |_| {
+            Ok(RecheckOutcome::Verified(Box::new(
+                VerifiedReceipt::from_broker(&legacy)?,
+            )))
+        })
+        .unwrap_err();
+    assert!(denied.to_string().contains("broker-assessed T3 provenance"));
+    assert!(state.claim("C")?.unwrap().stale);
+
+    let assess = |target: &FrozenTarget| {
+        let result = broker
+            .assess_recheck_with_dependencies(&toolchain, target, &old_proof, HEAD, &new_deps);
+        let RecheckAssessment::Verified(candidate) = result else {
+            anyhow::bail!("expected successful T3 assessment: {result:?}");
+        };
+        Ok(candidate)
+    };
+
     // A valid theorem with the same name in the wrong file cannot clear this claim.
     target.file_path = "Other.lean".into();
     let mismatch = state
         .recheck_stale(HEAD, "native-integration", |_| {
-            let wrong = broker
-                .recheck_with_dependencies(&toolchain, &target, &old_proof, HEAD, &new_deps)?;
+            let wrong = assess(&target)?;
             Ok(RecheckOutcome::Verified(Box::new(
                 VerifiedReceipt::from_broker(&wrong)?,
             )))
@@ -76,8 +99,7 @@ fn native_old_proof_recheck_updates_sqlite_atomically() -> Result<()> {
 
     target.file_path = "Proof.lean".into();
     let report = state.recheck_stale(HEAD, "native-integration", |_| {
-        let result =
-            broker.recheck_with_dependencies(&toolchain, &target, &old_proof, HEAD, &new_deps)?;
+        let result = assess(&target)?;
         assert_eq!(result.receipt().tier(), ReceiptTier::T3TaintRebuild);
         assert_ne!(
             result.receipt().receipt_sha256(),

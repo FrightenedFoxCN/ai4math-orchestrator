@@ -60,6 +60,7 @@ fn receipt(tier: &str, base: &str, nonce: u32) -> VerifiedReceipt {
             "receipt_sha256": receipt_sha256, "dependencies_sha256": lean_breaker_sources_sha256(&[]),
         }),
         regression_checked: tier == "T1_PROMOTION",
+        broker_assessed_t3: tier == "T3_TAINT_REBUILD",
         lean_comparison: None,
     }
 }

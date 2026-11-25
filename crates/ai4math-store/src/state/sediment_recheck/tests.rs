@@ -84,6 +84,7 @@ fn install_historical_promotion(store: &mut StateStore) -> Result<()> {
         receipt_sha256: T1.into(),
         raw: json!({"file_path": FILE,"dependencies_sha256": EMPTY_DEPENDENCIES}),
         regression_checked: true,
+        broker_assessed_t3: false,
         lean_comparison: None,
     };
     store.prepare_promotion(&intent, &receipt)?;

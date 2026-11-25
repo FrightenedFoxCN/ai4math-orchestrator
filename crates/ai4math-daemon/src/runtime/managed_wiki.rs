@@ -109,17 +109,8 @@ pub(crate) fn is_forward_main(repo: &str, previous: &str, current: &str) -> bool
     let Some(mut command) = managed_git(repo) else {
         return false;
     };
-    let Ok(mut child) = command
-        .env("GIT_GRAFT_FILE", "/dev/null")
-        .args([
-            "-c",
-            "core.commitGraph=false",
-            "merge-base",
-            "--is-ancestor",
-            previous,
-            current,
-        ])
-        .spawn()
+    let Ok(mut child) =
+        ai4math_broker::git_policy::physical_ancestry(&mut command, previous, current).spawn()
     else {
         return false;
     };
@@ -212,10 +203,15 @@ mod tests {
         assert!(!is_forward_main(name, &child, &first));
         assert!(!is_forward_main(name, &first, &first));
         assert!(!is_forward_main(name, &first, &other));
-        std::fs::write(repo.join("info/grafts"), format!("{other} {first}\n"))?;
-        // Confirm the repository-local graft would fool an ordinary ancestry probe.
+        std::fs::write(
+            repo.join("info/grafts"),
+            format!("{other} {first}\n{child}\n"),
+        )?;
+        // The graft invents one edge and hides another from ordinary Git.
         assert!(git(&["merge-base", "--is-ancestor", &first, &other]).is_ok());
+        assert!(git(&["merge-base", "--is-ancestor", &first, &child]).is_err());
         assert!(!is_forward_main(name, &first, &other));
+        assert!(is_forward_main(name, &first, &child));
         assert!(!is_forward_main(name, "--all", &other));
         Ok(())
     }

@@ -80,6 +80,7 @@ fn promotion(
         receipt_sha256: digest.into(),
         raw: json!({"file_path": file}),
         regression_checked: true,
+        broker_assessed_t3: false,
         lean_comparison: Some(reviewed_lean::ComparedSpec {
             spec_file: "Spec.lean".into(),
             spec_decl: "reviewed".into(),

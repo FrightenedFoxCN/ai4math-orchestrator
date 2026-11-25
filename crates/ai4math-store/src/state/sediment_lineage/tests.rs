@@ -47,6 +47,7 @@ fn promotion(
         receipt_sha256: digest.into(),
         raw: json!({"file_path": intent.file_path}),
         regression_checked: true,
+        broker_assessed_t3: false,
         lean_comparison: Some(reviewed_lean::ComparedSpec {
             spec_file: plan.spec_file.clone(),
             spec_decl: plan.spec_decl.clone(),
@@ -336,6 +337,7 @@ fn restore_core_t3(
     let (_, mut receipt) = promotion(adaptation, NEW, &format!("{n:064x}"));
     receipt.base_commit = plan.reviewed_commit.clone();
     receipt.tier = "T3_TAINT_REBUILD".into();
+    receipt.broker_assessed_t3 = true;
     receipt.regression_checked = false;
     receipt.lean_comparison.as_mut().unwrap().receipt_sha256 = format!("{:064x}", n + 1000);
     let id = receipt.id.clone();

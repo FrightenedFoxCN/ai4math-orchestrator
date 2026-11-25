@@ -239,6 +239,8 @@ pub struct VerifiedReceipt {
     receipt_sha256: String,
     raw: Value,
     regression_checked: bool,
+    // Copied only from the sealed broker candidate, never the serialized receipt.
+    broker_assessed_t3: bool,
     lean_comparison: Option<reviewed_lean::ComparedSpec>,
 }
 
@@ -290,6 +292,7 @@ impl VerifiedReceipt {
             receipt_sha256: r.receipt_sha256().into(),
             raw: serde_json::to_value(r)?,
             regression_checked: false,
+            broker_assessed_t3: candidate.is_assessed_t3(),
             lean_comparison: None,
         })
     }
@@ -1138,8 +1141,9 @@ impl StateStore {
         })
     }
 
-    /// Recheck ordinary stale L5 proofs in logical dependency order. Claims bound to a
-    /// reviewed Lean spec are deferred; they require an applied operator plan.
+    /// Recheck ordinary stale L5 proofs in logical dependency order. A successful
+    /// result requires broker-assessed T3 evidence, not a legacy tier-only receipt.
+    /// Claims bound to a reviewed Lean spec require an applied operator plan.
     pub fn recheck_stale(
         &mut self,
         commit: &str,
@@ -1150,8 +1154,8 @@ impl StateStore {
     }
 
     /// Recheck at the review commit pinned by the durable applied plan. The trusted operator
-    /// coordinator verifies the exact Git snapshot and supplies fresh broker evidence.
-    /// Bound Lean claims can only recover using a sealed comparison of the original proof.
+    /// coordinator verifies the exact Git snapshot and supplies fresh broker-assessed T3
+    /// evidence. Bound Lean claims also require a sealed comparison of the original proof.
     pub fn recheck_stale_for_plan(
         &mut self,
         plan_sha256: &str,
@@ -1371,6 +1375,10 @@ impl StateStore {
                         ensure!(
                             receipt.tier == "T3_TAINT_REBUILD",
                             "T3 recheck needs a T3 receipt"
+                        );
+                        ensure!(
+                            receipt.broker_assessed_t3,
+                            "T3 recheck requires broker-assessed T3 provenance"
                         );
                         let evidence = if let Some(spec) = &binding {
                             let plan = &applied

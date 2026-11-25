@@ -88,6 +88,20 @@ export async function browser(t, remote) {
   const imports = [];
   const timers = new Map();
   let nextTimer = 0;
+  let now = 0;
+  function advanceTimersBy(ms) {
+    const target = now + ms;
+    for (;;) {
+      const next = [...timers].filter(([, timer]) => timer.due <= target)
+        .sort((a, b) => a[1].due - b[1].due)[0];
+      if (!next) break;
+      const [id, timer] = next;
+      now = timer.due;
+      timers.delete(id);
+      timer.fn();
+    }
+    now = target;
+  }
   let loaded;
   const document = {
     createElement(type) {
@@ -99,7 +113,7 @@ export async function browser(t, remote) {
   runInNewContext(bundle, {
     window: { __ModuleLoader__: { load(entry) { assert.equal(loaded, undefined); loaded = entry; } } },
     document, AbortController, AbortSignal, TextEncoder,
-    setTimeout(fn, ms) { const id = ++nextTimer; timers.set(id, { fn, ms }); return id; },
+    setTimeout(fn, ms) { const id = ++nextTimer; timers.set(id, { fn, ms, due: now + ms }); return id; },
     clearTimeout(id) { timers.delete(id); },
   }, { filename: 'dsh-ai4math/client.js' });
   assert.equal(loaded?.id, 'dsh-ai4math');
@@ -156,7 +170,7 @@ export async function browser(t, remote) {
   t.after(dispose);
   await plugin.apply(ctx);
   return {
-    tabs, slots, styles, registrations, timers, navigation, opened, targetElements, dispose,
+    tabs, slots, styles, registrations, timers, advanceTimersBy, navigation, opened, targetElements, dispose,
     mount(name, key = '') {
       const View = slots.get(name + ':' + key);
       assert.ok(View, 'no registration for ' + name + ':' + key);

@@ -374,6 +374,7 @@ fn successful_finalization_atomically_advances_incident_base() -> Result<()> {
         receipt_sha256: OTHER_COMPILER.into(),
         raw: json!({}),
         regression_checked: true,
+        broker_assessed_t3: false,
         lean_comparison: None,
     };
     store.prepare_promotion(&intent, &receipt)?;

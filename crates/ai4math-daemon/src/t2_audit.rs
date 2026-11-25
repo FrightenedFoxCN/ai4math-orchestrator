@@ -1,8 +1,10 @@
 //! Opt-in, pinned resident audit. Its observations carry no proof authority.
 use crate::{
+    resident_paths::{
+        read_trusted_config, trusted_directory, trusted_executable, trusted_state_path,
+    },
+    resident_process::capture_stdout,
     runtime::managed_wiki::direct_main,
-    t3_discovery::capture_stdout,
-    t3_worker::{read_trusted_config, trusted_directory, trusted_executable, trusted_state_path},
 };
 use ai4math_store::StateStore;
 use anyhow::{Context, Result, ensure};

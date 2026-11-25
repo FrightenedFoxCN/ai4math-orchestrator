@@ -658,15 +658,14 @@ impl PromotionRepo {
     pub(crate) fn is_ungrafted_ancestor(&self, old: &str, new: &str) -> Result<bool> {
         self.require_commit(old)?;
         self.require_commit(new)?;
-        let args = ["merge-base", "--is-ancestor", old, new];
-        let output = git_command(&self.path, &args, None, false)
-            .env("GIT_GRAFT_FILE", "/dev/null")
-            .env("GIT_ALLOW_PROTOCOL", "")
-            .output()?;
+        let mut command = git_command(&self.path, &[], None, false);
+        command.env("GIT_ALLOW_PROTOCOL", "");
+        let output =
+            ai4math_broker::git_policy::physical_ancestry(&mut command, old, new).output()?;
         if output.status.code() == Some(1) {
             return Ok(false);
         }
-        git_success(&args, output)?;
+        git_success(&["merge-base"], output)?;
         Ok(true)
     }
 
@@ -1423,6 +1422,61 @@ mod tests {
             None,
             None,
         )?)
+    }
+
+    #[test]
+    fn t3_plan_and_ungrafted_ancestry_ignore_local_grafts() -> Result<()> {
+        let (_temp, repo) = bare()?;
+        let base = branch(&repo)?;
+        let tree = tree_with_blob(repo.path(), &base, "A.lean", b"import B\ndef a := 1\n")?;
+        let child = commit_tree(&repo, &tree, &base)?;
+        let unrelated = text(git(
+            repo.path(),
+            &["commit-tree", &tree, "-m", "unrelated"],
+            None,
+            None,
+        )?)?;
+        let ledger = tempfile::tempdir()?;
+        let mut state = ai4math_store::StateStore::open(ledger.path().join("state.sqlite"))?;
+        let mut plan = |reviewed| {
+            crate::t3::plan(
+                &mut state,
+                &repo,
+                "A.lean",
+                &base,
+                reviewed,
+                ai4math_core::Engine::Lean4,
+            )
+        };
+
+        let digest = plan(&child)?.plan_sha256;
+        assert!(repo.is_ungrafted_ancestor(&base, &base)?);
+        assert!(
+            plan(&base)
+                .unwrap_err()
+                .to_string()
+                .contains("explicit descendant")
+        );
+        assert!(plan(&unrelated).is_err());
+        assert!(repo.is_ungrafted_ancestor("HEAD", &child).is_err());
+
+        std::fs::write(
+            repo.path().join("info/grafts"),
+            format!("{unrelated} {base}\n{child}\n"),
+        )?;
+        // The graft invents one edge and hides another from ordinary Git.
+        assert!(repo.is_ancestor(&base, &unrelated)?);
+        assert!(!repo.is_ancestor(&base, &child)?);
+        assert!(!repo.is_ungrafted_ancestor(&base, &unrelated)?);
+        assert!(repo.is_ungrafted_ancestor(&base, &child)?);
+        assert!(
+            plan(&unrelated)
+                .unwrap_err()
+                .to_string()
+                .contains("explicit descendant")
+        );
+        assert_eq!(plan(&child)?.plan_sha256, digest);
+        Ok(())
     }
 
     fn id(digit: char) -> String {
