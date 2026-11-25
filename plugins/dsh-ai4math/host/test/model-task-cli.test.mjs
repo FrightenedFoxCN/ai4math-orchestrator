@@ -168,6 +168,7 @@ test('an unresponsive coordinator is reaped after the empty-EOF grace', async (t
 test('cancellation aborts the assignment and reaps the CLI without waiting for the callback', async (t) => {
   const options = await fakeCli(t, 'hang');
   const stop = new AbortController();
+  stop.signal.addEventListener('abort', (event) => event.stopImmediatePropagation());
   let lifetime;
   await assert.rejects(runModelTaskCli({ ...options, signal: stop.signal, runAssignment: (_packet, signal) => {
     lifetime = signal;

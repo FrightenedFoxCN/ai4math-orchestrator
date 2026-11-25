@@ -77,8 +77,14 @@
 - [原生 CI](../.github/workflows/ci.yml) 用 SHA-256 固定 [Lean 4.35.0 arm64 发布包](https://github.com/leanprover/lean4/releases/tag/v4.35.0)，通过同一[测试脚本](../.github/native-lean.sh)执行。该脚本在本机 macOS 实跑 11 项全过，含 T3 错误分类、Witness、Golden 克隆、下游失败不发布和 3 项 Git 恢复（含 graft 正负例）；另单独实跑 breaker 和 T2 原生各 1 项，均通过。尚无 GitHub 托管 runner 实跑记录。
 - Rust 工作区 523 通过、0 失败、75 默认忽略；插件 55 通过；fmt、diff 与 Clippy 通过（仍有既有警告）。
 
+## 后续批次：独立 DeepSeek 模型任务
+
+- 操作者显式选择的 DeepSeek 任务在单独进程执行；可信 SDK 与 adapter 在其中的 worker 线程运行，由进程主线程监视时限及父生命线。父侧在超时或取消时终止进程组并等待直接子进程回收。父侧中断时由 fd 3 EOF 唤醒仍可运行的 guardian。不是 OS watchdog，也不隔离恶意 SDK；父崩溃后不保证清理逃逸或整个进程组。可注入 adapter 的旧进程内入口仅供夹具和可信本地实验。
+- 配置经有界 stdin 帧传入，不进入 argv 或子进程环境；只接受有界单帧结果和成功退出。Rust 仍核对任务/租约并只留存未验证建议。没有接入 GUI、常驻排程或环境中的生产凭据。
+- 本机 Electron/已安装 SDK 使用合成凭据和 localhost Messages 流式夹具验证了证明及审阅角色、HTTP 失败不入账与显式重试；未访问远端服务，未验收真实 GUI 或 Linux 宿主。插件测试 78 通过；Rust 工作区 523 通过、75 默认忽略，fmt、diff 与 Clippy 通过（仍有既有警告）。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。
-- 模型任务仍运行在 Host 进程内，无法硬抢占不合作 adapter/Agent。
+- 显式 DeepSeek 任务已有可回收进程；基于持久租约的常驻调度、跨进程重启恢复与生产凭据接线仍待交付。
 - Linux bwrap/cgroups、全主机配额、Agda/Rocq 独立 T2、生产 GUI 写闭环仍未交付。

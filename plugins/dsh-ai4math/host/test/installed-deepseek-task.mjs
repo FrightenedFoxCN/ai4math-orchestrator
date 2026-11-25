@@ -128,7 +128,6 @@ const dir = await mkdtemp(join(tmpdir(), 'ai4math-installed-deepseek-'));
 const root = join(dir, 'project');
 const source = join(dir, 'source');
 const bareRepo = join(dir, 'repo.git');
-const realFetch = globalThis.fetch;
 let scenario;
 const server = createServer(async (request, response) => {
   try {
@@ -204,21 +203,13 @@ try {
   server.listen(0, '127.0.0.1');
   await once(server, 'listening');
   const baseUrl = 'http://127.0.0.1:' + server.address().port;
-  const endpoint = baseUrl + '/v1/messages';
-  // Any unexpected fetch, including a remote fallback, fails without contacting it.
-  // Admitted requests still use the real fetch implementation and local HTTP server.
-  globalThis.fetch = (resource, init) => {
-    try {
-      assert.equal(String(resource), endpoint, 'provider fetch escaped the local Messages endpoint');
-    } catch (error) {
-      if (scenario) scenario.failure ??= error;
-      throw error;
-    }
-    return realFetch(resource, init);
-  };
-
-  for (const [taskId, role, suggestion] of [
-    ['fixture-prover', 'prover_worker', { kind: 'proof_body', proof_body: 'by trivial' }],
+  // A loopback-only route and synthetic key are enforced before the child is
+  // launched. Observe the child's real HTTP requests on the local fixture.
+  const proof = { kind: 'proof_body', proof_body: 'by trivial' };
+  for (const [taskId, role, suggestion, firstFailure] of [
+    ['fixture-prover-auth', 'prover_worker', proof, 'auth'],
+    ['fixture-prover-redirect', 'prover_worker', proof, 'redirect'],
+    ['fixture-prover-final', 'prover_worker', proof, 'final'],
     ['fixture-reviewer', 'independent_reviewer', { kind: 'review', verdict: 'looks_consistent', rationale: 'The header matches the statement.' }],
   ]) {
     ai('task-register', bareRepo, taskId, 'infrastructure', modulePath, decl);
@@ -249,14 +240,13 @@ try {
       return summary;
     }
 
-    if (role === 'prover_worker') {
-      // A final HTTP failure must not retain a submission already accepted by the scoped tool.
-      for (const fail of ['auth', 'redirect', 'final']) {
-        await runScenario({ fail });
-        run(cliPath, ['task-result', root, taskId], dir, { absent: true });
-      }
+    if (firstFailure) {
+      // Each failure mode uses a fresh task, without crossing the ledger's
+      // three-failure quarantine. Even a final failure may not retain a result.
+      await runScenario({ fail: firstFailure });
+      run(cliPath, ['task-result', root, taskId], dir, { absent: true });
     }
-    // Reuse the same task id immediately after failures: no retry and no stranded lease.
+    // An explicit retry of that same task demonstrates no stranded lease.
     assert.deepEqual(await runScenario(), {
       task_id: taskId, base_commit: base, role, source: 'dsh_model', suggestion_recorded: true, proof_verified: false,
     });
@@ -274,7 +264,6 @@ try {
   console.log('Installed DeepSeekAdapter + local Messages SSE + Rust CLI: exact role schemas and tool round trips; SQLite suggestions unverified; main unchanged');
   console.log('HTTP 401, unfollowed 307, and final 503 created no durable result; the same task was reclaimed without retry');
 } finally {
-  globalThis.fetch = realFetch;
   if (server.listening) {
     const closed = once(server, 'close');
     server.close();

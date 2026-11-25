@@ -7,9 +7,9 @@ const routePart = (part) => typeof part === 'string' && part.length <= 200 &&
   /^[A-Za-z0-9][A-Za-z0-9._:/-]*$/u.test(part) && !/[\r\n]/u.test(part);
 const absolute = (path) => typeof path === 'string' && path.length <= 4096 && isAbsolute(path) && !path.includes('\0');
 
-/** Provision one assignment and write back only its advisory outcome. The
- * trusted operator supplies the SDK, model route and explicit adapter factory
- * (or adapter); this does not discover credentials, pick defaults or retry. */
+/** In-process seam for SDK fixtures and trusted local experiments only. It
+ * cannot hard-stop a stuck adapter; never use it for resident model dispatch.
+ * The isolated operator path is runDeepSeekModelTask. */
 export async function runDshModelTask({ cliPath, root, bareRepo, taskId, claimId, role, wallSeconds,
   dshRoot, provider, model, adapter, registerAdapter, maxModelCalls, signal } = {}) {
   if (!absolute(dshRoot) || !routePart(provider) || !routePart(model) ||

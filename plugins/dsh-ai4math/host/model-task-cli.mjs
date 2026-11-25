@@ -1,5 +1,6 @@
 // Private Host transport. Nothing here is mounted as an agent tool or plugin.
 import { spawn } from 'node:child_process';
+import { addAbortListener } from 'node:events';
 import { isAbsolute } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { TextDecoder } from 'node:util';
@@ -104,12 +105,12 @@ export async function runModelTaskCli({ cliPath, root, bareRepo, taskId, claimId
     let used = 0, stderrBytes = 0;
     let packet, summary, wrote = false, closed = false, settled = false, error, releaseTimer, reapTimer;
     const logicalTimer = setTimeout(() => stop('timeout'), Math.max(0, deadline - performance.now()));
-    const onAbort = () => stop('cancelled');
+    let abortSubscription;
 
     function finish(err) {
       if (settled) return;
       settled = true;
-      signal?.removeEventListener('abort', onAbort);
+      abortSubscription?.[Symbol.dispose]();
       clearTimeout(logicalTimer);
       clearTimeout(releaseTimer);
       clearTimeout(reapTimer);
@@ -206,7 +207,7 @@ export async function runModelTaskCli({ cliPath, root, bareRepo, taskId, claimId
       if (!packet || !wrote || !summary || used !== 0) return stop('protocol');
       finish();
     });
-    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal) abortSubscription = addAbortListener(signal, () => stop('cancelled'));
     if (signal?.aborted) onAbort();
   });
 }
