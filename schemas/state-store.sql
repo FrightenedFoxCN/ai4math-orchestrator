@@ -254,6 +254,30 @@ BEGIN SELECT RAISE(ABORT, 'InfraRFC may be approved once without modifying the d
 CREATE TRIGGER IF NOT EXISTS infra_rfcs_no_delete BEFORE DELETE ON infra_rfcs
 BEGIN SELECT RAISE(ABORT, 'InfraRFC is immutable'); END;
 
+-- Append-only InfraRFC lifecycle transitions after DRAFT/APPROVED intake.
+CREATE TABLE IF NOT EXISTS infra_rfc_transitions (
+  event_seq INTEGER PRIMARY KEY NOT NULL REFERENCES events(event_seq) CHECK(event_seq>0),
+  rfc_id TEXT NOT NULL REFERENCES infra_rfcs(rfc_id),
+  from_status TEXT NOT NULL CHECK(from_status IN ('DRAFT','APPROVED','BUILDING_SMOKE','FROZEN_PROVING')),
+  to_status TEXT NOT NULL CHECK(to_status IN ('BUILDING_SMOKE','FROZEN_PROVING','COMPLETED','SUPERSEDED','REJECTED')),
+  git_commit TEXT NOT NULL CHECK(length(git_commit) IN (40,64) AND git_commit NOT GLOB '*[^0-9a-f]*'),
+  evidence_sha256 TEXT CHECK(evidence_sha256 IS NULL OR (length(evidence_sha256)=64 AND evidence_sha256 NOT GLOB '*[^0-9a-f]*')),
+  superseded_by_rfc_id TEXT REFERENCES infra_rfcs(rfc_id),
+  reason TEXT CHECK(reason IS NULL OR length(CAST(reason AS BLOB)) BETWEEN 1 AND 512),
+  UNIQUE(rfc_id, to_status)
+) STRICT;
+CREATE INDEX IF NOT EXISTS idx_infra_rfc_transitions_rfc_seq ON infra_rfc_transitions(rfc_id, event_seq);
+CREATE TRIGGER IF NOT EXISTS infra_rfc_transitions_no_update BEFORE UPDATE ON infra_rfc_transitions
+BEGIN SELECT RAISE(ABORT, 'InfraRFC transitions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS infra_rfc_transitions_no_delete BEFORE DELETE ON infra_rfc_transitions
+BEGIN SELECT RAISE(ABORT, 'InfraRFC transitions are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS infra_rfc_transitions_no_replace BEFORE INSERT ON infra_rfc_transitions
+WHEN EXISTS (
+  SELECT 1 FROM infra_rfc_transitions
+  WHERE event_seq=NEW.event_seq OR (rfc_id=NEW.rfc_id AND to_status=NEW.to_status)
+)
+BEGIN SELECT RAISE(ABORT, 'InfraRFC transitions are immutable'); END;
+
 -- Internal regression episode state, never projected or used as trust evidence.
 -- Holds only the last observed base; a newer observed base or final promotion
 -- clears all pending and latched contexts. At most 4096 context rows per base

@@ -1,11 +1,19 @@
-//! Operator-only durable RFC intake. Approval records consent, not work admission or authority.
+//! Operator-only durable RFC intake and 7-state lifecycle.
+//! Approval and lifecycle transitions record operator-verified milestones, not work admission or trust.
 use super::*;
+use ai4math_broker::{VerifiedInfraCompletion, VerifiedInfraSmoke};
 use ai4math_core::{Engine, InfraRFC, InfraStatus, validate_source_path};
+use anyhow::bail;
 use sha2::{Digest, Sha256};
 
 pub const INFRA_RFC_MAX_BYTES: usize = 16 * 1024;
 pub(crate) const SUBMITTED: &str = "INFRA_RFC_SUBMITTED";
 pub(crate) const APPROVED: &str = "INFRA_RFC_APPROVED";
+pub(crate) const SMOKE_STARTED: &str = "INFRA_RFC_SMOKE_STARTED";
+pub(crate) const FROZEN: &str = "INFRA_RFC_FROZEN";
+pub(crate) const COMPLETED: &str = "INFRA_RFC_COMPLETED";
+pub(crate) const SUPERSEDED: &str = "INFRA_RFC_SUPERSEDED";
+pub(crate) const REJECTED: &str = "INFRA_RFC_REJECTED";
 const ACTOR: &str = "operator:infra-rfc";
 const ENTITY: &str = "infra_rfc";
 const READ: &str = "SELECT module_path,reviewed_commit,draft_sha256,consumer_sha256,draft_json,submitted_event_seq,approved_event_seq FROM infra_rfcs WHERE rfc_id=?1 AND repo=?2";
@@ -15,6 +23,42 @@ const READ: &str = "SELECT module_path,reviewed_commit,draft_sha256,consumer_sha
 pub enum InfraRfcStatus {
     Draft,
     Approved,
+    BuildingSmoke,
+    FrozenProving,
+    Completed,
+    Superseded,
+    Rejected,
+}
+
+impl InfraRfcStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Draft => "DRAFT",
+            Self::Approved => "APPROVED",
+            Self::BuildingSmoke => "BUILDING_SMOKE",
+            Self::FrozenProving => "FROZEN_PROVING",
+            Self::Completed => "COMPLETED",
+            Self::Superseded => "SUPERSEDED",
+            Self::Rejected => "REJECTED",
+        }
+    }
+
+    fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "DRAFT" => Some(Self::Draft),
+            "APPROVED" => Some(Self::Approved),
+            "BUILDING_SMOKE" => Some(Self::BuildingSmoke),
+            "FROZEN_PROVING" => Some(Self::FrozenProving),
+            "COMPLETED" => Some(Self::Completed),
+            "SUPERSEDED" => Some(Self::Superseded),
+            "REJECTED" => Some(Self::Rejected),
+            _ => None,
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Superseded | Self::Rejected)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -28,6 +72,28 @@ pub struct InfraRfcRecord {
     pub submitted_event_seq: i64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_event_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smoke_started_event_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smoke_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub smoke_receipt_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frozen_event_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_commit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_receipt_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completed_event_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_by_rfc_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub superseded_event_seq: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_event_seq: Option<i64>,
 }
 
 fn id(text: &str, max: usize) -> bool {
@@ -51,9 +117,12 @@ fn sha(data: &impl Serialize) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(serde_json::to_vec(data)?)))
 }
 fn text_ok(s: &str, max: usize, multiline: bool) -> bool {
-    !s.is_empty() && s.len()<=max && s.trim()==s && !s.chars().any(|c| {
-        (c.is_control() && !(multiline && matches!(c,'\n' | '\t')))
-            || matches!(c,'\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    !s.is_empty() && s.len() <= max && s.trim() == s && !s.chars().any(|c| {
+        (c.is_control() && !(multiline && matches!(c, '\n' | '\t')))
+            || matches!(
+                c,
+                '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+            )
     })
 }
 fn list_ok(items: &[String], nonempty: bool) -> bool {
@@ -119,7 +188,11 @@ fn writing_scope(tx: &Transaction<'_>, repo: &str, review: &str) -> Result<()> {
         commit(review),
         "InfraRFC requires a full reviewed Git commit ID"
     );
-    let ready:bool=tx.query_row("SELECT NOT EXISTS(SELECT 1 FROM promotion_intent) AND NOT EXISTS(SELECT 1 FROM pivot_resume_intent)",[],|r|r.get(0))?;
+    let ready: bool = tx.query_row(
+        "SELECT NOT EXISTS(SELECT 1 FROM promotion_intent) AND NOT EXISTS(SELECT 1 FROM pivot_resume_intent)",
+        [],
+        |r| r.get(0),
+    )?;
     ensure!(
         ready,
         "recover pending promotion or Pivot before changing an InfraRFC"
@@ -127,16 +200,20 @@ fn writing_scope(tx: &Transaction<'_>, repo: &str, review: &str) -> Result<()> {
     Ok(())
 }
 fn consumer(db: &Connection, draft: &InfraRFC) -> Result<String> {
-    let (module,target,state):(String,String,String)=db.query_row(
-        "SELECT c.module_path,c.formal_target,
-                json_array(c.title,c.informal_statement,c.formal_signature,c.local_trust_level,c.effective_trust_level,
-                           c.is_critical_path,c.receipt_id,c.wiki_id,c.updated_at,
-                           (SELECT max(e.event_seq) FROM events e WHERE e.entity_type='claim' AND e.entity_id=c.claim_id))
-           FROM claims c WHERE c.claim_id=?1 AND c.engine=?2 AND c.module_path IS NOT NULL AND c.formal_target IS NOT NULL
-             AND c.stale=0 AND c.effective_stale=0
-             AND c.local_trust_level NOT IN ('L2a','L2b','L5') AND c.effective_trust_level NOT IN ('L2a','L2b','L5')",
-        params![draft.requested_by_claim,draft.engine.as_str()],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-    ).optional()?.context("InfraRFC requires an open nonstale same-engine consumer Claim with a formal target")?;
+    let (module, target, state): (String, String, String) = db
+        .query_row(
+            "SELECT c.module_path,c.formal_target,
+                    json_array(c.title,c.informal_statement,c.formal_signature,c.local_trust_level,c.effective_trust_level,
+                               c.is_critical_path,c.receipt_id,c.wiki_id,c.updated_at,
+                               (SELECT max(e.event_seq) FROM events e WHERE e.entity_type='claim' AND e.entity_id=c.claim_id))
+               FROM claims c WHERE c.claim_id=?1 AND c.engine=?2 AND c.module_path IS NOT NULL AND c.formal_target IS NOT NULL
+                 AND c.stale=0 AND c.effective_stale=0
+                 AND c.local_trust_level NOT IN ('L2a','L2b','L5') AND c.effective_trust_level NOT IN ('L2a','L2b','L5')",
+            params![draft.requested_by_claim, draft.engine.as_str()],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+        .context("InfraRFC requires an open nonstale same-engine consumer Claim with a formal target")?;
     ensure!(
         validate_source_path(draft.engine, &module).is_ok()
             && target
@@ -179,6 +256,34 @@ fn valid_module(module: &str, engine: Engine) -> Result<()> {
 fn event_payload(module: &str, engine: Engine, digest: &str) -> Value {
     json!({"module_path":module,"engine":engine.as_str(),"draft_sha256":digest})
 }
+#[allow(clippy::too_many_arguments)]
+fn transition_event_payload(
+    module: &str,
+    engine: Engine,
+    digest: &str,
+    from: InfraRfcStatus,
+    to: InfraRfcStatus,
+    evidence_sha256: Option<&str>,
+    superseded_by: Option<&str>,
+    reason: Option<&str>,
+) -> Value {
+    let mut map = serde_json::Map::new();
+    map.insert("module_path".into(), json!(module));
+    map.insert("engine".into(), json!(engine.as_str()));
+    map.insert("draft_sha256".into(), json!(digest));
+    map.insert("from_status".into(), json!(from.as_str()));
+    map.insert("to_status".into(), json!(to.as_str()));
+    if let Some(evidence) = evidence_sha256 {
+        map.insert("evidence_sha256".into(), json!(evidence));
+    }
+    if let Some(replacement) = superseded_by {
+        map.insert("superseded_by_rfc_id".into(), json!(replacement));
+    }
+    if let Some(reason) = reason {
+        map.insert("reason".into(), json!(reason));
+    }
+    Value::Object(map)
+}
 fn event_matches(
     db: &Connection,
     seq: i64,
@@ -187,17 +292,43 @@ fn event_matches(
     review: &str,
     payload: &Value,
 ) -> Result<bool> {
-    Ok(db.query_row("SELECT EXISTS(SELECT 1 FROM events WHERE event_seq=?1 AND event_type=?2 AND entity_type=?3 AND entity_id=?4 AND git_commit=?5 AND actor=?6 AND payload_json=?7)",
-        params![seq,kind,ENTITY,id,review,ACTOR,serde_json::to_string(payload)?],|r|r.get(0))?)
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM events WHERE event_seq=?1 AND event_type=?2 AND entity_type=?3 AND entity_id=?4 AND git_commit=?5 AND actor=?6 AND payload_json=?7)",
+        params![
+            seq,
+            kind,
+            ENTITY,
+            id,
+            review,
+            ACTOR,
+            serde_json::to_string(payload)?
+        ],
+        |r| r.get(0),
+    )?)
 }
 
 struct Stored {
     row: InfraRfcRecord,
     consumer_sha: String,
+    smoke_started_commit: Option<String>,
+    superseded_commit: Option<String>,
+    superseded_reason: Option<String>,
+    rejected_commit: Option<String>,
 }
-fn fetch(db: &Connection, repo: &str, id: &str) -> Result<Option<Stored>> {
+
+struct TransitionRow {
+    event_seq: i64,
+    from_status: String,
+    to_status: String,
+    git_commit: String,
+    evidence_sha256: Option<String>,
+    superseded_by_rfc_id: Option<String>,
+    reason: Option<String>,
+}
+
+fn fetch(db: &Connection, repo: &str, rfc_id: &str) -> Result<Option<Stored>> {
     let found = db
-        .query_row(READ, params![id, repo], |r| {
+        .query_row(READ, params![rfc_id, repo], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -209,13 +340,39 @@ fn fetch(db: &Connection, repo: &str, id: &str) -> Result<Option<Stored>> {
             ))
         })
         .optional()?;
+    let mut retained = db.prepare(
+        "SELECT event_seq FROM events WHERE entity_type=?1 AND entity_id=?2
+          AND event_type IN (?3,?4,?5,?6,?7,?8,?9) ORDER BY event_seq LIMIT 8",
+    )?;
+    let retained = retained
+        .query_map(
+            params![
+                ENTITY,
+                rfc_id,
+                SUBMITTED,
+                APPROVED,
+                SMOKE_STARTED,
+                FROZEN,
+                COMPLETED,
+                SUPERSEDED,
+                REJECTED
+            ],
+            |r| r.get::<_, i64>(0),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
     let Some((module, review, digest, consumer_sha, body, submitted, approved)) = found else {
+        ensure!(
+            retained.is_empty(),
+            "InfraRFC events without their immutable draft"
+        );
         return Ok(None);
     };
+    let mut linked = vec![submitted];
+    linked.extend(approved);
     let draft = parse_infra_rfc_draft(body.as_bytes())?;
     valid_module(&module, draft.engine)?;
     ensure!(
-        draft.rfc_id == id
+        draft.rfc_id == rfc_id
             && commit(&review)
             && hex(&consumer_sha, 64)
             && canonical(&draft)? == body
@@ -224,32 +381,321 @@ fn fetch(db: &Connection, repo: &str, id: &str) -> Result<Option<Stored>> {
     );
     let payload = event_payload(&module, draft.engine, &digest);
     ensure!(
-        submitted > 0 && event_matches(db, submitted, SUBMITTED, id, &review, &payload)?,
+        submitted > 0 && event_matches(db, submitted, SUBMITTED, rfc_id, &review, &payload)?,
         "invalid InfraRFC submission event binding"
     );
     if let Some(seq) = approved {
         ensure!(
-            seq > submitted && event_matches(db, seq, APPROVED, id, &review, &payload)?,
+            seq > submitted && event_matches(db, seq, APPROVED, rfc_id, &review, &payload)?,
             "invalid InfraRFC approval event binding"
         );
     }
+
+    let mut status = if approved.is_some() {
+        InfraRfcStatus::Approved
+    } else {
+        InfraRfcStatus::Draft
+    };
+    let mut last_seq = approved.unwrap_or(submitted);
+    let mut smoke_started_event_seq = None;
+    let mut smoke_started_commit = None;
+    let mut smoke_commit = None;
+    let mut smoke_receipt_sha256 = None;
+    let mut frozen_event_seq = None;
+    let mut completion_commit = None;
+    let mut completion_receipt_sha256 = None;
+    let mut completed_event_seq = None;
+    let mut superseded_by_rfc_id = None;
+    let mut superseded_event_seq = None;
+    let mut superseded_commit = None;
+    let mut superseded_reason = None;
+    let mut rejected_reason = None;
+    let mut rejected_event_seq = None;
+    let mut rejected_commit = None;
+
+    let has_transitions: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='infra_rfc_transitions')",
+        [],
+        |r| r.get(0),
+    )?;
+    if has_transitions {
+        let mut stmt = db.prepare(
+            "SELECT event_seq,from_status,to_status,git_commit,evidence_sha256,superseded_by_rfc_id,reason
+               FROM infra_rfc_transitions
+              WHERE rfc_id=?1
+              ORDER BY event_seq ASC",
+        )?;
+        let transitions = stmt
+            .query_map([rfc_id], |r| {
+                Ok(TransitionRow {
+                    event_seq: r.get(0)?,
+                    from_status: r.get(1)?,
+                    to_status: r.get(2)?,
+                    git_commit: r.get(3)?,
+                    evidence_sha256: r.get(4)?,
+                    superseded_by_rfc_id: r.get(5)?,
+                    reason: r.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        for t in transitions {
+            ensure!(
+                !status.is_terminal(),
+                "invalid InfraRFC transition after terminal status"
+            );
+            ensure!(
+                t.event_seq > last_seq,
+                "invalid InfraRFC transition sequence ordering"
+            );
+            let from = InfraRfcStatus::parse(&t.from_status)
+                .context("invalid InfraRFC transition from_status")?;
+            let to = InfraRfcStatus::parse(&t.to_status)
+                .context("invalid InfraRFC transition to_status")?;
+            ensure!(
+                from == status,
+                "InfraRFC transition chain mismatch: expected {} but found {}",
+                status.as_str(),
+                from.as_str()
+            );
+            ensure!(
+                commit(&t.git_commit),
+                "invalid InfraRFC transition Git commit"
+            );
+            let event_type = match to {
+                InfraRfcStatus::BuildingSmoke => {
+                    ensure!(
+                        from == InfraRfcStatus::Approved
+                            && t.git_commit == review
+                            && t.evidence_sha256.is_none()
+                            && t.superseded_by_rfc_id.is_none()
+                            && t.reason.is_none(),
+                        "invalid BUILDING_SMOKE InfraRFC transition row"
+                    );
+                    smoke_started_event_seq = Some(t.event_seq);
+                    smoke_started_commit = Some(t.git_commit.clone());
+                    SMOKE_STARTED
+                }
+                InfraRfcStatus::FrozenProving => {
+                    let receipt = t
+                        .evidence_sha256
+                        .as_deref()
+                        .context("FROZEN_PROVING transition requires smoke receipt")?;
+                    ensure!(
+                        from == InfraRfcStatus::BuildingSmoke
+                            && draft.engine == Engine::Lean4
+                            && hex(receipt, 64)
+                            && t.superseded_by_rfc_id.is_none()
+                            && t.reason.is_none(),
+                        "invalid FROZEN_PROVING InfraRFC transition row"
+                    );
+                    smoke_commit = Some(t.git_commit.clone());
+                    smoke_receipt_sha256 = Some(receipt.to_owned());
+                    frozen_event_seq = Some(t.event_seq);
+                    FROZEN
+                }
+                InfraRfcStatus::Completed => {
+                    let receipt = t
+                        .evidence_sha256
+                        .as_deref()
+                        .context("COMPLETED transition requires completion receipt")?;
+                    ensure!(
+                        from == InfraRfcStatus::FrozenProving
+                            && draft.engine == Engine::Lean4
+                            && smoke_commit.as_deref() == Some(t.git_commit.as_str())
+                            && hex(receipt, 64)
+                            && t.superseded_by_rfc_id.is_none()
+                            && t.reason.is_none(),
+                        "invalid COMPLETED InfraRFC transition row"
+                    );
+                    completion_commit = Some(t.git_commit.clone());
+                    completion_receipt_sha256 = Some(receipt.to_owned());
+                    completed_event_seq = Some(t.event_seq);
+                    COMPLETED
+                }
+                InfraRfcStatus::Rejected => {
+                    let reason = t
+                        .reason
+                        .as_deref()
+                        .context("REJECTED transition requires a reason")?;
+                    ensure!(
+                        matches!(
+                            from,
+                            InfraRfcStatus::Draft
+                                | InfraRfcStatus::Approved
+                                | InfraRfcStatus::BuildingSmoke
+                        ) && t.evidence_sha256.is_none()
+                            && t.superseded_by_rfc_id.is_none()
+                            && text_ok(reason, 512, false),
+                        "invalid REJECTED InfraRFC transition row"
+                    );
+                    rejected_reason = Some(reason.to_owned());
+                    rejected_event_seq = Some(t.event_seq);
+                    rejected_commit = Some(t.git_commit.clone());
+                    REJECTED
+                }
+                InfraRfcStatus::Superseded => {
+                    let replacement = t
+                        .superseded_by_rfc_id
+                        .as_deref()
+                        .context("SUPERSEDED transition requires replacement RFC ID")?;
+                    let reason = t
+                        .reason
+                        .as_deref()
+                        .context("SUPERSEDED transition requires a reason")?;
+                    ensure!(
+                        matches!(
+                            from,
+                            InfraRfcStatus::Approved
+                                | InfraRfcStatus::BuildingSmoke
+                                | InfraRfcStatus::FrozenProving
+                        ) && t.evidence_sha256.is_none()
+                            && id(replacement, 100)
+                            && replacement != rfc_id
+                            && text_ok(reason, 512, false),
+                        "invalid SUPERSEDED InfraRFC transition row"
+                    );
+                    let replacement_valid: bool = db.query_row(
+                        "SELECT EXISTS(
+                            SELECT 1 FROM infra_rfcs r
+                             WHERE r.rfc_id=?1 AND r.repo=?2 AND r.submitted_event_seq<?4
+                               AND json_extract(r.draft_json,'$.requested_by_claim')=?3
+                               AND NOT EXISTS (
+                                   SELECT 1 FROM events e WHERE e.entity_type=?5 AND e.entity_id=r.rfc_id
+                                     AND e.event_seq<?4 AND e.event_type IN (?6,?7)
+                               )
+                         )",
+                        params![replacement, repo, &draft.requested_by_claim, t.event_seq, ENTITY, REJECTED, SUPERSEDED],
+                        |r| r.get(0),
+                    )?;
+                    ensure!(
+                        replacement_valid,
+                        "SUPERSEDED transition replacement RFC was not valid for this repository and consumer at supersession"
+                    );
+                    superseded_by_rfc_id = Some(replacement.to_owned());
+                    superseded_event_seq = Some(t.event_seq);
+                    superseded_commit = Some(t.git_commit.clone());
+                    superseded_reason = Some(reason.to_owned());
+                    SUPERSEDED
+                }
+                InfraRfcStatus::Draft | InfraRfcStatus::Approved => {
+                    bail!("invalid InfraRFC transition target status");
+                }
+            };
+
+            let t_payload = transition_event_payload(
+                &module,
+                draft.engine,
+                &digest,
+                from,
+                to,
+                t.evidence_sha256.as_deref(),
+                t.superseded_by_rfc_id.as_deref(),
+                t.reason.as_deref(),
+            );
+            ensure!(
+                event_matches(
+                    db,
+                    t.event_seq,
+                    event_type,
+                    rfc_id,
+                    &t.git_commit,
+                    &t_payload
+                )?,
+                "invalid InfraRFC transition event binding"
+            );
+            linked.push(t.event_seq);
+            status = to;
+            last_seq = t.event_seq;
+        }
+    }
+    ensure!(
+        retained == linked,
+        "InfraRFC event history has missing projection rows"
+    );
+
     Ok(Some(Stored {
         consumer_sha,
+        smoke_started_commit,
+        superseded_commit,
+        superseded_reason,
+        rejected_commit,
         row: InfraRfcRecord {
             schema: "ai4math.infra-rfc.v1",
             module_path: module,
             reviewed_commit: review,
             draft_sha256: digest,
-            status: if approved.is_some() {
-                InfraRfcStatus::Approved
-            } else {
-                InfraRfcStatus::Draft
-            },
+            status,
             draft,
             submitted_event_seq: submitted,
             approved_event_seq: approved,
+            smoke_started_event_seq,
+            smoke_commit,
+            smoke_receipt_sha256,
+            frozen_event_seq,
+            completion_commit,
+            completion_receipt_sha256,
+            completed_event_seq,
+            superseded_by_rfc_id,
+            superseded_event_seq,
+            rejected_reason,
+            rejected_event_seq,
         },
     }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_transition(
+    tx: &Transaction<'_>,
+    repo: &str,
+    row: &InfraRfcRecord,
+    to: InfraRfcStatus,
+    event_type: &str,
+    git_commit: &str,
+    evidence_sha256: Option<&str>,
+    superseded_by: Option<&str>,
+    reason: Option<&str>,
+    confirm_git: impl FnOnce() -> Result<()>,
+) -> Result<InfraRfcRecord> {
+    let payload = transition_event_payload(
+        &row.module_path,
+        row.draft.engine,
+        &row.draft_sha256,
+        row.status,
+        to,
+        evidence_sha256,
+        superseded_by,
+        reason,
+    );
+    let seq = event(
+        tx,
+        Change {
+            actor: ACTOR,
+            git_commit: Some(git_commit),
+        },
+        event_type,
+        ENTITY,
+        &row.draft.rfc_id,
+        payload,
+    )?;
+    tx.execute(
+        "INSERT INTO infra_rfc_transitions(event_seq,rfc_id,from_status,to_status,git_commit,evidence_sha256,superseded_by_rfc_id,reason) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+        params![
+            seq,
+            &row.draft.rfc_id,
+            row.status.as_str(),
+            to.as_str(),
+            git_commit,
+            evidence_sha256,
+            superseded_by,
+            reason,
+        ],
+    )?;
+    let updated = fetch(tx, repo, &row.draft.rfc_id)?
+        .context("updated InfraRFC disappeared")?
+        .row;
+    confirm_git()?;
+    Ok(updated)
 }
 
 impl StateStore {
@@ -281,19 +727,36 @@ impl StateStore {
         let body = canonical(draft)?;
         valid_module(module, draft.engine)?;
         self.write(|tx| {
-            writing_scope(tx,repo,review)?;
-            let consumer_sha=consumer(tx,draft)?;
-            let digest=draft_sha(repo,review,module,draft,&consumer_sha)?;
-            let rfc=&draft.rfc_id;
-            if let Some(stored)=fetch(tx,repo,rfc)? {
-                ensure!(stored.row.draft_sha256==digest,"InfraRFC ID already identifies a different immutable draft or review scope");
+            writing_scope(tx, repo, review)?;
+            let consumer_sha = consumer(tx, draft)?;
+            let digest = draft_sha(repo, review, module, draft, &consumer_sha)?;
+            let rfc = &draft.rfc_id;
+            if let Some(stored) = fetch(tx, repo, rfc)? {
+                ensure!(
+                    stored.row.draft_sha256 == digest,
+                    "InfraRFC ID already identifies a different immutable draft or review scope"
+                );
                 confirm_git()?;
                 return Ok(stored.row);
             }
-            let seq=event(tx,Change{actor:ACTOR,git_commit:Some(review)},SUBMITTED,ENTITY,rfc,event_payload(module,draft.engine,&digest))?;
-            tx.execute("INSERT INTO infra_rfcs(rfc_id,repo,module_path,reviewed_commit,draft_sha256,consumer_sha256,draft_json,submitted_event_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
-                params![rfc,repo,module,review,digest,consumer_sha,body,seq])?;
-            let row=fetch(tx,repo,rfc)?.context("submitted InfraRFC disappeared")?.row;
+            let seq = event(
+                tx,
+                Change {
+                    actor: ACTOR,
+                    git_commit: Some(review),
+                },
+                SUBMITTED,
+                ENTITY,
+                rfc,
+                event_payload(module, draft.engine, &digest),
+            )?;
+            tx.execute(
+                "INSERT INTO infra_rfcs(rfc_id,repo,module_path,reviewed_commit,draft_sha256,consumer_sha256,draft_json,submitted_event_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
+                params![rfc, repo, module, review, digest, consumer_sha, body, seq],
+            )?;
+            let row = fetch(tx, repo, rfc)?
+                .context("submitted InfraRFC disappeared")?
+                .row;
             confirm_git()?;
             Ok(row)
         })
@@ -313,20 +776,428 @@ impl StateStore {
             "invalid InfraRFC ID or approval digest"
         );
         self.write(|tx| {
-            writing_scope(tx,repo,review)?;
-            let stored=fetch(tx,repo,rfc_id)?.context("unknown InfraRFC")?;
-            let row=&stored.row;
-            ensure!(row.reviewed_commit==review && row.draft_sha256==approval,"InfraRFC approval does not match the exact reviewed draft");
-            ensure!(consumer(tx,&row.draft)?==stored.consumer_sha,"InfraRFC consumer changed since submission");
-            if row.approved_event_seq.is_some() {
+            writing_scope(tx, repo, review)?;
+            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let row = &stored.row;
+            ensure!(
+                row.reviewed_commit == review && row.draft_sha256 == approval,
+                "InfraRFC approval does not match the exact reviewed draft"
+            );
+            ensure!(
+                consumer(tx, &row.draft)? == stored.consumer_sha,
+                "InfraRFC consumer changed since submission"
+            );
+            if row.status == InfraRfcStatus::Approved {
                 confirm_git()?;
                 return Ok(stored.row);
             }
-            let seq=event(tx,Change{actor:ACTOR,git_commit:Some(review)},APPROVED,ENTITY,rfc_id,event_payload(&row.module_path,row.draft.engine,approval))?;
-            ensure!(tx.execute("UPDATE infra_rfcs SET approved_event_seq=?2 WHERE rfc_id=?1 AND approved_event_seq IS NULL",params![rfc_id,seq])?==1,"InfraRFC approval row changed");
-            let approved=fetch(tx,repo,rfc_id)?.context("approved InfraRFC disappeared")?.row;
+            ensure!(
+                row.status == InfraRfcStatus::Draft && row.approved_event_seq.is_none(),
+                "InfraRFC can only be approved from DRAFT status"
+            );
+            let seq = event(
+                tx,
+                Change {
+                    actor: ACTOR,
+                    git_commit: Some(review),
+                },
+                APPROVED,
+                ENTITY,
+                rfc_id,
+                event_payload(&row.module_path, row.draft.engine, approval),
+            )?;
+            ensure!(
+                tx.execute(
+                    "UPDATE infra_rfcs SET approved_event_seq=?2 WHERE rfc_id=?1 AND approved_event_seq IS NULL",
+                    params![rfc_id, seq],
+                )? == 1,
+                "InfraRFC approval row changed"
+            );
+            let approved = fetch(tx, repo, rfc_id)?
+                .context("approved InfraRFC disappeared")?
+                .row;
             confirm_git()?;
             Ok(approved)
+        })
+    }
+
+    /// Transition an APPROVED InfraRFC into BUILDING_SMOKE.
+    pub fn start_infra_rfc_smoke(
+        &mut self,
+        repo: &str,
+        reviewed_main: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        ensure!(
+            id(rfc_id, 100) && hex(draft_sha256, 64),
+            "invalid InfraRFC ID or draft digest"
+        );
+        self.write(|tx| {
+            writing_scope(tx, repo, reviewed_main)?;
+            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let row = &stored.row;
+            ensure!(
+                row.reviewed_commit == reviewed_main && row.draft_sha256 == draft_sha256,
+                "InfraRFC smoke start does not match the exact reviewed draft"
+            );
+            if row.status == InfraRfcStatus::BuildingSmoke {
+                ensure!(
+                    stored.smoke_started_commit.as_deref() == Some(reviewed_main),
+                    "InfraRFC smoke build already started at a different commit"
+                );
+                confirm_git()?;
+                return Ok(stored.row);
+            }
+            ensure!(
+                row.status == InfraRfcStatus::Approved,
+                "InfraRFC smoke build can only start from APPROVED status"
+            );
+            ensure!(
+                consumer(tx, &row.draft)? == stored.consumer_sha,
+                "InfraRFC consumer changed since submission"
+            );
+            record_transition(
+                tx,
+                repo,
+                row,
+                InfraRfcStatus::BuildingSmoke,
+                SMOKE_STARTED,
+                reviewed_main,
+                None,
+                None,
+                None,
+                confirm_git,
+            )
+        })
+    }
+
+    /// Transition a BUILDING_SMOKE Lean 4 InfraRFC into FROZEN_PROVING using sealed broker smoke evidence.
+    pub fn freeze_infra_rfc(
+        &mut self,
+        repo: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        smoke: &VerifiedInfraSmoke,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        self.freeze_infra_rfc_verified(
+            repo,
+            rfc_id,
+            draft_sha256,
+            smoke.commit(),
+            smoke.module_path(),
+            smoke.definitions(),
+            smoke.receipt_sha256(),
+            confirm_git,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn freeze_infra_rfc_verified(
+        &mut self,
+        repo: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        smoke_commit: &str,
+        smoke_module: &str,
+        smoke_definitions: &[String],
+        smoke_receipt_sha256: &str,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        ensure!(
+            id(rfc_id, 100) && hex(draft_sha256, 64),
+            "invalid InfraRFC ID or draft digest"
+        );
+        ensure!(
+            commit(smoke_commit) && hex(smoke_receipt_sha256, 64),
+            "invalid verified InfraRFC smoke evidence"
+        );
+        self.write(|tx| {
+            writing_scope(tx, repo, smoke_commit)?;
+            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let row = &stored.row;
+            ensure!(
+                row.draft_sha256 == draft_sha256,
+                "InfraRFC draft digest does not match"
+            );
+            ensure!(
+                row.draft.engine == Engine::Lean4,
+                "InfraRFC smoke verification requires Lean 4"
+            );
+            ensure!(
+                smoke_module == row.module_path,
+                "verified smoke module does not match InfraRFC module"
+            );
+            ensure!(
+                smoke_definitions == row.draft.proposed_definitions.as_slice(),
+                "verified smoke definitions do not match InfraRFC proposed_definitions"
+            );
+            if row.status == InfraRfcStatus::FrozenProving {
+                ensure!(
+                    row.smoke_commit.as_deref() == Some(smoke_commit)
+                        && row.smoke_receipt_sha256.as_deref() == Some(smoke_receipt_sha256),
+                    "InfraRFC already frozen with different smoke evidence"
+                );
+                confirm_git()?;
+                return Ok(stored.row);
+            }
+            ensure!(
+                row.status == InfraRfcStatus::BuildingSmoke,
+                "InfraRFC can only freeze from BUILDING_SMOKE status"
+            );
+            record_transition(
+                tx,
+                repo,
+                row,
+                InfraRfcStatus::FrozenProving,
+                FROZEN,
+                smoke_commit,
+                Some(smoke_receipt_sha256),
+                None,
+                None,
+                confirm_git,
+            )
+        })
+    }
+
+    /// Transition a FROZEN_PROVING Lean 4 InfraRFC into COMPLETED using sealed broker completion evidence.
+    pub fn complete_infra_rfc(
+        &mut self,
+        repo: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        completion: &VerifiedInfraCompletion,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        self.complete_infra_rfc_verified(
+            repo,
+            rfc_id,
+            draft_sha256,
+            completion.commit(),
+            completion.module_path(),
+            completion.definitions(),
+            completion.api_lemmas(),
+            completion.receipt_sha256(),
+            confirm_git,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn complete_infra_rfc_verified(
+        &mut self,
+        repo: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        completion_commit: &str,
+        completion_module: &str,
+        completion_definitions: &[String],
+        completion_api_lemmas: &[String],
+        completion_receipt_sha256: &str,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        ensure!(
+            id(rfc_id, 100) && hex(draft_sha256, 64),
+            "invalid InfraRFC ID or draft digest"
+        );
+        ensure!(
+            commit(completion_commit) && hex(completion_receipt_sha256, 64),
+            "invalid verified InfraRFC completion evidence"
+        );
+        self.write(|tx| {
+            writing_scope(tx, repo, completion_commit)?;
+            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let row = &stored.row;
+            ensure!(
+                row.draft_sha256 == draft_sha256,
+                "InfraRFC draft digest does not match"
+            );
+            ensure!(
+                row.draft.engine == Engine::Lean4,
+                "InfraRFC completion verification requires Lean 4"
+            );
+            ensure!(
+                completion_module == row.module_path,
+                "verified completion module does not match InfraRFC module"
+            );
+            ensure!(
+                completion_definitions == row.draft.proposed_definitions.as_slice(),
+                "verified completion definitions do not match InfraRFC proposed_definitions"
+            );
+            ensure!(
+                completion_api_lemmas == row.draft.required_api_lemmas.as_slice(),
+                "verified completion API lemmas do not match InfraRFC required_api_lemmas"
+            );
+            if row.status == InfraRfcStatus::Completed {
+                ensure!(
+                    row.smoke_commit.as_deref() == Some(completion_commit)
+                        && row.completion_commit.as_deref() == Some(completion_commit)
+                        && row.completion_receipt_sha256.as_deref()
+                            == Some(completion_receipt_sha256),
+                    "InfraRFC already completed with different completion evidence"
+                );
+                confirm_git()?;
+                return Ok(stored.row);
+            }
+            ensure!(
+                row.status == InfraRfcStatus::FrozenProving,
+                "InfraRFC can only complete from FROZEN_PROVING status"
+            );
+            ensure!(
+                row.smoke_commit.as_deref() == Some(completion_commit),
+                "InfraRFC completion commit must exactly match frozen smoke commit"
+            );
+            record_transition(
+                tx,
+                repo,
+                row,
+                InfraRfcStatus::Completed,
+                COMPLETED,
+                completion_commit,
+                Some(completion_receipt_sha256),
+                None,
+                None,
+                confirm_git,
+            )
+        })
+    }
+
+    /// Reject a DRAFT, APPROVED, or BUILDING_SMOKE InfraRFC with a bounded single-line reason.
+    pub fn reject_infra_rfc(
+        &mut self,
+        repo: &str,
+        reviewed_main: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        reason: &str,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        ensure!(
+            id(rfc_id, 100) && hex(draft_sha256, 64),
+            "invalid InfraRFC ID or draft digest"
+        );
+        ensure!(
+            text_ok(reason, 512, false),
+            "invalid InfraRFC rejection reason"
+        );
+        self.write(|tx| {
+            writing_scope(tx, repo, reviewed_main)?;
+            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let row = &stored.row;
+            ensure!(
+                row.draft_sha256 == draft_sha256,
+                "InfraRFC draft digest does not match"
+            );
+            if row.status == InfraRfcStatus::Rejected {
+                ensure!(
+                    row.rejected_reason.as_deref() == Some(reason)
+                        && stored.rejected_commit.as_deref() == Some(reviewed_main),
+                    "InfraRFC already rejected with different reason or commit"
+                );
+                confirm_git()?;
+                return Ok(stored.row);
+            }
+            ensure!(
+                matches!(
+                    row.status,
+                    InfraRfcStatus::Draft
+                        | InfraRfcStatus::Approved
+                        | InfraRfcStatus::BuildingSmoke
+                ),
+                "InfraRFC can only be rejected from DRAFT, APPROVED, or BUILDING_SMOKE status"
+            );
+            record_transition(
+                tx,
+                repo,
+                row,
+                InfraRfcStatus::Rejected,
+                REJECTED,
+                reviewed_main,
+                None,
+                None,
+                Some(reason),
+                confirm_git,
+            )
+        })
+    }
+
+    /// Supersede an APPROVED, BUILDING_SMOKE, or FROZEN_PROVING InfraRFC with a live same-claim replacement RFC.
+    #[allow(clippy::too_many_arguments)]
+    pub fn supersede_infra_rfc(
+        &mut self,
+        repo: &str,
+        reviewed_main: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        replacement_rfc_id: &str,
+        reason: &str,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        ensure!(
+            id(rfc_id, 100) && id(replacement_rfc_id, 100) && hex(draft_sha256, 64),
+            "invalid InfraRFC ID, replacement RFC ID, or draft digest"
+        );
+        ensure!(
+            replacement_rfc_id != rfc_id,
+            "InfraRFC cannot supersede itself"
+        );
+        ensure!(
+            text_ok(reason, 512, false),
+            "invalid InfraRFC supersession reason"
+        );
+        self.write(|tx| {
+            writing_scope(tx, repo, reviewed_main)?;
+            let stored = fetch(tx, repo, rfc_id)?.context("unknown InfraRFC")?;
+            let row = &stored.row;
+            ensure!(
+                row.draft_sha256 == draft_sha256,
+                "InfraRFC draft digest does not match"
+            );
+            if row.status == InfraRfcStatus::Superseded {
+                ensure!(
+                    row.superseded_by_rfc_id.as_deref() == Some(replacement_rfc_id)
+                        && stored.superseded_reason.as_deref() == Some(reason)
+                        && stored.superseded_commit.as_deref() == Some(reviewed_main),
+                    "InfraRFC already superseded with different replacement, reason, or commit"
+                );
+                confirm_git()?;
+                return Ok(stored.row);
+            }
+            ensure!(
+                matches!(
+                    row.status,
+                    InfraRfcStatus::Approved
+                        | InfraRfcStatus::BuildingSmoke
+                        | InfraRfcStatus::FrozenProving
+                ),
+                "InfraRFC can only be superseded from APPROVED, BUILDING_SMOKE, or FROZEN_PROVING status"
+            );
+            let replacement = fetch(tx, repo, replacement_rfc_id)?
+                .context("replacement InfraRFC not found in this repository")?;
+            ensure!(
+                replacement.row.draft.requested_by_claim == row.draft.requested_by_claim,
+                "replacement InfraRFC must target the same consumer Claim"
+            );
+            ensure!(
+                !matches!(
+                    replacement.row.status,
+                    InfraRfcStatus::Rejected | InfraRfcStatus::Superseded
+                ),
+                "replacement InfraRFC cannot be REJECTED or SUPERSEDED"
+            );
+            record_transition(
+                tx,
+                repo,
+                row,
+                InfraRfcStatus::Superseded,
+                SUPERSEDED,
+                reviewed_main,
+                None,
+                Some(replacement_rfc_id),
+                Some(reason),
+                confirm_git,
+            )
         })
     }
 }

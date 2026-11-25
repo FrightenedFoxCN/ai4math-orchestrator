@@ -139,6 +139,9 @@ pub struct TelemetrySnapshot {
     pub archived_breakers: i64,
     pub infra_rfc_drafts: i64,
     pub infra_rfc_approved: i64,
+    pub infra_rfc_building_smoke: i64,
+    pub infra_rfc_frozen_proving: i64,
+    pub infra_rfc_completed: i64,
     pub task_scheduler: crate::TaskSchedulerStatus,
     pub last_alert: Option<PushAlert>,
 }
@@ -599,12 +602,46 @@ fn trust_transitions(
 impl StateStore {
     pub fn live_telemetry(&mut self) -> Result<TelemetrySnapshot> {
         let tx = self.db.transaction()?;
-        let (infra_rfc_drafts, infra_rfc_approved) = tx.query_row(
-            "SELECT count(*) FILTER (WHERE approved_event_seq IS NULL), count(approved_event_seq)
-             FROM infra_rfcs",
+        let has_infra_transitions: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='infra_rfc_transitions')",
             [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
+            |r| r.get(0),
         )?;
+        let (
+            infra_rfc_drafts,
+            infra_rfc_approved,
+            infra_rfc_building_smoke,
+            infra_rfc_frozen_proving,
+            infra_rfc_completed,
+        ) = if has_infra_transitions {
+            tx.query_row(
+                "WITH effective AS (
+                    SELECT COALESCE(
+                        (SELECT t.to_status FROM infra_rfc_transitions t
+                          WHERE t.rfc_id = r.rfc_id
+                          ORDER BY t.event_seq DESC LIMIT 1),
+                        CASE WHEN r.approved_event_seq IS NOT NULL THEN 'APPROVED' ELSE 'DRAFT' END
+                    ) AS status
+                    FROM infra_rfcs r
+                )
+                SELECT
+                    count(*) FILTER (WHERE status = 'DRAFT'),
+                    count(*) FILTER (WHERE status = 'APPROVED'),
+                    count(*) FILTER (WHERE status = 'BUILDING_SMOKE'),
+                    count(*) FILTER (WHERE status = 'FROZEN_PROVING'),
+                    count(*) FILTER (WHERE status = 'COMPLETED')
+                FROM effective",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?
+        } else {
+            tx.query_row(
+                "SELECT count(*) FILTER (WHERE approved_event_seq IS NULL), count(approved_event_seq), 0, 0, 0
+                 FROM infra_rfcs",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?
+        };
         let value=TelemetrySnapshot { event_seq:max_seq(&tx)?,
             observed_at:tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')",[],|r|r.get(0))?,
             trust:trust_counts(&tx)?,stale_claims:stale_claims(&tx)?,
@@ -614,6 +651,9 @@ impl StateStore {
             archived_breakers:tx.query_row("SELECT count(*) FROM circuit_breakers WHERE state='ARCHIVED'",[],|r|r.get(0))?,
             infra_rfc_drafts,
             infra_rfc_approved,
+            infra_rfc_building_smoke,
+            infra_rfc_frozen_proving,
+            infra_rfc_completed,
             task_scheduler:crate::state::scheduler_snapshot(&tx)?,
             last_alert:tx.query_row("SELECT alert_id,event_seq,created_at,reason_code,dedupe_key,headline,entity_id,briefing_id
                 FROM daemon_alerts ORDER BY event_seq DESC LIMIT 1",[],read_alert).optional()?,

@@ -50,6 +50,11 @@ ai4math task-register ROOT BARE_REPO ID TRACK MODULE TARGET [DEP_ID ...]
 ai4math tasks-status ROOT
 ai4math infra-rfc-submit ROOT BARE_REPO TARGET_MODULE REVIEWED_MAIN DRAFT_JSON
 ai4math infra-rfc-approve ROOT BARE_REPO RFC_ID REVIEWED_MAIN APPROVED_SHA256
+ai4math infra-rfc-smoke-start ROOT BARE_REPO RFC_ID REVIEWED_MAIN DRAFT_SHA256
+ai4math infra-rfc-freeze ROOT BARE_REPO RFC_ID REVIEWED_MAIN DRAFT_SHA256 NATIVE_LEAN SMOKE_LEMMA...
+ai4math infra-rfc-complete ROOT BARE_REPO RFC_ID REVIEWED_MAIN DRAFT_SHA256 NATIVE_LEAN
+ai4math infra-rfc-reject ROOT BARE_REPO RFC_ID REVIEWED_MAIN DRAFT_SHA256 REASON
+ai4math infra-rfc-supersede ROOT BARE_REPO RFC_ID REVIEWED_MAIN DRAFT_SHA256 REPLACEMENT_RFC_ID REASON
 ai4math infra-rfc-inspect ROOT BARE_REPO RFC_ID
 ai4math task-bind ROOT BARE_REPO ANCHOR_MODULE REVIEWED_COMMIT
 ai4math task-run ROOT BARE_REPO ID CLAIM ROLE WORKER_EXE SHA256 WALL_SECONDS
@@ -1182,6 +1187,64 @@ fn run() -> Result<()> {
         ["infra-rfc-approve", root, repo, id, reviewed, sha] => {
             infra_rfc::approve(Path::new(root), Path::new(repo), id, reviewed, sha)
         }
+        ["infra-rfc-smoke-start", root, repo, id, reviewed, sha] => {
+            infra_rfc::smoke_start(Path::new(root), Path::new(repo), id, reviewed, sha)
+        }
+        [
+            "infra-rfc-freeze",
+            root,
+            repo,
+            id,
+            reviewed,
+            sha,
+            executable,
+            lemmas @ ..,
+        ] => infra_rfc::freeze(
+            Path::new(root),
+            Path::new(repo),
+            id,
+            reviewed,
+            sha,
+            Path::new(executable),
+            lemmas,
+        ),
+        [
+            "infra-rfc-complete",
+            root,
+            repo,
+            id,
+            reviewed,
+            sha,
+            executable,
+        ] => infra_rfc::complete(
+            Path::new(root),
+            Path::new(repo),
+            id,
+            reviewed,
+            sha,
+            Path::new(executable),
+        ),
+        ["infra-rfc-reject", root, repo, id, reviewed, sha, reason] => {
+            infra_rfc::reject(Path::new(root), Path::new(repo), id, reviewed, sha, reason)
+        }
+        [
+            "infra-rfc-supersede",
+            root,
+            repo,
+            id,
+            reviewed,
+            sha,
+            replacement,
+            reason,
+        ] => infra_rfc::supersede(
+            Path::new(root),
+            Path::new(repo),
+            id,
+            reviewed,
+            sha,
+            replacement,
+            reason,
+        ),
         ["infra-rfc-inspect", root, repo, id] => {
             infra_rfc::inspect(Path::new(root), Path::new(repo), id)
         }

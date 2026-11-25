@@ -726,8 +726,17 @@ impl StateStore {
             "sediment adaptation lineage events require the typed retention API"
         );
         ensure!(
-            !matches!(kind, infra_rfc::SUBMITTED | infra_rfc::APPROVED),
-            "InfraRFC events require the typed submission or approval API"
+            !matches!(
+                kind,
+                infra_rfc::SUBMITTED
+                    | infra_rfc::APPROVED
+                    | infra_rfc::SMOKE_STARTED
+                    | infra_rfc::FROZEN
+                    | infra_rfc::COMPLETED
+                    | infra_rfc::SUPERSEDED
+                    | infra_rfc::REJECTED
+            ),
+            "InfraRFC events require the typed lifecycle API"
         );
         self.write(|tx| event(tx, change, kind, entity, id, payload))
     }

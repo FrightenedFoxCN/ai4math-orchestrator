@@ -1,6 +1,8 @@
 mod breaker_probe;
 pub use breaker_probe::{VerifiedBreakerProbes, lean_breaker_sources_sha256};
 mod golden;
+mod infra_smoke;
+pub use infra_smoke::{VerifiedInfraCompletion, VerifiedInfraSmoke, lean_infra_sources_sha256};
 mod lean_hammer;
 pub use lean_hammer::{
     HammerCandidate, HammerPremises, MAX_HAMMER_DEPENDENCIES, MAX_HAMMER_PREMISES_BYTES,

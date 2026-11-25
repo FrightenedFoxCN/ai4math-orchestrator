@@ -402,11 +402,26 @@ function BreakerTotals({ snapshot }) {
 }
 
 function InfraRfcTotals({ snapshot }) {
-  const { event_seq: seq, infra_rfc_drafts: drafts, infra_rfc_approved: approved } = snapshot ?? {}
+  const {
+    event_seq: seq,
+    infra_rfc_drafts: drafts,
+    infra_rfc_approved: approved,
+    infra_rfc_building_smoke: smoke,
+    infra_rfc_frozen_proving: frozen,
+    infra_rfc_completed: completed,
+  } = snapshot ?? {}
   // Every recorded RFC has a submission event at or before this snapshot.
   // Reject absent, unsafe, or out-of-ledger totals without inferring zero.
   if (!isCount(seq) || !isCount(drafts) || !isCount(approved) || drafts > seq || approved > seq - drafts) return null
-  return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run')
+  const hasLifecycle = smoke !== undefined || frozen !== undefined || completed !== undefined
+  if (!hasLifecycle) {
+    return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run')
+  }
+  if (!isCount(smoke) || !isCount(frozen) || !isCount(completed)) return null
+  const total = drafts + approved + smoke + frozen + completed
+  if (!Number.isSafeInteger(total) || total > seq) return null
+  return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved
+    + ' · SMOKE ' + smoke + ' · FROZEN ' + frozen + ' · COMPLETED ' + completed)
 }
 
 function DiscoveryBadge({ value, currentSeq }) {

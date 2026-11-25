@@ -2452,6 +2452,431 @@ fn operator_infra_rfc_rejects_invalid_drafts_and_stale_review() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires AI4MATH_TEST_CLI pointing to the built ai4math operator binary"]
+fn operator_infra_rfc_reject_and_supersede_lifecycle() -> Result<()> {
+    let (fixture, head) = infra_rfc_fixture()?;
+    let (project, bare) = fixture.paths()?;
+    fixture.run(&["task-bind", project, bare, "Spec.lean", &head])?;
+    let runtime = fixture.root.path().join(".runtime");
+    let store = StateStore::open_readonly(runtime.join("state.sqlite"))?;
+    let mut child = boot(fixture.root.path())?;
+    let socket = runtime.join("ai4mathd.sock");
+    let mut rpc = wait_connection(&socket, &mut child)?;
+    let mut listener = Rpc::new(UnixStream::connect(socket)?)?;
+    listener.result("subscribe", json!({"topics":["vital_signs.tick"]}))?;
+
+    let write_draft = |name: &str, rfc: &ai4math_core::InfraRFC| -> Result<std::path::PathBuf> {
+        let p = fixture.root.path().join(name);
+        fs::write(&p, serde_json::to_vec(rfc)?)?;
+        Ok(p)
+    };
+
+    // 1. DRAFT -> REJECTED is terminal and blocks subsequent approval.
+    let rejected_rfc = infra_rfc_draft("RFC-REJECT-1");
+    let p_rej = write_draft("rej.json", &rejected_rfc)?;
+    let sub_rej = fixture.run(&[
+        "infra-rfc-submit",
+        project,
+        bare,
+        "Spec.lean",
+        &head,
+        p_rej.to_str().unwrap(),
+    ])?;
+    let rej_sha = sub_rej["draft_sha256"].as_str().context("rej sha")?;
+    let rej_res = fixture.run(&[
+        "infra-rfc-reject",
+        project,
+        bare,
+        "RFC-REJECT-1",
+        &head,
+        rej_sha,
+        "Abstraction conflicts with consumer notation",
+    ])?;
+    assert_eq!(rej_res["status"], "REJECTED");
+    assert_eq!(
+        rej_res["rejected_reason"],
+        "Abstraction conflicts with consumer notation"
+    );
+    assert_eq!(
+        fixture.run(&[
+            "infra-rfc-reject",
+            project,
+            bare,
+            "RFC-REJECT-1",
+            &head,
+            rej_sha,
+            "Abstraction conflicts with consumer notation",
+        ])?,
+        rej_res
+    );
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-approve",
+            project,
+            bare,
+            "RFC-REJECT-1",
+            &head,
+            rej_sha,
+        ],
+    )?;
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-smoke-start",
+            project,
+            bare,
+            "RFC-REJECT-1",
+            &head,
+            rej_sha,
+        ],
+    )?;
+
+    // 2. DRAFT -> APPROVED -> BUILDING_SMOKE -> SUPERSEDED by a valid replacement RFC.
+    let old_rfc = infra_rfc_draft("RFC-OLD-1");
+    let p_old = write_draft("old.json", &old_rfc)?;
+    let sub_old = fixture.run(&[
+        "infra-rfc-submit",
+        project,
+        bare,
+        "Spec.lean",
+        &head,
+        p_old.to_str().unwrap(),
+    ])?;
+    let old_sha = sub_old["draft_sha256"].as_str().context("old sha")?;
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-smoke-start",
+            project,
+            bare,
+            "RFC-OLD-1",
+            &head,
+            old_sha,
+        ],
+    )?;
+    let app_old = fixture.run(&[
+        "infra-rfc-approve",
+        project,
+        bare,
+        "RFC-OLD-1",
+        &head,
+        old_sha,
+    ])?;
+    assert_eq!(app_old["status"], "APPROVED");
+    let smoke_old = fixture.run(&[
+        "infra-rfc-smoke-start",
+        project,
+        bare,
+        "RFC-OLD-1",
+        &head,
+        old_sha,
+    ])?;
+    assert_eq!(smoke_old["status"], "BUILDING_SMOKE");
+    let smoke_seq = smoke_old["smoke_started_event_seq"]
+        .as_i64()
+        .context("smoke_started_event_seq")?;
+    let tick = infra_tick_at(&mut listener, smoke_seq)?;
+    assert_eq!(tick["infra_rfc_drafts"], 0);
+    assert_eq!(tick["infra_rfc_approved"], 0);
+    assert_eq!(tick["infra_rfc_building_smoke"], 1);
+    assert_eq!(tick["infra_rfc_frozen_proving"], 0);
+    assert_eq!(tick["infra_rfc_completed"], 0);
+
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-supersede",
+            project,
+            bare,
+            "RFC-OLD-1",
+            &head,
+            old_sha,
+            "RFC-OLD-1",
+            "self supersede",
+        ],
+    )?;
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-supersede",
+            project,
+            bare,
+            "RFC-OLD-1",
+            &head,
+            old_sha,
+            "RFC-REJECT-1",
+            "rejected replacement",
+        ],
+    )?;
+
+    let mut new_rfc = infra_rfc_draft("RFC-NEW-2");
+    new_rfc.motivation = "Cleaner bundled interface".into();
+    let p_new = write_draft("new.json", &new_rfc)?;
+    fixture.run(&[
+        "infra-rfc-submit",
+        project,
+        bare,
+        "Spec.lean",
+        &head,
+        p_new.to_str().unwrap(),
+    ])?;
+
+    let sup = fixture.run(&[
+        "infra-rfc-supersede",
+        project,
+        bare,
+        "RFC-OLD-1",
+        &head,
+        old_sha,
+        "RFC-NEW-2",
+        "Replaced by cleaner interface",
+    ])?;
+    assert_eq!(sup["status"], "SUPERSEDED");
+    assert_eq!(sup["superseded_by_rfc_id"], "RFC-NEW-2");
+    let sup_seq = sup["superseded_event_seq"]
+        .as_i64()
+        .context("superseded seq")?;
+    let tick2 = infra_tick_at(&mut listener, sup_seq)?;
+    assert_eq!(tick2["infra_rfc_drafts"], 1);
+    assert_eq!(tick2["infra_rfc_approved"], 0);
+    assert_eq!(tick2["infra_rfc_building_smoke"], 0);
+    assert_eq!(tick2["infra_rfc_frozen_proving"], 0);
+    assert_eq!(tick2["infra_rfc_completed"], 0);
+    assert_eq!(rpc.result("status", json!({}))?["infra_rfc_drafts"], 1);
+    assert_eq!(store.status()?.last_event_seq, sup_seq);
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires AI4MATH_TEST_CLI and AI4MATH_TEST_LEAN with native macOS Seatbelt"]
+fn native_operator_infra_rfc_full_lifecycle_with_lean_smoke() -> Result<()> {
+    let lean = std::env::var_os("AI4MATH_TEST_LEAN")
+        .context("set AI4MATH_TEST_LEAN to native Lean executable")?;
+    let lean_str = lean.to_str().context("UTF-8 Lean path")?;
+    let (fixture, head0) = infra_rfc_fixture()?;
+    let (project, bare) = fixture.paths()?;
+    fixture.run(&["task-bind", project, bare, "Spec.lean", &head0])?;
+    let runtime = fixture.root.path().join(".runtime");
+    let store = StateStore::open_readonly(runtime.join("state.sqlite"))?;
+    let mut child = boot(fixture.root.path())?;
+    let socket = runtime.join("ai4mathd.sock");
+    let mut rpc = wait_connection(&socket, &mut child)?;
+
+    let draft = ai4math_core::InfraRFC {
+        rfc_id: "RFC-LEAN-FULL-1".into(),
+        requested_by_claim: "CriticalDefinition".into(),
+        engine: ai4math_core::Engine::Lean4,
+        motivation: "Provide a verified bundled witness structure".into(),
+        proposed_definitions: vec!["InfraPack".into(), "infraScore".into()],
+        required_api_lemmas: vec!["infraScore_add".into()],
+        consumer_usage_sketch: "exact infraScore_add p 1".into(),
+        smoke_test_criteria: vec![
+            "Nontrivial instance witness".into(),
+            "Core characterization lemma".into(),
+        ],
+        status: ai4math_core::InfraStatus::Draft,
+    };
+    let draft_path = fixture.root.path().join("rfc-full.json");
+    fs::write(&draft_path, serde_json::to_vec(&draft)?)?;
+
+    let submitted = fixture.run(&[
+        "infra-rfc-submit",
+        project,
+        bare,
+        "Spec.lean",
+        &head0,
+        draft_path.to_str().unwrap(),
+    ])?;
+    let sha = submitted["draft_sha256"].as_str().context("draft sha")?;
+    fixture.run(&[
+        "infra-rfc-approve",
+        project,
+        bare,
+        &draft.rfc_id,
+        &head0,
+        sha,
+    ])?;
+    fixture.run(&[
+        "infra-rfc-smoke-start",
+        project,
+        bare,
+        &draft.rfc_id,
+        &head0,
+        sha,
+    ])?;
+
+    let commit_spec = |source: &str, msg: &str| -> Result<String> {
+        fs::write(fixture.source.join("Spec.lean"), source)?;
+        PivotWorkflow::git(&fixture.source, &["add", "Spec.lean"])?;
+        PivotWorkflow::git(&fixture.source, &["commit", "-m", msg])?;
+        PivotWorkflow::git(&fixture.source, &["push", bare, "main"])?;
+        Ok(
+            PivotWorkflow::git(&fixture.repo, &["rev-parse", "refs/heads/main"])?
+                .trim()
+                .to_owned(),
+        )
+    };
+
+    // Commit 1: sorry and unrelated smoke lemmas must be rejected.
+    let head_sorry = commit_spec(
+        "def target : Prop := True
+structure InfraPack where
+  val : Nat
+def infraScore (p : InfraPack) : Nat := p.val + 1
+theorem smoke_unrelated : True := True.intro
+theorem smoke_sorry (p : InfraPack) : infraScore p > 0 := by sorry
+",
+        "add definitions with sorry smoke",
+    )?;
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-freeze",
+            project,
+            bare,
+            &draft.rfc_id,
+            &head_sorry,
+            sha,
+            lean_str,
+            "smoke_sorry",
+        ],
+    )?;
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-freeze",
+            project,
+            bare,
+            &draft.rfc_id,
+            &head_sorry,
+            sha,
+            lean_str,
+            "smoke_unrelated",
+        ],
+    )?;
+
+    // Commit 2: commit the smoke declarations and API theorem before freezing.
+    let head_smoke = commit_spec(
+        "def target : Prop := True
+structure InfraPack where
+  val : Nat
+def infraScore (p : InfraPack) : Nat := p.val + 1
+def smoke_witness : InfraPack := { val := 7 }
+theorem smoke_pos (p : InfraPack) : infraScore p = p.val + 1 := rfl
+theorem infraScore_add (p : InfraPack) (k : Nat) : infraScore { val := p.val + k } = infraScore p + k := by
+  simp [infraScore, Nat.add_right_comm]
+",
+        "clean definitions, smoke declarations and API theorem",
+    )?;
+    let frozen = fixture.run(&[
+        "infra-rfc-freeze",
+        project,
+        bare,
+        &draft.rfc_id,
+        &head_smoke,
+        sha,
+        lean_str,
+        "smoke_witness",
+        "smoke_pos",
+    ])?;
+    assert_eq!(frozen["status"], "FROZEN_PROVING");
+    assert_eq!(frozen["smoke_commit"], head_smoke);
+    let smoke_receipt = frozen["smoke_receipt_sha256"]
+        .as_str()
+        .context("smoke receipt")?;
+    assert_eq!(smoke_receipt.len(), 64);
+    assert_eq!(
+        fixture.run(&[
+            "infra-rfc-freeze",
+            project,
+            bare,
+            &draft.rfc_id,
+            &head_smoke,
+            sha,
+            lean_str,
+            "smoke_witness",
+            "smoke_pos",
+        ])?,
+        frozen
+    );
+    let frozen_status = rpc.result("status", json!({}))?;
+    assert_eq!(frozen_status["infra_rfc_building_smoke"], 0);
+    assert_eq!(frozen_status["infra_rfc_frozen_proving"], 1);
+    assert_eq!(frozen_status["infra_rfc_completed"], 0);
+    let completed = fixture.run(&[
+        "infra-rfc-complete",
+        project,
+        bare,
+        &draft.rfc_id,
+        &head_smoke,
+        sha,
+        lean_str,
+    ])?;
+    assert_eq!(completed["status"], "COMPLETED");
+    assert_eq!(completed["completion_commit"], head_smoke);
+    let done_receipt = completed["completion_receipt_sha256"]
+        .as_str()
+        .context("completion receipt")?;
+    assert_eq!(done_receipt.len(), 64);
+    let done_seq = completed["completed_event_seq"]
+        .as_i64()
+        .context("done seq")?;
+    assert_eq!(
+        fixture.run(&[
+            "infra-rfc-complete",
+            project,
+            bare,
+            &draft.rfc_id,
+            &head_smoke,
+            sha,
+            lean_str,
+        ])?,
+        completed
+    );
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-reject",
+            project,
+            bare,
+            &draft.rfc_id,
+            &head_smoke,
+            sha,
+            "too late",
+        ],
+    )?;
+    let tick_done = rpc.result("status", json!({}))?;
+    assert_eq!(tick_done["event_seq"], done_seq);
+    assert_eq!(tick_done["infra_rfc_frozen_proving"], 0);
+    assert_eq!(tick_done["infra_rfc_completed"], 1);
+    PivotWorkflow::git(
+        &fixture.source,
+        &["commit", "--allow-empty", "-m", "advance after freeze"],
+    )?;
+    PivotWorkflow::git(&fixture.source, &["push", bare, "main"])?;
+    let moved = PivotWorkflow::git(&fixture.repo, &["rev-parse", "refs/heads/main"])?;
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-complete",
+            project,
+            bare,
+            &draft.rfc_id,
+            moved.trim(),
+            sha,
+            lean_str,
+        ],
+    )?;
+    assert_eq!(store.status()?.last_event_seq, done_seq);
+    assert_eq!(
+        store.claim("CriticalDefinition")?.unwrap().local_trust,
+        ai4math_store::Trust::L0
+    );
+    Ok(())
+}
+
+#[test]
 fn operator_oracle_and_hammer_are_not_available_over_daemon_rpc() -> Result<()> {
     let dir = tempfile::Builder::new()
         .prefix("oa")
@@ -2512,6 +2937,11 @@ fn operator_oracle_and_hammer_are_not_available_over_daemon_rpc() -> Result<()> 
         "wiki.coreSearch",
         "wiki.coreProvenance",
         "wiki.sedimentArchive",
+        "infra.rfc.smokeStart",
+        "infra.rfc.freeze",
+        "infra.rfc.complete",
+        "infra.rfc.reject",
+        "infra.rfc.supersede",
     ] {
         assert_eq!(rpc.call(method, json!({}))?["error"]["code"], -32601);
     }

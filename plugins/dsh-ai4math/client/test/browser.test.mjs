@@ -42,6 +42,11 @@ test('HUD displays only bounded RFC counts with no readiness or action', async t
     ['unsafe count', { infra_rfc_drafts: 0, infra_rfc_approved: Number.MAX_SAFE_INTEGER + 1 }],
     ['counts exceed ledger', { infra_rfc_drafts: 11, infra_rfc_approved: 11 }],
     ['counts return', { infra_rfc_drafts: 1, infra_rfc_approved: 2 }, label(1, 2)],
+    ['full lifecycle counts', { infra_rfc_drafts: 1, infra_rfc_approved: 2, infra_rfc_building_smoke: 1, infra_rfc_frozen_proving: 3, infra_rfc_completed: 2 },
+      'Infra RFCs · DRAFT 1 · APPROVED 2 · SMOKE 1 · FROZEN 3 · COMPLETED 2'],
+    ['partial lifecycle counts rejected', { infra_rfc_drafts: 1, infra_rfc_approved: 0, infra_rfc_building_smoke: 1 }],
+    ['negative lifecycle count rejected', { infra_rfc_drafts: 0, infra_rfc_approved: 0, infra_rfc_building_smoke: 0, infra_rfc_frozen_proving: -1, infra_rfc_completed: 0 }],
+    ['lifecycle total exceeds ledger', { infra_rfc_drafts: 6, infra_rfc_approved: 6, infra_rfc_building_smoke: 6, infra_rfc_frozen_proving: 6, infra_rfc_completed: 6 }],
   ].map(([name, data, expected], i) => ({ name, data, expected, seq: 11 + i, gate: Promise.withResolvers() }));
   const disconnect = Promise.withResolvers();
   const app = await browser(t, {
