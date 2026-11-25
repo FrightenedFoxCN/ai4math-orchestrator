@@ -21,10 +21,17 @@ const target = evaluatePluginCompatibility(manifest, {}, '0.2.2');
 assert.deepEqual(target.requirements, { 'engines.dsh': '0.2.2-rc.5' });
 assert.equal(target.exempted, false);
 const patches = bundlePatchPaths(root, manifest.dsh.bundle).flatMap((file) => loadOverlayPatches('dsh', file));
-assert.deepEqual(composeEntries([patches]), [{
+const composed = composeEntries([patches]);
+assert.equal(composed.length, 2);
+const presetRow = composed.find((row) => row.id === 'preset-ai4math-chief');
+assert.equal(presetRow?.name, '@deepseek-ai/dsh-agent-preset');
+assert.equal(presetRow?.config?.id, 'ai4math-chief');
+assert.ok(Array.isArray(presetRow?.config?.plugins) && presetRow.config.plugins.length > 0);
+const pluginRow = composed.find((row) => row.id === 'dsh-ai4math');
+assert.deepEqual(pluginRow, {
   id: 'dsh-ai4math', name: 'dsh-ai4math', disabled: true,
-  config: { rolePresets: {}, proofSlots: {} },
-}]);
+  config: { rolePresets: { chief: 'ai4math-chief' }, proofSlots: {} },
+});
 const meta = readPluginMeta(manifest.name, new URL('../package.json', import.meta.url).href);
 assert.equal(meta.error, undefined);
 for (const language of ['en', 'zh']) {
@@ -33,4 +40,4 @@ for (const language of ['en', 'zh']) {
   assert.equal(meta.description[language], expected.description);
 }
 assert.equal(meta.icon, 'data:image/svg+xml;base64,' + readFileSync(join(root, 'icon.svg')).toString('base64'));
-console.log('DSH 0.2.2-rc.5: manifest, bilingual metadata, and icon accepted; one disabled row with no role or proof-slot grants');
+console.log('DSH 0.2.2-rc.5: manifest, bilingual metadata, icon, built-in ai4math-chief preset, and default-disabled dsh-ai4math row accepted');

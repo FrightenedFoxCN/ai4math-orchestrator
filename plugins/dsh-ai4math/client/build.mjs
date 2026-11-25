@@ -4,7 +4,9 @@ import { readFile, writeFile } from 'node:fs/promises';
 import { REMOTE_PACKAGE, REMOTE_NAMESPACE, REMOTE_METHODS, TOPICS, WIKI_SCOPES } from '../host/remote-contract.mjs';
 
 const path = name => new URL(name, import.meta.url);
-const source = await Promise.all(['plugin.cjs', 'remote.cjs', 'live.cjs', 'views.cjs'].map(async name =>
+const source = await Promise.all([
+  'plugin.cjs', 'remote.cjs', 'live.cjs', 'i18n.cjs', 'cli-helper.cjs', 'views.cjs', 'workbench-store.cjs', 'workbench.cjs',
+].map(async name =>
   JSON.stringify('./' + name) + ': (module, exports, require) => {\n' + await readFile(path(name), 'utf8') + '}'));
 const contract = JSON.stringify({ REMOTE_PACKAGE, REMOTE_NAMESPACE, REMOTE_METHODS, TOPICS, WIKI_SCOPES });
 const css = JSON.stringify(await readFile(path('style.css'), 'utf8'));

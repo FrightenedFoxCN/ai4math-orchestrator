@@ -349,8 +349,9 @@ test('lazy browser bundle mounts shell.bottom and four sidebar tabs with owned c
   assert.equal(app.registrations.length, 1);
   assert.equal(registration.package, 'dsh-ai4math');
   assert.deepEqual(Array.from(registration.descriptors, descriptor => descriptor.method).sort(),
-    ['alertsList', 'briefingGet', 'briefingPeek', 'briefingPull', 'frontierList', 'inboxList', 'status', 'subscribe',
-      'wikiCheckGraveyard', 'wikiProvenance', 'wikiSearch']);
+    ['alertsList', 'briefingGet', 'briefingPeek', 'briefingPull', 'daemonStart', 'daemonStop',
+      'frontierList', 'inboxList', 'projectInit', 'projectRemove', 'projectSelect', 'status', 'subscribe',
+      'wikiCheckGraveyard', 'wikiProvenance', 'wikiSearch', 'workbenchState']);
   const subscription = registration.descriptors.find(d => d.method === 'subscribe');
   assert.equal(subscription.mode, 'stream');
   assert.equal(subscription.cancellation.parameter, 'signal');
@@ -358,7 +359,7 @@ test('lazy browser bundle mounts shell.bottom and four sidebar tabs with owned c
   const [style] = app.styles;
   assert.equal(style.dataset.plugin, 'dsh-ai4math');
   assert.match(style.textContent, /\.ai4m-hud/);
-  assert.equal(app.slots.size, 5);
+  assert.equal(app.slots.size, 8);
   assert.equal(app.tabs.size, 4);
 
   const hud = app.mount('shell.bottom');
@@ -1077,4 +1078,217 @@ test('tab errors use a fixed message and unmount aborts a pending request', asyn
   await until(() => app.timers.size, count => count === 1, 'Expected pending stream retry');
   app.dispose();
   assert.equal(app.timers.size, 0, 'unmount cancels pending stream retry');
+});
+
+test('Workbench supports directory picker, project init, linked sessions, and one-click Chief launch', async t => {
+  const wbCalls = [];
+  const launched = [];
+  const openedSessions = [];
+  const selectedPanels = [];
+  const projA = {
+    id: 'proj-aaaa1111aaaa', name: 'Algebra', root: '/tmp/math/algebra', engine: 'lean4',
+    socket_path: '/tmp/math/algebra/.runtime/ai4mathd.sock', socket_bytes: 40, socket_limit: 103,
+    exists: true, initialized: true, daemon_status: 'managed', active: true, updated_at: '2026-11-26T00:00:00Z',
+  };
+  let wbState = {
+    active_project_id: null, active_socket_path: null, unmanaged_active: null, projects: [],
+    binaries: { cli_ready: true, daemon_ready: true, cli_path: '/bin/ai4math', daemon_path: '/bin/ai4mathd' },
+    socket_limit_bytes: 103, chief_preset: 'ai4math-chief', chief_bound: true,
+    role_presets: { chief: 'ai4math-chief' }, proof_slots: { prover: [], automation: [] },
+    managed_daemon: null, last_daemon_exit: null,
+  };
+  const services = {
+    layout: { selectPanel: (id) => selectedPanels.push(id) },
+    workspaces: { create: async ({ path }) => ({ workspaceId: 'ws-1', path, title: 'Algebra', sessionIds: ['sess-1'] }) },
+    uiWorkspace: {
+      pickDirectory: async () => '/tmp/math/algebra',
+      openSession: (id) => openedSessions.push(id),
+      startSession: (wsId, options) => launched.push({ wsId, options }),
+    },
+  };
+  const app = await browser(t, {
+    async *subscribe(_params, signal) {
+      yield transition('connected');
+      if (!signal.aborted) await once(signal, 'abort');
+    },
+    async status() { return ok(snapshot(5)); },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+    async workbenchState() { wbCalls.push(['workbenchState']); return ok(wbState); },
+    async projectInit(params) {
+      wbCalls.push(['projectInit', fromWire(params)]);
+      wbState = { ...wbState, active_project_id: projA.id, active_socket_path: projA.socket_path, projects: [projA] };
+      return ok({ ok: true, initialized: true, project: projA, state: wbState });
+    },
+    async daemonStop(params) {
+      wbCalls.push(['daemonStop', fromWire(params)]);
+      wbState = { ...wbState, projects: [{ ...projA, daemon_status: 'stopped' }] };
+      return ok({ ok: true, state: wbState });
+    },
+    async daemonStart(params) {
+      wbCalls.push(['daemonStart', fromWire(params)]);
+      wbState = { ...wbState, projects: [{ ...projA, daemon_status: 'managed' }] };
+      return ok({ ok: true, mode: 'managed', state: wbState });
+    },
+  }, services);
+
+  // Clicking AI4Math in HUD jumps to the main workbench panel
+  const hud = app.mount('shell.bottom');
+  hud.find('button', 'AI4Math').props.onClick();
+  assert.deepEqual(selectedPanels, ['ai4math']);
+
+  const workspaceSnap = {
+    items: [{ workspaceId: 'ws-1', path: '/tmp/math/algebra', title: 'Algebra', sessionIds: ['sess-1'] }],
+    archivedSessionIds: [],
+  };
+  const sessionSnap = {
+    ids: ['sess-1'],
+    byId: { 'sess-1': { sessionId: 'sess-1', cwd: '/tmp/math/algebra', running: true, blank: false, updatedAt: Date.now() } },
+    projectionsBySession: { 'sess-1': { values: { sessionTitle: 'Galois Frontier', agentPreset: 'ai4math-chief' } } },
+  };
+  const wb = app.mount('main', 'ai4math', {
+    useWorkspaces: (sel) => sel(workspaceSnap),
+    useSessions: (sel) => sel(sessionSnap),
+  });
+  await expectText(wb, /Add your first Math Project/);
+
+  // Pick folder via native picker mock and submit project init
+  await wb.find('button', 'Pick Folder').props.onClick();
+  await expectText(wb, /Socket path: 40 \/ 103 bytes/);
+  await wb.find('form').props.onSubmit({ preventDefault() {} });
+  await expectText(wb, /Initialized and connected project .*Galois Frontier/);
+  assert.deepEqual(wbCalls.find(([m]) => m === 'projectInit'), ['projectInit', { root: '/tmp/math/algebra', engine: 'lean4', auto_start: true, name: 'algebra' }]);
+
+  // Open existing linked conversation
+  wb.find('button', 'Open').props.onClick();
+  assert.deepEqual(openedSessions, ['sess-1']);
+
+  // Stop daemon, then one-click New Chief Session auto-starts daemon and creates Chief conversation
+  await wb.find('button', 'Stop daemon').props.onClick();
+  await expectText(wb, /Stopped Host-managed ai4mathd/);
+  wb.find('button', 'New Chief Session').props.onClick();
+  await until(() => launched.length, n => n === 1, 'Expected Chief session launch');
+  assert.equal(wbCalls.some(([m]) => m === 'daemonStart'), true);
+  assert.equal(launched[0].wsId, 'ws-1');
+  assert.equal(launched[0].options.agentPreset, 'ai4math-chief');
+  assert.match(launched[0].options.prompt, /ai4math_status/);
+});
+
+test('Session-aware HUD & header chip detect mismatched project and CLI helper stays read-only', async t => {
+  const switched = [];
+  const projA = { id: 'proj-aaaa', name: 'ProjA', root: '/tmp/a', engine: 'lean4', socket_path: '/tmp/a/.runtime/ai4mathd.sock', socket_bytes: 28, socket_limit: 103, exists: true, initialized: true, daemon_status: 'managed', active: true };
+  const projB = { id: 'proj-bbbb', name: 'ProjB', root: '/tmp/b', engine: 'agda', socket_path: '/tmp/b/.runtime/ai4mathd.sock', socket_bytes: 28, socket_limit: 103, exists: true, initialized: true, daemon_status: 'stopped', active: false };
+  let wbState = {
+    active_project_id: projA.id, active_socket_path: projA.socket_path, unmanaged_active: null,
+    projects: [projA, projB], binaries: { cli_ready: true, daemon_ready: true }, socket_limit_bytes: 103,
+    chief_preset: 'ai4math-chief', chief_bound: true, role_presets: { chief: 'ai4math-chief' }, proof_slots: { prover: [], automation: [] },
+  };
+  const app = await browser(t, {
+    async *subscribe(_params, signal) {
+      yield transition('connected');
+      if (!signal.aborted) await once(signal, 'abort');
+    },
+    async status() { return ok(snapshot(9)); },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+    async workbenchState() { return ok(wbState); },
+    async projectSelect(params) {
+      switched.push(fromWire(params));
+      wbState = {
+        ...wbState,
+        active_project_id: projB.id,
+        active_socket_path: projB.socket_path,
+        projects: [{ ...projA, active: false }, { ...projB, active: true, daemon_status: 'managed' }],
+      };
+      return ok({ ok: true, project: projB, state: wbState });
+    },
+    async inboxList() {
+      return ok({ items: [{ inbox_id: 'inb-1', priority: 'P0', category: 'definition_smell', summary: 'Review smell' }] });
+    },
+  });
+
+  const hud = app.mount('shell.bottom');
+  const headerChip = app.mount('conversation.session.header.utilities', 'ai4math-session-context', {
+    sessionId: 'sess-b',
+    useSessions: (sel) => sel({ byId: { 'sess-b': { sessionId: 'sess-b', cwd: '/tmp/b/subdir' } } }),
+  });
+  await expectText(headerChip, /AI4Math: ProjB · Switch/);
+  await expectText(hud, /Current session directory matches AI4Math project “ProjB”/);
+  await hud.find('button', 'Switch project').props.onClick();
+  assert.deepEqual(switched, [{ project_id: 'proj-bbbb', auto_start: true }]);
+  await until(hud.text, txt => !/matches AI4Math project/.test(txt), 'Mismatch banner clears after switching');
+
+  // Inbox tab renders read-only operator CLI helper with active project root
+  const inbox = mountTab(app, 'inbox');
+  await expectText(inbox, /Operator CLI commands \(read-only\) .*ai4math owner-archive-preview '\/tmp\/b'/);
+});
+
+test('UI follows DSH locale service reactively between zh and en with full dictionary parity', async t => {
+  const registered = [];
+  const disposed = [];
+  const listeners = new Set();
+  let localeSnap = { active: 'zh-CN', revision: 1 };
+  const localeService = {
+    getSnapshot: () => localeSnap,
+    subscribe(fn) { listeners.add(fn); return () => listeners.delete(fn); },
+    register(ns, lang, dict) {
+      registered.push({ ns, lang, keys: Object.keys(dict).sort() });
+      return () => disposed.push({ ns, lang });
+    },
+    setActive(next) {
+      localeSnap = { active: next, revision: localeSnap.revision + 1 };
+      for (const fn of [...listeners]) fn();
+    },
+  };
+  const projA = { id: 'proj-aaaa', name: 'ProjA', root: '/tmp/a', engine: 'lean4', socket_path: '/tmp/a/.runtime/ai4mathd.sock', socket_bytes: 28, socket_limit: 103, exists: true, initialized: true, daemon_status: 'managed', active: true };
+  const projB = { id: 'proj-bbbb', name: 'ProjB', root: '/tmp/b', engine: 'agda', socket_path: '/tmp/b/.runtime/ai4mathd.sock', socket_bytes: 28, socket_limit: 103, exists: true, initialized: true, daemon_status: 'stopped', active: false };
+  const wbState = {
+    active_project_id: projA.id, active_socket_path: projA.socket_path, unmanaged_active: null,
+    projects: [projA, projB], binaries: { cli_ready: true, daemon_ready: true }, socket_limit_bytes: 103,
+    chief_preset: 'ai4math-chief', chief_bound: true, role_presets: { chief: 'ai4math-chief' }, proof_slots: { prover: [], automation: [] },
+  };
+  const app = await browser(t, {
+    async *subscribe(_params, signal) {
+      yield transition('connected');
+      if (!signal.aborted) await once(signal, 'abort');
+    },
+    async status() { return ok(snapshot(12)); },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+    async workbenchState() { return ok(wbState); },
+    async inboxList() { return ok({ items: [{ inbox_id: 'i1', priority: 'P0', category: 'definition_smell', summary: 'Smell' }] }); },
+  }, { locale: localeService });
+
+  // Dictionary registration & EN/ZH key parity
+  assert.equal(registered.length, 2);
+  const enEntry = registered.find(r => r.lang === 'en');
+  const zhEntry = registered.find(r => r.lang === 'zh');
+  assert.deepEqual(zhEntry.keys, enEntry.keys, 'ZH and EN dictionaries must have identical key sets');
+
+  // Right-sidebar tab titles follow zh
+  assert.equal(app.tabs.get('dsh-ai4math/briefing').title(), '简报');
+  assert.equal(app.tabs.get('dsh-ai4math/frontier').title(), '前沿');
+  assert.equal(app.tabs.get('dsh-ai4math/inbox').title(), '收件箱');
+  assert.equal(app.tabs.get('dsh-ai4math/wiki').title(), 'Wiki');
+
+  // HUD, Workbench, Session Chip, and Inbox CLI Helper render in Chinese
+  const hud = app.mount('shell.bottom');
+  const wb = app.mount('main', 'ai4math');
+  const chip = app.mount('conversation.session.header.utilities', 'ai4math-session-context', {
+    sessionId: 's-b',
+    useSessions: (sel) => sel({ byId: { 's-b': { sessionId: 's-b', cwd: '/tmp/b' } } }),
+  });
+  const inbox = mountTab(app, 'inbox');
+  await expectText(hud, /在线 .*内存 .*待重验 .*简报 .*前沿 .*收件箱/);
+  await expectText(wb, /AI4Math 工作台 .*新建 Chief 主编排会话 .*总览 .*环境与角色/);
+  await expectText(chip, /AI4Math：ProjB · 切换/);
+  await expectText(inbox, /决策收件箱 .*操作者 CLI 命令（只读参考）/);
+
+  // Switching DSH locale live to English updates all surfaces without remounting
+  localeService.setActive('en');
+  assert.equal(app.tabs.get('dsh-ai4math/briefing').title(), 'Briefing');
+  assert.match(hud.text(), /Live .*RAM .*Stale .*Briefing .*Frontier .*Inbox/);
+  assert.match(wb.text(), /AI4Math Workbench .*New Chief Session .*Overview .*Setup & Roles/);
+  assert.match(chip.text(), /AI4Math: ProjB · Switch/);
+  assert.match(inbox.text(), /Decision inbox .*Operator CLI commands \(read-only\)/);
+
+  app.dispose();
+  assert.equal(disposed.length, 2, 'locale dictionary registrations are disposed on unload');
 });

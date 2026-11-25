@@ -15,8 +15,8 @@ const react = {
   },
   useState(initial) {
     const hook = renderScope.hook();
-    if (!('value' in hook)) hook.value = initial;
-    return [hook.value, value => { hook.value = value; }];
+    if (!('value' in hook)) hook.value = typeof initial === 'function' ? initial() : initial;
+    return [hook.value, value => { hook.value = typeof value === 'function' ? value(hook.value) : value; }];
   },
   useRef(current) {
     const hook = renderScope.hook();
@@ -41,12 +41,24 @@ const react = {
   },
 };
 
-function nodes(element) {
+function nodes(element, path = 'root', fibers, seen, commit) {
   if (element == null || typeof element === 'boolean') return [];
-  if (Array.isArray(element)) return element.flatMap(nodes);
+  if (Array.isArray(element)) return element.flatMap((child, i) => nodes(child, path + '.' + i, fibers, seen, commit));
   if (typeof element !== 'object') return [String(element)];
-  if (typeof element.type === 'function') return nodes(element.type(element.props));
-  return [{ ...element, children: nodes(element.props.children) }];
+  if (typeof element.type === 'function') {
+    const fiberKey = path + ':' + (element.type.name || 'anon');
+    seen.add(fiberKey);
+    let hooks = fibers.get(fiberKey);
+    if (!hooks) { hooks = []; fibers.set(fiberKey, hooks); }
+    let index = 0;
+    const prev = renderScope;
+    renderScope = { hook: () => (hooks[index++] ??= {}), commit };
+    let rendered;
+    try { rendered = element.type(element.props); }
+    finally { renderScope = prev; }
+    return nodes(rendered, fiberKey, fibers, seen, commit);
+  }
+  return [{ ...element, children: nodes(element.props.children, path + '/' + element.type, fibers, seen, commit) }];
 }
 
 function all(tree) {
@@ -55,26 +67,36 @@ function all(tree) {
 
 const text = tree => all(tree).filter(node => typeof node === 'string').join(' ').replace(/\s+/g, ' ').trim();
 
-function render(View) {
-  const hooks = [];
-  function read() {
-    let index = 0;
-    const scope = { hook: () => (hooks[index++] ??= {}), commit: [] };
-    renderScope = scope;
-    let tree;
-    try { tree = nodes(react.createElement(View, null)); }
-    finally { renderScope = undefined; }
-    for (const effect of scope.commit) effect();
+function render(View, initialProps = null) {
+  const fibers = new Map();
+  let currentProps = initialProps;
+  function read(nextProps) {
+    if (nextProps !== undefined) currentProps = nextProps;
+    const seen = new Set();
+    const commit = [];
+    const tree = nodes(react.createElement(View, currentProps), 'root', fibers, seen, commit);
+    for (const [key, hooks] of [...fibers]) {
+      if (!seen.has(key)) {
+        for (const hook of hooks.toReversed()) hook.dispose?.();
+        fibers.delete(key);
+      }
+    }
+    for (const effect of commit) effect();
     return tree;
   }
   return {
-    text: () => text(read()),
+    text: (nextProps) => text(read(nextProps)),
     find(type, label) {
       const node = all(read()).find(node => node.type === type && (label === undefined || text(node.children) === label));
       assert.ok(node, 'render did not contain ' + type + (label === undefined ? '' : ': ' + label));
       return node;
     },
-    dispose() { for (const hook of hooks.toReversed()) hook.dispose?.(); },
+    dispose() {
+      for (const hooks of [...fibers.values()].toReversed()) {
+        for (const hook of hooks.toReversed()) hook.dispose?.();
+      }
+      fibers.clear();
+    },
   };
 }
 
@@ -86,7 +108,7 @@ function generatorCleanups(setup) {
   return cleanups;
 }
 
-export async function browser(t, remote) {
+export async function browser(t, remote, services = {}) {
   const tabs = new Map();
   const slots = new Map();
   const styles = new Set();
@@ -175,9 +197,9 @@ export async function browser(t, remote) {
         injectedSlot = name;
         try { return setup(); } finally { injectedSlot = undefined; }
       },
-      register({ name, key = '' }, View) {
+      register({ name, key = '', id = '' }, View) {
         assert.equal(name, injectedSlot, 'register under the correct slot owner');
-        return add(slots, name + ':' + key, View);
+        return add(slots, name + ':' + (key || id), View);
       },
     },
     sidebarRight: {
@@ -207,6 +229,7 @@ export async function browser(t, remote) {
     }
     const ctx = {
       remote: gate(allowed),
+      get(name) { return services[name]; },
       effect,
       ...surface,
       plugin(callback) {
@@ -248,10 +271,10 @@ export async function browser(t, remote) {
   await plugin.apply(ctx);
   return {
     tabs, slots, styles, registrations, timers, advanceTimersBy, navigation, opened, targetElements, dispose,
-    mount(name, key = '') {
+    mount(name, key = '', props = null) {
       const View = slots.get(name + ':' + key);
       assert.ok(View, 'no registration for ' + name + ':' + key);
-      const view = render(View);
+      const view = render(View, props);
       mountedViews.add(view);
       return Object.assign(view, { close: () => close(view) });
     },

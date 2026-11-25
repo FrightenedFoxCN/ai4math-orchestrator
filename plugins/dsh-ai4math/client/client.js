@@ -6,7 +6,10 @@ window.__ModuleLoader__.load({ id: "dsh-ai4math", factory: platformRequire => {
 const { createElement: h } = require('react')
 const { contribution } = require('./remote.cjs')
 const { createLive } = require('./live.cjs')
+const { EN, ZH, createI18n } = require('./i18n.cjs')
 const { LiveHud, panels, views } = require('./views.cjs')
+const { createWorkbenchStore } = require('./workbench-store.cjs')
+const { Workbench, Ai4mathNavIcon, SessionContextChip } = require('./workbench.cjs')
 const contract = require('./contract')
 const css = require('./style')
 
@@ -32,11 +35,56 @@ async function apply(ctx) {
   const ui = ctx.inject([namespace, 'slots', 'sidebarRight', 'sidebarRightTabs'], scoped => {
     const remote = scoped.remote[REMOTE_NAMESPACE]
     const live = createLive(remote, { topics: TOPICS })
+    const wbStore = createWorkbenchStore(remote)
+    const getService = name => typeof scoped.get === 'function' ? scoped.get(name) : undefined
+    const localeService = getService('locale')
+    if (localeService?.register) {
+      scoped.effect(() => {
+        const dropEn = localeService.register(REMOTE_PACKAGE, 'en', EN)
+        const dropZh = localeService.register(REMOTE_PACKAGE, 'zh', ZH)
+        return () => { dropZh?.(); dropEn?.() }
+      }, 'ai4math.locale')
+    }
+    const i18n = createI18n(localeService)
     const open = (key, element) => {
       const target = scoped.sidebarRight.commandTarget(element)
       if (target === undefined) return false
       scoped.sidebarRight.openTabFromTarget(kind(key), target)
       return true
+    }
+    const openWorkbench = () => {
+      const layout = getService('layout')
+      if (!layout?.selectPanel) return false
+      try { layout.selectPanel('ai4math'); return true } catch { return false }
+    }
+    const actions = {
+      openWorkbench,
+      pickDirectory: async () => {
+        const uiWs = getService('uiWorkspace')
+        if (!uiWs?.pickDirectory) return { error: 'unavailable' }
+        try {
+          const path = await uiWs.pickDirectory()
+          return typeof path === 'string' && path.length > 0 ? { path } : { cancelled: true }
+        } catch {
+          return { error: 'failed' }
+        }
+      },
+      openSession: (sessionId) => {
+        const uiWs = getService('uiWorkspace')
+        uiWs?.openSession?.(sessionId)
+      },
+      openChiefSession: async ({ root, preset, prompt }) => {
+        const wsApi = getService('workspaces')
+        const uiWs = getService('uiWorkspace')
+        if (!wsApi?.create || !uiWs?.startSession) return false
+        try {
+          const ws = await wsApi.create({ path: root })
+          uiWs.startSession(ws.workspaceId, { agentPreset: preset, prompt, whenDraftExists: 'keep' })
+          return true
+        } catch {
+          return false
+        }
+      },
     }
     scoped.effect(() => {
       const tag = document.createElement('style')
@@ -46,18 +94,43 @@ async function apply(ctx) {
       return () => tag.remove()
     }, 'ai4math.styles')
     scoped.effect(() => live.start(), 'ai4math.live')
+    scoped.effect(() => wbStore.start(), 'ai4math.workbench-store')
     scoped.effect(() => scoped.slots.inject('shell.bottom', () => scoped.slots.register({
       name: 'shell.bottom',
-    }, function Hud() { return h(LiveHud, { live, open }) })), 'ai4math.hud')
+    }, function Hud() {
+      return h(LiveHud, { live, open, wbStore, i18n, openWorkbench: getService('layout') ? openWorkbench : undefined })
+    })), 'ai4math.hud')
+    scoped.effect(() => scoped.slots.inject('sidebar.panellist', () => scoped.slots.register({
+      name: 'sidebar.panellist', id: 'ai4math', order: 18, label: () => i18n.t('nav.label'),
+    }, function Ai4mathNav(props) { return h(Ai4mathNavIcon, { size: props?.size }) })), 'ai4math.nav')
+    scoped.effect(() => scoped.slots.inject('main', () => scoped.slots.register({
+      name: 'main', key: 'ai4math',
+    }, function Ai4mathMain(props) {
+      return h(Workbench, {
+        remote, live, wbStore, actions, i18n,
+        useWorkspaces: props?.useWorkspaces,
+        useSessions: props?.useSessions,
+      })
+    })), 'ai4math.workbench')
+    scoped.effect(() => scoped.slots.inject('conversation.session.header.utilities', () => scoped.slots.register({
+      name: 'conversation.session.header.utilities', id: 'ai4math-session-context', order: 40,
+    }, function Ai4mathSessionHeader(props) {
+      return h(SessionContextChip, {
+        sessionId: props?.sessionId,
+        useSessions: props?.useSessions,
+        wbStore,
+        i18n,
+      })
+    })), 'ai4math.session-context')
     for (const [index, panel] of panels.entries()) {
-      const title = () => panel.label
+      const title = () => i18n.t(panel.labelKey)
       scoped.effect(() => scoped.sidebarRightTabs.register({
         id: id(panel.key), kind: kind(panel.key), title,
-        guide: [{ id: 'open', order: 60 + index, title, description: () => panel.description }],
+        guide: [{ id: 'open', order: 60 + index, title, description: () => i18n.t(panel.descKey) }],
       }), 'ai4math.type.' + panel.key)
       scoped.effect(() => scoped.slots.inject('sidebar.right.pane.tab', () => scoped.slots.register({
         name: 'sidebar.right.pane.tab', key: id(panel.key),
-      }, function Tab() { return h(views[panel.key], { remote, live }) })), 'ai4math.body.' + panel.key)
+      }, function Tab() { return h(views[panel.key], { remote, live, wbStore, i18n }) })), 'ai4math.body.' + panel.key)
     }
   })
   const dispose = ctx.effect(function* ai4mathMount() {
@@ -399,69 +472,988 @@ function createLive(remote, { topics, retryMs = 1500,
 
 module.exports = { createLive }
 },
+"./i18n.cjs": (module, exports, require) => {
+const { useSyncExternalStore } = require('react')
+
+const EN = Object.freeze({
+  // Navigation & panels
+  'nav.label': 'AI4Math',
+  'panel.briefing.label': 'Briefing',
+  'panel.briefing.desc': 'Preview or retain a deterministic fact pack.',
+  'panel.frontier.label': 'Frontier',
+  'panel.frontier.desc': 'Inspect active claims, dependency plans, and breaker signals.',
+  'panel.inbox.label': 'Inbox',
+  'panel.inbox.desc': 'Review prioritized decisions awaiting human attention.',
+  'panel.wiki.label': 'Wiki',
+  'panel.wiki.desc': 'Search CORE and inspect archaeology hints and provenance.',
+
+  // Common atoms
+  'common.na': 'n/a',
+  'common.refresh': 'Refresh',
+  'common.refreshing': 'Refreshing…',
+  'common.retry': 'Retry',
+  'common.cancel': 'Cancel',
+  'common.close': 'Close',
+  'common.dismiss': 'Dismiss',
+  'common.open': 'Open',
+  'common.inspect': 'Inspect',
+  'common.remove': 'Remove',
+  'common.confirmRemove': 'Confirm remove',
+  'common.activate': 'Activate',
+  'common.start': 'Start',
+  'common.stop': 'Stop',
+  'common.working': 'Working…',
+  'common.noRecords': 'No records returned.',
+  'common.loading': 'Loading AI4Math data…',
+  'common.unavailable': 'AI4Math data unavailable. Check the host daemon connection or retry.',
+  'common.notSupplied': 'Not supplied',
+  'common.boundedSlice': 'The daemon returned a bounded slice.',
+
+  // HUD
+  'hud.aria': 'AI4Math Live HUD',
+  'hud.panelsAria': 'AI4Math panels',
+  'hud.openWorkbenchTitle': 'Open AI4Math Workbench',
+  'hud.openWorkbenchProjectTitle': 'Open AI4Math Workbench ({root})',
+  'hud.live': 'Live',
+  'hud.connectedStale': 'Connected · stale',
+  'hud.reconnectingStale': 'Reconnecting · stale',
+  'hud.reconnecting': 'Reconnecting',
+  'hud.connecting': 'Connecting',
+  'hud.ram': 'RAM',
+  'hud.broker': 'Daemon broker',
+  'hud.brokerTitle': 'Daemon-managed work only; independent CLI processes are not counted.',
+  'hud.brokerSummary': 'fast {fastBusy}/{fastCap} busy · heavy {heavyRun} running / {heavyQueue} queued',
+  'hud.leanAdvisory': 'Lean advisory · {busy} in use / {cap} nominal cap',
+  'hud.workers': 'Workers',
+  'hud.stale': 'Stale',
+  'hud.seq': 'Seq',
+  'hud.trustAria': 'Trust ledger',
+  'hud.oracleHeld': 'Oracle-held exploration',
+  'hud.oracleHeldTitle': 'Temporary exploration scheduling hold; not a Claim refutation.',
+  'hud.openSessionFirst': 'Open a DSH session before opening an AI4Math tab.',
+  'hud.mismatchBanner': 'Current session directory matches AI4Math project “{name}”.',
+  'hud.switchProject': 'Switch project',
+  'hud.switching': 'Switching…',
+  'hud.lastP0': 'Last P0',
+  'hud.latestBreaker': 'Latest breaker event',
+
+  // Alert catch-up
+  'catchup.loading': 'Loading next P0 alert batch…',
+  'catchup.incomplete': 'P0 alert catch-up incomplete.',
+  'catchup.waiting': 'P0 alert catch-up incomplete. Waiting for the daemon to reconnect.',
+  'catchup.button': 'Continue P0 alert catch-up',
+
+  // Breakers & RFCs & Audits
+  'breaker.tripped': 'Tripped {n}',
+  'breaker.halfOpen': 'HALF_OPEN {n}',
+  'breaker.halfOpenFrozen': 'HALF_OPEN {n} · Affected ordinary queues remain frozen',
+  'breaker.archivedGated': 'ARCHIVED {n} · Affected ordinary queues remain gated',
+  'breaker.awaitingReview': 'Blocked — awaiting human review',
+  'breaker.needsProbe': 'Blocked — a probe is required',
+  'breaker.failed': 'Blocked — probe failed',
+  'breaker.ready': 'Waiting — probe ready',
+  'breaker.running': 'Waiting — probe attempt started',
+  'breaker.verified': 'Probe verified',
+  'breaker.unavailable': 'Probe status unavailable',
+  'breaker.progress': '{passed}/{required} probes passed',
+  'breaker.queueFrozen': 'Ordinary queue remains frozen',
+  'breaker.queueGated': 'Ordinary queue remains gated',
+  'breaker.unnamed': 'Breaker',
+  'breaker.transitionEvidence': 'Recorded transition evidence',
+
+  'rfc.reviewOnly': 'Infra RFCs · DRAFT {drafts} · APPROVED {approved} · Review only; not ready to run',
+  'rfc.lifecycle': 'Infra RFCs · DRAFT {drafts} · APPROVED {approved} · SMOKE {smoke} · FROZEN {frozen} · COMPLETED {completed}',
+
+  't3.label': 'T3 discovery',
+  't3.lastLabel': 'Last T3 discovery',
+  't3.waiting': 'Waiting for first sample',
+  't3.unavailable': 'Unavailable',
+  't3.unchanged': 'No structural change',
+  't3.diverged': 'Main diverged · review baseline',
+  't3.changed': 'Structure changed · {count} source change(s)',
+  't3.orderChanged': ' · module list changed',
+  't3.claimBaseline': ' · Claim {tier} baseline',
+  't3.advisory': ' · advisory only',
+  't3.olderSample': ' · older ledger sample',
+  't3.title': 'Observed Git commit: {hash}. This sample does not approve or apply a T3 plan.{scope}',
+  't3.scopeNote': ' Baseline verified for one Claim, not for all of main.',
+
+  't2.prefix': 'T2 Audit · advisory only · ',
+  't2.starting': 'Starting',
+  't2.running': 'Running',
+  't2.unavailable': 'Unavailable',
+  't2.waiting': 'Waiting',
+  't2.headChanged': 'Reviewed head changed',
+  't2.attemptOne': '{n} attempt',
+  't2.attemptMany': '{n} attempts',
+  't2.older': 'older ledger sample',
+  't2.future': 'awaiting matching ledger',
+  't2.exhausted': ' · exhausted',
+  't2.hbMet': 'Heartbeat thresholds met ({reasons})',
+  't2.hbMax': 'max command',
+  't2.hbTotal': 'total commands',
+  't2.hbNotMet': 'Heartbeat thresholds not met',
+  't2.compile': '{ms} ms compile',
+  't2.modOne': '{n} module',
+  't2.modMany': '{n} modules',
+  't2.debtOne': '{n} debt finding',
+  't2.debtMany': '{n} debt findings',
+  't2.indOne': '{n} independent theorem check',
+  't2.indMany': '{n} independent theorem checks',
+  't2.titleBase': 'Reviewed Git commit: {oid}. This sample carries no proof authority.',
+  't2.titleHb': ' Heartbeat comparison covers one selected module.',
+  't2.titleInd': ' Independent checks cover only the reviewed selection.',
+
+  // Events
+  'event.default': 'Event',
+  'event.empty': 'No new events in this window.',
+  'event.bounded': 'The fact pack contains a bounded event window.',
+  'event.allTracksBlocked': 'Exploration blocked: {exp}; infrastructure blocked: {infra}',
+  'event.meltdown': '{module}: {candidates} distinct candidates failed full regression',
+  'event.critBreakerOne': 'No known route remains for {first}',
+  'event.critBreakerMany': 'No known route remains for {first} ({affected} critical claims affected)',
+
+  // Math / Claim / Inbox / Plan
+  'math.informal': 'Informal statement',
+  'math.formal': 'Formal signature',
+  'math.target': 'Formal target',
+  'claim.unnamed': 'Unnamed claim',
+  'claim.effective': 'Effective {trust}',
+  'claim.local': 'Local {trust}',
+  'claim.critical': 'Critical',
+  'claim.stale': 'Stale',
+  'claim.oracleDebt': 'Oracle debt',
+  'claim.wikiRef': 'Wiki reference',
+  'inbox.noSummary': 'No summary supplied',
+  'inbox.leverage': 'Leverage',
+  'inbox.evidence': 'Recorded evidence / options',
+  'inbox.truncated': 'Evidence was truncated by the daemon.',
+  'plan.title': 'Dependency plan slice',
+  'plan.empty': 'No dependency edges in this slice.',
+  'plan.noData': 'No dependency edge data supplied.',
+  'plan.truncated': 'Dependencies outside the bounded slice are not shown.',
+
+  // Briefing panel
+  'briefing.title': 'Review briefing',
+  'briefing.subtitle': 'Deterministic fact packs; neither action advances the human checkpoint.',
+  'briefing.peek': 'Peek (preview only)',
+  'briefing.pull': 'Pull and retain',
+  'briefing.idle': 'Choose Peek or Pull to request a briefing.',
+  'briefing.noPack': 'No fact pack supplied.',
+  'briefing.recentP0': 'Recent P0 alerts',
+  'briefing.openRetained': 'Open retained facts',
+  'briefing.modePreview': 'Preview',
+  'briefing.modeRetained': 'Retained alert',
+  'briefing.modePull': 'Pull',
+  'briefing.window': 'Event window',
+  'briefing.retained': 'Retained',
+  'briefing.checkpointSeq': 'Retained human checkpoint event_seq',
+  'briefing.checkpointAdr': 'Checkpoint ADR',
+  'briefing.sha256': 'Fact SHA-256',
+  'briefing.p0Sources': 'P0 alert sources',
+  'briefing.noP0Sources': 'No P0 alert source events in this retained fact pack.',
+  'briefing.trustLedger': 'Trust ledger',
+  'briefing.crossEngineDebt': 'Cross-engine debt',
+  'briefing.milestonesRefutations': 'Milestones / Refutations',
+  'briefing.milestones': 'Milestones',
+  'briefing.refutations': 'Refutations',
+  'briefing.eventNum': 'Event #{seq}',
+  'briefing.graveyardWitness': 'Graveyard witness',
+  'briefing.frontierClaims': 'Frontier claims',
+  'briefing.recentEvents': 'Recent events / expand evidence',
+  'briefing.breakers': 'Circuit breakers',
+  'briefing.inbox': 'Decision inbox',
+
+  // Frontier & Inbox panels
+  'frontier.title': 'Active frontier',
+  'frontier.subtitle': 'A bounded claim and dependency slice, not the full proof DAG.',
+  'frontier.staleSuffix': '· Live status unavailable or stale',
+  'frontier.readOnlyNote': 'Read-only. To review stored breaker records, use Briefing → Peek.',
+  'frontier.waiting': 'Waiting for frontier…',
+  'frontier.claims': 'Claims',
+  'inbox.title': 'Decision inbox',
+  'inbox.subtitle': 'Pending decisions only. This panel does not submit decisions.',
+  'inbox.waiting': 'Waiting for inbox…',
+  'inbox.empty': 'No pending decisions.',
+
+  // Wiki panel
+  'wiki.title': 'Math Wiki',
+  'wiki.subtitle': 'Search CORE first; inspect SEDIMENT and GRAVEYARD as separate strata.',
+  'wiki.query': 'Query',
+  'wiki.queryPlaceholder': 'Title, mathematical phrase, or ID…',
+  'wiki.scope': 'Scope',
+  'wiki.search': 'Search',
+  'wiki.invalidQuery': 'Queries must be at most 512 UTF-8 bytes and cannot contain a NUL character.',
+  'wiki.idle': 'Enter a title, mathematical phrase, or identifier.',
+  'wiki.resultsFor': 'Results for “{term}” · {stratum}',
+  'wiki.graveyardWarn': 'Graveyard matches are historical warnings, not verified evidence.',
+  'wiki.noMatch': 'No matching records returned.',
+  'wiki.boundedSearch': 'Only a bounded search slice is shown.',
+  'wiki.covSearchYes': 'Derived CORE was checked for this search. Search again to check for changes.',
+  'wiki.covProvYes': 'Derived CORE lineage was checked for this response. Inspect again to check for changes.',
+  'wiki.covUnknownSearch': 'Derived CORE coverage was not reported for this search.',
+  'wiki.covUnknownProv': 'Derived CORE coverage was not reported for this provenance response.',
+  'wiki.covStaticSearch': 'Static Wiki only; derived CORE entries were not included.',
+  'wiki.covStaticProv': 'Static Wiki lineage only; derived CORE edges were not included.',
+  'wiki.untitled': 'Untitled Wiki entry',
+  'wiki.derivedCore': 'Derived CORE',
+  'wiki.indexedTrust': 'Indexed trust {trust}',
+  'wiki.virtualLocation': 'Virtual index location',
+  'wiki.sourcePath': 'Source path',
+  'wiki.verifiedCommit': 'Verified at Git commit',
+  'wiki.derivedNote': 'This derived index record is not an authored Wiki page or a proof source.',
+  'wiki.inspectProv': 'Inspect provenance for {id}',
+  'wiki.provTitle': 'Provenance for {id}',
+  'wiki.provNote': 'Read-only lineage across strata; recorded edges do not confer proof status.',
+  'wiki.provDerivedNote': 'Derived CORE nodes are index records, not authored Wiki pages or proof sources.',
+  'wiki.outsideIndex': 'Outside index',
+  'wiki.hops': 'Hops',
+  'wiki.edgeMeta': 'Indexed edge metadata',
+  'wiki.noEdges': 'No edges returned for this slice.',
+  'wiki.boundedProv': 'Only a bounded provenance slice is shown.',
+  'wiki.lessonsTitle': 'Operator route lessons',
+  'wiki.lessonsNote': 'Historical warnings only. These lessons are not proofs or mathematical refutations.',
+  'wiki.lessonBadge': 'L0 · advisory only',
+  'wiki.lessonLabel': 'Lesson',
+  'wiki.approvedAdr': 'Approved ADR',
+  'wiki.archivedRoutes': 'Archived routes',
+  'wiki.boundedLessons': 'Only a bounded route lesson slice is shown.',
+  'wiki.shadowSummary': 'Shadow hint · SEDIMENT {sed} / GRAVEYARD {grv}',
+  'wiki.shadowSediment': 'Closest sediment lead: {label}',
+  'wiki.shadowGraveyard': 'Graveyard warning: {id} is historical, not verified evidence.',
+  'wiki.searchStratum': 'Search {stratum}',
+
+  // CLI Helper
+  'cli.summary': 'Operator CLI commands (read-only)',
+  'cli.disclaimer': 'Run in an operator terminal. Replace <PLACEHOLDER> arguments before running. This UI never signs or executes ledger writes.',
+  'cli.copy': 'Copy',
+  'cli.copied': 'Copied',
+  'cli.copyFailed': 'Copy failed',
+  'cli.copyAria': 'Copy: {label}',
+  'cli.previewArchive': 'Preview owner archive (read-only)',
+  'cli.previewProbes': 'Preview breaker probes (read-only)',
+  'cli.inspectStatus': 'Inspect ledger status',
+  'cli.auditGraph': 'Audit claim graph',
+
+  // Workbench
+  'wb.aria': 'AI4Math Workbench',
+  'wb.title': 'AI4Math Workbench',
+  'wb.subtitle': 'Multi-project math orchestration, local daemon lifecycle, and Chief session launcher.',
+  'wb.newOpenProject': '+ New / Open Project',
+  'wb.hideProjectForm': 'Hide Project Form',
+  'wb.newChiefSession': 'New Chief Session',
+  'wb.launchingChief': 'Launching Chief…',
+  'wb.launchChiefTitle': 'Open a new DSH conversation in {root} with preset "{preset}"',
+  'wb.selectProjectFirst': 'Select a project first',
+  'wb.projectLabel': 'Project',
+  'wb.projectSelectAria': 'Active AI4Math project',
+  'wb.noProjectsOption': 'No projects added yet',
+  'wb.externalOption': 'External socket (not in project list)',
+  'wb.externalUnlisted': 'External socket (unlisted)',
+  'wb.daemonManaged': 'Managed · Live',
+  'wb.daemonManagedTitle': 'Supervised by DSH Host.',
+  'wb.daemonExternal': 'External · Live',
+  'wb.daemonExternalTitle': 'Supervised outside DSH; never stopped by DSH.',
+  'wb.daemonStarting': 'Starting…',
+  'wb.daemonStale': 'Stale socket',
+  'wb.daemonConflict': 'Socket conflict',
+  'wb.daemonInvalid': 'Path too long',
+  'wb.daemonStopped': 'Stopped',
+  'wb.hudLive': 'HUD Live',
+  'wb.hudOffline': 'HUD Offline',
+  'wb.stopDaemon': 'Stop daemon',
+  'wb.startDaemon': 'Start daemon',
+  'wb.daemonMissingTitle': 'ai4mathd binary not found — check Setup & Roles',
+  'wb.tabsAria': 'AI4Math Workbench views',
+  'wb.tab.overview': 'Overview',
+  'wb.tab.briefing': 'Briefing',
+  'wb.tab.frontier': 'Frontier',
+  'wb.tab.inbox': 'Inbox',
+  'wb.tab.wiki': 'Wiki',
+  'wb.tab.setup': 'Setup & Roles',
+  'wb.loadingState': 'Loading AI4Math Workbench state…',
+  'wb.loadError': 'Could not read AI4Math Workbench state from DSH Host.',
+  'wb.missingBinaries': 'Local ai4math / ai4mathd binaries are missing. Build the Rust workspace or configure paths in Setup & Roles.',
+  'wb.openSetup': 'Open Setup & Roles',
+  'wb.formOnboardingTitle': 'Add your first Math Project',
+  'wb.formTitle': 'Initialize or Open a Math Project',
+  'wb.formHint': 'Pick an empty directory to run `ai4math init`, or pick an already-initialized project to adopt it.',
+  'wb.formDirLabel': 'Project directory (absolute path)',
+  'wb.pickFolder': 'Pick Folder',
+  'wb.picking': 'Picking…',
+  'wb.formEngineLabel': 'Primary engine',
+  'wb.formNameLabel': 'Display name (optional)',
+  'wb.formNamePlaceholder': 'Auto from folder',
+  'wb.formAutoStart': 'Auto-start local ai4mathd',
+  'wb.socketPathLen': 'Socket path: {bytes} / {limit} bytes',
+  'wb.socketPathTooLongSuffix': ' (too long — choose a shorter folder)',
+  'wb.initAndConnect': 'Initialize & Connect',
+  'wb.overviewVitals': 'Trust Ledger & Vitals',
+  'wb.linkedConversations': 'Linked Conversations',
+  'wb.addChiefShort': '+ Chief Session',
+  'wb.noProjectSessions': 'Add or select a math project to see linked DSH conversations.',
+  'wb.emptySessions': 'No DSH conversations in {root} yet. Click “+ Chief Session” to launch your main orchestrator.',
+  'wb.blankSession': 'New blank session',
+  'wb.running': 'Running',
+  'wb.justNow': 'just now',
+  'wb.minsAgo': '{n}m ago',
+  'wb.hoursAgo': '{n}h ago',
+  'wb.daysAgo': '{n}d ago',
+  'wb.alertsDecisions': 'Alerts & Decisions',
+  'wb.openBriefing': 'Open Briefing',
+  'wb.openInbox': 'Open Inbox',
+  'wb.noP0Session': 'No P0 alerts recorded in this session.',
+  'wb.activeProjectCard': 'Active Project & Chief Binding',
+  'wb.rootLabel': 'Root',
+  'wb.socketLabel': 'Socket',
+  'wb.chiefPresetLabel': 'Chief preset',
+  'wb.toolsBound': 'Tools bound',
+  'wb.toolsUnbound': 'Not bound in rolePresets',
+  'wb.noActiveProject': 'No active project selected.',
+  'wb.registeredProjects': 'Registered Math Projects',
+  'wb.noProjectsYet': 'No projects registered yet. Use “+ New / Open Project” above.',
+  'wb.activeBadge': 'Active',
+  'wb.supervisedExternally': 'Supervised externally',
+  'wb.removeTitle': 'Remove from Workbench list only; keeps all files on disk',
+  'wb.pathLabel': 'Path',
+  'wb.binariesSection': 'Local Binaries & Role Presets',
+  'wb.cliReady': 'ai4math CLI Ready',
+  'wb.cliMissing': 'ai4math CLI Missing',
+  'wb.daemonReady': 'ai4mathd Ready',
+  'wb.daemonMissing': 'ai4mathd Missing',
+  'wb.rolePresetsLabel': 'Role presets',
+  'wb.noneConfigured': 'None configured',
+  'wb.boundaryNote': 'Owner approval & ledger write boundary: Pivot/Archive signing and Broker kernel verification remain isolated outside this UI.',
+  'wb.daemonOutput': 'Managed Daemon Output',
+  'wb.sessionChip': 'AI4Math: {name} · Switch',
+  'wb.sessionChipTitle': 'Switch active AI4Math daemon bridge to {root}',
+  'wb.pickerUnavailable': 'Native folder picker is unavailable here. Paste an absolute directory path directly.',
+  'wb.selectBeforeChief': 'Select or initialize a math project first before launching a Chief session.',
+  'wb.sessionOpenFailed': 'Could not open a DSH session for this workspace. Check DSH workspace permissions.',
+  'wb.chiefPrompt': 'Start as AI4Math Chief Orchestrator for project "{name}". First call ai4math_status, ai4math_frontier_list, and ai4math_inbox_list to inspect the current ledger, then summarize the current state and ask what open problem or lemma frontier we should work on next.',
+
+  // Store notices & Host error codes
+  'notice.initNew': 'Initialized and connected project “{name}”.',
+  'notice.initAdopt': 'Connected existing project “{name}”.',
+  'notice.switched': 'Switched active project to “{name}”.',
+  'notice.removed': 'Removed project from Workbench list (files on disk were kept).',
+  'notice.daemonManaged': 'Started Host-managed ai4mathd.',
+  'notice.daemonExternal': 'Attached to existing external ai4mathd.',
+  'notice.daemonStopped': 'Stopped Host-managed ai4mathd.',
+  'notice.actionFailed': 'AI4Math workbench action failed.',
+  'notice.requestFailed': 'AI4Math workbench request failed. Check the DSH Host connection.',
+  'err.not_directory': 'Selected path is not an existing directory.',
+  'err.missing_directory': 'Selected directory does not exist.',
+  'err.socket_path_too_long': 'Unix socket path exceeds the platform byte limit. Please pick a shorter directory path.',
+  'err.missing_binary': 'Required ai4math / ai4mathd binary was not found. Build target/debug or configure paths.',
+  'err.limit_reached': 'Project list limit reached. Remove an unused project first.',
+  'err.not_found': 'Project not found in Workbench list.',
+  'err.no_project': 'No active AI4Math project selected.',
+  'err.external_or_stopped': 'No Host-managed daemon is running for this project. External daemons are never killed by DSH.',
+  'err.socket_conflict': 'A non-socket file exists at .runtime/ai4mathd.sock.',
+  'err.stale_socket': 'Could not remove stale ai4mathd.sock before starting.',
+  'err.missing_project': 'Project directory does not exist on disk.',
+})
+
+const ZH = Object.freeze({
+  // Navigation & panels
+  'nav.label': 'AI4Math',
+  'panel.briefing.label': '简报',
+  'panel.briefing.desc': '预览或留存确定性事实包。',
+  'panel.frontier.label': '前沿',
+  'panel.frontier.desc': '查看活跃猜想、依赖计划与熔断信号。',
+  'panel.inbox.label': '收件箱',
+  'panel.inbox.desc': '审阅等待人工裁决的优先级事项。',
+  'panel.wiki.label': 'Wiki',
+  'panel.wiki.desc': '检索 CORE，并按层查阅沉降、墓地提示与血缘。',
+
+  // Common atoms
+  'common.na': '无',
+  'common.refresh': '刷新',
+  'common.refreshing': '刷新中…',
+  'common.retry': '重试',
+  'common.cancel': '取消',
+  'common.close': '关闭',
+  'common.dismiss': '关闭',
+  'common.open': '打开',
+  'common.inspect': '查看',
+  'common.remove': '移除',
+  'common.confirmRemove': '确认移除',
+  'common.activate': '激活',
+  'common.start': '启动',
+  'common.stop': '停止',
+  'common.working': '处理中…',
+  'common.noRecords': '暂无记录。',
+  'common.loading': '正在加载 AI4Math 数据…',
+  'common.unavailable': 'AI4Math 数据不可用，请检查本机守护进程连接后重试。',
+  'common.notSupplied': '未提供',
+  'common.boundedSlice': '守护进程仅返回有界切片。',
+
+  // HUD
+  'hud.aria': 'AI4Math 实时状态栏',
+  'hud.panelsAria': 'AI4Math 面板入口',
+  'hud.openWorkbenchTitle': '打开 AI4Math 工作台',
+  'hud.openWorkbenchProjectTitle': '打开 AI4Math 工作台（{root}）',
+  'hud.live': '在线',
+  'hud.connectedStale': '已连接 · 数据陈旧',
+  'hud.reconnectingStale': '重连中 · 数据陈旧',
+  'hud.reconnecting': '重连中',
+  'hud.connecting': '连接中',
+  'hud.ram': '内存',
+  'hud.broker': '调度器',
+  'hud.brokerTitle': '仅统计守护进程管理的工作，不计入独立 CLI 进程。',
+  'hud.brokerSummary': '快车道 {fastBusy}/{fastCap} 占用 · 重车道 {heavyRun} 运行 / {heavyQueue} 排队',
+  'hud.leanAdvisory': 'Lean 建议并发 · {busy} 占用 / {cap} 上限',
+  'hud.workers': '工作槽',
+  'hud.stale': '待重验',
+  'hud.seq': '序号',
+  'hud.trustAria': '信任账本',
+  'hud.oracleHeld': 'Oracle 挂起探索',
+  'hud.oracleHeldTitle': '临时探索调度挂起，不构成对猜想的数学证伪。',
+  'hud.openSessionFirst': '请先打开一个 DSH 会话，再打开 AI4Math 侧栏标签。',
+  'hud.mismatchBanner': '当前会话目录对应 AI4Math 项目「{name}」。',
+  'hud.switchProject': '切换项目',
+  'hud.switching': '切换中…',
+  'hud.lastP0': '最新 P0',
+  'hud.latestBreaker': '最新熔断事件',
+
+  // Alert catch-up
+  'catchup.loading': '正在补读下一批 P0 告警…',
+  'catchup.incomplete': 'P0 告警补读尚未完成。',
+  'catchup.waiting': 'P0 告警补读未完成，等待守护进程重连。',
+  'catchup.button': '继续补读 P0 告警',
+
+  // Breakers & RFCs & Audits
+  'breaker.tripped': '已熔断 {n}',
+  'breaker.halfOpen': '半开 {n}',
+  'breaker.halfOpenFrozen': '半开 {n} · 受影响常规队列保持冻结',
+  'breaker.archivedGated': '已归档 {n} · 受影响常规队列保持拦截',
+  'breaker.awaitingReview': '已阻断 — 等待人工审阅',
+  'breaker.needsProbe': '已阻断 — 需要执行探针校验',
+  'breaker.failed': '已阻断 — 探针校验失败',
+  'breaker.ready': '等待中 — 探针已就绪',
+  'breaker.running': '等待中 — 探针尝试已启动',
+  'breaker.verified': '探针已验证',
+  'breaker.unavailable': '探针状态不可用',
+  'breaker.progress': '已通过 {passed}/{required} 项探针',
+  'breaker.queueFrozen': '常规队列保持冻结',
+  'breaker.queueGated': '常规队列保持拦截',
+  'breaker.unnamed': '熔断器',
+  'breaker.transitionEvidence': '已记录的状态转换证据',
+
+  'rfc.reviewOnly': '基建 RFC · 草稿 {drafts} · 已批 {approved} · 仅审阅，尚未就绪',
+  'rfc.lifecycle': '基建 RFC · 草稿 {drafts} · 已批 {approved} · 冒烟 {smoke} · 冻结 {frozen} · 完成 {completed}',
+
+  't3.label': 'T3 变更探测',
+  't3.lastLabel': '最近 T3 探测',
+  't3.waiting': '等待首次采样',
+  't3.unavailable': '不可用',
+  't3.unchanged': '无结构变化',
+  't3.diverged': '主干已分叉 · 请复核基线',
+  't3.changed': '结构已变化 · {count} 处源码改动',
+  't3.orderChanged': ' · 模块列表已变',
+  't3.claimBaseline': ' · 单猜想 {tier} 基线',
+  't3.advisory': ' · 仅供参考',
+  't3.olderSample': ' · 旧账本采样',
+  't3.title': '观测到的 Git 提交：{hash}。此采样不批准也不执行 T3 计划。{scope}',
+  't3.scopeNote': '基线仅针对单个猜想校验，不代表整个主干。',
+
+  't2.prefix': 'T2 审计 · 仅供参考 · ',
+  't2.starting': '启动中',
+  't2.running': '运行中',
+  't2.unavailable': '不可用',
+  't2.waiting': '等待中',
+  't2.headChanged': '已审主干已变更',
+  't2.attemptOne': '{n} 次尝试',
+  't2.attemptMany': '{n} 次尝试',
+  't2.older': '旧账本采样',
+  't2.future': '等待匹配账本',
+  't2.exhausted': ' · 次数已耗尽',
+  't2.hbMet': '触发心跳回归阈值（{reasons}）',
+  't2.hbMax': '单命令峰值',
+  't2.hbTotal': '总命令耗时',
+  't2.hbNotMet': '未触发心跳回归阈值',
+  't2.compile': '编译 {ms} ms',
+  't2.modOne': '{n} 个模块',
+  't2.modMany': '{n} 个模块',
+  't2.debtOne': '{n} 项信任债',
+  't2.debtMany': '{n} 项信任债',
+  't2.indOne': '{n} 项独立定理复核',
+  't2.indMany': '{n} 项独立定理复核',
+  't2.titleBase': '已审 Git 提交：{oid}。此采样不具备证明授权。',
+  't2.titleHb': '心跳对比仅覆盖选定的单个模块。',
+  't2.titleInd': '独立复核仅覆盖已审选定范围。',
+
+  // Events
+  'event.default': '事件',
+  'event.empty': '当前窗口内无新事件。',
+  'event.bounded': '该事实包仅包含有界事件窗口。',
+  'event.allTracksBlocked': '探索轨阻塞 {exp} 项；基建轨阻塞 {infra} 项',
+  'event.meltdown': '{module}：{candidates} 个不同候选全量回归失败',
+  'event.critBreakerOne': '{first} 已无已知可行路线',
+  'event.critBreakerMany': '{first} 已无已知可行路线（共影响 {affected} 条关键猜想）',
+
+  // Math / Claim / Inbox / Plan
+  'math.informal': '非形式化陈述',
+  'math.formal': '形式化签名',
+  'math.target': '形式化目标',
+  'claim.unnamed': '未命名猜想',
+  'claim.effective': '有效信任 {trust}',
+  'claim.local': '局部信任 {trust}',
+  'claim.critical': '关键路径',
+  'claim.stale': '待重验',
+  'claim.oracleDebt': 'Oracle 债',
+  'claim.wikiRef': 'Wiki 引用',
+  'inbox.noSummary': '未提供摘要',
+  'inbox.leverage': '杠杆分',
+  'inbox.evidence': '已记录的证据与选项',
+  'inbox.truncated': '证据已被守护进程截断。',
+  'plan.title': '依赖计划切片',
+  'plan.empty': '当前切片中无依赖边。',
+  'plan.noData': '未提供依赖边数据。',
+  'plan.truncated': '超出有界切片的依赖未展示。',
+
+  // Briefing panel
+  'briefing.title': '复盘简报',
+  'briefing.subtitle': '确定性事实包；预览与留存均不推进人工审阅检查点。',
+  'briefing.peek': '预览（不留存）',
+  'briefing.pull': '拉取并留存',
+  'briefing.idle': '选择「预览」或「拉取并留存」以获取简报。',
+  'briefing.noPack': '未返回事实包。',
+  'briefing.recentP0': '最近 P0 告警',
+  'briefing.openRetained': '打开留存事实包',
+  'briefing.modePreview': '预览',
+  'briefing.modeRetained': '留存告警',
+  'briefing.modePull': '已拉取留存',
+  'briefing.window': '事件窗口',
+  'briefing.retained': '留存编号',
+  'briefing.checkpointSeq': '人工检查点序号',
+  'briefing.checkpointAdr': '检查点 ADR',
+  'briefing.sha256': '事实包 SHA-256',
+  'briefing.p0Sources': 'P0 告警源事件',
+  'briefing.noP0Sources': '该留存事实包中无 P0 告警源事件。',
+  'briefing.trustLedger': '信任账本',
+  'briefing.crossEngineDebt': '跨引擎债',
+  'briefing.milestonesRefutations': '里程碑 / 证伪记录',
+  'briefing.milestones': '里程碑',
+  'briefing.refutations': '证伪记录',
+  'briefing.eventNum': '事件 #{seq}',
+  'briefing.graveyardWitness': '墓地反例证人',
+  'briefing.frontierClaims': '前沿猜想',
+  'briefing.recentEvents': '最近事件 / 展开证据',
+  'briefing.breakers': '熔断器',
+  'briefing.inbox': '决策收件箱',
+
+  // Frontier & Inbox panels
+  'frontier.title': '活跃前沿',
+  'frontier.subtitle': '有界猜想与依赖切片，非完整证明有向图。',
+  'frontier.staleSuffix': '· 实时状态不可用或已陈旧',
+  'frontier.readOnlyNote': '只读视图。如需查看完整留存熔断记录，请使用「简报 → 预览」。',
+  'frontier.waiting': '正在获取前沿…',
+  'frontier.claims': '猜想列表',
+  'inbox.title': '决策收件箱',
+  'inbox.subtitle': '仅显示待处理决策；本面板不提交裁决。',
+  'inbox.waiting': '正在获取收件箱…',
+  'inbox.empty': '当前无待处理决策。',
+
+  // Wiki panel
+  'wiki.title': '数学 Wiki',
+  'wiki.subtitle': '优先检索 CORE；SEDIMENT 与 GRAVEYARD 按独立层查阅。',
+  'wiki.query': '关键词',
+  'wiki.queryPlaceholder': '输入标题、数学短语或编号…',
+  'wiki.scope': '层级',
+  'wiki.search': '检索',
+  'wiki.invalidQuery': '查询长度不得超过 512 UTF-8 字节，且不能包含 NUL 字符。',
+  'wiki.idle': '输入标题、数学短语或标识符开始检索。',
+  'wiki.resultsFor': '「{term}」的检索结果 · {stratum}',
+  'wiki.graveyardWarn': '墓地（GRAVEYARD）命中仅为历史警示，不构成已验证证据。',
+  'wiki.noMatch': '未找到匹配记录。',
+  'wiki.boundedSearch': '仅展示有界检索切片。',
+  'wiki.covSearchYes': '本次检索已核对衍生 CORE，重新检索可检查最新变更。',
+  'wiki.covProvYes': '本次响应已核对衍生 CORE 血缘，重新查看可检查最新变更。',
+  'wiki.covUnknownSearch': '本次检索未上报衍生 CORE 覆盖情况。',
+  'wiki.covUnknownProv': '本次血缘响应未上报衍生 CORE 覆盖情况。',
+  'wiki.covStaticSearch': '仅包含静态 Wiki，未纳入衍生 CORE 条目。',
+  'wiki.covStaticProv': '仅包含静态 Wiki 血缘，未纳入衍生 CORE 边。',
+  'wiki.untitled': '未命名 Wiki 条目',
+  'wiki.derivedCore': '衍生 CORE',
+  'wiki.indexedTrust': '索引信任 {trust}',
+  'wiki.virtualLocation': '虚拟索引位置',
+  'wiki.sourcePath': '源文件路径',
+  'wiki.verifiedCommit': '验证对应 Git 提交',
+  'wiki.derivedNote': '此衍生索引记录并非人工撰写的 Wiki 页面，也不作为证明源码。',
+  'wiki.inspectProv': '查看 {id} 的血缘',
+  'wiki.provTitle': '{id} 的血缘关系',
+  'wiki.provNote': '跨层只读血缘；已记录的边不赋予证明效力。',
+  'wiki.provDerivedNote': '衍生 CORE 节点为索引记录，并非人工撰写的 Wiki 页面或证明源码。',
+  'wiki.outsideIndex': '索引之外',
+  'wiki.hops': '跳数',
+  'wiki.edgeMeta': '索引边元数据',
+  'wiki.noEdges': '当前切片未返回血缘边。',
+  'wiki.boundedProv': '仅展示有界血缘切片。',
+  'wiki.lessonsTitle': '操作者路线教训',
+  'wiki.lessonsNote': '仅为历史警示，不是数学证明或形式化证伪。',
+  'wiki.lessonBadge': 'L0 · 仅供参考',
+  'wiki.lessonLabel': '教训编号',
+  'wiki.approvedAdr': '已批 ADR',
+  'wiki.archivedRoutes': '已归档路线',
+  'wiki.boundedLessons': '仅展示有界路线教训切片。',
+  'wiki.shadowSummary': '跨层线索 · SEDIMENT {sed} / GRAVEYARD {grv}',
+  'wiki.shadowSediment': '最接近的沉降线索：{label}',
+  'wiki.shadowGraveyard': '墓地警示：{id} 仅为历史记录，非已验证证据。',
+  'wiki.searchStratum': '检索 {stratum}',
+
+  // CLI Helper
+  'cli.summary': '操作者 CLI 命令（只读参考）',
+  'cli.disclaimer': '请在操作者终端中执行，运行前请替换 <PLACEHOLDER> 参数。本界面不签署也不执行账本写入。',
+  'cli.copy': '复制',
+  'cli.copied': '已复制',
+  'cli.copyFailed': '复制失败',
+  'cli.copyAria': '复制：{label}',
+  'cli.previewArchive': '预览 Owner 归档计划（只读）',
+  'cli.previewProbes': '预览熔断探针（只读）',
+  'cli.inspectStatus': '查看账本状态',
+  'cli.auditGraph': '审计猜想图谱',
+
+  // Workbench
+  'wb.aria': 'AI4Math 工作台',
+  'wb.title': 'AI4Math 工作台',
+  'wb.subtitle': '多项目数学编排、本地守护进程管理与 Chief 主控会话一键启动。',
+  'wb.newOpenProject': '+ 新建 / 打开项目',
+  'wb.hideProjectForm': '收起项目表单',
+  'wb.newChiefSession': '新建 Chief 主编排会话',
+  'wb.launchingChief': '正在启动 Chief…',
+  'wb.launchChiefTitle': '在 {root} 中以预设「{preset}」开启新的 DSH 会话',
+  'wb.selectProjectFirst': '请先选择或初始化一个项目',
+  'wb.projectLabel': '项目',
+  'wb.projectSelectAria': '当前活跃的 AI4Math 项目',
+  'wb.noProjectsOption': '尚未添加项目',
+  'wb.externalOption': '外部 Socket（未加入项目列表）',
+  'wb.externalUnlisted': '外部 Socket（未列在清单）',
+  'wb.daemonManaged': '托管 · 在线',
+  'wb.daemonManagedTitle': '由 DSH Host 托管看护。',
+  'wb.daemonExternal': '外部 · 在线',
+  'wb.daemonExternalTitle': '由外部进程托管，DSH 不会停止它。',
+  'wb.daemonStarting': '启动中…',
+  'wb.daemonStale': '残留 Socket',
+  'wb.daemonConflict': 'Socket 冲突',
+  'wb.daemonInvalid': '路径过长',
+  'wb.daemonStopped': '已停止',
+  'wb.hudLive': 'HUD 在线',
+  'wb.hudOffline': 'HUD 离线',
+  'wb.stopDaemon': '停止守护进程',
+  'wb.startDaemon': '启动守护进程',
+  'wb.daemonMissingTitle': '未找到 ai4mathd 二进制文件——请前往「环境与角色」检查',
+  'wb.tabsAria': 'AI4Math 工作台视图',
+  'wb.tab.overview': '总览',
+  'wb.tab.briefing': '简报',
+  'wb.tab.frontier': '前沿',
+  'wb.tab.inbox': '收件箱',
+  'wb.tab.wiki': 'Wiki',
+  'wb.tab.setup': '环境与角色',
+  'wb.loadingState': '正在加载 AI4Math 工作台状态…',
+  'wb.loadError': '无法从 DSH Host 读取 AI4Math 工作台状态。',
+  'wb.missingBinaries': '未检测到本地 ai4math / ai4mathd 二进制文件，请先编译 Rust 工作区或在「环境与角色」中检查路径。',
+  'wb.openSetup': '查看环境与角色',
+  'wb.formOnboardingTitle': '添加你的第一个数学项目',
+  'wb.formTitle': '初始化或打开数学项目',
+  'wb.formHint': '选择空目录将自动执行 `ai4math init`；选择已初始化项目目录将直接接管。',
+  'wb.formDirLabel': '项目目录（绝对路径）',
+  'wb.pickFolder': '选择文件夹',
+  'wb.picking': '选择中…',
+  'wb.formEngineLabel': '主引擎',
+  'wb.formNameLabel': '显示名称（可选）',
+  'wb.formNamePlaceholder': '默认使用目录名',
+  'wb.formAutoStart': '自动启动本地 ai4mathd',
+  'wb.socketPathLen': 'Socket 路径：{bytes} / {limit} 字节',
+  'wb.socketPathTooLongSuffix': '（超出上限——请换更短的目录路径）',
+  'wb.initAndConnect': '初始化并连接',
+  'wb.overviewVitals': '信任账本与系统体征',
+  'wb.linkedConversations': '关联会话',
+  'wb.addChiefShort': '+ Chief 会话',
+  'wb.noProjectSessions': '添加或选择一个数学项目后，这里会列出该项目关联的 DSH 会话。',
+  'wb.emptySessions': '{root} 下还没有 DSH 会话。点击「+ Chief 会话」一键启动主编排器。',
+  'wb.blankSession': '新建空白会话',
+  'wb.running': '运行中',
+  'wb.justNow': '刚刚',
+  'wb.minsAgo': '{n} 分钟前',
+  'wb.hoursAgo': '{n} 小时前',
+  'wb.daysAgo': '{n} 天前',
+  'wb.alertsDecisions': '告警与待决事项',
+  'wb.openBriefing': '打开简报',
+  'wb.openInbox': '打开收件箱',
+  'wb.noP0Session': '本次会话暂无 P0 告警记录。',
+  'wb.activeProjectCard': '当前项目与 Chief 绑定',
+  'wb.rootLabel': '根目录',
+  'wb.socketLabel': 'Socket',
+  'wb.chiefPresetLabel': 'Chief 预设',
+  'wb.toolsBound': '工具已绑定',
+  'wb.toolsUnbound': '未在 rolePresets 中绑定',
+  'wb.noActiveProject': '尚未选择活跃项目。',
+  'wb.registeredProjects': '已注册数学项目',
+  'wb.noProjectsYet': '尚未注册任何项目，请使用上方「+ 新建 / 打开项目」。',
+  'wb.activeBadge': '当前活跃',
+  'wb.supervisedExternally': '外部托管',
+  'wb.removeTitle': '仅从工作台列表移除，保留磁盘上的全部文件',
+  'wb.pathLabel': '路径',
+  'wb.binariesSection': '本地二进制与角色 Preset',
+  'wb.cliReady': 'ai4math CLI 就绪',
+  'wb.cliMissing': 'ai4math CLI 缺失',
+  'wb.daemonReady': 'ai4mathd 就绪',
+  'wb.daemonMissing': 'ai4mathd 缺失',
+  'wb.rolePresetsLabel': '角色 Preset 映射',
+  'wb.noneConfigured': '尚未配置',
+  'wb.boundaryNote': 'Owner 审批与账本写边界：Pivot/归档签名与 Broker 内核校验始终隔离在本界面之外。',
+  'wb.daemonOutput': '托管守护进程输出',
+  'wb.sessionChip': 'AI4Math：{name} · 切换',
+  'wb.sessionChipTitle': '将当前 AI4Math 守护进程桥接切换至 {root}',
+  'wb.pickerUnavailable': '当前环境不支持原生文件夹选择器，请直接粘贴绝对目录路径。',
+  'wb.selectBeforeChief': '请先选择或初始化一个数学项目，再启动 Chief 主编排会话。',
+  'wb.sessionOpenFailed': '无法为该工作区打开 DSH 会话，请检查工作区权限。',
+  'wb.chiefPrompt': '请作为项目「{name}」的 AI4Math Chief 主编排器启动工作。首先调用 ai4math_status、ai4math_frontier_list 和 ai4math_inbox_list 检查当前账本状态，然后简要汇总现状，并询问接下来要推进哪一条开放问题或引理前沿。',
+
+  // Store notices & Host error codes
+  'notice.initNew': '已初始化并连接项目「{name}」。',
+  'notice.initAdopt': '已连接已有项目「{name}」。',
+  'notice.switched': '已将活跃项目切换为「{name}」。',
+  'notice.removed': '已从工作台列表移除项目（磁盘文件已保留）。',
+  'notice.daemonManaged': '已启动 Host 托管的 ai4mathd。',
+  'notice.daemonExternal': '已接管现有外部 ai4mathd。',
+  'notice.daemonStopped': '已停止 Host 托管的 ai4mathd。',
+  'notice.actionFailed': 'AI4Math 工作台操作失败。',
+  'notice.requestFailed': 'AI4Math 工作台请求失败，请检查 DSH Host 连接。',
+  'err.not_directory': '所选路径不是一个已存在的目录。',
+  'err.missing_directory': '所选目录不存在。',
+  'err.socket_path_too_long': 'Unix socket 路径超出平台字节上限，请改用更短的目录路径。',
+  'err.missing_binary': '未找到所需的 ai4math / ai4mathd 二进制文件，请先编译或配置路径。',
+  'err.limit_reached': '项目列表已达上限，请先移除不用的项目。',
+  'err.not_found': '工作台列表中未找到该项目。',
+  'err.no_project': '当前未选择活跃的 AI4Math 项目。',
+  'err.external_or_stopped': '该项目没有运行中的 Host 托管守护进程（外部守护进程不会被 DSH 终止）。',
+  'err.socket_conflict': '.runtime/ai4mathd.sock 位置存在非 socket 文件。',
+  'err.stale_socket': '启动前无法清理残留的 ai4mathd.sock。',
+  'err.missing_project': '磁盘上的项目目录不存在。',
+})
+
+const FALLBACK_SNAPSHOT = Object.freeze({ active: 'en', revision: 0 })
+
+function isChineseLocale(id) {
+  return typeof id === 'string' && /^zh(?:$|[-_])/i.test(id.trim())
+}
+
+function format(template, vars) {
+  if (!vars) return template
+  return template.replace(/\{([A-Za-z0-9_]+)\}/g, (_, key) =>
+    Object.hasOwn(vars, key) && vars[key] != null ? String(vars[key]) : '')
+}
+
+function translateFor(localeId, key, vars) {
+  const dict = isChineseLocale(localeId) ? ZH : EN
+  const template = dict[key] ?? EN[key] ?? key
+  return format(template, vars)
+}
+
+function createI18n(localeService) {
+  const subscribe = localeService?.subscribe ? (fn) => localeService.subscribe(fn) : () => () => {}
+  const getSnapshot = () => {
+    const snap = localeService?.getSnapshot?.() ?? localeService?.getLocale?.()
+    return snap && typeof snap.active === 'string' ? snap : FALLBACK_SNAPSHOT
+  }
+  const t = (key, vars) => translateFor(getSnapshot().active, key, vars)
+  return Object.freeze({
+    subscribe,
+    getSnapshot,
+    t,
+    isZh: () => isChineseLocale(getSnapshot().active),
+  })
+}
+
+const DEFAULT_I18N = createI18n(null)
+
+function useI18n(i18n) {
+  const active = i18n ?? DEFAULT_I18N
+  const snap = useSyncExternalStore(active.subscribe, active.getSnapshot)
+  const localeId = snap?.active ?? 'en'
+  return {
+    locale: localeId,
+    isZh: isChineseLocale(localeId),
+    t: (key, vars) => translateFor(localeId, key, vars),
+  }
+}
+
+module.exports = { EN, ZH, createI18n, useI18n, isChineseLocale, DEFAULT_I18N }
+},
+"./cli-helper.cjs": (module, exports, require) => {
+const { createElement: h } = require('react')
+const { DEFAULT_I18N } = require('./i18n.cjs')
+
+function shellQuote(value) {
+  return "'" + String(value).replace(/'/g, "'\\''") + "'"
+}
+
+function safeToken(value, fallback) {
+  if (typeof value !== 'string') return fallback
+  const trimmed = value.trim()
+  if (!trimmed || /[\u0000-\u001f\u007f]/.test(trimmed) || trimmed.length > 256) return fallback
+  return trimmed
+}
+
+function buildBreakerCommands(item, projectRoot, t = DEFAULT_I18N.t) {
+  if (typeof projectRoot !== 'string' || !projectRoot.trim()) return []
+  const root = shellQuote(projectRoot)
+  const breakerId = shellQuote(safeToken(item?.breaker_id ?? item?.target_definition_id, '<BREAKER_ID>'))
+  const state = item?.state ?? item?.to_state
+  const commands = [
+    {
+      label: t('cli.previewArchive'),
+      command: `ai4math owner-archive-preview ${root} <BARE_REPO> <FACT_SHA256> ${breakerId} 'Archive reason'`,
+    },
+  ]
+  if (state === 'TRIPPED' || state === 'HALF_OPEN') {
+    commands.push({
+      label: t('cli.previewProbes'),
+      command: `ai4math breaker-probes-preview ${root} <BARE_REPO> ${breakerId} <THEOREM>`,
+    })
+  }
+  return commands
+}
+
+function buildInboxCommands(item, projectRoot, t = DEFAULT_I18N.t) {
+  if (typeof projectRoot !== 'string' || !projectRoot.trim()) return []
+  const root = shellQuote(projectRoot)
+  const commands = [
+    { label: t('cli.inspectStatus'), command: `ai4math status ${root}` },
+    { label: t('cli.auditGraph'), command: `ai4math graph-audit ${root}` },
+  ]
+  if (item?.category === 'definition_smell' || item?.category === 'circuit_breaker') {
+    commands.push({
+      label: t('cli.previewArchive'),
+      command: `ai4math owner-archive-preview ${root} <BARE_REPO> <FACT_SHA256> <BREAKER_ID> 'Archive reason'`,
+    })
+  }
+  return commands
+}
+
+// Hook-free so it stays safe inside lists and matches vm-fixture.mjs constraints.
+function flashButton(buttonEl, label, restoreLabel) {
+  if (!buttonEl || typeof buttonEl !== 'object') return
+  buttonEl.textContent = label
+  if (buttonEl.__a4CopyTimer) clearTimeout(buttonEl.__a4CopyTimer)
+  buttonEl.__a4CopyTimer = setTimeout(() => {
+    buttonEl.textContent = restoreLabel
+    buttonEl.__a4CopyTimer = null
+  }, 1500)
+}
+
+function copyCommand(command, buttonEl, t) {
+  const copyLabel = t('cli.copy')
+  const write = typeof navigator !== 'undefined' && navigator?.clipboard?.writeText
+    ? navigator.clipboard.writeText.bind(navigator.clipboard)
+    : null
+  if (!write) {
+    flashButton(buttonEl, t('cli.copyFailed'), copyLabel)
+    return
+  }
+  void write(command).then(
+    () => flashButton(buttonEl, t('cli.copied'), copyLabel),
+    () => flashButton(buttonEl, t('cli.copyFailed'), copyLabel),
+  )
+}
+
+function CliHelper({ commands, t = DEFAULT_I18N.t }) {
+  if (!Array.isArray(commands) || commands.length === 0) return null
+  return h('details', { className: 'ai4m-cli-helper' },
+    h('summary', null, t('cli.summary')),
+    h('div', { className: 'ai4m-cli-list' },
+      h('p', { className: 'ai4m-muted' }, t('cli.disclaimer')),
+      ...commands.map((entry, index) => h('div', { key: index, className: 'ai4m-cli-row' },
+        h('div', { className: 'ai4m-cli-row-head' },
+          h('span', { className: 'ai4m-muted' }, entry.label),
+          h('button', {
+            type: 'button',
+            className: 'ai4m-button',
+            'aria-label': t('cli.copyAria', { label: entry.label }),
+            onClick: event => copyCommand(entry.command, event.currentTarget, t),
+          }, t('cli.copy'))),
+        h('pre', { className: 'ai4m-cli-cmd' }, entry.command)))))
+}
+
+module.exports = { shellQuote, buildBreakerCommands, buildInboxCommands, CliHelper }
+},
 "./views.cjs": (module, exports, require) => {
 const { createElement: h, useCallback, useEffect, useRef, useState, useSyncExternalStore } = require('react')
 const { call } = require('./remote.cjs')
 const { REMOTE_METHODS, WIKI_SCOPES } = require('./contract')
+const { DEFAULT_I18N, useI18n } = require('./i18n.cjs')
+const { buildBreakerCommands, buildInboxCommands, CliHelper } = require('./cli-helper.cjs')
+const { resolveNoticeText } = require('./workbench-store.cjs')
+
+const EMPTY_STORE = Object.freeze({
+  subscribe: () => () => {},
+  getSnapshot: () => null,
+  activeProject: () => null,
+  mismatchedProject: () => null,
+})
 
 const TRUST = ['L0', 'L1', 'L2a', 'L2b', 'L3', 'L4a', 'L4b', 'L5']
 const PRIORITIES = ['P0', 'P1', 'P2']
-const NA = 'n/a'
-const text = (value, otherwise = NA) => typeof value === 'string' && value.length > 0 ? value : otherwise
+const text = (value, otherwise) => typeof value === 'string' && value.length > 0 ? value : otherwise
 const isCount = value => Number.isSafeInteger(value) && value >= 0
-const count = value => isCount(value) ? String(value) : NA
-const numeric = value => typeof value === 'number' && Number.isFinite(value) ? String(value) : NA
+const countOf = (value, na) => isCount(value) ? String(value) : na
+const numericOf = (value, na) => typeof value === 'number' && Number.isFinite(value) ? String(value) : na
 const rows = (value, max = 80) => Array.isArray(value)
   ? value.slice(0, max).filter(item => item && typeof item === 'object' && !Array.isArray(item)) : []
-const pct = value => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100
-  ? Math.round(value) + '%' : NA
+const pctOf = (value, na) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100
+  ? Math.round(value) + '%' : na
 const trustTone = level => level === 'L5' ? 'good' : level === 'L2b' ? 'danger' : (level === 'L4a' || level === 'L4b') ? 'brand' : undefined
 const badge = (label, tone) => h('span', { className: 'ai4m-badge', 'data-tone': tone }, label)
-const labelValue = (label, value) => h('span', { className: 'ai4m-kv' },
+const labelValue = (label, value, na = 'n/a') => h('span', { className: 'ai4m-kv' },
   h('span', { className: 'ai4m-muted' }, label + ' '),
-  value === NA ? h('span', { className: 'ai4m-muted' }, value) : value)
+  value === na ? h('span', { className: 'ai4m-muted' }, value) : value)
 const button = (label, onClick, disabled, variant) => h('button', {
   className: 'ai4m-button', type: 'button', onClick, disabled, ...(variant ? { 'data-variant': variant } : {}),
 }, label)
 const note = (value, role) => h('p', { className: 'ai4m-muted', role }, value)
 const banner = (value, tone, role) => h('p', { className: 'ai4m-banner', ...(tone ? { 'data-tone': tone } : {}), role }, value)
-const empty = (value) => h('p', { className: 'ai4m-empty' }, value ?? 'No records returned.')
+const empty = (value, t = DEFAULT_I18N.t) => h('p', { className: 'ai4m-empty' }, value ?? t('common.noRecords'))
 const panels = Object.freeze([
-  { key: 'briefing', label: 'Briefing', description: 'Preview or retain a deterministic fact pack.' },
-  { key: 'frontier', label: 'Frontier', description: 'Inspect active claims, dependency plans, and breaker signals.' },
-  { key: 'inbox', label: 'Inbox', description: 'Review prioritized decisions awaiting human attention.' },
-  { key: 'wiki', label: 'Wiki', description: 'Search CORE and inspect archaeology hints and provenance.' },
+  { key: 'briefing', labelKey: 'panel.briefing.label', descKey: 'panel.briefing.desc', label: 'Briefing', description: 'Preview or retain a deterministic fact pack.' },
+  { key: 'frontier', labelKey: 'panel.frontier.label', descKey: 'panel.frontier.desc', label: 'Frontier', description: 'Inspect active claims, dependency plans, and breaker signals.' },
+  { key: 'inbox', labelKey: 'panel.inbox.label', descKey: 'panel.inbox.desc', label: 'Inbox', description: 'Review prioritized decisions awaiting human attention.' },
+  { key: 'wiki', labelKey: 'panel.wiki.label', descKey: 'panel.wiki.desc', label: 'Wiki', description: 'Search CORE and inspect archaeology hints and provenance.' },
 ])
 
-function trustTape(trust) {
-  return h('span', { className: 'ai4m-tape', 'aria-label': 'Trust ledger' }, TRUST.map(level => {
+function trustTape(trust, t = DEFAULT_I18N.t) {
+  const na = t('common.na')
+  return h('span', { className: 'ai4m-tape', 'aria-label': t('hud.trustAria') }, TRUST.map(level => {
     const value = trust?.[level]
     const nonzero = isCount(value) && value > 0
     return h('span', { key: level, className: 'ai4m-tier', 'data-level': level, 'data-nonzero': nonzero ? 'true' : 'false' },
-      labelValue(level, count(value)))
+      labelValue(level, countOf(value, na), na))
   }))
 }
 
-function AlertCatchUp({ live, state }) {
+function AlertCatchUp({ live, state, t = DEFAULT_I18N.t }) {
   if (!state.alertHistoryIncomplete) return null
   return h('div', { className: 'ai4m-hud-catchup' },
-    note(state.alertHistoryLoading ? 'Loading next P0 alert batch…' : state.phase === 'live'
-      ? 'P0 alert catch-up incomplete.' : 'P0 alert catch-up incomplete. Waiting for the daemon to reconnect.', 'status'),
-    button('Continue P0 alert catch-up', live.continueAlertCatchUp, state.phase !== 'live' || state.alertHistoryLoading))
+    note(state.alertHistoryLoading ? t('catchup.loading') : state.phase === 'live'
+      ? t('catchup.incomplete') : t('catchup.waiting'), 'status'),
+    button(t('catchup.button'), live.continueAlertCatchUp, state.phase !== 'live' || state.alertHistoryLoading))
 }
 
-function BreakerTotals({ snapshot }) {
+function BreakerTotals({ snapshot, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
   const tripped = snapshot?.tripped_breakers
   const halfOpen = snapshot?.half_open_breakers
   const archived = snapshot?.archived_breakers
   return h('span', { className: 'ai4m-meta', role: 'status' },
-    badge('Tripped ' + count(tripped), isCount(tripped) && tripped > 0 ? 'danger' : 'muted'),
-    isCount(halfOpen) && badge('HALF_OPEN ' + halfOpen + (halfOpen > 0 ? ' · Affected ordinary queues remain frozen' : ''),
+    badge(t('breaker.tripped', { n: countOf(tripped, na) }), isCount(tripped) && tripped > 0 ? 'danger' : 'muted'),
+    isCount(halfOpen) && badge(halfOpen > 0 ? t('breaker.halfOpenFrozen', { n: halfOpen }) : t('breaker.halfOpen', { n: halfOpen }),
       halfOpen > 0 ? 'warn' : 'muted'),
-    isCount(archived) && archived > 0 && badge('ARCHIVED ' + archived + ' · Affected ordinary queues remain gated', 'warn'))
+    isCount(archived) && archived > 0 && badge(t('breaker.archivedGated', { n: archived }), 'warn'))
 }
 
-function InfraRfcTotals({ snapshot }) {
+function InfraRfcTotals({ snapshot, t = DEFAULT_I18N.t }) {
   const {
     event_seq: seq,
     infra_rfc_drafts: drafts,
@@ -470,26 +1462,22 @@ function InfraRfcTotals({ snapshot }) {
     infra_rfc_frozen_proving: frozen,
     infra_rfc_completed: completed,
   } = snapshot ?? {}
-  // Every recorded RFC has a submission event at or before this snapshot.
-  // Reject absent, unsafe, or out-of-ledger totals without inferring zero.
   if (!isCount(seq) || !isCount(drafts) || !isCount(approved) || drafts > seq || approved > seq - drafts) return null
   const hasLifecycle = smoke !== undefined || frozen !== undefined || completed !== undefined
   if (!hasLifecycle) {
-    return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run',
-      drafts + approved === 0 ? 'muted' : undefined)
+    return badge(t('rfc.reviewOnly', { drafts, approved }), drafts + approved === 0 ? 'muted' : undefined)
   }
   if (!isCount(smoke) || !isCount(frozen) || !isCount(completed)) return null
   const total = drafts + approved + smoke + frozen + completed
   if (!Number.isSafeInteger(total) || total > seq) return null
-  return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved
-    + ' · SMOKE ' + smoke + ' · FROZEN ' + frozen + ' · COMPLETED ' + completed,
-    total === 0 ? 'muted' : undefined)
+  return badge(t('rfc.lifecycle', { drafts, approved, smoke, frozen, completed }), total === 0 ? 'muted' : undefined)
 }
 
-function DiscoveryBadge({ value, currentSeq }) {
+function DiscoveryBadge({ value, currentSeq, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
   if (!value || typeof value !== 'object') return null
-  if (value.status === 'starting') return labelValue('T3 discovery', 'Waiting for first sample')
-  if (value.status === 'unavailable') return labelValue('T3 discovery', 'Unavailable')
+  if (value.status === 'starting') return labelValue(t('t3.label'), t('t3.waiting'), na)
+  if (value.status === 'unavailable') return labelValue(t('t3.label'), t('t3.unavailable'), na)
   const hash = value.observed_head
   const claimTier = value.baseline_scope === 'claim_t1' ? 'T1' : value.baseline_scope === 'claim_t3' ? 'T3' : null
   if (Object.hasOwn(value, 'baseline_scope') && !claimTier) return null
@@ -497,28 +1485,28 @@ function DiscoveryBadge({ value, currentSeq }) {
     || typeof hash !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hash)) return null
   let summary
   switch (value.status) {
-    case 'unchanged': summary = 'No structural change'; break
-    case 'diverged': summary = 'Main diverged · review baseline'; break
+    case 'unchanged': summary = t('t3.unchanged'); break
+    case 'diverged': summary = t('t3.diverged'); break
     case 'structural_change':
       if (!isCount(value.changed_module_count) || value.changed_module_count > 255
         || typeof value.module_order_changed !== 'boolean') return null
-      summary = 'Structure changed · ' + value.changed_module_count + ' source change(s)'
-        + (value.module_order_changed ? ' · module list changed' : '')
+      summary = t('t3.changed', { count: value.changed_module_count })
+        + (value.module_order_changed ? t('t3.orderChanged') : '')
       break
     default: return null
   }
-  const scopeNote = claimTier ? ' Baseline verified for one Claim, not for all of main.' : ''
-  return h('span', { title: 'Observed Git commit: ' + hash + '. This sample does not approve or apply a T3 plan.' + scopeNote },
-    labelValue('Last T3 discovery', summary + (claimTier ? ' · Claim ' + claimTier + ' baseline' : '') + ' · advisory only'
-      + (isCount(currentSeq) && value.ledger_event_seq < currentSeq ? ' · older ledger sample' : '')))
+  const scopeNote = claimTier ? t('t3.scopeNote') : ''
+  return h('span', { title: t('t3.title', { hash, scope: scopeNote }) },
+    labelValue(t('t3.lastLabel'), summary + (claimTier ? t('t3.claimBaseline', { tier: claimTier }) : '') + t('t3.advisory')
+      + (isCount(currentSeq) && value.ledger_event_seq < currentSeq ? t('t3.olderSample') : ''), na))
 }
 
-const T2_AUDIT_STATUS_TEXT = {
-  starting: 'Starting',
-  running: 'Running',
-  unavailable: 'Unavailable',
-  waiting: 'Waiting',
-  head_changed: 'Reviewed head changed',
+const T2_AUDIT_STATUS_KEYS = {
+  starting: 't2.starting',
+  running: 't2.running',
+  unavailable: 't2.unavailable',
+  waiting: 't2.waiting',
+  head_changed: 't2.headChanged',
 }
 
 function hasExactOwnKeys(value, ...keys) {
@@ -526,7 +1514,7 @@ function hasExactOwnKeys(value, ...keys) {
     && Reflect.ownKeys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key))
 }
 
-function T2AuditBadge({ value, currentSeq }) {
+function T2AuditBadge({ value, currentSeq, t = DEFAULT_I18N.t }) {
   if (!isCount(currentSeq)) return null
   const hasObservation = hasExactOwnKeys(value, 'status', 'attempts', 'exhausted', 'observation')
   if (!hasObservation && !hasExactOwnKeys(value, 'status', 'attempts', 'exhausted')) return null
@@ -536,7 +1524,7 @@ function T2AuditBadge({ value, currentSeq }) {
     || (status === 'starting' && attempts !== 0)
     || (status === 'running' && (attempts === 0 || exhausted))) return null
 
-  const attemptsText = attempts + (attempts === 1 ? ' attempt' : ' attempts')
+  const attemptsText = t(attempts === 1 ? 't2.attemptOne' : 't2.attemptMany', { n: attempts })
   let summary, title
   if (hasObservation) {
     const sample = value.observation
@@ -552,115 +1540,137 @@ function T2AuditBadge({ value, currentSeq }) {
       || (oid.length !== 40 && oid.length !== 64) || /[^0-9a-f]/.test(oid) || !/[1-9a-f]/.test(oid)
       || !isCount(sampleSeq)) return null
 
-    title = 'Reviewed Git commit: ' + oid + '. This sample carries no proof authority.'
+    title = t('t2.titleBase', { oid })
     if (heartbeats) {
       const { regressed, max_command_regressed: max, total_commands_regressed: total } = sample
       if (typeof max !== 'boolean' || typeof total !== 'boolean' || regressed !== (max || total)) return null
-      title += ' Heartbeat comparison covers one selected module.'
-      summary = (regressed
-        ? 'Heartbeat thresholds met (' + [max ? 'max command' : '', total ? 'total commands' : ''].filter(Boolean).join(', ') + ')'
-        : 'Heartbeat thresholds not met') + ' · ' + attemptsText
+      title += t('t2.titleHb')
+      const reasons = [max ? t('t2.hbMax') : '', total ? t('t2.hbTotal') : ''].filter(Boolean).join(', ')
+      summary = (regressed ? t('t2.hbMet', { reasons }) : t('t2.hbNotMet')) + ' · ' + attemptsText
     } else {
       const { compile_ms: ms, module_count: modules, debt_findings: debt, independent_checks: checks } = sample
       if ((!independent && schema !== 'ai4math.t2.resident-sample.v1')
         || (independent && (debt !== 0 || !isCount(checks) || checks < 1 || checks > 8))
         || !isCount(ms) || ms > 120000 || !isCount(modules) || modules < 1 || modules > 128
         || !isCount(debt) || debt > 3072) return null
-      if (independent) title += ' Independent checks cover only the reviewed selection.'
-      summary = ms + ' ms compile · ' + modules + (modules === 1 ? ' module' : ' modules')
-        + ' · ' + debt + (debt === 1 ? ' debt finding' : ' debt findings')
-        + (independent ? ' · ' + checks + (checks === 1 ? ' independent theorem check' : ' independent theorem checks') : '')
+      if (independent) title += t('t2.titleInd')
+      summary = t('t2.compile', { ms }) + ' · ' + t(modules === 1 ? 't2.modOne' : 't2.modMany', { n: modules })
+        + ' · ' + t(debt === 1 ? 't2.debtOne' : 't2.debtMany', { n: debt })
+        + (independent ? ' · ' + t(checks === 1 ? 't2.indOne' : 't2.indMany', { n: checks }) : '')
         + ' · ' + attemptsText
     }
-    if (sampleSeq < currentSeq) summary = 'older ledger sample'
-    else if (sampleSeq > currentSeq) summary = 'awaiting matching ledger'
+    if (sampleSeq < currentSeq) summary = t('t2.older')
+    else if (sampleSeq > currentSeq) summary = t('t2.future')
   } else {
-    if (typeof status !== 'string' || !Object.hasOwn(T2_AUDIT_STATUS_TEXT, status)) return null
-    summary = T2_AUDIT_STATUS_TEXT[status] + ' · ' + attemptsText
+    if (typeof status !== 'string' || !Object.hasOwn(T2_AUDIT_STATUS_KEYS, status)) return null
+    summary = t(T2_AUDIT_STATUS_KEYS[status]) + ' · ' + attemptsText
   }
   return h('span', { className: 'ai4m-badge', title },
-    'T2 Audit · advisory only · ' + summary + (exhausted ? ' · exhausted' : ''))
+    t('t2.prefix') + summary + (exhausted ? t('t2.exhausted') : ''))
 }
 
-function leanAdvisoryBadge(broker) {
+function leanAdvisoryBadge(broker, t = DEFAULT_I18N.t) {
   const { lean_advisory_busy: busy, lean_advisory_capacity: capacity, fast_busy: fastBusy, fast_capacity: fastCapacity } = broker ?? {}
   if (!isCount(busy) || !isCount(capacity) || capacity < 1 || capacity > 4
     || !isCount(fastCapacity) || capacity > fastCapacity
     || !isCount(fastBusy) || busy > fastBusy || busy > capacity) return null
-  return badge('Lean advisory · ' + busy + ' in use / ' + capacity + ' nominal cap')
+  return badge(t('hud.leanAdvisory', { busy, cap: capacity }))
 }
 
-function LiveHud({ live, open }) {
+function LiveHud({ live, open, wbStore, openWorkbench, i18n }) {
   const [navigationError, setNavigationError] = useState(false)
+  const { t } = useI18n(i18n)
+  const na = t('common.na')
   const state = useSyncExternalStore(live.subscribe, live.getSnapshot)
+  const store = wbStore ?? EMPTY_STORE
+  const wbSnap = useSyncExternalStore(store.subscribe, store.getSnapshot)
+  const activeProject = store.activeProject(wbSnap?.data)
+  const mismatched = store.mismatchedProject(wbSnap)
+  const wbError = wbSnap?.notice?.tone === 'danger' ? resolveNoticeText(wbSnap.notice, t) : null
   const { phase, snapshot, snapshotStale, recentAlerts, breaker } = state
   const snapshotFresh = phase === 'live' && !snapshotStale
-  const latestBreaker = phase === 'live' && readBreakerEvent(breaker)
+  const latestBreaker = phase === 'live' && readBreakerEvent(breaker, t)
   const alert = recentAlerts[0]
   const alertText = text(alert?.headline, '')
   const memory = snapshot?.memory
   const pressure = typeof memory?.pressure === 'string' ? memory.pressure : undefined
   const broker = snapshot?.broker
-  const advisoryBadge = snapshotFresh ? leanAdvisoryBadge(broker) : null
+  const advisoryBadge = snapshotFresh ? leanAdvisoryBadge(broker, t) : null
   const workers = snapshot?.workers
   const staleClaims = snapshot?.stale_claims
   const oracleHeld = snapshot?.task_scheduler?.exploration?.held_for_oracle
-  const brokerText = !broker ? NA
-    : 'fast ' + count(broker.fast_busy) + '/' + count(broker.fast_capacity) + ' busy · heavy '
-      + count(broker.heavy_running) + ' running / ' + count(broker.heavy_queued) + ' queued'
-  const phaseLabel = phase === 'live' ? (snapshotStale ? 'Connected · stale' : 'Live')
-    : phase === 'reconnecting' ? (snapshot ? 'Reconnecting · stale' : 'Reconnecting') : 'Connecting'
-  return h('section', { className: 'ai4m ai4m-hud', 'aria-label': 'AI4Math Live HUD' },
+  const brokerText = !broker ? na
+    : t('hud.brokerSummary', {
+        fastBusy: countOf(broker.fast_busy, na),
+        fastCap: countOf(broker.fast_capacity, na),
+        heavyRun: countOf(broker.heavy_running, na),
+        heavyQueue: countOf(broker.heavy_queued, na),
+      })
+  const phaseLabel = phase === 'live' ? (snapshotStale ? t('hud.connectedStale') : t('hud.live'))
+    : phase === 'reconnecting' ? (snapshot ? t('hud.reconnectingStale') : t('hud.reconnecting')) : t('hud.connecting')
+  return h('section', { className: 'ai4m ai4m-hud', 'aria-label': t('hud.aria') },
     h('div', { className: 'ai4m-hud-line' },
       h('div', { className: 'ai4m-hud-brand' },
-        h('strong', null, 'AI4Math'),
+        openWorkbench
+          ? h('button', {
+              type: 'button', className: 'ai4m-hud-brand-btn',
+              title: activeProject ? t('hud.openWorkbenchProjectTitle', { root: activeProject.root }) : t('hud.openWorkbenchTitle'),
+              onClick: () => openWorkbench(),
+            }, 'AI4Math')
+          : h('strong', null, 'AI4Math'),
+        activeProject && badge(activeProject.name, 'brand'),
         h('span', { className: 'ai4m-hud-status', role: 'status' }, badge(phaseLabel, snapshotFresh ? 'good' : 'warn'))),
       h('div', { className: 'ai4m-hud-telemetry' },
         h('div', { className: 'ai4m-hud-group' },
           h('span', { className: 'ai4m-hud-metric', 'data-pressure': pressure },
-            labelValue('RAM', pct(memory?.used_percent) + (pressure ? ' · ' + pressure : ''))),
-          h('span', { title: 'Daemon-managed work only; independent CLI processes are not counted.' },
-            labelValue('Daemon broker', brokerText), advisoryBadge && ' ', advisoryBadge),
-          labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active))),
+            labelValue(t('hud.ram'), pctOf(memory?.used_percent, na) + (pressure ? ' · ' + pressure : ''), na)),
+          h('span', { title: t('hud.brokerTitle') },
+            labelValue(t('hud.broker'), brokerText, na), advisoryBadge && ' ', advisoryBadge),
+          labelValue(t('hud.workers'), countOf(typeof workers === 'number' ? workers : workers?.active, na), na)),
         h('div', { className: 'ai4m-hud-group' },
-          trustTape(snapshot?.trust)),
+          trustTape(snapshot?.trust, t)),
         h('div', { className: 'ai4m-hud-group' },
           h('span', { className: 'ai4m-hud-metric', 'data-nonzero': isCount(staleClaims) && staleClaims > 0 ? 'true' : 'false' },
-            labelValue('Stale', count(staleClaims))),
-          snapshotFresh && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
-          snapshotFresh && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
-          h(BreakerTotals, { snapshot }),
-          snapshotFresh && h(InfraRfcTotals, { snapshot }),
+            labelValue(t('hud.stale'), countOf(staleClaims, na), na)),
+          snapshotFresh && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq, t }),
+          snapshotFresh && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq, t }),
+          h(BreakerTotals, { snapshot, t }),
+          snapshotFresh && h(InfraRfcTotals, { snapshot, t }),
           snapshotFresh && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
             className: 'ai4m-hud-metric', 'data-nonzero': 'true',
-            title: 'Temporary exploration scheduling hold; not a Claim refutation.',
-          }, labelValue('Oracle-held exploration', count(oracleHeld))))),
+            title: t('hud.oracleHeldTitle'),
+          }, labelValue(t('hud.oracleHeld'), countOf(oracleHeld, na), na)))),
       h('div', { className: 'ai4m-hud-pinned' },
         ...PRIORITIES.map(priority => {
           const value = snapshot?.pending_inbox?.[priority]
           const active = isCount(value) && value > 0
           return h('span', { key: priority, className: 'ai4m-hud-priority', 'data-zero': active ? 'false' : 'true' },
-            badge(priority + ' ' + count(value),
+            badge(priority + ' ' + countOf(value, na),
               active ? (priority === 'P0' ? 'danger' : priority === 'P1' ? 'warn' : 'brand') : 'muted'))
         }),
-        h('span', { className: 'ai4m-hud-seq', title: text(snapshot?.observed_at, '') }, labelValue('Seq', count(snapshot?.event_seq)))),
-      h('nav', { className: 'ai4m-hud-nav', 'aria-label': 'AI4Math panels' }, panels.map(panel =>
-        h('button', { key: panel.key, type: 'button', className: 'ai4m-button', title: panel.description, onClick: event => {
+        h('span', { className: 'ai4m-hud-seq', title: text(snapshot?.observed_at, '') }, labelValue(t('hud.seq'), countOf(snapshot?.event_seq, na), na))),
+      h('nav', { className: 'ai4m-hud-nav', 'aria-label': t('hud.panelsAria') }, panels.map(panel =>
+        h('button', { key: panel.key, type: 'button', className: 'ai4m-button', title: t(panel.descKey), onClick: event => {
           setNavigationError(!open(panel.key, event.currentTarget))
-        } }, panel.label)))),
-    navigationError && banner('Open a DSH session before opening an AI4Math tab.', 'warn', 'status'),
-    h(AlertCatchUp, { live, state }),
+        } }, t(panel.labelKey))))),
+    navigationError && banner(t('hud.openSessionFirst'), 'warn', 'status'),
+    mismatched && h('div', { className: 'ai4m-hud-notice', role: 'status' },
+      h('span', null, t('hud.mismatchBanner', { name: mismatched.name })),
+      button(wbSnap?.busy ? t('hud.switching') : t('hud.switchProject'),
+        () => void store.projectSelect?.({ project_id: mismatched.id, auto_start: true }), wbSnap?.busy, 'primary')),
+    wbError && h('div', { className: 'ai4m-hud-alert', role: 'alert' },
+      h('span', null, wbError),
+      button(t('common.dismiss'), () => store.clearNotice?.())),
+    h(AlertCatchUp, { live, state, t }),
     h('div', { role: 'status', 'aria-atomic': true }, (latestBreaker?.probe || latestBreaker?.state === 'ARCHIVED') &&
       h('div', { className: 'ai4m-hud-alert ai4m-hud-alert--breaker' },
-        'Latest breaker event · ', h('code', null, text(breaker.entity_id)), ' · #' + count(breaker.event_seq) + ' ',
-        h(BreakerReading, { reading: latestBreaker }))),
+        t('hud.latestBreaker') + ' · ', h('code', null, text(breaker.entity_id, na)), ' · #' + countOf(breaker.event_seq, na) + ' ',
+        h(BreakerReading, { reading: latestBreaker, t }))),
     alertText && h('div', { className: 'ai4m-hud-alert' },
-      badge('Last P0', 'danger'), ' ', alertText,
-      alert.briefing_id && h('span', null, ' · ', h('code', null, text(alert.briefing_id)))))
+      badge(t('hud.lastP0'), 'danger'), ' ', alertText,
+      alert.briefing_id && h('span', null, ' · ', h('code', null, text(alert.briefing_id, na)))))
 }
 
-// Each mounted tab owns its request. Manual actions do not retry writes, and
-// stale completions cannot update an unmounted tab or replace a newer query.
 function useQuery(remote) {
   const [state, setState] = useState({ phase: 'idle', value: null })
   const active = useRef(null)
@@ -680,10 +1690,10 @@ function useQuery(remote) {
   return { ...state, run }
 }
 
-function queryNote(query, fallback) {
-  if (query.phase === 'loading') return banner('Loading AI4Math data…', 'loading', 'status')
-  if (query.phase === 'error') return banner('AI4Math data unavailable. Check the host daemon connection or retry.', 'danger', 'alert')
-  if (query.phase === 'idle') return fallback ? empty(fallback) : null
+function queryNote(query, fallback, t = DEFAULT_I18N.t) {
+  if (query.phase === 'loading') return banner(t('common.loading'), 'loading', 'status')
+  if (query.phase === 'error') return banner(t('common.unavailable'), 'danger', 'alert')
+  if (query.phase === 'idle') return fallback ? empty(fallback, t) : null
   return null
 }
 
@@ -695,51 +1705,54 @@ function Panel({ title, subtitle, actions, children }) {
     children)
 }
 
-function MathCard({ informal, formal, target }) {
-  const informalText = text(informal, 'Not supplied')
-  const formalText = text(formal, 'Not supplied')
+function MathCard({ informal, formal, target, t = DEFAULT_I18N.t }) {
+  const missing = t('common.notSupplied')
+  const informalText = text(informal, missing)
+  const formalText = text(formal, missing)
   return h('div', { className: 'ai4m-math' },
     h('div', { className: 'ai4m-math-informal' },
-      h('strong', null, 'Informal statement'),
-      h('p', { className: informalText === 'Not supplied' ? 'ai4m-placeholder' : undefined }, informalText)),
+      h('strong', null, t('math.informal')),
+      h('p', { className: informalText === missing ? 'ai4m-placeholder' : undefined }, informalText)),
     h('div', { className: 'ai4m-math-formal' },
-      h('strong', null, 'Formal signature'),
-      h('pre', { className: formalText === 'Not supplied' ? 'ai4m-placeholder' : undefined }, formalText),
-      text(target, '') && h('p', { className: 'ai4m-math-target' }, labelValue('Formal target', h('code', null, target)))))
+      h('strong', null, t('math.formal')),
+      h('pre', { className: formalText === missing ? 'ai4m-placeholder' : undefined }, formalText),
+      text(target, '') && h('p', { className: 'ai4m-math-target' }, labelValue(t('math.target'), h('code', null, target), t('common.na')))))
 }
 
-function ClaimCard({ claim }) {
+function ClaimCard({ claim, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
   const accent = claim.stale === true || claim.oracle_debt === true ? 'warn'
     : claim.effective_trust === 'L2b' ? 'danger'
     : claim.effective_trust === 'L5' ? 'good' : undefined
   return h('article', { className: 'ai4m-card', 'data-accent': accent },
-    h('h4', null, text(claim.title, text(claim.claim_id, 'Unnamed claim'))),
+    h('h4', null, text(claim.title, text(claim.claim_id, t('claim.unnamed')))),
     h('div', { className: 'ai4m-meta' },
-      h('code', null, text(claim.claim_id)), badge(text(claim.engine), 'muted'),
-      badge('Effective ' + text(claim.effective_trust), trustTone(claim.effective_trust)),
-      badge('Local ' + text(claim.local_trust), trustTone(claim.local_trust)),
-      claim.critical === true && badge('Critical', 'brand'),
-      claim.stale === true && badge('Stale', 'warn'),
-      claim.oracle_debt === true && badge('Oracle debt', 'warn')),
-    h(MathCard, { informal: claim.informal_statement, formal: claim.formal_signature, target: claim.formal_target }),
-    typeof claim.wiki_id === 'string' && h('div', { className: 'ai4m-card-foot' }, labelValue('Wiki reference', h('code', null, claim.wiki_id))))
+      h('code', null, text(claim.claim_id, na)), badge(text(claim.engine, na), 'muted'),
+      badge(t('claim.effective', { trust: text(claim.effective_trust, na) }), trustTone(claim.effective_trust)),
+      badge(t('claim.local', { trust: text(claim.local_trust, na) }), trustTone(claim.local_trust)),
+      claim.critical === true && badge(t('claim.critical'), 'brand'),
+      claim.stale === true && badge(t('claim.stale'), 'warn'),
+      claim.oracle_debt === true && badge(t('claim.oracleDebt'), 'warn')),
+    h(MathCard, { informal: claim.informal_statement, formal: claim.formal_signature, target: claim.formal_target, t }),
+    typeof claim.wiki_id === 'string' && h('div', { className: 'ai4m-card-foot' }, labelValue(t('claim.wikiRef'), h('code', null, claim.wiki_id), na)))
 }
 
-function InboxCard({ item }) {
+function InboxCard({ item, projectRoot, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
   const accent = item.priority === 'P0' ? 'danger' : item.priority === 'P1' ? 'warn' : undefined
   return h('article', { className: 'ai4m-card', 'data-accent': accent },
-    h('h4', null, text(item.summary, 'No summary supplied')),
+    h('h4', null, text(item.summary, t('inbox.noSummary'))),
     h('div', { className: 'ai4m-meta' },
-      badge(text(item.priority), item.priority === 'P0' ? 'danger' : item.priority === 'P1' ? 'warn' : 'muted'),
-      badge(text(item.category)), h('code', null, text(item.inbox_id)),
-      labelValue('Leverage', numeric(item.leverage_score)),
-      h('span', { className: 'ai4m-muted' }, text(item.created_at))),
-    item.payload != null && h(Evidence, { title: 'Recorded evidence / options', value: item.payload }),
-    item.payload_truncated === true && note('Evidence was truncated by the daemon.'))
+      badge(text(item.priority, na), item.priority === 'P0' ? 'danger' : item.priority === 'P1' ? 'warn' : 'muted'),
+      badge(text(item.category, na)), h('code', null, text(item.inbox_id, na)),
+      labelValue(t('inbox.leverage'), numericOf(item.leverage_score, na), na),
+      h('span', { className: 'ai4m-muted' }, text(item.created_at, na))),
+    item.payload != null && h(Evidence, { title: t('inbox.evidence'), value: item.payload }),
+    item.payload_truncated === true && note(t('inbox.truncated')),
+    projectRoot && h(CliHelper, { commands: buildInboxCommands(item, projectRoot, t), t }))
 }
 
 function Evidence({ title, value, open }) {
-  // Always React text. Compile no HTML, Markdown, URLs, or formal snippets.
   return h('details', { open }, h('summary', null, title), h(EvidenceText, { value }))
 }
 
@@ -751,25 +1764,27 @@ function Section({ title, className, children }) {
   return h('section', { className: className ? 'ai4m-section ' + className : 'ai4m-section' }, h('h3', null, title), children)
 }
 
-function Cards({ page, itemKey, card, emptyText }) {
+function Cards({ page, itemKey, card, emptyText, t = DEFAULT_I18N.t }) {
   const items = rows(page?.items)
   return h('div', { className: 'ai4m-stack' },
-    items.length ? items.map((item, index) => card(item, text(item[itemKey], 'item') + ':' + index)) : empty(emptyText),
-    page?.truncated === true && note('The daemon returned a bounded slice.'))
+    items.length ? items.map((item, index) => card(item, text(item[itemKey], 'item') + ':' + index)) : empty(emptyText, t),
+    page?.truncated === true && note(t('common.boundedSlice')))
 }
 
-function PlanSlice({ page }) {
+function PlanSlice({ page, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
   const edges = rows(page?.items)
-  return h(Section, { title: 'Dependency plan slice' }, edges.length > 0 ? h('ul', { className: 'ai4m-edges' }, edges.map((edge, index) =>
-    h('li', { key: index }, h('code', null, text(edge.target_claim_id)), ' · ',
-      h('code', null, text(edge.plan_id)), ' ', badge(text(edge.plan_status)),
+  return h(Section, { title: t('plan.title') }, edges.length > 0 ? h('ul', { className: 'ai4m-edges' }, edges.map((edge, index) =>
+    h('li', { key: index }, h('code', null, text(edge.target_claim_id, na)), ' · ',
+      h('code', null, text(edge.plan_id, na)), ' ', badge(text(edge.plan_status, na)),
       typeof edge.dep_claim_id === 'string' && h('span', null, ' → ', h('code', null, edge.dep_claim_id), ' ', text(edge.dep_kind, '')))))
-    : empty(page ? 'No dependency edges in this slice.' : 'No dependency edge data supplied.'),
-  page?.truncated === true && note('Dependencies outside the bounded slice are not shown.'))
+    : empty(page ? t('plan.empty') : t('plan.noData'), t),
+  page?.truncated === true && note(t('plan.truncated')))
 }
 
-function readBreaker(item) {
-  const state = text(item?.state, text(item?.to_state))
+function readBreaker(item, t = DEFAULT_I18N.t) {
+  const na = t('common.na')
+  const state = text(item?.state, text(item?.to_state, na))
   const status = item?.probe_status
   const passed = item?.probe_passed
   const required = item?.probe_required
@@ -779,191 +1794,206 @@ function readBreaker(item) {
   let probe, tone
   if (halfOpen || state === 'TRIPPED') {
     switch (status) {
-      case 'AWAITING_REVIEW': probe = 'Blocked — awaiting human review'; break
-      case 'NEEDS_PROBE': probe = 'Blocked — a probe is required'; break
-      case 'FAILED': probe = 'Blocked — probe failed'; break
-      case 'READY': if (halfOpen) probe = 'Waiting — probe ready'; break
-      case 'RUNNING': if (halfOpen) probe = 'Waiting — probe attempt started'; break
+      case 'AWAITING_REVIEW': probe = t('breaker.awaitingReview'); tone = 'danger'; break
+      case 'NEEDS_PROBE': probe = t('breaker.needsProbe'); tone = 'danger'; break
+      case 'FAILED': probe = t('breaker.failed'); tone = 'danger'; break
+      case 'READY': if (halfOpen) { probe = t('breaker.ready'); tone = 'warn' } break
+      case 'RUNNING': if (halfOpen) { probe = t('breaker.running'); tone = 'warn' } break
     }
-    if (probe) tone = probe.startsWith('Blocked') ? 'danger' : 'warn'
   }
-  // Verification comes from an explicit daemon outcome, never from the counts
-  // alone. Older payloads can omit both counts; contradictory counts cannot verify.
   if (status === 'PASSED' && state === 'CLOSED' &&
     (countsAbsent || (validCounts && passed === required))) {
-    probe = 'Probe verified'
+    probe = t('breaker.verified')
     tone = 'good'
   }
-  const progress = probe && validCounts ? passed + '/' + required + ' probes passed' : null
+  const progress = probe && validCounts ? t('breaker.progress', { passed, required }) : null
   if (!probe && (halfOpen || (status === 'PASSED' && state !== 'ARCHIVED'))) {
-    probe = 'Probe status unavailable'
+    probe = t('breaker.unavailable')
     tone = 'warn'
   }
   return { state, probe, tone, halfOpen, progress }
 }
 
-function readBreakerEvent(event) {
-  // Daemon events carry state and probe details in the event payload. A
-  // truncated payload is evidence only and must not imply verification.
+function readBreakerEvent(event, t = DEFAULT_I18N.t) {
   if (!event?.payload || event.payload_truncated === true) return null
-  const reading = readBreaker(event.payload)
-  return reading.state === NA ? null : reading
+  const reading = readBreaker(event.payload, t)
+  return reading.state === t('common.na') ? null : reading
 }
 
-function BreakerReading({ reading }) {
+function BreakerReading({ reading, t = DEFAULT_I18N.t }) {
   const { state, probe, tone, halfOpen, progress } = reading
   return h('span', { className: 'ai4m-meta' },
     badge(state, state === 'TRIPPED' ? 'danger' : (halfOpen || state === 'ARCHIVED') ? 'warn' : state === 'CLOSED' ? 'good' : undefined),
     probe && badge(probe, tone),
     progress && h('span', null, progress),
-    halfOpen && h('span', { className: 'ai4m-muted' }, 'Ordinary queue remains frozen'),
-    state === 'ARCHIVED' && h('span', { className: 'ai4m-muted' }, 'Ordinary queue remains gated'))
+    halfOpen && h('span', { className: 'ai4m-muted' }, t('breaker.queueFrozen')),
+    state === 'ARCHIVED' && h('span', { className: 'ai4m-muted' }, t('breaker.queueGated')))
 }
 
-function BreakerCard({ item }) {
-  const reading = readBreaker(item)
+function BreakerCard({ item, projectRoot, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
+  const reading = readBreaker(item, t)
   const accent = reading.state === 'TRIPPED' ? 'danger'
     : (reading.halfOpen || reading.state === 'ARCHIVED') ? 'warn'
     : reading.state === 'CLOSED' ? 'good' : undefined
   return h('article', { className: 'ai4m-card', 'data-accent': accent },
-    h('h4', null, text(item.target_definition_id, text(item.breaker_id, 'Breaker'))),
-    h('div', { className: 'ai4m-meta' }, h(BreakerReading, { reading }),
-      h('code', null, text(item.module_path)), text(item.engine), text(item.updated_at, '')))
+    h('h4', null, text(item.target_definition_id, text(item.breaker_id, t('breaker.unnamed')))),
+    h('div', { className: 'ai4m-meta' }, h(BreakerReading, { reading, t }),
+      h('code', null, text(item.module_path, na)), text(item.engine, na), text(item.updated_at, '')),
+    projectRoot && h(CliHelper, { commands: buildBreakerCommands(item, projectRoot, t), t }))
 }
 
-function BreakerSignal({ event }) {
-  const reading = readBreakerEvent(event)
+function BreakerSignal({ event, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
+  const reading = readBreakerEvent(event, t)
   return h('article', { className: 'ai4m-card', 'data-accent': 'warn' },
-    h('h4', null, 'Latest breaker event'),
-    h('div', { className: 'ai4m-meta', role: 'status' }, badge(text(event.event_type), 'warn'),
-      h('code', null, text(event.entity_id)), labelValue('Seq', count(event.event_seq)),
-      reading && h(BreakerReading, { reading })),
-    event.payload != null && h(Evidence, { title: 'Recorded transition evidence', value: event.payload }))
+    h('h4', null, t('hud.latestBreaker')),
+    h('div', { className: 'ai4m-meta', role: 'status' }, badge(text(event.event_type, na), 'warn'),
+      h('code', null, text(event.entity_id, na)), labelValue(t('hud.seq'), countOf(event.event_seq, na), na),
+      reading && h(BreakerReading, { reading, t })),
+    event.payload != null && h(Evidence, { title: t('breaker.transitionEvidence'), value: event.payload }))
 }
 
-function schedulerBlockSummary(event) {
+function schedulerBlockSummary(event, t = DEFAULT_I18N.t) {
   if ((event.event_kind ?? event.event_type) !== 'ALL_TRACKS_BLOCKED') return ''
   const exploration = event.payload?.exploration_blocked
   const infrastructure = event.payload?.infrastructure_blocked
   if (!isCount(exploration) || !isCount(infrastructure) || exploration < 1 || infrastructure < 1
     || exploration + infrastructure > 4096) return ''
-  return 'Exploration blocked: ' + exploration + '; infrastructure blocked: ' + infrastructure
+  return t('event.allTracksBlocked', { exp: exploration, infra: infrastructure })
 }
 
-function regressionAlertSummary(event) {
+function regressionAlertSummary(event, t = DEFAULT_I18N.t) {
   if ((event.event_kind ?? event.event_type) !== 'BROKER_REGRESSION_MELTDOWN') return ''
   const { failed_module: module, distinct_candidates: candidates, window_seconds: seconds } = event.payload ?? {}
   if (typeof module !== 'string' || !/^[A-Z][A-Za-z0-9_]{0,250}\.lean$/.test(module)
     || candidates !== 3 || seconds !== 900) return ''
-  return module + ': ' + candidates + ' distinct candidates failed full regression'
+  return t('event.meltdown', { module, candidates })
 }
 
-function criticalBreakerSummary(event) {
+function criticalBreakerSummary(event, t = DEFAULT_I18N.t) {
   if ((event.event_kind ?? event.event_type) !== 'CRITICAL_BREAKER_TRIPPED') return ''
   const { critical_claim_id: first, critical_claim_count: affected } = event.payload ?? {}
   if (typeof first !== 'string' || !first.length || first.length > 256 || /[\u0000-\u001f\u007f]/.test(first)
     || !isCount(affected) || affected < 1) return ''
-  return 'No known route remains for ' + first + (affected > 1 ? ' (' + affected + ' critical claims affected)' : '')
+  return affected > 1 ? t('event.critBreakerMany', { first, affected }) : t('event.critBreakerOne', { first })
 }
 
-function EventList({ page, openEventSeq, emptyText = 'No new events in this window.' }) {
+function EventList({ page, openEventSeq, emptyText, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
   const events = rows(page?.items)
   return h('div', { className: 'ai4m-stack' },
     events.length ? events.map((event, index) => h(Evidence, { key: index, value: event,
       open: openEventSeq != null && event.event_seq === openEventSeq ? true : undefined,
-      title: [text(event.event_kind, text(event.event_type, 'Event')), text(event.entity_id, ''), '#' + count(event.event_seq),
-        schedulerBlockSummary(event), regressionAlertSummary(event), criticalBreakerSummary(event)]
-        .filter(Boolean).join(' · ') })) : empty(emptyText),
-    page?.truncated === true && note('The fact pack contains a bounded event window.'))
+      title: [text(event.event_kind, text(event.event_type, t('event.default'))), text(event.entity_id, ''), '#' + countOf(event.event_seq, na),
+        schedulerBlockSummary(event, t), regressionAlertSummary(event, t), criticalBreakerSummary(event, t)]
+        .filter(Boolean).join(' · ') })) : empty(emptyText ?? t('event.empty'), t),
+    page?.truncated === true && note(t('event.bounded')))
 }
 
-function Briefing({ remote, live }) {
+function Briefing({ remote, live, projectRoot, wbStore, i18n }) {
+  const { t } = useI18n(i18n)
+  const na = t('common.na')
   const state = useSyncExternalStore(live.subscribe, live.getSnapshot)
+  const store = wbStore ?? EMPTY_STORE
+  const wbSnap = useSyncExternalStore(store.subscribe, store.getSnapshot)
+  const resolvedRoot = projectRoot ?? store.activeProject(wbSnap?.data)?.root ?? null
   const { recentAlerts, alertHistoryIncomplete } = state
   const query = useQuery(remote)
   const pack = query.value?.fact_pack
   const checkpoint = pack?.checkpoint
   const hasCheckpoint = checkpoint != null && typeof checkpoint === 'object' && !Array.isArray(checkpoint)
   const busy = query.phase === 'loading'
-  const modeLabel = query.method === 'briefingPeek' ? 'Preview' : query.method === 'briefingGet' ? 'Retained alert' : 'Pull'
+  const modeLabel = query.method === 'briefingPeek' ? t('briefing.modePreview')
+    : query.method === 'briefingGet' ? t('briefing.modeRetained') : t('briefing.modePull')
   const modeTone = query.method === 'briefingGet' ? 'danger' : query.method === 'briefingPull' ? 'brand' : 'muted'
-  return h(Panel, { title: 'Review briefing', subtitle: 'Deterministic fact packs; neither action advances the human checkpoint.',
-    actions: [h('span', { key: 'peek' }, button('Peek (preview only)', () => void query.run('briefingPeek', {}), busy)),
-      h('span', { key: 'pull' }, button('Pull and retain', () => void query.run('briefingPull', {}), busy, 'primary'))] },
-    queryNote(query, 'Choose Peek or Pull to request a briefing.'),
-    query.phase === 'done' && !pack && empty('No fact pack supplied.'),
-    (recentAlerts.length > 0 || alertHistoryIncomplete) && h(Section, { title: 'Recent P0 alerts' },
-      h(AlertCatchUp, { live, state }),
+  return h(Panel, { title: t('briefing.title'), subtitle: t('briefing.subtitle'),
+    actions: [h('span', { key: 'peek' }, button(t('briefing.peek'), () => void query.run('briefingPeek', {}), busy)),
+      h('span', { key: 'pull' }, button(t('briefing.pull'), () => void query.run('briefingPull', {}), busy, 'primary'))] },
+    queryNote(query, t('briefing.idle'), t),
+    query.phase === 'done' && !pack && empty(t('briefing.noPack'), t),
+    (recentAlerts.length > 0 || alertHistoryIncomplete) && h(Section, { title: t('briefing.recentP0') },
+      h(AlertCatchUp, { live, state, t }),
       recentAlerts.length > 0 && h('ul', { className: 'ai4m-edges ai4m-edges--alerts' }, recentAlerts.map(alert =>
         h('li', { key: alert.event_seq },
-          h('span', null, '#' + count(alert.event_seq) + ' · ' + alert.headline),
+          h('span', null, '#' + countOf(alert.event_seq, na) + ' · ' + alert.headline),
           typeof alert.briefing_id === 'string' && /^[0-9a-f]{64}$/.test(alert.briefing_id)
-            && button('Open retained facts', () => void query.run('briefingGet', { id: alert.briefing_id }, alert.event_seq), busy))))),
+            && button(t('briefing.openRetained'), () => void query.run('briefingGet', { id: alert.briefing_id }, alert.event_seq), busy))))),
     pack && h('div', { className: 'ai4m-stack' },
       h('div', { className: 'ai4m-meta-box' },
         badge(modeLabel, modeTone),
-        labelValue('Event window', '(' + count(pack.event_from_exclusive) + ', ' + count(pack.event_to_inclusive) + ']'),
-        query.value.retained_id != null && labelValue('Retained', h('code', null, text(query.value.retained_id))),
-        hasCheckpoint && labelValue('Retained human checkpoint event_seq', count(checkpoint.event_seq)),
-        hasCheckpoint && labelValue('Checkpoint ADR', h('code', null, text(checkpoint.last_adr_id))),
-        labelValue('Fact SHA-256', h('code', null, text(pack.fact_sha256)))),
-      query.method === 'briefingGet' && h(Section, { title: 'P0 alert sources' },
+        labelValue(t('briefing.window'), '(' + countOf(pack.event_from_exclusive, na) + ', ' + countOf(pack.event_to_inclusive, na) + ']', na),
+        query.value.retained_id != null && labelValue(t('briefing.retained'), h('code', null, text(query.value.retained_id, na)), na),
+        hasCheckpoint && labelValue(t('briefing.checkpointSeq'), countOf(checkpoint.event_seq, na), na),
+        hasCheckpoint && labelValue(t('briefing.checkpointAdr'), h('code', null, text(checkpoint.last_adr_id, na)), na),
+        labelValue(t('briefing.sha256'), h('code', null, text(pack.fact_sha256, na)), na)),
+      query.method === 'briefingGet' && h(Section, { title: t('briefing.p0Sources') },
         h(EventList, { page: { items: pack.alert_sources }, openEventSeq: query.alertEventSeq,
-          emptyText: 'No P0 alert source events in this retained fact pack.' })),
-      h(Section, { title: 'Trust ledger' },
-        trustTape(pack.trust),
+          emptyText: t('briefing.noP0Sources'), t })),
+      h(Section, { title: t('briefing.trustLedger') },
+        trustTape(pack.trust, t),
         h('div', { className: 'ai4m-summary-row' },
-          labelValue('Stale', count(pack.stale_claims)),
-          pack.risk_radar && labelValue('Oracle debt', count(pack.risk_radar.oracle_debts)),
-          pack.risk_radar && labelValue('Cross-engine debt', count(pack.risk_radar.cross_engine_debts)))),
-      h(Section, { title: 'Milestones / Refutations' }, ...[['Milestones', pack.milestones, 'good'], ['Refutations', pack.refutations, 'danger']].map(([title, page, accent]) =>
-        h('div', { key: title, className: 'ai4m-subgroup' }, h('h4', null, title), h(Cards, { page, itemKey: 'event_seq', card: (item, key) =>
-          h('article', { key, className: 'ai4m-card', 'data-accent': accent },
-            h('h4', null, text(item.claim?.title ?? item.claim_id)),
-            h('div', { className: 'ai4m-meta' },
-              item.new_local_trust && badge(item.new_local_trust, trustTone(item.new_local_trust)),
-              h('span', { className: 'ai4m-muted' }, 'Event #' + count(item.event_seq))),
-            h(MathCard, { informal: item.claim?.informal_statement, formal: item.claim?.formal_signature,
-              target: item.claim?.formal_target }),
-            item.graveyard_id && h('div', { className: 'ai4m-card-foot' }, labelValue('Graveyard witness', h('code', null, text(item.graveyard_id))))) })))),
-      h(Section, { title: 'Frontier claims' }, h(Cards, { page: pack.frontier, itemKey: 'claim_id',
-        card: (claim, key) => h(ClaimCard, { claim, key }) })),
-      h(PlanSlice, { page: pack.frontier?.plans }),
-      h(Section, { title: 'Recent events / expand evidence' }, h(EventList, { page: pack.events })),
-      h(Section, { title: 'Circuit breakers' }, h(Cards, { page: pack.breakers, itemKey: 'breaker_id',
-        card: (item, key) => h(BreakerCard, { item, key }) })),
-      h(Section, { title: 'Decision inbox' }, h(Cards, { page: pack.inbox, itemKey: 'inbox_id',
-        card: (item, key) => h(InboxCard, { item, key }) }))))
+          labelValue(t('hud.stale'), countOf(pack.stale_claims, na), na),
+          pack.risk_radar && labelValue(t('claim.oracleDebt'), countOf(pack.risk_radar.oracle_debts, na), na),
+          pack.risk_radar && labelValue(t('briefing.crossEngineDebt'), countOf(pack.risk_radar.cross_engine_debts, na), na))),
+      h(Section, { title: t('briefing.milestonesRefutations') },
+        ...[[t('briefing.milestones'), 'milestones', pack.milestones, 'good'], [t('briefing.refutations'), 'refutations', pack.refutations, 'danger']].map(([title, keyId, page, accent]) =>
+          h('div', { key: keyId, className: 'ai4m-subgroup' }, h('h4', null, title), h(Cards, { page, itemKey: 'event_seq', t, card: (item, key) =>
+            h('article', { key, className: 'ai4m-card', 'data-accent': accent },
+              h('h4', null, text(item.claim?.title ?? item.claim_id, na)),
+              h('div', { className: 'ai4m-meta' },
+                item.new_local_trust && badge(item.new_local_trust, trustTone(item.new_local_trust)),
+                h('span', { className: 'ai4m-muted' }, t('briefing.eventNum', { seq: countOf(item.event_seq, na) }))),
+              h(MathCard, { informal: item.claim?.informal_statement, formal: item.claim?.formal_signature,
+                target: item.claim?.formal_target, t }),
+              item.graveyard_id && h('div', { className: 'ai4m-card-foot' }, labelValue(t('briefing.graveyardWitness'), h('code', null, text(item.graveyard_id, na)), na))) })))),
+      h(Section, { title: t('briefing.frontierClaims') }, h(Cards, { page: pack.frontier, itemKey: 'claim_id', t,
+        card: (claim, key) => h(ClaimCard, { claim, key, t }) })),
+      h(PlanSlice, { page: pack.frontier?.plans, t }),
+      h(Section, { title: t('briefing.recentEvents') }, h(EventList, { page: pack.events, t })),
+      h(Section, { title: t('briefing.breakers') }, h(Cards, { page: pack.breakers, itemKey: 'breaker_id', t,
+        card: (item, key) => h(BreakerCard, { item, key, projectRoot: resolvedRoot, t }) })),
+      h(Section, { title: t('briefing.inbox') }, h(Cards, { page: pack.inbox, itemKey: 'inbox_id', t,
+        card: (item, key) => h(InboxCard, { item, key, projectRoot: resolvedRoot, t }) }))))
 }
 
-function Frontier({ remote, live }) {
+function Frontier({ remote, live, projectRoot, wbStore, i18n }) {
+  const { t } = useI18n(i18n)
   const query = useQuery(remote)
   const { phase, snapshot, snapshotStale, breaker } = useSyncExternalStore(live.subscribe, live.getSnapshot)
+  const store = wbStore ?? EMPTY_STORE
+  const wbSnap = useSyncExternalStore(store.subscribe, store.getSnapshot)
+  const resolvedRoot = projectRoot ?? store.activeProject(wbSnap?.data)?.root ?? null
   const refresh = useCallback(() => void query.run('frontierList', { limit: 32 }), [query.run])
   useEffect(refresh, [refresh])
-  return h(Panel, { title: 'Active frontier', subtitle: 'A bounded claim and dependency slice, not the full proof DAG.',
-    actions: button('Refresh', refresh, query.phase === 'loading') },
-    h(Section, { title: 'Circuit breakers' },
+  return h(Panel, { title: t('frontier.title'), subtitle: t('frontier.subtitle'),
+    actions: button(t('common.refresh'), refresh, query.phase === 'loading') },
+    h(Section, { title: t('briefing.breakers') },
       h('div', { className: 'ai4m-summary-row' },
-        h(BreakerTotals, { snapshot }),
-        (phase !== 'live' || snapshotStale) && h('span', { className: 'ai4m-muted' }, '· Live status unavailable or stale')),
-      phase === 'live' && breaker && h(BreakerSignal, { event: breaker }),
-      note('Read-only. To review stored breaker records, use Briefing → Peek.')),
-    queryNote(query, 'Waiting for frontier…'),
-    query.value && h(Section, { title: 'Claims' }, h(Cards, { page: query.value, itemKey: 'claim_id',
-      card: (claim, key) => h(ClaimCard, { claim, key }) })),
-    query.value && h(PlanSlice, { page: query.value.plans }))
+        h(BreakerTotals, { snapshot, t }),
+        (phase !== 'live' || snapshotStale) && h('span', { className: 'ai4m-muted' }, t('frontier.staleSuffix'))),
+      phase === 'live' && breaker && h(BreakerSignal, { event: breaker, t }),
+      note(t('frontier.readOnlyNote'))),
+    queryNote(query, t('frontier.waiting'), t),
+    query.value && h(Section, { title: t('frontier.claims') }, h(Cards, { page: query.value, itemKey: 'claim_id', t,
+      card: (claim, key) => h(ClaimCard, { claim, key, t }) })),
+    query.value && h(PlanSlice, { page: query.value.plans, t }),
+    resolvedRoot && breaker && h(CliHelper, { commands: buildBreakerCommands(breaker.payload ?? breaker, resolvedRoot, t), t }))
 }
 
-function Inbox({ remote }) {
+function Inbox({ remote, projectRoot, wbStore, i18n }) {
+  const { t } = useI18n(i18n)
   const query = useQuery(remote)
+  const store = wbStore ?? EMPTY_STORE
+  const wbSnap = useSyncExternalStore(store.subscribe, store.getSnapshot)
+  const resolvedRoot = projectRoot ?? store.activeProject(wbSnap?.data)?.root ?? null
   const refresh = useCallback(() => void query.run('inboxList', { limit: 32 }), [query.run])
   useEffect(refresh, [refresh])
-  return h(Panel, { title: 'Decision inbox', subtitle: 'Pending decisions only. This panel does not submit decisions.',
-    actions: button('Refresh', refresh, query.phase === 'loading') },
-    queryNote(query, 'Waiting for inbox…'),
-    query.value && h(Cards, { page: query.value, itemKey: 'inbox_id', emptyText: 'No pending decisions.',
-      card: (item, key) => h(InboxCard, { item, key }) }))
+  return h(Panel, { title: t('inbox.title'), subtitle: t('inbox.subtitle'),
+    actions: button(t('common.refresh'), refresh, query.phase === 'loading') },
+    queryNote(query, t('inbox.waiting'), t),
+    query.value && h(Cards, { page: query.value, itemKey: 'inbox_id', emptyText: t('inbox.empty'), t,
+      card: (item, key) => h(InboxCard, { item, key, projectRoot: resolvedRoot, t }) }))
 }
 
 const provenanceIdSchema = REMOTE_METHODS.wikiProvenance.params.properties.id
@@ -971,64 +2001,60 @@ const validProvenanceId = id => typeof id === 'string'
   && new TextEncoder().encode(id).byteLength <= provenanceIdSchema['x-ai4math-maxUtf8Bytes']
   && new RegExp(provenanceIdSchema.pattern, 'u').test(id)
 
-// Identity comes from the reserved index namespace, not from L5 or the
-// response-wide generation flag. Provenance endpoints have no file_path.
 const managedCorePath = '.managed-core/'
 const isDerivedCore = (id, stratum) => stratum === 'core'
   && typeof id === 'string' && /^CORE-ADAPT-[0-9a-f]{64}$/.test(id)
 
-function wikiCoverageNote(value, surface) {
-  if (value.managed_core === true) return banner(surface === 'search'
-    ? 'Derived CORE was checked for this search. Search again to check for changes.'
-    : 'Derived CORE lineage was checked for this response. Inspect again to check for changes.')
-  if (value.managed_core !== false) return banner('Derived CORE coverage was not reported for this ' + surface + '.')
-  return banner(surface === 'search'
-    ? 'Static Wiki only; derived CORE entries were not included.'
-    : 'Static Wiki lineage only; derived CORE edges were not included.')
+function wikiCoverageNote(value, surface, t = DEFAULT_I18N.t) {
+  if (value.managed_core === true) return banner(surface === 'search' ? t('wiki.covSearchYes') : t('wiki.covProvYes'))
+  if (value.managed_core !== false) return banner(surface === 'search' ? t('wiki.covUnknownSearch') : t('wiki.covUnknownProv'))
+  return banner(surface === 'search' ? t('wiki.covStaticSearch') : t('wiki.covStaticProv'))
 }
 
-function WikiCard({ hit, inspectProvenance }) {
+function WikiCard({ hit, inspectProvenance, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
   const hasPath = typeof hit.file_path === 'string'
   const virtual = hasPath && hit.file_path.startsWith(managedCorePath)
   const derived = virtual && isDerivedCore(hit.id, hit.stratum) && hit.file_path === managedCorePath + hit.id
   return h('article', { className: 'ai4m-card', 'data-accent': derived ? 'brand' : undefined },
-    h('h4', null, text(hit.title, text(hit.id, 'Untitled Wiki entry'))),
-    h('div', { className: 'ai4m-meta' }, h('code', null, text(hit.id)), badge(text(hit.engine), 'muted'),
-      badge(derived ? 'Derived CORE' : text(hit.stratum), derived ? 'brand' : undefined),
-      badge((derived ? 'Indexed trust ' : '') + text(hit.trust_level), trustTone(hit.trust_level)),
-      badge(text(hit.status), 'muted')),
-    h(MathCard, { informal: hit.informal_gloss, formal: hit.formal_signature }),
+    h('h4', null, text(hit.title, text(hit.id, t('wiki.untitled')))),
+    h('div', { className: 'ai4m-meta' }, h('code', null, text(hit.id, na)), badge(text(hit.engine, na), 'muted'),
+      badge(derived ? t('wiki.derivedCore') : text(hit.stratum, na), derived ? 'brand' : undefined),
+      badge(derived ? t('wiki.indexedTrust', { trust: text(hit.trust_level, na) }) : text(hit.trust_level, na), trustTone(hit.trust_level)),
+      badge(text(hit.status, na), 'muted')),
+    h(MathCard, { informal: hit.informal_gloss, formal: hit.formal_signature, t }),
     (hasPath || (derived && typeof hit.verified_at_commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hit.verified_at_commit)))
       && h('div', { className: 'ai4m-card-foot' },
-        hasPath && labelValue(virtual ? 'Virtual index location' : 'Source path', h('code', null, hit.file_path)),
+        hasPath && labelValue(virtual ? t('wiki.virtualLocation') : t('wiki.sourcePath'), h('code', null, hit.file_path), na),
         derived && typeof hit.verified_at_commit === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(hit.verified_at_commit)
-          && labelValue('Verified at Git commit', h('code', null, hit.verified_at_commit))),
-    derived && banner('This derived index record is not an authored Wiki page or a proof source.'),
+          && labelValue(t('wiki.verifiedCommit'), h('code', null, hit.verified_at_commit), na)),
+    derived && banner(t('wiki.derivedNote')),
     validProvenanceId(hit.id) && h('div', { className: 'ai4m-actions' },
-      button('Inspect provenance for ' + hit.id, () => inspectProvenance(hit.id, derived))))
+      button(t('wiki.inspectProv', { id: hit.id }), () => inspectProvenance(hit.id, derived))))
 }
 
-function WikiProvenance({ target, query, sectionRef, onClose }) {
+function WikiProvenance({ target, query, sectionRef, onClose, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
   const edges = rows(query.value?.edges, 24)
   const hasDerived = target.derived || edges.some(edge => isDerivedCore(edge.src_id, edge.src_stratum)
     || isDerivedCore(edge.dst_id, edge.dst_stratum))
-  const endpoint = (value, stratum) => h('span', null, h('code', null, text(value)), ' ',
-    badge(isDerivedCore(value, stratum) ? 'Derived CORE' : text(stratum, 'Outside index'),
+  const endpoint = (value, stratum) => h('span', null, h('code', null, text(value, na)), ' ',
+    badge(isDerivedCore(value, stratum) ? t('wiki.derivedCore') : text(stratum, t('wiki.outsideIndex')),
       isDerivedCore(value, stratum) ? 'brand' : 'muted'))
   return h('section', { ref: sectionRef, className: 'ai4m-section ai4m-provenance' },
     h('div', { className: 'ai4m-provenance-head' },
-      h('h3', null, 'Provenance for ' + target.id),
-      onClose && button('Close', onClose)),
-    note('Read-only lineage across strata; recorded edges do not confer proof status.'),
-    hasDerived && banner('Derived CORE nodes are index records, not authored Wiki pages or proof sources.'),
-    queryNote(query),
-    query.value && wikiCoverageNote(query.value, 'provenance response'),
+      h('h3', null, t('wiki.provTitle', { id: target.id })),
+      onClose && button(t('common.close'), onClose)),
+    note(t('wiki.provNote')),
+    hasDerived && banner(t('wiki.provDerivedNote')),
+    queryNote(query, null, t),
+    query.value && wikiCoverageNote(query.value, 'provenance response', t),
     query.phase === 'done' && (edges.length ? h('ol', { className: 'ai4m-edges' }, edges.map((edge, index) =>
       h('li', { key: index }, endpoint(edge.src_id, edge.src_stratum), ' → ', endpoint(edge.dst_id, edge.dst_stratum),
-        ' · ', text(edge.edge_type), ' · ', labelValue('Hops', count(edge.depth)),
-        edge.metadata && Object.keys(edge.metadata).length > 0 && h(Evidence, { title: 'Indexed edge metadata', value: edge.metadata }))))
-      : empty('No edges returned for this slice.')),
-    query.value?.truncated === true && note('Only a bounded provenance slice is shown.'))
+        ' · ', text(edge.edge_type, na), ' · ', labelValue(t('wiki.hops'), countOf(edge.depth, na), na),
+        edge.metadata && Object.keys(edge.metadata).length > 0 && h(Evidence, { title: t('wiki.edgeMeta'), value: edge.metadata }))))
+      : empty(t('wiki.noEdges'), t)),
+    query.value?.truncated === true && note(t('wiki.boundedProv')))
 }
 
 function validRouteLesson(record) {
@@ -1046,22 +2072,25 @@ function validRouteLesson(record) {
     && Array.from(record.plan_ids).every(id => bounded(id, 256)) && new Set(record.plan_ids).size === record.plan_ids.length
 }
 
-function RouteLessons({ entries, truncated }) {
+function RouteLessons({ entries, truncated, t = DEFAULT_I18N.t }) {
+  const na = t('common.na')
   if (entries.length === 0 && !truncated) return null
-  return h(Section, { title: 'Operator route lessons' },
-    banner('Historical warnings only. These lessons are not proofs or mathematical refutations.', 'warn'),
+  return h(Section, { title: t('wiki.lessonsTitle') },
+    banner(t('wiki.lessonsNote'), 'warn'),
     ...entries.map(item => h('article', { key: item.lesson_id, className: 'ai4m-card', 'data-accent': 'warn' },
       h('h4', null, item.title),
-      h('div', { className: 'ai4m-meta' }, badge('L0 · advisory only', 'warn')),
+      h('div', { className: 'ai4m-meta' }, badge(t('wiki.lessonBadge'), 'warn')),
       h('p', null, item.lesson),
       h('div', { className: 'ai4m-card-foot' },
-        labelValue('Lesson', h('code', null, item.lesson_id)),
-        labelValue('Approved ADR', h('code', null, item.adr_id)),
-        labelValue('Archived routes', item.plan_ids.join(', '))))),
-    truncated && note('Only a bounded route lesson slice is shown.'))
+        labelValue(t('wiki.lessonLabel'), h('code', null, item.lesson_id), na),
+        labelValue(t('wiki.approvedAdr'), h('code', null, item.adr_id), na),
+        labelValue(t('wiki.archivedRoutes'), item.plan_ids.join(', '), na)))),
+    truncated && note(t('wiki.boundedLessons')))
 }
 
-function Wiki({ remote }) {
+function Wiki({ remote, i18n }) {
+  const { t } = useI18n(i18n)
+  const na = t('common.na')
   const query = useQuery(remote)
   const provenance = useQuery(remote)
   const [provenanceTarget, setProvenanceTarget] = useState(null)
@@ -1089,47 +2118,780 @@ function Wiki({ remote }) {
     setProvenanceTarget({ id, derived })
     void provenance.run('wikiProvenance', { id, max_depth: 2, limit: 24 })
   }
-  return h(Panel, { title: 'Math Wiki', subtitle: 'Search CORE first; inspect SEDIMENT and GRAVEYARD as separate strata.' },
+  return h(Panel, { title: t('wiki.title'), subtitle: t('wiki.subtitle') },
     h('form', { className: 'ai4m-search-form', onSubmit: event => { event.preventDefault(); submit(term, scope) } },
-      h('label', { className: 'ai4m-field ai4m-field--grow' }, 'Query ', h('input', { type: 'search', value: input, maxLength: 512,
-        placeholder: 'Title, mathematical phrase, or ID…',
+      h('label', { className: 'ai4m-field ai4m-field--grow' }, t('wiki.query') + ' ', h('input', { type: 'search', value: input, maxLength: 512,
+        placeholder: t('wiki.queryPlaceholder'),
         onChange: event => setInput(event.target.value), required: true })),
-      h('label', { className: 'ai4m-field' }, 'Scope ', h('select', { value: scope, onChange: event => setScope(event.target.value) },
+      h('label', { className: 'ai4m-field' }, t('wiki.scope') + ' ', h('select', { value: scope, onChange: event => setScope(event.target.value) },
         WIKI_SCOPES.map(value => h('option', { key: value, value }, value.toUpperCase())))),
-      h('button', { className: 'ai4m-button', 'data-variant': 'primary', type: 'submit', disabled: busy || !term || invalid }, 'Search')),
-    invalid && banner('Queries must be at most 512 UTF-8 bytes and cannot contain a NUL character.', 'warn', 'status'),
-    queryNote(query, 'Enter a title, mathematical phrase, or identifier.'),
-    query.value && searched && h('p', { className: 'ai4m-results-head' }, 'Results for “' + searched.term + '” · ' + searched.stratum.toUpperCase()),
-    query.value && searched?.stratum === 'core' && wikiCoverageNote(query.value, 'search'),
-    query.value && searched?.stratum === 'graveyard' && banner('Graveyard matches are historical warnings, not verified evidence.', 'warn'),
+      h('button', { className: 'ai4m-button', 'data-variant': 'primary', type: 'submit', disabled: busy || !term || invalid }, t('wiki.search'))),
+    invalid && banner(t('wiki.invalidQuery'), 'warn', 'status'),
+    queryNote(query, t('wiki.idle'), t),
+    query.value && searched && h('p', { className: 'ai4m-results-head' }, t('wiki.resultsFor', { term: searched.term, stratum: searched.stratum.toUpperCase() })),
+    query.value && searched?.stratum === 'core' && wikiCoverageNote(query.value, 'search', t),
+    query.value && searched?.stratum === 'graveyard' && banner(t('wiki.graveyardWarn'), 'warn'),
     provenanceTarget && h(WikiProvenance, {
-      target: provenanceTarget, query: provenance, sectionRef: provenanceRef, onClose: () => setProvenanceTarget(null),
+      target: provenanceTarget, query: provenance, sectionRef: provenanceRef, onClose: () => setProvenanceTarget(null), t,
     }),
     query.value && (hits.length > 0 ? h('div', { className: 'ai4m-stack' },
-      hits.map((hit, index) => h(WikiCard, { key: text(hit.id, 'hit') + ':' + index, hit, inspectProvenance })))
-      : (lessonRows.length === 0 && !routeLessonsTruncated && empty('No matching records returned.'))),
-    h(RouteLessons, { entries: lessonRows, truncated: routeLessonsTruncated }),
-    query.value?.truncated === true && note('Only a bounded search slice is shown.'),
+      hits.map((hit, index) => h(WikiCard, { key: text(hit.id, 'hit') + ':' + index, hit, inspectProvenance, t })))
+      : (lessonRows.length === 0 && !routeLessonsTruncated && empty(t('wiki.noMatch'), t))),
+    h(RouteLessons, { entries: lessonRows, truncated: routeLessonsTruncated, t }),
+    query.value?.truncated === true && note(t('wiki.boundedSearch')),
     shadow && searched && h('details', null,
-      h('summary', null, 'Shadow hint · SEDIMENT ' + count(shadow.sediment_count) + ' / GRAVEYARD ' + count(shadow.graveyard_count)),
+      h('summary', null, t('wiki.shadowSummary', { sed: countOf(shadow.sediment_count, na), grv: countOf(shadow.graveyard_count, na) })),
       h('div', { className: 'ai4m-shadow-body' },
-        shadow.top_sediment && note('Closest sediment lead: ' + text(shadow.top_sediment.title, text(shadow.top_sediment.id))),
-        shadow.top_graveyard_id && note('Graveyard warning: ' + text(shadow.top_graveyard_id) + ' is historical, not verified evidence.'),
+        shadow.top_sediment && note(t('wiki.shadowSediment', { label: text(shadow.top_sediment.title, text(shadow.top_sediment.id, na)) })),
+        shadow.top_graveyard_id && note(t('wiki.shadowGraveyard', { id: text(shadow.top_graveyard_id, na) })),
         h('div', { className: 'ai4m-actions' },
-          ...['sediment', 'graveyard'].map(stratum => h('span', { key: stratum }, button('Search ' + stratum.toUpperCase(), () => {
+          ...['sediment', 'graveyard'].map(stratum => h('span', { key: stratum }, button(t('wiki.searchStratum', { stratum: stratum.toUpperCase() }), () => {
             setInput(searched.term); setScope(stratum); submit(searched.term, stratum)
           }, busy || !(shadow[stratum + '_count'] > 0))))))))
 }
 
 module.exports = { LiveHud, panels, views: { briefing: Briefing, frontier: Frontier, inbox: Inbox, wiki: Wiki },
+  trustTape, BreakerTotals, AlertCatchUp,
   MathCard, ClaimCard, InboxCard, WikiCard, EvidenceText }
+},
+"./workbench-store.cjs": (module, exports, require) => {
+const { call } = require('./remote.cjs')
+
+function normalizeDir(value) {
+  if (typeof value !== 'string' || value.length === 0) return null
+  return value.length > 1 && value.endsWith('/') ? value.slice(0, -1) : value
+}
+
+function matchProjectForCwd(projects, cwd) {
+  const cleanCwd = normalizeDir(cwd)
+  if (!cleanCwd || !Array.isArray(projects)) return null
+  // Prefer the deepest matching project root if nested.
+  let best = null
+  for (const project of projects) {
+    const root = normalizeDir(project?.root)
+    if (!root) continue
+    if (cleanCwd === root || cleanCwd.startsWith(root + '/')) {
+      if (!best || root.length > best.root.length) best = project
+    }
+  }
+  return best
+}
+
+function createWorkbenchStore(remote) {
+  const listeners = new Set()
+  let state = {
+    phase: 'idle',
+    data: null,
+    busy: false,
+    notice: null,
+    currentSession: { sessionId: null, cwd: null },
+  }
+  let controller = null
+  let disposed = false
+
+  function emit(next) {
+    state = next
+    for (const fn of [...listeners]) fn()
+  }
+
+  function activeProject(data = state.data) {
+    if (!data || !Array.isArray(data.projects)) return null
+    return data.projects.find(p => p.id === data.active_project_id)
+      ?? data.projects.find(p => p.active)
+      ?? null
+  }
+
+  function mismatchedProject(snapshot = state) {
+    const { data, currentSession } = snapshot
+    if (!data || !currentSession?.cwd) return null
+    const matched = matchProjectForCwd(data.projects, currentSession.cwd)
+    if (!matched) return null
+    if (matched.id === data.active_project_id || matched.active) return null
+    return matched
+  }
+
+  async function invoke(method, params, { setBusy = true, successNotice } = {}) {
+    if (disposed || typeof remote?.[method] !== 'function') return null
+    if (setBusy) emit({ ...state, busy: true, notice: null })
+    const owner = new AbortController()
+    const prev = controller
+    if (method === 'workbenchState') {
+      prev?.abort()
+      controller = owner
+    }
+    try {
+      const value = await call(remote, method, params, owner.signal)
+      if (disposed || owner.signal.aborted) return null
+      const nextData = method === 'workbenchState' ? value : (value.state ?? state.data)
+      let notice = state.notice
+      if (method !== 'workbenchState') {
+        if (value.ok === false) {
+          notice = {
+            tone: 'danger',
+            key: typeof value.code === 'string' ? 'err.' + value.code : 'notice.actionFailed',
+            fallback: typeof value.message === 'string' ? value.message : undefined,
+          }
+        } else if (successNotice) {
+          const built = typeof successNotice === 'function' ? successNotice(value) : successNotice
+          notice = { tone: 'good', ...built }
+        }
+      }
+      emit({
+        ...state,
+        phase: 'ready',
+        data: nextData,
+        busy: false,
+        notice,
+      })
+      return value
+    } catch {
+      if (disposed || owner.signal.aborted) return null
+      emit({
+        ...state,
+        phase: state.data ? 'ready' : 'error',
+        busy: false,
+        notice: method === 'workbenchState'
+          ? state.notice
+          : { tone: 'danger', key: 'notice.requestFailed' },
+      })
+      return null
+    } finally {
+      if (controller === owner) controller = null
+    }
+  }
+
+  return Object.freeze({
+    subscribe(fn) {
+      listeners.add(fn)
+      return () => listeners.delete(fn)
+    },
+    getSnapshot: () => state,
+    activeProject,
+    mismatchedProject,
+    start() {
+      disposed = false
+      if (typeof remote?.workbenchState === 'function') void invoke('workbenchState', {}, { setBusy: false })
+      return () => {
+        disposed = true
+        controller?.abort()
+        controller = null
+      }
+    },
+    refresh: () => invoke('workbenchState', {}, { setBusy: false }),
+    projectInit: (params) => invoke('projectInit', params, {
+      successNotice: res => ({
+        key: res.initialized ? 'notice.initNew' : 'notice.initAdopt',
+        vars: { name: res.project?.name ?? 'math' },
+      }),
+    }),
+    projectSelect: (params) => invoke('projectSelect', params, {
+      successNotice: res => ({ key: 'notice.switched', vars: { name: res.project?.name ?? 'math' } }),
+    }),
+    projectRemove: (params) => invoke('projectRemove', params, {
+      successNotice: { key: 'notice.removed' },
+    }),
+    daemonStart: (params = {}) => invoke('daemonStart', params, {
+      successNotice: res => ({ key: res.mode === 'external' ? 'notice.daemonExternal' : 'notice.daemonManaged' }),
+    }),
+    daemonStop: (params = {}) => invoke('daemonStop', params, {
+      successNotice: { key: 'notice.daemonStopped' },
+    }),
+    setCurrentSession(sessionId, cwd) {
+      const nextId = typeof sessionId === 'string' && sessionId.length > 0 ? sessionId : null
+      const nextCwd = normalizeDir(cwd)
+      if (state.currentSession.sessionId === nextId && state.currentSession.cwd === nextCwd) return
+      emit({ ...state, currentSession: { sessionId: nextId, cwd: nextCwd } })
+    },
+    setNotice(tone, keyOrText, vars) {
+      if (!tone || !keyOrText) {
+        emit({ ...state, notice: null })
+        return
+      }
+      emit({ ...state, notice: { tone, key: keyOrText, vars } })
+    },
+    clearNotice() {
+      if (state.notice !== null) emit({ ...state, notice: null })
+    },
+  })
+}
+
+function resolveNoticeText(notice, t) {
+  if (!notice) return ''
+  if (typeof notice.key === 'string') {
+    const translated = t(notice.key, notice.vars)
+    if (translated !== notice.key) return translated
+  }
+  return notice.fallback ?? notice.text ?? t('notice.actionFailed')
+}
+
+module.exports = { createWorkbenchStore, matchProjectForCwd, normalizeDir, resolveNoticeText }
+},
+"./workbench.cjs": (module, exports, require) => {
+const { createElement: h, useCallback, useEffect, useState, useSyncExternalStore } = require('react')
+const { views, trustTape, BreakerTotals, AlertCatchUp } = require('./views.cjs')
+const { matchProjectForCwd, normalizeDir, resolveNoticeText } = require('./workbench-store.cjs')
+const { useI18n } = require('./i18n.cjs')
+
+const ENGINES = ['lean4', 'agda', 'rocq']
+const ENGINE_LABELS = { lean4: 'Lean 4', agda: 'Agda', rocq: 'Rocq' }
+const TABS = [
+  { id: 'overview', labelKey: 'wb.tab.overview' },
+  { id: 'briefing', labelKey: 'wb.tab.briefing' },
+  { id: 'frontier', labelKey: 'wb.tab.frontier' },
+  { id: 'inbox', labelKey: 'wb.tab.inbox' },
+  { id: 'wiki', labelKey: 'wb.tab.wiki' },
+  { id: 'setup', labelKey: 'wb.tab.setup' },
+]
+
+const noopHook = () => null
+const identity = value => value
+const utf8Bytes = value => new TextEncoder().encode(String(value)).byteLength
+const isCount = value => Number.isSafeInteger(value) && value >= 0
+const countOf = (value, na) => isCount(value) ? String(value) : na
+const pctOf = (value, na) => typeof value === 'number' && Number.isFinite(value) && value >= 0 && value <= 100
+  ? Math.round(value) + '%' : na
+const badge = (label, tone, title) => h('span', { className: 'ai4m-badge', 'data-tone': tone, ...(title ? { title } : {}) }, label)
+
+function daemonBadgeMeta(status, t) {
+  switch (status) {
+    case 'managed': return { label: t('wb.daemonManaged'), tone: 'good', title: t('wb.daemonManagedTitle') }
+    case 'external': return { label: t('wb.daemonExternal'), tone: 'good', title: t('wb.daemonExternalTitle') }
+    case 'starting': return { label: t('wb.daemonStarting'), tone: 'warn' }
+    case 'stale': return { label: t('wb.daemonStale'), tone: 'warn' }
+    case 'conflict': return { label: t('wb.daemonConflict'), tone: 'danger' }
+    case 'invalid': return { label: t('wb.daemonInvalid'), tone: 'danger' }
+    default: return { label: t('wb.daemonStopped'), tone: 'muted' }
+  }
+}
+
+function Ai4mathNavIcon({ size = 16 }) {
+  return h('svg', {
+    width: size,
+    height: size,
+    viewBox: '0 0 24 24',
+    fill: 'none',
+    stroke: 'currentColor',
+    strokeWidth: 1.8,
+    strokeLinecap: 'round',
+    strokeLinejoin: 'round',
+    'aria-hidden': true,
+  },
+  h('circle', { cx: 6, cy: 6, r: 2.5 }),
+  h('circle', { cx: 18, cy: 6, r: 2.5 }),
+  h('circle', { cx: 12, cy: 18, r: 2.5 }),
+  h('path', { d: 'M8.2 7.2L10.8 15.6M15.8 7.2L13.2 15.6M8.5 6H15.5' }))
+}
+
+function SessionContextChip({ sessionId, useSessions = noopHook, wbStore, i18n }) {
+  const { t } = useI18n(i18n)
+  const sessionList = useSessions(identity)
+  const wbSnap = useSyncExternalStore(wbStore.subscribe, wbStore.getSnapshot)
+  const cwd = sessionId ? (sessionList?.byId?.[sessionId]?.cwd ?? null) : null
+  useEffect(() => {
+    wbStore.setCurrentSession(sessionId || null, cwd)
+    return () => wbStore.setCurrentSession(null, null)
+  }, [sessionId, cwd, wbStore])
+  const mismatched = wbStore.mismatchedProject(wbSnap)
+  if (!mismatched) return null
+  return h('span', { className: 'ai4m ai4m-session-chip' },
+    h('button', {
+      type: 'button',
+      className: 'ai4m-button',
+      'data-variant': 'primary',
+      disabled: wbSnap.busy,
+      title: t('wb.sessionChipTitle', { root: mismatched.root }),
+      onClick: () => void wbStore.projectSelect({ project_id: mismatched.id, auto_start: true }),
+    }, wbSnap.busy ? t('hud.switching') : t('wb.sessionChip', { name: mismatched.name })))
+}
+
+function resolveLinkedSessions(projectRoot, workspaceSnap, sessionSnap, blankLabel) {
+  const root = normalizeDir(projectRoot)
+  if (!root || !sessionSnap?.byId) return []
+  const archived = new Set(workspaceSnap?.archivedSessionIds ?? [])
+  const ws = (workspaceSnap?.items ?? []).find(item => normalizeDir(item?.path) === root)
+  const seen = new Set()
+  const items = []
+  const pushId = (id) => {
+    if (!id || seen.has(id) || archived.has(id)) return
+    const summary = sessionSnap.byId[id]
+    if (!summary || summary.origin === 'subagent') return
+    seen.add(id)
+    const projValues = sessionSnap.projectionsBySession?.[id]?.values
+    const title = projValues?.sessionTitle ?? summary.projections?.sessionTitle ?? (summary.blank ? blankLabel : id.slice(0, 14))
+    const preset = projValues?.agentPreset ?? summary.projections?.agentPreset ?? null
+    items.push({
+      sessionId: id,
+      title: typeof title === 'string' && title.trim() ? title.trim() : id.slice(0, 14),
+      preset: typeof preset === 'string' && preset.trim() ? preset.trim() : null,
+      running: summary.running === true,
+      blank: summary.blank === true,
+      updatedAt: typeof summary.updatedAt === 'number' ? summary.updatedAt : 0,
+    })
+  }
+  for (const id of ws?.sessionIds ?? []) pushId(id)
+  for (const id of sessionSnap.ids ?? Object.keys(sessionSnap.byId)) {
+    const cwd = normalizeDir(sessionSnap.byId[id]?.cwd)
+    if (cwd && (cwd === root || cwd.startsWith(root + '/'))) pushId(id)
+  }
+  items.sort((a, b) => b.updatedAt - a.updatedAt)
+  return items.slice(0, 12)
+}
+
+function formatUpdated(timestamp, t) {
+  if (!timestamp || !Number.isFinite(timestamp)) return ''
+  const deltaSec = Math.max(0, Math.floor((Date.now() - timestamp) / 1000))
+  if (deltaSec < 60) return t('wb.justNow')
+  if (deltaSec < 3600) return t('wb.minsAgo', { n: Math.floor(deltaSec / 60) })
+  if (deltaSec < 86400) return t('wb.hoursAgo', { n: Math.floor(deltaSec / 3600) })
+  return t('wb.daysAgo', { n: Math.floor(deltaSec / 86400) })
+}
+
+function Workbench({ remote, live, wbStore, actions, i18n, useWorkspaces = noopHook, useSessions = noopHook }) {
+  const { t } = useI18n(i18n)
+  const na = t('common.na')
+  const wbSnap = useSyncExternalStore(wbStore.subscribe, wbStore.getSnapshot)
+  const liveSnap = useSyncExternalStore(live.subscribe, live.getSnapshot)
+  const workspaceSnap = useWorkspaces(identity)
+  const sessionSnap = useSessions(identity)
+
+  const [tab, setTab] = useState('overview')
+  const [showNewForm, setShowNewForm] = useState(false)
+  const [rootInput, setRootInput] = useState('')
+  const [nameInput, setNameInput] = useState('')
+  const [engineInput, setEngineInput] = useState('lean4')
+  const [autoStart, setAutoStart] = useState(true)
+  const [launching, setLaunching] = useState(false)
+  const [picking, setPicking] = useState(false)
+  const [refreshing, setRefreshing] = useState(false)
+  const [confirmRemoveId, setConfirmRemoveId] = useState(null)
+
+  useEffect(() => {
+    void wbStore.refresh()
+  }, [wbStore])
+
+  const data = wbSnap.data
+  const projects = Array.isArray(data?.projects) ? data.projects : []
+  const activeProject = wbStore.activeProject(data)
+  const unmanaged = !activeProject ? data?.unmanaged_active : null
+  const activeRoot = activeProject?.root ?? unmanaged?.root ?? null
+  const activeKey = activeProject?.id ?? activeRoot ?? '__none'
+  const activeName = activeProject?.name ?? (unmanaged?.root ? unmanaged.root.split('/').filter(Boolean).at(-1) : null) ?? 'AI4Math'
+  const daemonStatus = activeProject?.daemon_status ?? unmanaged?.daemon_status ?? 'stopped'
+  const daemonMeta = daemonBadgeMeta(daemonStatus, t)
+  const chiefPreset = data?.chief_preset ?? 'ai4math-chief'
+  const socketLimit = data?.socket_limit_bytes ?? 103
+  const trimmedRoot = rootInput.trim()
+  const previewSocketBytes = trimmedRoot ? utf8Bytes(trimmedRoot.replace(/\/+$/, '') + '/.runtime/ai4mathd.sock') : 0
+  const pathTooLong = previewSocketBytes > socketLimit
+
+  const binariesMissing = Boolean(data && (!data.binaries?.cli_ready || !data.binaries?.daemon_ready))
+  const daemonUnavailableTitle = !data?.binaries?.daemon_ready ? t('wb.daemonMissingTitle') : undefined
+
+  const snapshot = liveSnap.snapshot
+  const snapshotFresh = liveSnap.phase === 'live' && !liveSnap.snapshotStale
+  const hudOffline = !activeRoot || daemonStatus === 'stopped' || daemonStatus === 'stale'
+  const hudBadgeLabel = snapshotFresh ? t('wb.hudLive')
+    : hudOffline ? t('wb.hudOffline')
+    : (liveSnap.phase === 'reconnecting' ? t('hud.reconnecting') : t('hud.connecting'))
+  const hudBadgeTone = snapshotFresh ? 'good' : hudOffline ? 'muted' : 'warn'
+
+  const pendingTotal = ['P0', 'P1', 'P2'].reduce((sum, p) => {
+    const n = snapshot?.pending_inbox?.[p]
+    return sum + (isCount(n) ? n : 0)
+  }, 0)
+  const linkedSessions = resolveLinkedSessions(activeRoot, workspaceSnap, sessionSnap, t('wb.blankSession'))
+  const busy = wbSnap.busy || launching
+
+  const handleRefresh = useCallback(async () => {
+    setRefreshing(true)
+    try { await wbStore.refresh() }
+    finally { setRefreshing(false) }
+  }, [wbStore])
+
+  const handlePickFolder = useCallback(async () => {
+    if (!actions?.pickDirectory || picking) return
+    setPicking(true)
+    try {
+      const result = await actions.pickDirectory()
+      const picked = typeof result === 'string' ? result : result?.path
+      if (typeof picked === 'string' && picked.length > 0) {
+        setRootInput(picked)
+        setNameInput(prev => prev.trim() ? prev : (picked.split('/').filter(Boolean).at(-1) ?? ''))
+        setShowNewForm(true)
+      } else if (result?.error) {
+        wbStore.setNotice('warn', 'wb.pickerUnavailable')
+      }
+    } finally {
+      setPicking(false)
+    }
+  }, [actions, picking, wbStore])
+
+  const handleCreateProject = useCallback(async (event) => {
+    event.preventDefault()
+    if (!trimmedRoot || pathTooLong || busy) return
+    const params = { root: trimmedRoot, engine: engineInput, auto_start: autoStart }
+    if (nameInput.trim()) params.name = nameInput.trim()
+    const res = await wbStore.projectInit(params)
+    if (res?.ok) {
+      setRootInput('')
+      setNameInput('')
+      setShowNewForm(false)
+    }
+  }, [trimmedRoot, pathTooLong, busy, engineInput, autoStart, nameInput, wbStore])
+
+  const handleLaunchChief = useCallback(async () => {
+    if (!activeRoot || !actions?.openChiefSession) {
+      setShowNewForm(true)
+      wbStore.setNotice('warn', 'wb.selectBeforeChief')
+      return
+    }
+    setLaunching(true)
+    try {
+      if (activeProject && daemonStatus !== 'managed' && daemonStatus !== 'external' && data?.binaries?.daemon_ready) {
+        const started = await wbStore.daemonStart({ project_id: activeProject.id })
+        if (!started?.ok) return
+      }
+      const ok = await actions.openChiefSession({
+        root: activeRoot,
+        preset: chiefPreset,
+        prompt: t('wb.chiefPrompt', { name: activeName }),
+      })
+      if (!ok) {
+        wbStore.setNotice('danger', 'wb.sessionOpenFailed')
+      }
+    } finally {
+      setLaunching(false)
+    }
+  }, [activeRoot, activeProject, activeName, daemonStatus, data, chiefPreset, actions, wbStore, t])
+
+  const handleTabKeyDown = useCallback((event) => {
+    const idx = TABS.findIndex(item => item.id === tab)
+    if (idx < 0) return
+    if (event.key === 'ArrowRight') {
+      event.preventDefault()
+      setTab(TABS[(idx + 1) % TABS.length].id)
+    } else if (event.key === 'ArrowLeft') {
+      event.preventDefault()
+      setTab(TABS[(idx - 1 + TABS.length) % TABS.length].id)
+    }
+  }, [tab])
+
+  const showOnboarding = wbSnap.phase === 'ready' && projects.length === 0 && !unmanaged
+  const effectiveFormOpen = showNewForm || showOnboarding
+
+  return h('section', { className: 'ai4m ai4m-workbench', 'aria-label': t('wb.aria') },
+    h('header', { className: 'ai4m-wb-top' },
+      h('div', { className: 'ai4m-wb-title-row' },
+        h('div', { className: 'ai4m-wb-brand' },
+          h(Ai4mathNavIcon, { size: 18 }),
+          h('div', null,
+            h('h2', null, t('wb.title')),
+            h('p', { className: 'ai4m-muted' }, t('wb.subtitle')))),
+        h('div', { className: 'ai4m-actions' },
+          !showOnboarding && h('button', {
+            type: 'button',
+            className: 'ai4m-button',
+            disabled: busy,
+            onClick: () => setShowNewForm(open => !open),
+          }, effectiveFormOpen ? t('wb.hideProjectForm') : t('wb.newOpenProject')),
+          h('button', {
+            type: 'button',
+            className: 'ai4m-button',
+            'data-variant': 'primary',
+            disabled: busy || !activeRoot,
+            title: activeRoot ? t('wb.launchChiefTitle', { root: activeRoot, preset: chiefPreset }) : t('wb.selectProjectFirst'),
+            onClick: () => void handleLaunchChief(),
+          }, launching ? t('wb.launchingChief') : t('wb.newChiefSession')))),
+
+      h('div', { className: 'ai4m-wb-bar' },
+        h('label', { className: 'ai4m-wb-select-wrap' },
+          h('span', { className: 'ai4m-muted' }, t('wb.projectLabel')),
+          h('select', {
+            'aria-label': t('wb.projectSelectAria'),
+            value: activeProject?.id ?? '',
+            disabled: busy || projects.length === 0,
+            onChange: event => {
+              const id = event.target.value
+              if (id) void wbStore.projectSelect({ project_id: id, auto_start: true })
+            },
+          },
+          projects.length === 0
+            ? h('option', { value: '' }, unmanaged ? t('wb.externalOption') : t('wb.noProjectsOption'))
+            : [
+                !activeProject && h('option', { key: '__none', value: '' }, t('wb.externalUnlisted')),
+                ...projects.map(project => h('option', { key: project.id, value: project.id },
+                  project.name + ' · ' + (ENGINE_LABELS[project.engine] ?? project.engine) + ' (' + daemonBadgeMeta(project.daemon_status, t).label + ')')),
+              ])),
+        activeProject && badge(ENGINE_LABELS[activeProject.engine] ?? activeProject.engine, 'brand'),
+        badge(daemonMeta.label, daemonMeta.tone, daemonMeta.title),
+        badge(hudBadgeLabel, hudBadgeTone),
+        h('div', { className: 'ai4m-wb-bar-right' },
+          activeProject && daemonStatus === 'managed' && h('button', {
+            type: 'button', className: 'ai4m-button', disabled: busy,
+            onClick: () => void wbStore.daemonStop({ project_id: activeProject.id }),
+          }, t('wb.stopDaemon')),
+          activeProject && daemonStatus !== 'managed' && daemonStatus !== 'external' && h('button', {
+            type: 'button', className: 'ai4m-button',
+            disabled: busy || !data?.binaries?.daemon_ready,
+            title: daemonUnavailableTitle,
+            onClick: () => void wbStore.daemonStart({ project_id: activeProject.id }),
+          }, t('wb.startDaemon')),
+          h('button', {
+            type: 'button', className: 'ai4m-button', disabled: busy || refreshing,
+            onClick: () => void handleRefresh(),
+          }, refreshing ? t('common.refreshing') : t('common.refresh'))))),
+
+    h('nav', {
+      className: 'ai4m-wb-tabs',
+      role: 'tablist',
+      'aria-label': t('wb.tabsAria'),
+      onKeyDown: handleTabKeyDown,
+    },
+    TABS.map(item => h('button', {
+      key: item.id,
+      id: 'ai4m-wb-tab-' + item.id,
+      type: 'button',
+      role: 'tab',
+      'aria-selected': tab === item.id,
+      'aria-controls': 'ai4m-wb-tabpanel',
+      className: 'ai4m-wb-tab',
+      'data-active': tab === item.id ? 'true' : 'false',
+      onClick: () => setTab(item.id),
+    },
+    t(item.labelKey),
+    item.id === 'inbox' && pendingTotal > 0 && badge(String(pendingTotal), (snapshot?.pending_inbox?.P0 ?? 0) > 0 ? 'danger' : 'warn')))),
+
+    h('div', {
+      id: 'ai4m-wb-tabpanel',
+      role: 'tabpanel',
+      'aria-labelledby': 'ai4m-wb-tab-' + tab,
+      className: 'ai4m-wb-body',
+    },
+      wbSnap.phase === 'idle' && h('div', { className: 'ai4m-wb-banners' },
+        h('p', { className: 'ai4m-banner', 'data-tone': 'loading', role: 'status' }, t('wb.loadingState'))),
+      wbSnap.phase === 'error' && !data && h('div', { className: 'ai4m-wb-banners' },
+        h('div', { className: 'ai4m-wb-notice ai4m-banner', 'data-tone': 'danger', role: 'alert' },
+          h('span', null, t('wb.loadError')),
+          h('button', { type: 'button', className: 'ai4m-button', onClick: () => void handleRefresh() }, t('common.retry')))),
+
+      wbSnap.notice && h('div', { className: 'ai4m-wb-banners' },
+        h('div', {
+          className: 'ai4m-wb-notice ai4m-banner',
+          'data-tone': wbSnap.notice.tone,
+          role: wbSnap.notice.tone === 'danger' ? 'alert' : 'status',
+        },
+        h('span', null, resolveNoticeText(wbSnap.notice, t)),
+        h('button', { type: 'button', className: 'ai4m-button', onClick: () => wbStore.clearNotice() }, t('common.dismiss')))),
+
+      binariesMissing && tab !== 'setup' && h('div', { className: 'ai4m-wb-banners' },
+        h('div', { className: 'ai4m-wb-notice ai4m-banner', 'data-tone': 'warn', role: 'status' },
+          h('span', null, t('wb.missingBinaries')),
+          h('button', { type: 'button', className: 'ai4m-button', onClick: () => setTab('setup') }, t('wb.openSetup')))),
+
+      effectiveFormOpen && h('form', { className: 'ai4m-wb-form', onSubmit: handleCreateProject },
+        h('div', { className: 'ai4m-wb-form-head' },
+          h('strong', null, showOnboarding ? t('wb.formOnboardingTitle') : t('wb.formTitle')),
+          h('span', { className: 'ai4m-muted' }, t('wb.formHint'))),
+        h('div', { className: 'ai4m-wb-form-row' },
+          h('label', { className: 'ai4m-field ai4m-field--grow' },
+            t('wb.formDirLabel'),
+            h('div', { className: 'ai4m-wb-path-input' },
+              h('input', {
+                type: 'text',
+                value: rootInput,
+                placeholder: '/Users/you/math/my-problem',
+                required: true,
+                onChange: event => setRootInput(event.target.value),
+              }),
+              actions?.pickDirectory && h('button', {
+                type: 'button', className: 'ai4m-button', disabled: busy || picking, onClick: () => void handlePickFolder(),
+              }, picking ? t('wb.picking') : t('wb.pickFolder')))),
+          h('label', { className: 'ai4m-field' },
+            t('wb.formEngineLabel'),
+            h('select', { value: engineInput, onChange: event => setEngineInput(event.target.value) },
+              ENGINES.map(engine => h('option', { key: engine, value: engine }, ENGINE_LABELS[engine])))),
+          h('label', { className: 'ai4m-field' },
+            t('wb.formNameLabel'),
+            h('input', {
+              type: 'text', value: nameInput, maxLength: 80, placeholder: t('wb.formNamePlaceholder'),
+              onChange: event => setNameInput(event.target.value),
+            }))),
+        h('div', { className: 'ai4m-wb-form-foot' },
+          h('label', { className: 'ai4m-check' },
+            h('input', { type: 'checkbox', checked: autoStart, onChange: event => setAutoStart(event.target.checked) }),
+            t('wb.formAutoStart')),
+          trimmedRoot && h('span', { className: pathTooLong ? 'ai4m-badge' : 'ai4m-muted', 'data-tone': pathTooLong ? 'danger' : undefined },
+            t('wb.socketPathLen', { bytes: previewSocketBytes, limit: socketLimit }) + (pathTooLong ? t('wb.socketPathTooLongSuffix') : '')),
+          h('div', { className: 'ai4m-actions' },
+            !showOnboarding && h('button', { type: 'button', className: 'ai4m-button', onClick: () => setShowNewForm(false) }, t('common.cancel')),
+            h('button', {
+              type: 'submit', className: 'ai4m-button', 'data-variant': 'primary',
+              disabled: busy || !trimmedRoot || pathTooLong,
+            }, busy ? t('common.working') : t('wb.initAndConnect'))))),
+
+      tab === 'overview' && h('div', { className: 'ai4m-wb-overview' },
+        h('section', { className: 'ai4m-section' },
+          h('h3', null, t('wb.overviewVitals')),
+          trustTape(snapshot?.trust, t),
+          h('div', { className: 'ai4m-summary-row' },
+            h('span', null, h('span', { className: 'ai4m-muted' }, t('hud.ram') + ' '), pctOf(snapshot?.memory?.used_percent, na),
+              typeof snapshot?.memory?.pressure === 'string' ? ' · ' + snapshot.memory.pressure : ''),
+            h('span', null, h('span', { className: 'ai4m-muted' }, t('hud.stale') + ' '), countOf(snapshot?.stale_claims, na)),
+            h('span', null, h('span', { className: 'ai4m-muted' }, t('hud.seq') + ' '), countOf(snapshot?.event_seq, na)),
+            h(BreakerTotals, { snapshot, t }))),
+
+        h('div', { className: 'ai4m-wb-grid' },
+          h('section', { className: 'ai4m-section ai4m-card' },
+            h('div', { className: 'ai4m-wb-card-head' },
+              h('h3', null, t('wb.linkedConversations')),
+              h('button', {
+                type: 'button', className: 'ai4m-button', 'data-variant': 'primary',
+                disabled: busy || !activeRoot, onClick: () => void handleLaunchChief(),
+              }, t('wb.addChiefShort'))),
+            !activeRoot
+              ? h('p', { className: 'ai4m-empty' }, t('wb.noProjectSessions'))
+              : linkedSessions.length === 0
+                ? h('p', { className: 'ai4m-empty' }, t('wb.emptySessions', { root: activeRoot }))
+                : h('ul', { className: 'ai4m-edges' }, linkedSessions.map(item =>
+                    h('li', { key: item.sessionId, className: 'ai4m-wb-session-row' },
+                      h('div', { className: 'ai4m-wb-session-meta' },
+                        h('strong', { title: item.title }, item.title),
+                        h('span', { className: 'ai4m-meta' },
+                          item.preset && badge(item.preset, item.preset === chiefPreset ? 'brand' : 'muted'),
+                          item.running && badge(t('wb.running'), 'good'),
+                          item.updatedAt > 0 && h('span', { className: 'ai4m-muted' }, formatUpdated(item.updatedAt, t)))),
+                      actions?.openSession && h('button', {
+                        type: 'button', className: 'ai4m-button',
+                        onClick: () => actions.openSession(item.sessionId),
+                      }, t('common.open')))))),
+
+          h('div', { className: 'ai4m-stack' },
+            h('section', { className: 'ai4m-section ai4m-card' },
+              h('div', { className: 'ai4m-wb-card-head' },
+                h('h3', null, t('wb.alertsDecisions')),
+                h('div', { className: 'ai4m-actions' },
+                  h('button', { type: 'button', className: 'ai4m-button', onClick: () => setTab('briefing') }, t('wb.openBriefing')),
+                  h('button', { type: 'button', className: 'ai4m-button', onClick: () => setTab('inbox') }, t('wb.openInbox')))),
+              h(AlertCatchUp, { live, state: liveSnap, t }),
+              liveSnap.recentAlerts.length > 0
+                ? h('ul', { className: 'ai4m-edges ai4m-edges--alerts' }, liveSnap.recentAlerts.slice(0, 5).map(alert =>
+                    h('li', { key: alert.event_seq },
+                      h('span', null, '#' + countOf(alert.event_seq, na) + ' · ' + alert.headline),
+                      h('button', { type: 'button', className: 'ai4m-button', onClick: () => setTab('briefing') }, t('common.inspect')))))
+                : h('p', { className: 'ai4m-empty' }, t('wb.noP0Session'))),
+
+            h('section', { className: 'ai4m-section ai4m-card' },
+              h('div', { className: 'ai4m-wb-card-head' },
+                h('h3', null, t('wb.activeProjectCard')),
+                h('button', { type: 'button', className: 'ai4m-button', onClick: () => setTab('setup') }, t('wb.tab.setup'))),
+              activeRoot
+                ? h('div', { className: 'ai4m-stack' },
+                    h('div', { className: 'ai4m-meta' },
+                      h('span', { className: 'ai4m-muted' }, t('wb.rootLabel')),
+                      h('code', null, activeRoot)),
+                    h('div', { className: 'ai4m-meta' },
+                      h('span', { className: 'ai4m-muted' }, t('wb.socketLabel')),
+                      h('code', null, data?.active_socket_path ?? na)),
+                    h('div', { className: 'ai4m-meta' },
+                      h('span', { className: 'ai4m-muted' }, t('wb.chiefPresetLabel')),
+                      h('code', null, chiefPreset),
+                      badge(data?.chief_bound ? t('wb.toolsBound') : t('wb.toolsUnbound'), data?.chief_bound ? 'good' : 'warn')))
+                : h('p', { className: 'ai4m-empty' }, t('wb.noActiveProject')))))),
+
+      tab === 'briefing' && h(views.briefing, { key: activeKey, remote, live, projectRoot: activeRoot, i18n }),
+      tab === 'frontier' && h(views.frontier, { key: activeKey, remote, live, projectRoot: activeRoot, i18n }),
+      tab === 'inbox' && h(views.inbox, { key: activeKey, remote, projectRoot: activeRoot, i18n }),
+      tab === 'wiki' && h(views.wiki, { key: activeKey, remote, i18n }),
+
+      tab === 'setup' && h('div', { className: 'ai4m-wb-setup ai4m-stack' },
+        h('section', { className: 'ai4m-section' },
+          h('h3', null, t('wb.registeredProjects')),
+          projects.length === 0
+            ? h('p', { className: 'ai4m-empty' }, t('wb.noProjectsYet'))
+            : h('div', { className: 'ai4m-stack' }, projects.map(project => {
+                const status = daemonBadgeMeta(project.daemon_status, t)
+                const confirming = confirmRemoveId === project.id
+                return h('article', {
+                  key: project.id,
+                  className: 'ai4m-card',
+                  'data-accent': project.active ? 'brand' : undefined,
+                },
+                h('div', { className: 'ai4m-wb-card-head' },
+                  h('div', { className: 'ai4m-meta' },
+                    h('h4', null, project.name),
+                    badge(ENGINE_LABELS[project.engine] ?? project.engine, 'muted'),
+                    badge(status.label, status.tone, status.title),
+                    project.active && badge(t('wb.activeBadge'), 'brand')),
+                  h('div', { className: 'ai4m-actions' },
+                    !project.active && h('button', {
+                      type: 'button', className: 'ai4m-button', 'data-variant': 'primary', disabled: busy,
+                      onClick: () => void wbStore.projectSelect({ project_id: project.id, auto_start: true }),
+                    }, t('common.activate')),
+                    project.daemon_status === 'managed'
+                      ? h('button', {
+                          type: 'button', className: 'ai4m-button', disabled: busy,
+                          onClick: () => void wbStore.daemonStop({ project_id: project.id }),
+                        }, t('common.stop'))
+                      : project.daemon_status === 'external'
+                        ? h('span', { className: 'ai4m-muted' }, t('wb.supervisedExternally'))
+                        : h('button', {
+                            type: 'button', className: 'ai4m-button',
+                            disabled: busy || !data?.binaries?.daemon_ready,
+                            title: daemonUnavailableTitle,
+                            onClick: () => void wbStore.daemonStart({ project_id: project.id }),
+                          }, t('common.start')),
+                    confirming
+                      ? [
+                          h('button', {
+                            key: 'yes', type: 'button', className: 'ai4m-button', 'data-variant': 'danger', disabled: busy,
+                            onClick: () => { setConfirmRemoveId(null); void wbStore.projectRemove({ project_id: project.id }) },
+                          }, t('common.confirmRemove')),
+                          h('button', {
+                            key: 'no', type: 'button', className: 'ai4m-button', disabled: busy,
+                            onClick: () => setConfirmRemoveId(null),
+                          }, t('common.cancel')),
+                        ]
+                      : h('button', {
+                          type: 'button', className: 'ai4m-button', disabled: busy,
+                          title: t('wb.removeTitle'),
+                          onClick: () => setConfirmRemoveId(project.id),
+                        }, t('common.remove')))),
+                h('div', { className: 'ai4m-card-foot' },
+                  h('span', null, h('span', { className: 'ai4m-muted' }, t('wb.pathLabel') + ' '), h('code', null, project.root)),
+                  h('span', null, h('span', { className: 'ai4m-muted' }, t('wb.socketLabel') + ' '), `${project.socket_bytes}/${project.socket_limit} B`)))
+              }))),
+
+        h('section', { className: 'ai4m-section' },
+          h('h3', null, t('wb.binariesSection')),
+          h('div', { className: 'ai4m-card' },
+            h('div', { className: 'ai4m-meta' },
+              badge(data?.binaries?.cli_ready ? t('wb.cliReady') : t('wb.cliMissing'), data?.binaries?.cli_ready ? 'good' : 'danger'),
+              data?.binaries?.cli_path && h('code', null, data.binaries.cli_path)),
+            h('div', { className: 'ai4m-meta' },
+              badge(data?.binaries?.daemon_ready ? t('wb.daemonReady') : t('wb.daemonMissing'), data?.binaries?.daemon_ready ? 'good' : 'danger'),
+              data?.binaries?.daemon_path && h('code', null, data.binaries.daemon_path)),
+            h('div', { className: 'ai4m-meta' },
+              h('span', { className: 'ai4m-muted' }, t('wb.rolePresetsLabel')),
+              Object.keys(data?.role_presets ?? {}).length === 0
+                ? badge(t('wb.noneConfigured'), 'warn')
+                : Object.entries(data.role_presets).map(([role, presetId]) =>
+                    badge(role + ' → ' + presetId, role === 'chief' ? 'brand' : 'muted'))),
+            h('p', { className: 'ai4m-muted' }, t('wb.boundaryNote')))),
+
+        (data?.managed_daemon?.logs?.length > 0 || data?.last_daemon_exit?.logs?.length > 0) && h('section', { className: 'ai4m-section' },
+          h('h3', null, t('wb.daemonOutput')),
+          h('pre', { className: 'ai4m-evidence' },
+            (data?.managed_daemon?.logs?.length ? data.managed_daemon.logs : data.last_daemon_exit.logs).join('\n'))))))
+}
+
+module.exports = { Workbench, Ai4mathNavIcon, SessionContextChip, resolveLinkedSessions, matchProjectForCwd }
 }
   };
   const cache = Object.create(null);
   const load = name => {
     if (name === 'react') return platformRequire(name);
-    if (name === './contract') return {"REMOTE_PACKAGE":"dsh-ai4math","REMOTE_NAMESPACE":"ai4math","REMOTE_METHODS":{"proofSubmit":{"method":"proof.submit","description":"Check a proof body in an operator-assigned frozen slot; does not promote.","params":{"type":"object","properties":{"target_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]+$"},"proof_body":{"type":"string","minLength":1,"maxLength":262144}},"required":["target_id","proof_body"],"additionalProperties":false},"agentOnly":true},"status":{"method":"status","description":"Read the current ai4math status snapshot.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false}},"subscribe":{"method":"subscribe","description":"Follow selected live ai4math events.","params":{"type":"object","properties":{"topics":{"type":"array","items":{"type":"string","enum":["vital_signs.tick","alert.p0","breaker.state_changed"]},"minItems":1,"maxItems":3,"uniqueItems":true}},"required":["topics"],"additionalProperties":false},"stream":true},"briefingPeek":{"method":"briefing.peek","description":"Preview the factual briefing without retention or checkpoint changes.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false}},"briefingGet":{"method":"briefing.get","description":"Open a retained fact pack by its SHA-256 ID.","params":{"type":"object","properties":{"id":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"}},"required":["id"],"additionalProperties":false}},"briefingPull":{"method":"briefing.pull","description":"Retain the factual briefing without advancing the review checkpoint.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false}},"frontierList":{"method":"frontier.list","description":"List bounded claim frontier summaries.","params":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":64}},"required":[],"additionalProperties":false}},"inboxList":{"method":"inbox.list","description":"List bounded decision inbox summaries.","params":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":64}},"required":[],"additionalProperties":false}},"alertsList":{"method":"alerts.list","description":"List retained alerts after an event sequence.","params":{"type":"object","properties":{"after":{"type":"integer","minimum":0,"maximum":9007199254740991},"limit":{"type":"integer","minimum":1,"maximum":64}},"required":[],"additionalProperties":false}},"wikiSearch":{"method":"wiki.search","description":"Search the local math wiki index. Unfiltered GRAVEYARD searches can also return operator route lessons (L0). All GRAVEYARD matches are advisory, not instructions or verified evidence.","params":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":512,"x-ai4math-maxUtf8Bytes":512,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"scope":{"type":"string","enum":["core","sediment","graveyard"]},"engine":{"type":"string","enum":["lean4","agda","rocq","smt","atp","cas","informal"]},"conclusion_head":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"hypothesis_heads":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"maxItems":8,"uniqueItems":true},"typeclasses":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"maxItems":8,"uniqueItems":true},"include_shadow_hint":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":32}},"required":["text"],"additionalProperties":false}},"wikiCheckGraveyard":{"method":"wiki.check_graveyard","description":"Look for previously rejected ideas in GRAVEYARD. Static warnings and any operator route lessons (L0) are advisory, not instructions, proof, or a clearance decision.","params":{"type":"object","properties":{"informal_statement":{"type":"string","minLength":1,"maxLength":512,"x-ai4math-maxUtf8Bytes":512,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"formal_signature":{"type":"string","minLength":1,"maxLength":512,"x-ai4math-maxUtf8Bytes":512,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"limit":{"type":"integer","minimum":1,"maximum":16}},"required":["informal_statement"],"additionalProperties":false}},"wikiProvenance":{"method":"wiki.provenance","description":"Inspect indexed incoming and outgoing provenance edges across strata. Edges do not confer proof status.","params":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"max_depth":{"type":"integer","minimum":1,"maximum":16},"limit":{"type":"integer","minimum":1,"maximum":64}},"required":["id"],"additionalProperties":false}}},"TOPICS":["vital_signs.tick","alert.p0","breaker.state_changed"],"WIKI_SCOPES":["core","sediment","graveyard"]};
-    if (name === './style') return ".ai4m {\n  --a4-text: var(--dsw-alias-label-primary, CanvasText);\n  --a4-muted: var(--dsw-alias-label-secondary, color-mix(in srgb, currentColor 62%, transparent));\n  --a4-bg: var(--dsw-alias-bg-base, Canvas);\n  --a4-surface: var(--dsw-alias-bg-layer-1, color-mix(in srgb, currentColor 3%, transparent));\n  --a4-surface-2: var(--dsw-alias-bg-layer-2, color-mix(in srgb, currentColor 6%, transparent));\n  --a4-sidebar: var(--dsw-specific-sidebar-fill, var(--a4-bg));\n  --a4-border: var(--dsw-alias-border-l1, color-mix(in srgb, currentColor 14%, transparent));\n  --a4-border-strong: var(--dsw-alias-border-l2, color-mix(in srgb, currentColor 24%, transparent));\n  --a4-brand: var(--dsw-alias-brand-primary, currentColor);\n  --a4-good: var(--dsw-alias-state-success-primary, currentColor);\n  --a4-warn: var(--dsw-alias-state-warn-primary, currentColor);\n  --a4-danger: var(--dsw-alias-state-error-primary, currentColor);\n  --a4-idle: var(--dsw-alias-state-idle-primary, var(--a4-muted));\n  --a4-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;\n  box-sizing: border-box;\n  color: var(--a4-text);\n  font: inherit;\n  overflow-wrap: anywhere;\n}\n.ai4m *, .ai4m *::before, .ai4m *::after { box-sizing: inherit; }\n\n/* --- Inline typography & atoms ------------------------------------------- */\n.ai4m h2, .ai4m h3, .ai4m h4, .ai4m p, .ai4m pre { margin: 0; }\n.ai4m h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; }\n.ai4m h3 {\n  font-size: 11.5px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  text-transform: uppercase;\n  color: var(--a4-muted);\n  padding-block-end: 5px;\n  border-block-end: 1px solid var(--a4-border);\n}\n.ai4m h4 { font-size: 13px; font-weight: 600; line-height: 1.35; }\n.ai4m code {\n  font-family: var(--a4-mono);\n  font-size: 0.9em;\n  padding: 1px 5px;\n  border-radius: 4px;\n  background: var(--a4-surface-2);\n  border: 1px solid var(--a4-border);\n  overflow-wrap: anywhere;\n}\n.ai4m-muted { color: var(--a4-muted); }\n.ai4m-placeholder { color: var(--a4-muted); font-style: italic; }\n.ai4m-kv { display: inline-flex; align-items: baseline; gap: 4px; flex-wrap: wrap; max-width: 100%; min-width: 0; }\n.ai4m-hud .ai4m-kv { flex-wrap: nowrap; }\n.ai4m-results-head {\n  font-size: 12px;\n  font-weight: 600;\n  color: var(--a4-text);\n  padding-block: 2px;\n}\n\n/* --- Badges -------------------------------------------------------------- */\n.ai4m-badge {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface-2);\n  color: var(--a4-text);\n  border-radius: 999px;\n  padding: 1px 7px;\n  line-height: 1.35;\n  font-size: 11px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n.ai4m-badge[data-tone=\"good\"] {\n  border-color: color-mix(in srgb, var(--a4-good) 38%, transparent);\n  background: color-mix(in srgb, var(--a4-good) 12%, transparent);\n  color: var(--a4-good);\n}\n.ai4m-badge[data-tone=\"warn\"] {\n  border-color: color-mix(in srgb, var(--a4-warn) 42%, transparent);\n  background: color-mix(in srgb, var(--a4-warn) 13%, transparent);\n  color: var(--a4-warn);\n}\n.ai4m-badge[data-tone=\"danger\"] {\n  border-color: color-mix(in srgb, var(--a4-danger) 46%, transparent);\n  background: color-mix(in srgb, var(--a4-danger) 14%, transparent);\n  color: var(--a4-danger);\n  font-weight: 600;\n}\n.ai4m-badge[data-tone=\"brand\"] {\n  border-color: color-mix(in srgb, var(--a4-brand) 38%, transparent);\n  background: color-mix(in srgb, var(--a4-brand) 12%, transparent);\n  color: var(--a4-brand);\n}\n.ai4m-badge[data-tone=\"muted\"] {\n  color: var(--a4-muted);\n  background: var(--a4-surface);\n}\n\n/* --- Controls ------------------------------------------------------------ */\n.ai4m-button, .ai4m input, .ai4m select {\n  border: 1px solid var(--a4-border-strong);\n  background: var(--a4-surface);\n  color: var(--a4-text);\n  font: inherit;\n  border-radius: 6px;\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\n}\n.ai4m-button {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 5px;\n  height: 28px;\n  padding: 0 10px;\n  font-size: 12px;\n  font-weight: 500;\n  line-height: 1;\n  white-space: nowrap;\n}\n.ai4m-button[data-variant=\"primary\"] {\n  background: color-mix(in srgb, var(--a4-brand) 14%, var(--a4-surface));\n  border-color: color-mix(in srgb, var(--a4-brand) 44%, var(--a4-border));\n  color: var(--a4-brand);\n}\n.ai4m-button:not(:disabled), .ai4m details > summary { cursor: pointer; }\n.ai4m-button:not(:disabled):hover {\n  background: var(--a4-surface-2);\n  border-color: var(--a4-border-strong);\n}\n.ai4m-button[data-variant=\"primary\"]:not(:disabled):hover {\n  background: color-mix(in srgb, var(--a4-brand) 22%, var(--a4-surface));\n  border-color: color-mix(in srgb, var(--a4-brand) 60%, var(--a4-border));\n}\n.ai4m-button:disabled { opacity: 0.48; cursor: default; }\n.ai4m input, .ai4m select {\n  height: 30px;\n  padding: 0 9px;\n  font-size: 12.5px;\n  background: var(--a4-bg);\n}\n.ai4m input:focus, .ai4m select:focus { border-color: var(--a4-brand); }\n.ai4m input:focus:not(:focus-visible), .ai4m select:focus:not(:focus-visible) { outline: none; }\n.ai4m select option { background: var(--a4-bg); color: var(--a4-text); }\n.ai4m :focus-visible { outline: 2px solid var(--a4-brand); outline-offset: 2px; }\n\n/* --- Bottom Live HUD ----------------------------------------------------- */\n.ai4m-hud {\n  container-type: inline-size;\n  container-name: ai4m-hud;\n  border-block-start: 1px solid var(--a4-border);\n  background: var(--a4-sidebar);\n  padding: 5px 10px;\n  font-size: 11.5px;\n  line-height: 1.35;\n  font-variant-numeric: tabular-nums;\n}\n.ai4m-hud-line {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n}\n.ai4m-hud-brand {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  flex: 0 0 auto;\n  white-space: nowrap;\n}\n.ai4m-hud-brand > strong {\n  font-size: 11.5px;\n  font-weight: 650;\n  letter-spacing: -0.01em;\n}\n.ai4m-hud-status .ai4m-badge::before {\n  content: \"\";\n  width: 6px;\n  height: 6px;\n  border-radius: 999px;\n  background: currentColor;\n  flex: 0 0 auto;\n}\n.ai4m-hud-telemetry {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex: 1 1 auto;\n  min-width: 0;\n  overflow-x: auto;\n  scrollbar-width: thin;\n  padding: 1px 16px 1px 2px;\n  mask-image: linear-gradient(to right, currentColor calc(100% - 14px), transparent);\n}\n.ai4m-hud-group {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  flex: 0 0 auto;\n  white-space: nowrap;\n}\n.ai4m-hud-group + .ai4m-hud-group {\n  padding-inline-start: 8px;\n  border-inline-start: 1px solid var(--a4-border);\n}\n.ai4m-hud-metric[data-pressure=\"GREEN\"] { color: var(--a4-text); }\n.ai4m-hud-metric[data-pressure=\"YELLOW\"] { color: var(--a4-warn); font-weight: 500; }\n.ai4m-hud-metric[data-pressure=\"RED\"] { color: var(--a4-danger); font-weight: 600; }\n.ai4m-hud-metric[data-nonzero=\"true\"] { color: var(--a4-warn); font-weight: 600; }\n.ai4m-hud-pinned {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  flex: 0 0 auto;\n  padding-inline-start: 8px;\n  border-inline-start: 1px solid var(--a4-border);\n  white-space: nowrap;\n}\n.ai4m-hud-priority[data-zero=\"true\"] .ai4m-badge { background: transparent; }\n.ai4m-hud-seq { font-family: var(--a4-mono); font-size: 11px; margin-inline-start: 3px; }\n.ai4m-hud-nav {\n  display: inline-flex;\n  align-items: center;\n  gap: 3px;\n  flex: 0 0 auto;\n  padding-inline-start: 8px;\n  border-inline-start: 1px solid var(--a4-border);\n  white-space: nowrap;\n}\n@container ai4m-hud (max-width: 760px) {\n  .ai4m-hud-line { flex-wrap: wrap; row-gap: 5px; }\n  .ai4m-hud-telemetry { order: 3; flex: 1 1 100%; padding-inline-start: 0; }\n  .ai4m-hud-pinned { border-inline-start: none; padding-inline-start: 0; margin-inline-start: auto; }\n}\n.ai4m-hud .ai4m-button {\n  height: 22px;\n  padding: 0 8px;\n  font-size: 11px;\n  border-color: var(--a4-border);\n  background: var(--a4-surface);\n}\n.ai4m-hud .ai4m-button:not(:disabled):hover {\n  background: var(--a4-surface-2);\n  border-color: var(--a4-border-strong);\n}\n\n/* HUD Trust Tape: compact segmented capsule */\n.ai4m-hud .ai4m-tape {\n  display: inline-flex;\n  align-items: center;\n  gap: 2px;\n  padding: 1px 4px;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n}\n.ai4m-hud .ai4m-tier {\n  display: inline-flex;\n  align-items: baseline;\n  gap: 2px;\n  padding: 0 4px;\n  border-radius: 4px;\n}\n.ai4m-hud .ai4m-tier .ai4m-kv { gap: 3px; }\n.ai4m-hud .ai4m-tier[data-nonzero=\"false\"] { color: var(--a4-muted); }\n.ai4m-hud .ai4m-tier[data-nonzero=\"true\"] { font-weight: 600; }\n.ai4m-tier[data-level=\"L5\"][data-nonzero=\"true\"] {\n  color: var(--a4-good);\n  background: color-mix(in srgb, var(--a4-good) 12%, transparent);\n}\n.ai4m-tier[data-level=\"L2b\"][data-nonzero=\"true\"] {\n  color: var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 12%, transparent);\n}\n.ai4m-tier[data-level=\"L4a\"][data-nonzero=\"true\"],\n.ai4m-tier[data-level=\"L4b\"][data-nonzero=\"true\"] {\n  color: var(--a4-brand);\n  background: color-mix(in srgb, var(--a4-brand) 10%, transparent);\n}\n\n/* HUD Secondary Alerts & Banners */\n.ai4m-hud-alert {\n  margin-block-start: 5px;\n  padding: 4px 8px;\n  max-height: 4.8em;\n  overflow: auto;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  border-inline-start: 3px solid var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 9%, var(--a4-surface));\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  flex-wrap: wrap;\n}\n.ai4m-hud-alert--breaker {\n  border-inline-start-color: var(--a4-warn);\n  background: color-mix(in srgb, var(--a4-warn) 9%, var(--a4-surface));\n}\n.ai4m-hud-catchup {\n  margin-block-start: 5px;\n  padding: 4px 8px;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  border-inline-start: 3px solid var(--a4-warn);\n  background: color-mix(in srgb, var(--a4-warn) 8%, var(--a4-surface));\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  flex-wrap: wrap;\n}\n\n.ai4m-hud > .ai4m-banner { margin-block-start: 5px; padding: 4px 8px; }\n.ai4m-panel .ai4m-hud-catchup { margin-block-start: 0; padding: 7px 10px; }\n\n/* --- Shared flex groups -------------------------------------------------- */\n.ai4m-meta, .ai4m-actions {\n  display: inline-flex;\n  gap: 5px 7px;\n  align-items: center;\n  flex-wrap: wrap;\n}\n\n/* --- Right Sidebar Panels ------------------------------------------------ */\n.ai4m-panel {\n  container-type: inline-size;\n  container-name: ai4m-panel;\n  height: 100%;\n  min-height: 0;\n  min-width: 0;\n  overflow: auto;\n  padding: 14px 16px 24px;\n  background: var(--a4-bg);\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n  font-size: 13px;\n  line-height: 1.5;\n  font-variant-numeric: tabular-nums;\n}\n.ai4m-panel > header {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  padding-block-end: 12px;\n  border-block-end: 1px solid var(--a4-border);\n}\n.ai4m-panel > header > p { font-size: 12px; line-height: 1.45; }\n.ai4m-panel > header .ai4m-actions { margin-block-start: 6px; }\n\n.ai4m-stack { display: flex; flex-direction: column; gap: 10px; min-width: 0; }\n.ai4m-section { display: flex; flex-direction: column; gap: 8px; min-width: 0; }\n.ai4m-subgroup { display: flex; flex-direction: column; gap: 6px; min-width: 0; }\n.ai4m-subgroup > h4 { font-size: 12px; color: var(--a4-muted); font-weight: 600; }\n.ai4m-panel .ai4m-badge {\n  max-width: 100%;\n  white-space: normal;\n  overflow-wrap: anywhere;\n  border-radius: 10px;\n}\n\n/* Panel Trust Ledger: clean tile grid */\n.ai4m-panel .ai4m-tape {\n  display: grid;\n  grid-template-columns: repeat(4, minmax(0, 1fr));\n  gap: 6px;\n}\n@container ai4m-panel (min-width: 480px) {\n  .ai4m-panel .ai4m-tape { grid-template-columns: repeat(8, minmax(0, 1fr)); }\n}\n.ai4m-panel .ai4m-tier {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  padding: 7px 4px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 15px;\n  font-weight: 650;\n  line-height: 1.25;\n}\n.ai4m-panel .ai4m-tier > span {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: 2px;\n}\n.ai4m-panel .ai4m-tier .ai4m-kv > :first-child {\n  font-size: 10.5px;\n  font-weight: 600;\n  letter-spacing: 0.02em;\n}\n.ai4m-panel .ai4m-tier .ai4m-kv > :last-child.ai4m-muted {\n  font-size: 13px;\n  font-weight: 500;\n}\n.ai4m-panel .ai4m-tier[data-nonzero=\"false\"] {\n  color: var(--a4-muted);\n  background: var(--a4-bg);\n}\n\n/* Fact Pack summary box & risk row */\n.ai4m-meta-box {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 6px 10px;\n  padding: 10px 12px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 12px;\n}\n.ai4m-summary-row {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 6px 10px;\n  padding: 8px 10px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 12px;\n}\n\n/* Status, Empty & Advisory Banners */\n.ai4m-empty {\n  padding: 12px 14px;\n  border: 1px dashed var(--a4-border-strong);\n  border-radius: 8px;\n  background: var(--a4-surface);\n  color: var(--a4-muted);\n  font-size: 12px;\n}\n.ai4m-banner {\n  padding: 8px 11px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  color: var(--a4-muted);\n  font-size: 12px;\n  line-height: 1.45;\n}\n.ai4m-banner[data-tone=\"loading\"] {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  border-inline-start: 3px solid var(--a4-brand);\n  color: var(--a4-text);\n}\n.ai4m-banner[data-tone=\"loading\"]::before {\n  content: \"\";\n  width: 7px;\n  height: 7px;\n  border-radius: 999px;\n  background: var(--a4-brand);\n  flex: 0 0 auto;\n  animation: ai4m-pulse 1.2s ease-in-out infinite;\n}\n@keyframes ai4m-pulse {\n  0%, 100% { opacity: 0.35; }\n  50% { opacity: 1; }\n}\n.ai4m-banner[data-tone=\"warn\"] {\n  border-inline-start: 3px solid var(--a4-warn);\n  background: color-mix(in srgb, var(--a4-warn) 8%, var(--a4-surface));\n  color: var(--a4-text);\n}\n.ai4m-banner[data-tone=\"danger\"] {\n  border-inline-start: 3px solid var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 10%, var(--a4-surface));\n  color: var(--a4-danger);\n}\n\n/* Cards */\n.ai4m-card {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  min-width: 0;\n  border: 1px solid var(--a4-border);\n  border-radius: 10px;\n  padding: 11px 12px;\n  background: var(--a4-surface);\n  transition: border-color 120ms ease;\n}\n.ai4m-card:hover { border-color: var(--a4-border-strong); }\n.ai4m-card[data-accent=\"danger\"] { border-inline-start: 3px solid var(--a4-danger); }\n.ai4m-card[data-accent=\"warn\"] { border-inline-start: 3px solid var(--a4-warn); }\n.ai4m-card[data-accent=\"good\"] { border-inline-start: 3px solid var(--a4-good); }\n.ai4m-card[data-accent=\"brand\"] { border-inline-start: 3px solid var(--a4-brand); }\n.ai4m-panel .ai4m-card .ai4m-button {\n  max-width: 100%;\n  height: auto;\n  min-height: 25px;\n  padding: 4px 9px;\n  font-size: 11.5px;\n  line-height: 1.3;\n  white-space: normal;\n  text-align: start;\n  overflow-wrap: anywhere;\n}\n.ai4m-card-foot {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 6px 12px;\n  font-size: 11.5px;\n  color: var(--a4-muted);\n}\n\n/* Math Card: single-column in narrow sidebars, dual-column when wide */\n.ai4m-math {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr);\n  gap: 8px;\n}\n@container ai4m-panel (min-width: 520px) {\n  .ai4m-math { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }\n}\n.ai4m-math > div {\n  border-radius: 7px;\n  padding: 8px 10px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface-2);\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n}\n.ai4m-math > div.ai4m-math-formal { background: var(--a4-bg); }\n.ai4m-math > div > strong {\n  font-size: 10.5px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  text-transform: uppercase;\n  color: var(--a4-muted);\n}\n.ai4m-math > div > p { font-size: 12.5px; line-height: 1.5; }\n.ai4m-math pre {\n  font-family: var(--a4-mono);\n  font-size: 12px;\n  line-height: 1.5;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n}\n.ai4m-math-target { font-size: 11.5px; margin-block-start: 2px; }\n\n/* Collapsible Evidence & Shadow Hint */\n.ai4m details {\n  border: 1px solid var(--a4-border);\n  border-radius: 8px;\n  background: var(--a4-surface);\n  overflow: hidden;\n}\n.ai4m details > summary {\n  padding: 7px 10px;\n  font-size: 12px;\n  font-weight: 500;\n  line-height: 1.4;\n  list-style-position: inside;\n  transition: background-color 120ms ease;\n}\n.ai4m details > summary:hover { background: var(--a4-surface-2); }\n.ai4m details > summary:focus-visible { outline-offset: -2px; }\n.ai4m details[open] > summary {\n  border-block-end: 1px solid var(--a4-border);\n  background: var(--a4-surface-2);\n}\n.ai4m details > :not(summary) { padding: 8px 10px; }\n.ai4m pre.ai4m-evidence {\n  margin: 0;\n  padding: 9px 10px;\n  max-height: 18rem;\n  overflow: auto;\n  background: var(--a4-bg);\n  font-family: var(--a4-mono);\n  font-size: 11.5px;\n  line-height: 1.45;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n}\n\n/* Structured Edge / Alert Lists */\n.ai4m-edges {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  margin: 0;\n  padding: 0;\n  list-style: none;\n}\n.ai4m-edges > li {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 4px 5px;\n  padding: 7px 10px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 12px;\n  line-height: 1.45;\n}\n.ai4m-edges--alerts {\n  max-height: 14rem;\n  overflow-y: auto;\n}\n.ai4m-edges--alerts > li {\n  justify-content: space-between;\n  border-inline-start: 3px solid var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 6%, var(--a4-surface));\n}\n.ai4m-edges > li .ai4m-button { height: 24px; padding: 0 8px; font-size: 11.5px; }\n.ai4m-edges > li details { width: 100%; margin-block-start: 4px; }\n\n/* Wiki Search Toolbar & Provenance Inspector */\n.ai4m-search-form {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: flex-end;\n  gap: 8px;\n  padding: 10px 12px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n}\n.ai4m-field {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  font-size: 11px;\n  font-weight: 600;\n  color: var(--a4-muted);\n}\n.ai4m-field--grow { flex: 1 1 170px; min-width: 0; }\n.ai4m-field--grow input { width: 100%; max-width: none; }\n.ai4m-search-form .ai4m-button { height: 30px; padding: 0 13px; }\n.ai4m-provenance {\n  padding: 10px 12px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border-strong);\n  background: var(--a4-surface);\n}\n.ai4m-provenance-head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  padding-block-end: 5px;\n  border-block-end: 1px solid var(--a4-border);\n}\n.ai4m-provenance-head > h3 {\n  text-transform: none;\n  letter-spacing: 0;\n  font-size: 12.5px;\n  color: var(--a4-text);\n  border-block-end: none;\n  padding-block-end: 0;\n  min-width: 0;\n}\n.ai4m-provenance-head .ai4m-button { height: 24px; padding: 0 8px; font-size: 11.5px; flex: 0 0 auto; }\n.ai4m-shadow-body {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n";
+    if (name === './contract') return {"REMOTE_PACKAGE":"dsh-ai4math","REMOTE_NAMESPACE":"ai4math","REMOTE_METHODS":{"workbenchState":{"method":"workbench.state","description":"Read local AI4Math workbench projects, binaries, role bindings, and managed daemon status.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false},"hostOnly":true},"projectInit":{"method":"workbench.project_init","description":"Initialize or adopt a local AI4Math project directory and select it in the workbench.","params":{"type":"object","properties":{"root":{"type":"string","minLength":1,"maxLength":4096},"engine":{"type":"string","enum":["lean4","agda","rocq"]},"name":{"type":"string","minLength":1,"maxLength":80},"auto_start":{"type":"boolean"}},"required":["root"],"additionalProperties":false},"hostOnly":true},"projectSelect":{"method":"workbench.project_select","description":"Switch the active AI4Math project and retarget the local daemon bridge.","params":{"type":"object","properties":{"project_id":{"type":"string","minLength":4,"maxLength":64,"pattern":"^[A-Za-z0-9_-]+$"},"auto_start":{"type":"boolean"}},"required":["project_id"],"additionalProperties":false},"hostOnly":true},"projectRemove":{"method":"workbench.project_remove","description":"Remove a project from the workbench list without deleting files on disk.","params":{"type":"object","properties":{"project_id":{"type":"string","minLength":4,"maxLength":64,"pattern":"^[A-Za-z0-9_-]+$"}},"required":["project_id"],"additionalProperties":false},"hostOnly":true},"daemonStart":{"method":"workbench.daemon_start","description":"Start a Host-managed ai4mathd for the selected project or attach to an existing external daemon.","params":{"type":"object","properties":{"project_id":{"type":"string","minLength":4,"maxLength":64,"pattern":"^[A-Za-z0-9_-]+$"},"tick_ms":{"type":"integer","minimum":100,"maximum":60000}},"required":[],"additionalProperties":false},"hostOnly":true},"daemonStop":{"method":"workbench.daemon_stop","description":"Stop the Host-managed ai4mathd; never kills an externally started daemon.","params":{"type":"object","properties":{"project_id":{"type":"string","minLength":4,"maxLength":64,"pattern":"^[A-Za-z0-9_-]+$"}},"required":[],"additionalProperties":false},"hostOnly":true},"proofSubmit":{"method":"proof.submit","description":"Check a proof body in an operator-assigned frozen slot; does not promote.","params":{"type":"object","properties":{"target_id":{"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]+$"},"proof_body":{"type":"string","minLength":1,"maxLength":262144}},"required":["target_id","proof_body"],"additionalProperties":false},"agentOnly":true},"status":{"method":"status","description":"Read the current ai4math status snapshot.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false}},"subscribe":{"method":"subscribe","description":"Follow selected live ai4math events.","params":{"type":"object","properties":{"topics":{"type":"array","items":{"type":"string","enum":["vital_signs.tick","alert.p0","breaker.state_changed"]},"minItems":1,"maxItems":3,"uniqueItems":true}},"required":["topics"],"additionalProperties":false},"stream":true},"briefingPeek":{"method":"briefing.peek","description":"Preview the factual briefing without retention or checkpoint changes.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false}},"briefingGet":{"method":"briefing.get","description":"Open a retained fact pack by its SHA-256 ID.","params":{"type":"object","properties":{"id":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"}},"required":["id"],"additionalProperties":false}},"briefingPull":{"method":"briefing.pull","description":"Retain the factual briefing without advancing the review checkpoint.","params":{"type":"object","properties":{},"required":[],"additionalProperties":false}},"frontierList":{"method":"frontier.list","description":"List bounded claim frontier summaries.","params":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":64}},"required":[],"additionalProperties":false}},"inboxList":{"method":"inbox.list","description":"List bounded decision inbox summaries.","params":{"type":"object","properties":{"limit":{"type":"integer","minimum":1,"maximum":64}},"required":[],"additionalProperties":false}},"alertsList":{"method":"alerts.list","description":"List retained alerts after an event sequence.","params":{"type":"object","properties":{"after":{"type":"integer","minimum":0,"maximum":9007199254740991},"limit":{"type":"integer","minimum":1,"maximum":64}},"required":[],"additionalProperties":false}},"wikiSearch":{"method":"wiki.search","description":"Search the local math wiki index. Unfiltered GRAVEYARD searches can also return operator route lessons (L0). All GRAVEYARD matches are advisory, not instructions or verified evidence.","params":{"type":"object","properties":{"text":{"type":"string","minLength":1,"maxLength":512,"x-ai4math-maxUtf8Bytes":512,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"scope":{"type":"string","enum":["core","sediment","graveyard"]},"engine":{"type":"string","enum":["lean4","agda","rocq","smt","atp","cas","informal"]},"conclusion_head":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"hypothesis_heads":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"maxItems":8,"uniqueItems":true},"typeclasses":{"type":"array","items":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"maxItems":8,"uniqueItems":true},"include_shadow_hint":{"type":"boolean"},"limit":{"type":"integer","minimum":1,"maximum":32}},"required":["text"],"additionalProperties":false}},"wikiCheckGraveyard":{"method":"wiki.check_graveyard","description":"Look for previously rejected ideas in GRAVEYARD. Static warnings and any operator route lessons (L0) are advisory, not instructions, proof, or a clearance decision.","params":{"type":"object","properties":{"informal_statement":{"type":"string","minLength":1,"maxLength":512,"x-ai4math-maxUtf8Bytes":512,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"formal_signature":{"type":"string","minLength":1,"maxLength":512,"x-ai4math-maxUtf8Bytes":512,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"limit":{"type":"integer","minimum":1,"maximum":16}},"required":["informal_statement"],"additionalProperties":false}},"wikiProvenance":{"method":"wiki.provenance","description":"Inspect indexed incoming and outgoing provenance edges across strata. Edges do not confer proof status.","params":{"type":"object","properties":{"id":{"type":"string","minLength":1,"maxLength":128,"x-ai4math-maxUtf8Bytes":128,"pattern":"^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$"},"max_depth":{"type":"integer","minimum":1,"maximum":16},"limit":{"type":"integer","minimum":1,"maximum":64}},"required":["id"],"additionalProperties":false}}},"TOPICS":["vital_signs.tick","alert.p0","breaker.state_changed"],"WIKI_SCOPES":["core","sediment","graveyard"]};
+    if (name === './style') return ".ai4m {\n  --a4-text: var(--dsw-alias-label-primary, CanvasText);\n  --a4-muted: var(--dsw-alias-label-secondary, color-mix(in srgb, currentColor 62%, transparent));\n  --a4-bg: var(--dsw-alias-bg-base, Canvas);\n  --a4-surface: var(--dsw-alias-bg-layer-1, color-mix(in srgb, currentColor 3%, transparent));\n  --a4-surface-2: var(--dsw-alias-bg-layer-2, color-mix(in srgb, currentColor 6%, transparent));\n  --a4-sidebar: var(--dsw-specific-sidebar-fill, var(--a4-bg));\n  --a4-border: var(--dsw-alias-border-l1, color-mix(in srgb, currentColor 14%, transparent));\n  --a4-border-strong: var(--dsw-alias-border-l2, color-mix(in srgb, currentColor 24%, transparent));\n  --a4-brand: var(--dsw-alias-brand-primary, currentColor);\n  --a4-good: var(--dsw-alias-state-success-primary, currentColor);\n  --a4-warn: var(--dsw-alias-state-warn-primary, currentColor);\n  --a4-danger: var(--dsw-alias-state-error-primary, currentColor);\n  --a4-idle: var(--dsw-alias-state-idle-primary, var(--a4-muted));\n  --a4-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;\n  box-sizing: border-box;\n  color: var(--a4-text);\n  font: inherit;\n  overflow-wrap: anywhere;\n}\n.ai4m *, .ai4m *::before, .ai4m *::after { box-sizing: inherit; }\n\n/* --- Inline typography & atoms ------------------------------------------- */\n.ai4m h2, .ai4m h3, .ai4m h4, .ai4m p, .ai4m pre { margin: 0; }\n.ai4m h2 { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3; }\n.ai4m h3 {\n  font-size: 11.5px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  text-transform: uppercase;\n  color: var(--a4-muted);\n  padding-block-end: 5px;\n  border-block-end: 1px solid var(--a4-border);\n}\n.ai4m h4 { font-size: 13px; font-weight: 600; line-height: 1.35; }\n.ai4m code {\n  font-family: var(--a4-mono);\n  font-size: 0.9em;\n  padding: 1px 5px;\n  border-radius: 4px;\n  background: var(--a4-surface-2);\n  border: 1px solid var(--a4-border);\n  overflow-wrap: anywhere;\n}\n.ai4m-muted { color: var(--a4-muted); }\n.ai4m-placeholder { color: var(--a4-muted); font-style: italic; }\n.ai4m-kv { display: inline-flex; align-items: baseline; gap: 4px; flex-wrap: wrap; max-width: 100%; min-width: 0; }\n.ai4m-hud .ai4m-kv { flex-wrap: nowrap; }\n.ai4m-results-head {\n  font-size: 12px;\n  font-weight: 600;\n  color: var(--a4-text);\n  padding-block: 2px;\n}\n\n/* --- Badges -------------------------------------------------------------- */\n.ai4m-badge {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface-2);\n  color: var(--a4-text);\n  border-radius: 999px;\n  padding: 1px 7px;\n  line-height: 1.35;\n  font-size: 11px;\n  font-weight: 500;\n  white-space: nowrap;\n}\n.ai4m-badge[data-tone=\"good\"] {\n  border-color: color-mix(in srgb, var(--a4-good) 38%, transparent);\n  background: color-mix(in srgb, var(--a4-good) 12%, transparent);\n  color: var(--a4-good);\n}\n.ai4m-badge[data-tone=\"warn\"] {\n  border-color: color-mix(in srgb, var(--a4-warn) 42%, transparent);\n  background: color-mix(in srgb, var(--a4-warn) 13%, transparent);\n  color: var(--a4-warn);\n}\n.ai4m-badge[data-tone=\"danger\"] {\n  border-color: color-mix(in srgb, var(--a4-danger) 46%, transparent);\n  background: color-mix(in srgb, var(--a4-danger) 14%, transparent);\n  color: var(--a4-danger);\n  font-weight: 600;\n}\n.ai4m-badge[data-tone=\"brand\"] {\n  border-color: color-mix(in srgb, var(--a4-brand) 38%, transparent);\n  background: color-mix(in srgb, var(--a4-brand) 12%, transparent);\n  color: var(--a4-brand);\n}\n.ai4m-badge[data-tone=\"muted\"] {\n  color: var(--a4-muted);\n  background: var(--a4-surface);\n}\n\n/* --- Controls ------------------------------------------------------------ */\n.ai4m-button, .ai4m input, .ai4m select {\n  border: 1px solid var(--a4-border-strong);\n  background: var(--a4-surface);\n  color: var(--a4-text);\n  font: inherit;\n  border-radius: 6px;\n  transition: background-color 120ms ease, border-color 120ms ease, color 120ms ease;\n}\n.ai4m-button {\n  display: inline-flex;\n  align-items: center;\n  justify-content: center;\n  gap: 5px;\n  height: 28px;\n  padding: 0 10px;\n  font-size: 12px;\n  font-weight: 500;\n  line-height: 1;\n  white-space: nowrap;\n}\n.ai4m-button[data-variant=\"primary\"] {\n  background: color-mix(in srgb, var(--a4-brand) 14%, var(--a4-surface));\n  border-color: color-mix(in srgb, var(--a4-brand) 44%, var(--a4-border));\n  color: var(--a4-brand);\n}\n.ai4m-button[data-variant=\"danger\"] {\n  background: color-mix(in srgb, var(--a4-danger) 14%, var(--a4-surface));\n  border-color: color-mix(in srgb, var(--a4-danger) 48%, var(--a4-border));\n  color: var(--a4-danger);\n}\n.ai4m-button:not(:disabled), .ai4m details > summary { cursor: pointer; }\n.ai4m-button:not(:disabled):hover {\n  background: var(--a4-surface-2);\n  border-color: var(--a4-border-strong);\n}\n.ai4m-button[data-variant=\"primary\"]:not(:disabled):hover {\n  background: color-mix(in srgb, var(--a4-brand) 22%, var(--a4-surface));\n  border-color: color-mix(in srgb, var(--a4-brand) 60%, var(--a4-border));\n}\n.ai4m-button[data-variant=\"danger\"]:not(:disabled):hover {\n  background: color-mix(in srgb, var(--a4-danger) 22%, var(--a4-surface));\n  border-color: color-mix(in srgb, var(--a4-danger) 64%, var(--a4-border));\n}\n.ai4m-button:disabled { opacity: 0.48; cursor: default; }\n.ai4m input, .ai4m select {\n  height: 30px;\n  padding: 0 9px;\n  font-size: 12.5px;\n  background: var(--a4-bg);\n}\n.ai4m input:focus, .ai4m select:focus { border-color: var(--a4-brand); }\n.ai4m input:focus:not(:focus-visible), .ai4m select:focus:not(:focus-visible) { outline: none; }\n.ai4m select option { background: var(--a4-bg); color: var(--a4-text); }\n.ai4m :focus-visible { outline: 2px solid var(--a4-brand); outline-offset: 2px; }\n\n/* --- Bottom Live HUD ----------------------------------------------------- */\n.ai4m-hud {\n  container-type: inline-size;\n  container-name: ai4m-hud;\n  border-block-start: 1px solid var(--a4-border);\n  background: var(--a4-sidebar);\n  padding: 5px 10px;\n  font-size: 11.5px;\n  line-height: 1.35;\n  font-variant-numeric: tabular-nums;\n}\n.ai4m-hud-line {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n}\n.ai4m-hud-brand {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  flex: 0 0 auto;\n  white-space: nowrap;\n}\n.ai4m-hud-brand > strong {\n  font-size: 11.5px;\n  font-weight: 650;\n  letter-spacing: -0.01em;\n}\n.ai4m-hud-status .ai4m-badge::before {\n  content: \"\";\n  width: 6px;\n  height: 6px;\n  border-radius: 999px;\n  background: currentColor;\n  flex: 0 0 auto;\n}\n.ai4m-hud-telemetry {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex: 1 1 auto;\n  min-width: 0;\n  overflow-x: auto;\n  scrollbar-width: thin;\n  padding: 1px 16px 1px 2px;\n  mask-image: linear-gradient(to right, currentColor calc(100% - 14px), transparent);\n}\n.ai4m-hud-group {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  flex: 0 0 auto;\n  white-space: nowrap;\n}\n.ai4m-hud-group + .ai4m-hud-group {\n  padding-inline-start: 8px;\n  border-inline-start: 1px solid var(--a4-border);\n}\n.ai4m-hud-metric[data-pressure=\"GREEN\"] { color: var(--a4-text); }\n.ai4m-hud-metric[data-pressure=\"YELLOW\"] { color: var(--a4-warn); font-weight: 500; }\n.ai4m-hud-metric[data-pressure=\"RED\"] { color: var(--a4-danger); font-weight: 600; }\n.ai4m-hud-metric[data-nonzero=\"true\"] { color: var(--a4-warn); font-weight: 600; }\n.ai4m-hud-pinned {\n  display: inline-flex;\n  align-items: center;\n  gap: 5px;\n  flex: 0 0 auto;\n  padding-inline-start: 8px;\n  border-inline-start: 1px solid var(--a4-border);\n  white-space: nowrap;\n}\n.ai4m-hud-priority[data-zero=\"true\"] .ai4m-badge { background: transparent; }\n.ai4m-hud-seq { font-family: var(--a4-mono); font-size: 11px; margin-inline-start: 3px; }\n.ai4m-hud-nav {\n  display: inline-flex;\n  align-items: center;\n  gap: 3px;\n  flex: 0 0 auto;\n  padding-inline-start: 8px;\n  border-inline-start: 1px solid var(--a4-border);\n  white-space: nowrap;\n}\n@container ai4m-hud (max-width: 760px) {\n  .ai4m-hud-line { flex-wrap: wrap; row-gap: 5px; }\n  .ai4m-hud-telemetry { order: 3; flex: 1 1 100%; padding-inline-start: 0; }\n  .ai4m-hud-pinned { border-inline-start: none; padding-inline-start: 0; margin-inline-start: auto; }\n}\n.ai4m-hud .ai4m-button {\n  height: 22px;\n  padding: 0 8px;\n  font-size: 11px;\n  border-color: var(--a4-border);\n  background: var(--a4-surface);\n}\n.ai4m-hud .ai4m-button:not(:disabled):hover {\n  background: var(--a4-surface-2);\n  border-color: var(--a4-border-strong);\n}\n\n/* HUD Trust Tape: compact segmented capsule */\n.ai4m-hud .ai4m-tape {\n  display: inline-flex;\n  align-items: center;\n  gap: 2px;\n  padding: 1px 4px;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n}\n.ai4m-hud .ai4m-tier {\n  display: inline-flex;\n  align-items: baseline;\n  gap: 2px;\n  padding: 0 4px;\n  border-radius: 4px;\n}\n.ai4m-hud .ai4m-tier .ai4m-kv { gap: 3px; }\n.ai4m-hud .ai4m-tier[data-nonzero=\"false\"] { color: var(--a4-muted); }\n.ai4m-hud .ai4m-tier[data-nonzero=\"true\"] { font-weight: 600; }\n.ai4m-tier[data-level=\"L5\"][data-nonzero=\"true\"] {\n  color: var(--a4-good);\n  background: color-mix(in srgb, var(--a4-good) 12%, transparent);\n}\n.ai4m-tier[data-level=\"L2b\"][data-nonzero=\"true\"] {\n  color: var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 12%, transparent);\n}\n.ai4m-tier[data-level=\"L4a\"][data-nonzero=\"true\"],\n.ai4m-tier[data-level=\"L4b\"][data-nonzero=\"true\"] {\n  color: var(--a4-brand);\n  background: color-mix(in srgb, var(--a4-brand) 10%, transparent);\n}\n\n/* HUD Secondary Alerts & Banners */\n.ai4m-hud-alert {\n  margin-block-start: 5px;\n  padding: 4px 8px;\n  max-height: 4.8em;\n  overflow: auto;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  border-inline-start: 3px solid var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 9%, var(--a4-surface));\n  display: flex;\n  align-items: center;\n  gap: 6px;\n  flex-wrap: wrap;\n}\n.ai4m-hud-alert--breaker {\n  border-inline-start-color: var(--a4-warn);\n  background: color-mix(in srgb, var(--a4-warn) 9%, var(--a4-surface));\n}\n.ai4m-hud-catchup {\n  margin-block-start: 5px;\n  padding: 4px 8px;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  border-inline-start: 3px solid var(--a4-warn);\n  background: color-mix(in srgb, var(--a4-warn) 8%, var(--a4-surface));\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  flex-wrap: wrap;\n}\n\n.ai4m-hud > .ai4m-banner { margin-block-start: 5px; padding: 4px 8px; }\n.ai4m-panel .ai4m-hud-catchup { margin-block-start: 0; padding: 7px 10px; }\n\n/* --- Shared flex groups -------------------------------------------------- */\n.ai4m-meta, .ai4m-actions {\n  display: inline-flex;\n  gap: 5px 7px;\n  align-items: center;\n  flex-wrap: wrap;\n}\n\n/* --- Right Sidebar Panels ------------------------------------------------ */\n.ai4m-panel {\n  container-type: inline-size;\n  container-name: ai4m-panel;\n  height: 100%;\n  min-height: 0;\n  min-width: 0;\n  overflow: auto;\n  padding: 14px 16px 24px;\n  background: var(--a4-bg);\n  display: flex;\n  flex-direction: column;\n  gap: 14px;\n  font-size: 13px;\n  line-height: 1.5;\n  font-variant-numeric: tabular-nums;\n}\n.ai4m-panel > header {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  padding-block-end: 12px;\n  border-block-end: 1px solid var(--a4-border);\n}\n.ai4m-panel > header > p { font-size: 12px; line-height: 1.45; }\n.ai4m-panel > header .ai4m-actions { margin-block-start: 6px; }\n\n.ai4m-stack { display: flex; flex-direction: column; gap: 10px; min-width: 0; }\n.ai4m-section { display: flex; flex-direction: column; gap: 8px; min-width: 0; }\n.ai4m-subgroup { display: flex; flex-direction: column; gap: 6px; min-width: 0; }\n.ai4m-subgroup > h4 { font-size: 12px; color: var(--a4-muted); font-weight: 600; }\n.ai4m-panel .ai4m-badge,\n.ai4m-wb-body .ai4m-badge {\n  max-width: 100%;\n  white-space: normal;\n  overflow-wrap: anywhere;\n  border-radius: 10px;\n}\n\n/* Panel Trust Ledger: clean tile grid */\n.ai4m-panel .ai4m-tape {\n  display: grid;\n  grid-template-columns: repeat(4, minmax(0, 1fr));\n  gap: 6px;\n}\n@container ai4m-panel (min-width: 480px) {\n  .ai4m-panel .ai4m-tape { grid-template-columns: repeat(8, minmax(0, 1fr)); }\n}\n.ai4m-panel .ai4m-tier {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  padding: 7px 4px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 15px;\n  font-weight: 650;\n  line-height: 1.25;\n}\n.ai4m-panel .ai4m-tier > span {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: 2px;\n}\n.ai4m-panel .ai4m-tier .ai4m-kv > :first-child {\n  font-size: 10.5px;\n  font-weight: 600;\n  letter-spacing: 0.02em;\n}\n.ai4m-panel .ai4m-tier .ai4m-kv > :last-child.ai4m-muted {\n  font-size: 13px;\n  font-weight: 500;\n}\n.ai4m-panel .ai4m-tier[data-nonzero=\"false\"] {\n  color: var(--a4-muted);\n  background: var(--a4-bg);\n}\n\n/* Fact Pack summary box & risk row */\n.ai4m-meta-box {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 6px 10px;\n  padding: 10px 12px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 12px;\n}\n.ai4m-summary-row {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 6px 10px;\n  padding: 8px 10px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 12px;\n}\n\n/* Status, Empty & Advisory Banners */\n.ai4m-empty {\n  padding: 12px 14px;\n  border: 1px dashed var(--a4-border-strong);\n  border-radius: 8px;\n  background: var(--a4-surface);\n  color: var(--a4-muted);\n  font-size: 12px;\n}\n.ai4m-banner {\n  padding: 8px 11px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  color: var(--a4-muted);\n  font-size: 12px;\n  line-height: 1.45;\n}\n.ai4m-banner[data-tone=\"loading\"] {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  border-inline-start: 3px solid var(--a4-brand);\n  color: var(--a4-text);\n}\n.ai4m-banner[data-tone=\"loading\"]::before {\n  content: \"\";\n  width: 7px;\n  height: 7px;\n  border-radius: 999px;\n  background: var(--a4-brand);\n  flex: 0 0 auto;\n  animation: ai4m-pulse 1.2s ease-in-out infinite;\n}\n@keyframes ai4m-pulse {\n  0%, 100% { opacity: 0.35; }\n  50% { opacity: 1; }\n}\n.ai4m-banner[data-tone=\"good\"] {\n  border-inline-start: 3px solid var(--a4-good);\n  background: color-mix(in srgb, var(--a4-good) 9%, var(--a4-surface));\n  color: var(--a4-text);\n}\n.ai4m-banner[data-tone=\"warn\"] {\n  border-inline-start: 3px solid var(--a4-warn);\n  background: color-mix(in srgb, var(--a4-warn) 8%, var(--a4-surface));\n  color: var(--a4-text);\n}\n.ai4m-banner[data-tone=\"danger\"] {\n  border-inline-start: 3px solid var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 10%, var(--a4-surface));\n  color: var(--a4-danger);\n}\n\n/* Cards */\n.ai4m-card {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n  min-width: 0;\n  border: 1px solid var(--a4-border);\n  border-radius: 10px;\n  padding: 11px 12px;\n  background: var(--a4-surface);\n  transition: border-color 120ms ease;\n}\n.ai4m-card:hover { border-color: var(--a4-border-strong); }\n.ai4m-card[data-accent=\"danger\"] { border-inline-start: 3px solid var(--a4-danger); }\n.ai4m-card[data-accent=\"warn\"] { border-inline-start: 3px solid var(--a4-warn); }\n.ai4m-card[data-accent=\"good\"] { border-inline-start: 3px solid var(--a4-good); }\n.ai4m-card[data-accent=\"brand\"] { border-inline-start: 3px solid var(--a4-brand); }\n.ai4m-panel .ai4m-card .ai4m-button {\n  max-width: 100%;\n  height: auto;\n  min-height: 25px;\n  padding: 4px 9px;\n  font-size: 11.5px;\n  line-height: 1.3;\n  white-space: normal;\n  text-align: start;\n  overflow-wrap: anywhere;\n}\n.ai4m-card-foot {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 6px 12px;\n  font-size: 11.5px;\n  color: var(--a4-muted);\n}\n\n/* Math Card: single-column in narrow sidebars, dual-column when wide */\n.ai4m-math {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr);\n  gap: 8px;\n}\n@container ai4m-panel (min-width: 520px) {\n  .ai4m-math { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }\n}\n.ai4m-math > div {\n  border-radius: 7px;\n  padding: 8px 10px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface-2);\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n}\n.ai4m-math > div.ai4m-math-formal { background: var(--a4-bg); }\n.ai4m-math > div > strong {\n  font-size: 10.5px;\n  font-weight: 600;\n  letter-spacing: 0.03em;\n  text-transform: uppercase;\n  color: var(--a4-muted);\n}\n.ai4m-math > div > p { font-size: 12.5px; line-height: 1.5; }\n.ai4m-math pre {\n  font-family: var(--a4-mono);\n  font-size: 12px;\n  line-height: 1.5;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n}\n.ai4m-math-target { font-size: 11.5px; margin-block-start: 2px; }\n\n/* Collapsible Evidence & Shadow Hint */\n.ai4m details {\n  border: 1px solid var(--a4-border);\n  border-radius: 8px;\n  background: var(--a4-surface);\n  overflow: hidden;\n}\n.ai4m details > summary {\n  padding: 7px 10px;\n  font-size: 12px;\n  font-weight: 500;\n  line-height: 1.4;\n  list-style-position: inside;\n  transition: background-color 120ms ease;\n}\n.ai4m details > summary:hover { background: var(--a4-surface-2); }\n.ai4m details > summary:focus-visible { outline-offset: -2px; }\n.ai4m details[open] > summary {\n  border-block-end: 1px solid var(--a4-border);\n  background: var(--a4-surface-2);\n}\n.ai4m details > :not(summary) { padding: 8px 10px; }\n.ai4m pre.ai4m-evidence {\n  margin: 0;\n  padding: 9px 10px;\n  max-height: 18rem;\n  overflow: auto;\n  background: var(--a4-bg);\n  font-family: var(--a4-mono);\n  font-size: 11.5px;\n  line-height: 1.45;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n}\n\n/* Structured Edge / Alert Lists */\n.ai4m-edges {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n  margin: 0;\n  padding: 0;\n  list-style: none;\n}\n.ai4m-edges > li {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 4px 5px;\n  padding: 7px 10px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 12px;\n  line-height: 1.45;\n}\n.ai4m-edges--alerts {\n  max-height: 14rem;\n  overflow-y: auto;\n}\n.ai4m-edges--alerts > li {\n  justify-content: space-between;\n  border-inline-start: 3px solid var(--a4-danger);\n  background: color-mix(in srgb, var(--a4-danger) 6%, var(--a4-surface));\n}\n.ai4m-edges > li .ai4m-button { height: 24px; padding: 0 8px; font-size: 11.5px; }\n.ai4m-edges > li details { width: 100%; margin-block-start: 4px; }\n\n/* Wiki Search Toolbar & Provenance Inspector */\n.ai4m-search-form {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: flex-end;\n  gap: 8px;\n  padding: 10px 12px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n}\n.ai4m-field {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n  font-size: 11px;\n  font-weight: 600;\n  color: var(--a4-muted);\n}\n.ai4m-field--grow { flex: 1 1 170px; min-width: 0; }\n.ai4m-field--grow input { width: 100%; max-width: none; }\n.ai4m-search-form .ai4m-button { height: 30px; padding: 0 13px; }\n.ai4m-provenance {\n  padding: 10px 12px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border-strong);\n  background: var(--a4-surface);\n}\n.ai4m-provenance-head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  padding-block-end: 5px;\n  border-block-end: 1px solid var(--a4-border);\n}\n.ai4m-provenance-head > h3 {\n  text-transform: none;\n  letter-spacing: 0;\n  font-size: 12.5px;\n  color: var(--a4-text);\n  border-block-end: none;\n  padding-block-end: 0;\n  min-width: 0;\n}\n.ai4m-provenance-head .ai4m-button { height: 24px; padding: 0 8px; font-size: 11.5px; flex: 0 0 auto; }\n.ai4m-shadow-body {\n  display: flex;\n  flex-direction: column;\n  gap: 6px;\n}\n\n/* --- HUD Brand Button, Session Mismatch Notice & Session Chip ------------ */\n.ai4m-hud-brand-btn {\n  border: none;\n  background: transparent;\n  color: var(--a4-text);\n  font: inherit;\n  font-size: 11.5px;\n  font-weight: 650;\n  letter-spacing: -0.01em;\n  padding: 2px 5px;\n  border-radius: 5px;\n  cursor: pointer;\n  transition: background-color 120ms ease, color 120ms ease;\n}\n.ai4m-hud-brand-btn:hover {\n  background: var(--a4-surface-2);\n  color: var(--a4-brand);\n}\n.ai4m-hud-notice {\n  margin-block-start: 5px;\n  padding: 4px 8px;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  border-inline-start: 3px solid var(--a4-brand);\n  background: color-mix(in srgb, var(--a4-brand) 9%, var(--a4-surface));\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  flex-wrap: wrap;\n}\n.ai4m-session-chip {\n  display: inline-flex;\n  align-items: center;\n  min-width: 0;\n}\n.ai4m-session-chip .ai4m-button {\n  height: 24px;\n  padding: 0 8px;\n  font-size: 11.5px;\n  max-width: 240px;\n  overflow: hidden;\n  text-overflow: ellipsis;\n  display: inline-block;\n  line-height: 22px;\n}\n\n/* --- Read-Only Operator CLI Helper --------------------------------------- */\n.ai4m-cli-helper { margin-block-start: 2px; }\n.ai4m-cli-list {\n  display: flex;\n  flex-direction: column;\n  gap: 8px;\n}\n.ai4m-cli-row {\n  display: flex;\n  flex-direction: column;\n  gap: 4px;\n}\n.ai4m-cli-row-head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  font-size: 11.5px;\n}\n.ai4m-panel .ai4m-card .ai4m-cli-row-head .ai4m-button,\n.ai4m-cli-row-head .ai4m-button {\n  height: 22px;\n  min-height: 22px;\n  padding: 0 8px;\n  font-size: 11px;\n  white-space: nowrap;\n  flex: 0 0 auto;\n}\n.ai4m-cli-cmd {\n  margin: 0;\n  padding: 7px 9px;\n  border-radius: 6px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-bg);\n  font-family: var(--a4-mono);\n  font-size: 11.5px;\n  line-height: 1.45;\n  white-space: pre-wrap;\n  overflow-wrap: anywhere;\n}\n\n/* --- Full-Screen Main AI4Math Workbench ---------------------------------- */\n.ai4m-workbench {\n  container-type: inline-size;\n  container-name: ai4m-wb;\n  height: 100%;\n  min-height: 0;\n  min-width: 0;\n  display: flex;\n  flex-direction: column;\n  background: var(--a4-bg);\n  color: var(--a4-text);\n  font-size: 13px;\n  line-height: 1.5;\n  font-variant-numeric: tabular-nums;\n}\n.ai4m-wb-top {\n  flex: 0 0 auto;\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n  padding: 16px 20px 12px;\n  border-block-end: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n}\nhtml[data-platform='darwin'] .ai4m-wb-top {\n  padding-block-start: calc(16px + var(--dsh-frame-top-clearance, 0px));\n}\n.ai4m-wb-title-row {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 12px;\n  flex-wrap: wrap;\n}\n.ai4m-wb-brand {\n  display: flex;\n  align-items: center;\n  gap: 10px;\n  min-width: 0;\n}\n.ai4m-wb-brand > svg {\n  flex: 0 0 auto;\n  color: var(--a4-brand);\n}\n.ai4m-wb-brand h2 { font-size: 16px; }\n.ai4m-wb-brand p { font-size: 12px; }\n.ai4m-wb-bar {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  flex-wrap: wrap;\n}\n.ai4m-wb-select-wrap {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 12px;\n  min-width: 0;\n  max-width: 100%;\n}\n.ai4m-wb-select-wrap select {\n  min-width: 0;\n  width: clamp(180px, 34cqi, 340px);\n  max-width: 100%;\n  height: 28px;\n  font-size: 12px;\n}\n.ai4m-wb-bar-right {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  margin-inline-start: auto;\n  flex-wrap: wrap;\n}\n.ai4m-wb-banners {\n  padding: 10px 20px 0;\n}\n.ai4m-wb-notice {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 10px;\n  flex-wrap: wrap;\n}\n.ai4m-wb-notice .ai4m-button { height: 24px; padding: 0 8px; font-size: 11.5px; }\n\n/* New / Open Project Form */\n.ai4m-wb-form {\n  margin: 12px 20px 0;\n  padding: 12px 14px;\n  border-radius: 10px;\n  border: 1px solid var(--a4-border-strong);\n  background: var(--a4-surface);\n  display: flex;\n  flex-direction: column;\n  gap: 10px;\n}\n.ai4m-wb-form-head {\n  display: flex;\n  flex-direction: column;\n  gap: 2px;\n}\n.ai4m-wb-form-head strong { font-size: 13px; }\n.ai4m-wb-form-head span { font-size: 12px; }\n.ai4m-wb-form-row {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: flex-end;\n  gap: 10px;\n}\n.ai4m-wb-path-input {\n  display: flex;\n  align-items: center;\n  gap: 6px;\n}\n.ai4m-wb-path-input input { flex: 1 1 200px; min-width: 0; }\n.ai4m-wb-path-input .ai4m-button { height: 30px; flex: 0 0 auto; }\n.ai4m-wb-form-foot {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 10px;\n  flex-wrap: wrap;\n  font-size: 12px;\n}\n.ai4m-check {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  font-size: 12px;\n  color: var(--a4-text);\n  cursor: pointer;\n}\n.ai4m-check input[type=\"checkbox\"] {\n  flex: 0 0 auto;\n  width: 14px;\n  height: 14px;\n  padding: 0;\n  margin: 0;\n  accent-color: var(--a4-brand);\n}\n\n/* Workbench Sub-Tabs */\n.ai4m-wb-tabs {\n  flex: 0 0 auto;\n  display: flex;\n  align-items: center;\n  gap: 4px;\n  padding: 8px 20px 0;\n  border-block-end: 1px solid var(--a4-border);\n  overflow-x: auto;\n  scrollbar-width: thin;\n}\n.ai4m-wb-tab {\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  padding: 7px 11px;\n  border: none;\n  border-block-end: 2px solid transparent;\n  background: transparent;\n  color: var(--a4-muted);\n  font: inherit;\n  font-size: 12.5px;\n  font-weight: 500;\n  cursor: pointer;\n  white-space: nowrap;\n  transition: color 120ms ease, border-color 120ms ease;\n}\n.ai4m-wb-tab:hover { color: var(--a4-text); }\n.ai4m-wb-tab:focus-visible { outline-offset: -2px; }\n.ai4m-wb-tab[data-active=\"true\"] {\n  color: var(--a4-text);\n  font-weight: 600;\n  border-block-end-color: var(--a4-brand);\n}\n\n/* Workbench Body */\n.ai4m-wb-body {\n  flex: 1 1 auto;\n  min-height: 0;\n  overflow: auto;\n}\n.ai4m-wb-body > .ai4m-panel {\n  height: auto;\n  overflow: visible;\n  padding: 16px 20px 28px;\n}\n.ai4m-wb-overview, .ai4m-wb-setup {\n  padding: 16px 20px 28px;\n  display: flex;\n  flex-direction: column;\n  gap: 16px;\n}\n.ai4m-workbench .ai4m-tape {\n  display: grid;\n  grid-template-columns: repeat(4, minmax(0, 1fr));\n  gap: 8px;\n}\n@container ai4m-wb (min-width: 560px) {\n  .ai4m-workbench .ai4m-tape { grid-template-columns: repeat(8, minmax(0, 1fr)); }\n}\n.ai4m-workbench .ai4m-tier {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  justify-content: center;\n  padding: 8px 4px;\n  border-radius: 8px;\n  border: 1px solid var(--a4-border);\n  background: var(--a4-surface);\n  font-size: 16px;\n  font-weight: 650;\n  line-height: 1.25;\n}\n.ai4m-workbench .ai4m-tier > span {\n  display: flex;\n  flex-direction: column;\n  align-items: center;\n  gap: 2px;\n}\n.ai4m-workbench .ai4m-tier .ai4m-kv > :first-child {\n  font-size: 10.5px;\n  font-weight: 600;\n  letter-spacing: 0.02em;\n}\n.ai4m-workbench .ai4m-tier .ai4m-kv > :last-child.ai4m-muted {\n  font-size: 13px;\n  font-weight: 500;\n}\n.ai4m-workbench .ai4m-tier[data-nonzero=\"false\"] {\n  color: var(--a4-muted);\n  background: var(--a4-bg);\n}\n.ai4m-wb-grid {\n  display: grid;\n  grid-template-columns: minmax(0, 1fr);\n  gap: 14px;\n  align-items: start;\n}\n@container ai4m-wb (min-width: 760px) {\n  .ai4m-wb-grid { grid-template-columns: minmax(0, 1.1fr) minmax(0, 1fr); }\n}\n.ai4m-wb-card-head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  flex-wrap: wrap;\n}\n.ai4m-wb-card-head > h3 {\n  border-block-end: none;\n  padding-block-end: 0;\n}\n.ai4m-wb-session-row {\n  flex-wrap: nowrap;\n  justify-content: space-between;\n  gap: 10px;\n}\n.ai4m-wb-session-row > .ai4m-button { flex: 0 0 auto; }\n.ai4m-wb-session-meta {\n  display: flex;\n  flex-direction: column;\n  gap: 3px;\n  flex: 1 1 0;\n  min-width: 0;\n}\n.ai4m-wb-session-meta > strong {\n  font-size: 12.5px;\n  font-weight: 600;\n  white-space: nowrap;\n  overflow: hidden;\n  text-overflow: ellipsis;\n}\n";
     if (!Object.hasOwn(modules, name)) throw new Error('Unexpected AI4Math module request: ' + name);
     if (!Object.hasOwn(cache, name)) {
       const module = { exports: {} };

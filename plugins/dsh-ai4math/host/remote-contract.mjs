@@ -15,11 +15,37 @@ const wikiText = (max) => Object.freeze({
 const wikiSymbol = wikiText(128);
 const wikiSymbols = Object.freeze({ type: 'array', items: wikiSymbol, maxItems: 8, uniqueItems: true });
 const wikiEngines = Object.freeze(['lean4', 'agda', 'rocq', 'smt', 'atp', 'cas', 'informal']);
+const primaryEngines = Object.freeze(['lean4', 'agda', 'rocq']);
+const projectId = Object.freeze({ type: 'string', minLength: 4, maxLength: 64, pattern: '^[A-Za-z0-9_-]+$' });
+const projectRoot = Object.freeze({ type: 'string', minLength: 1, maxLength: 4096 });
+const projectName = Object.freeze({ type: 'string', minLength: 1, maxLength: 80 });
 const list = object({ limit: limit(64) });
 const empty = object();
 const endpoint = (method, description, params, stream) => Object.freeze({ method, description, params, ...(stream ? { stream: true } : {}) });
+const hostEndpoint = (method, description, params) => Object.freeze({ ...endpoint(method, description, params), hostOnly: true });
 
 export const REMOTE_METHODS = Object.freeze({
+  workbenchState: hostEndpoint('workbench.state', 'Read local AI4Math workbench projects, binaries, role bindings, and managed daemon status.', empty),
+  projectInit: hostEndpoint('workbench.project_init', 'Initialize or adopt a local AI4Math project directory and select it in the workbench.', object({
+    root: projectRoot,
+    engine: Object.freeze({ type: 'string', enum: primaryEngines }),
+    name: projectName,
+    auto_start: Object.freeze({ type: 'boolean' }),
+  }, ['root'])),
+  projectSelect: hostEndpoint('workbench.project_select', 'Switch the active AI4Math project and retarget the local daemon bridge.', object({
+    project_id: projectId,
+    auto_start: Object.freeze({ type: 'boolean' }),
+  }, ['project_id'])),
+  projectRemove: hostEndpoint('workbench.project_remove', 'Remove a project from the workbench list without deleting files on disk.', object({
+    project_id: projectId,
+  }, ['project_id'])),
+  daemonStart: hostEndpoint('workbench.daemon_start', 'Start a Host-managed ai4mathd for the selected project or attach to an existing external daemon.', object({
+    project_id: projectId,
+    tick_ms: Object.freeze({ type: 'integer', minimum: 100, maximum: 60000 }),
+  })),
+  daemonStop: hostEndpoint('workbench.daemon_stop', 'Stop the Host-managed ai4mathd; never kills an externally started daemon.', object({
+    project_id: projectId,
+  })),
   proofSubmit: Object.freeze({ ...endpoint('proof.submit', 'Check a proof body in an operator-assigned frozen slot; does not promote.', object({
     target_id: Object.freeze({ type: 'string', minLength: 1, maxLength: 64, pattern: '^[A-Za-z0-9_-]+$' }),
     proof_body: Object.freeze({ type: 'string', minLength: 1, maxLength: 262144 }),

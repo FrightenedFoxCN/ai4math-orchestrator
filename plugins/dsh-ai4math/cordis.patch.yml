@@ -1,8 +1,121 @@
-# Selecting the bundle makes the row visible; it does not start the plugin.
+# Built-in AI4Math Chief orchestrator preset and the opt-in dsh-ai4math row.
+# Selecting the bundle makes the Chief preset available on the preset roster
+# and inserts dsh-ai4math (disabled by default until explicitly enabled).
 - insert:
+    - id: preset-ai4math-chief
+      name: '@deepseek-ai/dsh-agent-preset'
+      config:
+        id: ai4math-chief
+        name: AI4Math Chief
+        description: Main orchestrator for open math problem exploration with AI4Math ledger/Wiki tools, subagent delegation, and formal math skills.
+        order: 8
+        plugins:
+          - id: persona
+            name: '@deepseek-ai/dsh-persona'
+            config:
+              prefix: |-
+                You are the AI4Math Chief Orchestrator powered by the {{model}} model, coordinating open mathematical problem exploration and formal verification on a single local workstation.
+
+                Core operating discipline:
+                1. Inspect ground truth first: call `ai4math_status`, `ai4math_frontier_list`, `ai4math_inbox_list`, and `ai4math_briefing_peek` before planning or dispatching new work.
+                2. Search before reinventing: check `ai4math_wiki_search` (CORE first) and `ai4math_wiki_check_graveyard` to avoid repeating refuted or archived dead-end routes. Remember GRAVEYARD entries and route lessons (L0) are advisory historical warnings, never proofs.
+                3. Dual-track orchestration: balance Exploration (conjectures, counterexample checks, proof sketches) with Infrastructure (reusable lemmas, abstractions, Mathlib-gap bridges). Delegate focused sub-tasks via `subagent` and track progress cleanly.
+                4. Strict trust ledger discipline: never represent an informal sketch, Oracle output, or unverified model proof as kernel-verified (L5). Distinguish L0/L1/L2a/L2b/L3/L4a/L4b/L5 explicitly.
+                5. Human-in-the-loop escalation: surface definition smells, tripped circuit breakers, and high-leverage architectural pivots clearly to the human operator; never fabricate or bypass Owner approvals or kernel receipts.
+          - id: agent-instructions
+            name: '@deepseek-ai/dsh-agent-instructions'
+            config:
+              maxBytes: 65536
+          - id: time-context
+            name: '@deepseek-ai/dsh-time-context'
+          - id: tool-bash
+            name: '@deepseek-ai/dsh-tool-bash'
+            disabled: !!js process.platform === 'win32'
+          - id: tool-pwsh
+            name: '@deepseek-ai/dsh-tool-pwsh'
+            disabled: !!js process.platform !== 'win32'
+          - id: tool-fs
+            name: '@deepseek-ai/dsh-tool-fs'
+            config:
+              applyPatch: false
+          - id: tool-fs-search
+            name: '@deepseek-ai/dsh-tool-fs-search'
+            config:
+              sampleOverCapGlobResults: false
+          - id: tool-jobs
+            name: '@deepseek-ai/dsh-tool-jobs'
+          - id: tool-schedule
+            name: '@deepseek-ai/dsh-tool-schedule'
+          - id: skill-filesystem
+            name: '@deepseek-ai/dsh-skill-filesystem'
+          - id: tool-skill
+            name: '@deepseek-ai/dsh-tool-skill'
+          - id: command-goal
+            name: '@deepseek-ai/dsh-command-goal'
+          - id: tool-goal
+            name: '@deepseek-ai/dsh-tool-goal'
+          - id: compaction
+            name: cordis:group
+            group: true
+            isolate:
+              compaction: true
+              toolResultPruner: true
+            config:
+              - id: compaction-basic
+                name: '@deepseek-ai/dsh-compaction-basic'
+              - id: command-compact
+                name: '@deepseek-ai/dsh-command-compact'
+              - id: tool-result-pruner
+                name: '@deepseek-ai/dsh-compaction-tool-result-pruner'
+                config:
+                  thresholdChars: 8192
+                  headChars: 4096
+                  tailChars: 1024
+          - id: delegation
+            name: cordis:group
+            group: true
+            isolate:
+              workflowEngine: true
+            config:
+              - id: tool-subagent-control
+                name: '@deepseek-ai/dsh-tool-subagent-control'
+                config:
+                  interrupt: false
+              - id: tool-subagent
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: spawn
+                  toolName: subagent
+                  modelSelection: true
+                  modelDiscovery: true
+              - id: tool-subagent-fork
+                name: '@deepseek-ai/dsh-tool-subagent'
+                config:
+                  provider: fork
+                  toolName: subagent_fork
+              - id: workflow-ptc
+                name: '@deepseek-ai/dsh-workflow-ptc'
+                config:
+                  provider: spawn
+              - id: tool-workflow
+                name: '@deepseek-ai/dsh-tool-workflow'
+          - id: tool-ask-user
+            name: '@deepseek-ai/dsh-tool-ask-user'
+          - id: tool-todo
+            name: '@deepseek-ai/dsh-tool-todo'
+            config:
+              allowParallelInProgress: true
+          - id: tool-web
+            name: '@deepseek-ai/dsh-tool-web'
+            config:
+              fetch: true
+              searchTimeoutMs: 60000
+          - id: present
+            name: '@deepseek-ai/dsh-tool-present'
     - id: dsh-ai4math
       name: dsh-ai4math
       disabled: true
       config:
-        rolePresets: {}
+        rolePresets:
+          chief: ai4math-chief
         proofSlots: {}

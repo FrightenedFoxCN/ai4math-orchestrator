@@ -7,7 +7,7 @@ export const AGENT_ROLES = Object.freeze(['chief', 'regional', 'explorer', 'buil
 // In particular the blind Reviewer cannot retrieve orchestration history through this bridge.
 const readWiki = Object.freeze(['status', 'wikiSearch']);
 const roleMethods = Object.freeze({
-  owner: Object.freeze(Object.keys(REMOTE_METHODS).filter(key => !REMOTE_METHODS[key].agentOnly)),
+  owner: Object.freeze(Object.keys(REMOTE_METHODS).filter(key => !REMOTE_METHODS[key].agentOnly && !REMOTE_METHODS[key].hostOnly)),
   chief: Object.freeze(['status', 'briefingPeek', 'frontierList', 'inboxList', 'wikiSearch', 'wikiCheckGraveyard', 'wikiProvenance']),
   regional: Object.freeze([...readWiki, 'wikiCheckGraveyard']),
   explorer: Object.freeze([...readWiki, 'wikiCheckGraveyard', 'wikiProvenance']),
@@ -112,9 +112,10 @@ const withLifetime = (lifetime, signal) => signal ? AbortSignal.any([lifetime, s
 
 /** Factory kept private to the Host composition. Role is bound once from trusted context. */
 export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reconnectMaxMs = 5000 }) {
-  const path = socketPath === undefined ? undefined : requireSocketPath(socketPath);
+  let path = socketPath === undefined ? undefined : requireSocketPath(socketPath);
   const lifetime = new AbortController();
   const connections = new Set();
+  const sleepers = new Set();
   let unary;
   let streams = 0;
   let proofCalls = 0;
@@ -124,6 +125,30 @@ export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reco
     const conn = new NdjsonConnection(path, { timeoutMs, ...options });
     connections.add(conn);
     return conn;
+  }
+
+  function wakeSleepers() {
+    for (const sleeper of [...sleepers]) sleeper.abort();
+    sleepers.clear();
+  }
+
+  function disconnect() {
+    unary = undefined;
+    const error = new BridgeError('disconnected');
+    for (const conn of [...connections]) conn.close(error);
+    connections.clear();
+  }
+
+  function retarget(nextSocketPath) {
+    const validated = nextSocketPath === undefined ? undefined : requireSocketPath(nextSocketPath);
+    if (validated === path) {
+      wakeSleepers();
+      return false;
+    }
+    path = validated;
+    disconnect();
+    wakeSleepers();
+    return true;
   }
 
   async function* follow(topics, callerSignal) {
@@ -179,9 +204,19 @@ export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reco
           reconnecting = true;
           yield transition('reconnecting');
         }
-        try { await delay(Math.ceil(backoff * (0.5 + Math.random() / 2)), undefined, { signal }); }
-        catch (error) { if (signal.aborted) return; throw error; }
-        backoff = Math.min(backoff * 2, reconnectMaxMs);
+        const wake = new AbortController();
+        sleepers.add(wake);
+        try {
+          await delay(Math.ceil(backoff * (0.5 + Math.random() / 2)), undefined, { signal: AbortSignal.any([signal, wake.signal]) });
+          backoff = Math.min(backoff * 2, reconnectMaxMs);
+        } catch (error) {
+          if (signal.aborted) return;
+          if (wake.signal.aborted) {
+            backoff = reconnectMinMs;
+          } else throw error;
+        } finally {
+          sleepers.delete(wake);
+        }
       }
     } finally {
       streams--;
@@ -189,6 +224,10 @@ export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reco
   }
 
   return Object.freeze({
+    socketPath: () => path,
+    retarget,
+    disconnect,
+    wake: wakeSleepers,
     bind(role, { proofSlots = [] } = {}) {
       const allowed = methodsForRole(role);
       const assigned = new Set(proofSlots);

@@ -179,3 +179,31 @@ test('refuses additional streams beyond the host-wide limit', async (t) => {
   await assert.rejects(owner.subscribe({ topics }).next(), fails('busy'));
   await Promise.all(streams.map((stream) => stream.return()));
 });
+
+test('retarget switches unary calls and live subscriptions to a new daemon socket immediately', async (t) => {
+  const sockA = await fixture(t, ({ id, method }, socket) => {
+    if (method === 'subscribe') { reply(socket, id, { topics }); setTimeout(() => push(socket, event, { project: 'A' }), 5); }
+    else reply(socket, id, { project: 'A' });
+  });
+  const sockB = await fixture(t, ({ id, method }, socket) => {
+    if (method === 'subscribe') { reply(socket, id, { topics }); setTimeout(() => push(socket, event, { project: 'B' }), 5); }
+    else reply(socket, id, { project: 'B' });
+  });
+  const bridge = createBridge({ socketPath: sockA, reconnectMinMs: 20, reconnectMaxMs: 5000 });
+  t.after(() => bridge.close());
+  const owner = bridge.bind('owner');
+  assert.deepEqual(await owner.call('status', {}), { project: 'A' });
+  const ac = abort();
+  const stream = owner.subscribe({ topics }, ac.signal);
+  assert.equal((await stream.next()).value.data.state, 'connected');
+  assert.deepEqual((await stream.next()).value, { topic: event, data: { project: 'A' } });
+
+  assert.equal(bridge.retarget(sockB), true);
+  assert.equal(bridge.socketPath(), sockB);
+  assert.equal((await stream.next()).value.data.state, 'reconnecting');
+  assert.equal((await stream.next()).value.data.state, 'connected');
+  assert.deepEqual((await stream.next()).value, { topic: event, data: { project: 'B' } });
+  assert.deepEqual(await owner.call('status', {}), { project: 'B' });
+  ac.abort();
+  await stream.return();
+});

@@ -6,12 +6,17 @@ import { z } from 'zod';
 import { AGENT_ROLES, createBridge, methodsForRole, parseParams } from './bridge.mjs';
 import { BridgeError } from './connection.mjs';
 import { REMOTE_METHODS, REMOTE_NAMESPACE, REMOTE_PACKAGE } from './remote-contract.mjs';
+import { createWorkbench } from './workbench.mjs';
 
 export const name = 'dsh-ai4math';
 export const inject = ['typert', 'typertGateway'];
 export const Config = Schema.object({
-  socketPath: Schema.string().description('Absolute path to the local ai4mathd Unix socket; falls back to AI4MATH_SOCKET.'),
+  socketPath: Schema.string().description('Absolute path to the local ai4mathd Unix socket; falls back to AI4MATH_SOCKET or the active Workbench project.'),
   timeoutMs: Schema.natural().min(100).max(60_000).default(5000).description('Deadline for each local RPC, including connection.'),
+  cliPath: Schema.string().description('Optional absolute path to the local ai4math CLI binary; auto-detected from the repo checkout when omitted.'),
+  daemonPath: Schema.string().description('Optional absolute path to the local ai4mathd binary; auto-detected from the repo checkout when omitted.'),
+  registryPath: Schema.string().description('Optional absolute path to the Workbench project registry JSON file.'),
+  defaultChiefPreset: Schema.string().default('ai4math-chief').description('Agent preset ID launched by one-click Chief sessions from the Workbench.'),
   proofSlots: Schema.object({ prover: Schema.array(Schema.string()), automation: Schema.array(Schema.string()) }).default({})
     .description('Exact frozen slot IDs visible to the configured prover or automation preset. Defaults to none.'),
   rolePresets: Schema.object(Object.fromEntries(AGENT_ROLES.map((role) => [role, Schema.string()]))).default({})
@@ -52,10 +57,17 @@ function requireOwner(ctx) {
 }
 
 class Ai4mathRemote extends TypertRemoteService {
-  constructor(ctx, owner) {
+  constructor(ctx, owner, workbench) {
     super(ctx, REMOTE_NAMESPACE);
     this.owner = owner;
+    this.workbench = workbench;
   }
+  async workbenchState(params) { return callWorkbench(this, 'workbenchState', 'state', params); }
+  async projectInit(params) { return callWorkbench(this, 'projectInit', 'projectInit', params); }
+  async projectSelect(params) { return callWorkbench(this, 'projectSelect', 'projectSelect', params); }
+  async projectRemove(params) { return callWorkbench(this, 'projectRemove', 'projectRemove', params); }
+  async daemonStart(params) { return callWorkbench(this, 'daemonStart', 'daemonStart', params); }
+  async daemonStop(params) { return callWorkbench(this, 'daemonStop', 'daemonStop', params); }
   async status(params, signal) { return callOwner(this, 'status', params, signal); }
   async briefingPeek(params, signal) { return callOwner(this, 'briefingPeek', params, signal); }
   async briefingPull(params, signal) { return callOwner(this, 'briefingPull', params, signal); }
@@ -70,6 +82,16 @@ class Ai4mathRemote extends TypertRemoteService {
     requireOwner(this.ctx);
     try { yield* this.owner.subscribe(params, signal); }
     catch (error) { throw asRemoteError(error); }
+  }
+}
+
+async function callWorkbench(service, key, handler, params) {
+  requireOwner(service.ctx);
+  try {
+    const args = parseParams(key, params);
+    return await service.workbench[handler](args);
+  } catch (error) {
+    throw asRemoteError(error);
   }
 }
 
@@ -177,9 +199,23 @@ export function apply(ctx, config = {}) {
       throw new TypeError('ai4math proofSlots must list distinct approved slot IDs.');
     return [role, ids.slice()];
   }));
-  const bridge = createBridge({ socketPath: config.socketPath || process.env.AI4MATH_SOCKET || undefined, timeoutMs: config.timeoutMs });
-  ctx.effect(() => () => bridge.close(), 'ai4math.socket-lifecycle');
-  new Ai4mathRemote(ctx, bridge.bind('owner'));
+  const initialSocketPath = config.socketPath || process.env.AI4MATH_SOCKET || undefined;
+  const bridge = createBridge({ socketPath: initialSocketPath, timeoutMs: config.timeoutMs });
+  const workbench = createWorkbench({
+    bridge,
+    cliPath: config.cliPath,
+    daemonPath: config.daemonPath,
+    registryPath: config.registryPath,
+    initialSocketPath,
+    rolePresets: config.rolePresets ?? {},
+    proofSlots,
+    defaultChiefPreset: config.defaultChiefPreset ?? 'ai4math-chief',
+  });
+  ctx.effect(() => async () => {
+    await workbench.close();
+    bridge.close();
+  }, 'ai4math.socket-lifecycle');
+  new Ai4mathRemote(ctx, bridge.bind('owner'), workbench);
   ctx.typert.register(contribution);
   installTools(ctx, bridge, roleByPreset, proofSlots);
 }
