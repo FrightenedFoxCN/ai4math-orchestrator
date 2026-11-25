@@ -168,6 +168,14 @@ fn native(
         &next,
         clone.to_str().unwrap(),
     ]));
+    if engine == "AI4MATH_TEST_LEAN" && downstream.is_some() {
+        let mut names = fs::read_dir(&clone)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["Consumer.olean", "Proof.olean"]);
+    }
 }
 
 #[test]

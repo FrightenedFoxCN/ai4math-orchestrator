@@ -10,6 +10,8 @@ pub use lean_hammer::{
 };
 mod lean_kernel;
 use lean_kernel::LeanKernelPolicy;
+mod lean_objects;
+use lean_objects::LeanObjects;
 mod lean_spec;
 pub use lean_spec::VerifiedLeanComparison;
 mod oracle;
@@ -409,17 +411,19 @@ enum DiagnosticOutput {
 }
 
 enum CheckMode<'a> {
-    Default {
+    NonLean {
         save_object: bool,
-        diagnostic_output: DiagnosticOutput,
     },
     LeanAdvisory {
         deadline: Instant,
     },
     IsolatedLean {
         predecessors: &'a PathBuf,
+        save_object: bool,
         timeout: Duration,
         deadline: Option<Instant>,
+        diagnostic_output: DiagnosticOutput,
+        pin_audit_options: bool,
     },
 }
 
@@ -498,6 +502,89 @@ fn validate_modules_for_tool(
         LeanKernelPolicy::validate_modules(tool, modules, target)?;
     }
     Ok(())
+}
+
+/// Standard build session. Agda and Rocq retain their existing shared output layout;
+/// Lean only exposes the output pool to its compiler as read-only predecessor data.
+struct ModuleBuild<'a> {
+    tool: &'a Toolchain,
+    room: &'a Path,
+    output: PathBuf,
+    lean_objects: Option<LeanObjects>,
+}
+
+impl<'a> ModuleBuild<'a> {
+    fn new(tool: &'a Toolchain, room: &'a Path) -> Result<Self> {
+        let output = room.join("output");
+        let lean_objects = if tool.engine == Engine::Lean4 {
+            // This bound is already implied by source-count, recognized parts,
+            // and Seatbelt limits; do not shrink the legacy accepted build size.
+            // Golden still applies its own aggregate cap to published objects.
+            const STANDARD_POOL_CAP: u64 =
+                MAX_MODULES as u64 * lean_objects::MAX_PARTS_PER_MODULE * sandbox::FILE_CAP;
+            Some(LeanObjects::create(
+                &output,
+                sandbox::FILE_CAP,
+                STANDARD_POOL_CAP,
+            )?)
+        } else {
+            fs::create_dir(&output)?;
+            None
+        };
+        Ok(Self {
+            tool,
+            room,
+            output,
+            lean_objects,
+        })
+    }
+
+    fn compile(
+        &mut self,
+        broker: &Broker,
+        relative: &str,
+        source: &str,
+        save_object: bool,
+        diagnostic_output: DiagnosticOutput,
+    ) -> Result<String> {
+        if let Some(objects) = &mut self.lean_objects {
+            return objects.compile(
+                relative,
+                source,
+                save_object,
+                |room, writable, predecessors| {
+                    broker.check_with_output_timeout(
+                        self.tool,
+                        room,
+                        writable,
+                        relative,
+                        CheckMode::IsolatedLean {
+                            predecessors,
+                            save_object,
+                            timeout: TIMEOUT,
+                            deadline: None,
+                            diagnostic_output,
+                            pin_audit_options: false,
+                        },
+                    )
+                },
+            );
+        }
+        stage_source(self.tool.engine, self.room, &self.output, relative, source)?;
+        broker.check(self.tool, self.room, &self.output, relative, save_object)
+    }
+
+    fn compile_all(&mut self, broker: &Broker, modules: &[(&str, &str)]) -> Result<()> {
+        // All callers validate before staging. Retain the installation check
+        // here as defense in depth for internal callers.
+        if self.tool.engine == Engine::Lean4 {
+            lean_kernel::reject_installation_shadows(self.tool, modules)?;
+        }
+        for &(relative, source) in modules {
+            self.compile(broker, relative, source, true, DiagnosticOutput::Text)?;
+        }
+        Ok(())
+    }
 }
 
 fn stage_source(
@@ -584,34 +671,12 @@ impl Broker {
         relative: &str,
         save_object: bool,
     ) -> Result<String> {
-        self.check_with_output(
-            tool,
-            room,
-            output,
-            relative,
-            save_object,
-            DiagnosticOutput::Text,
-        )
-    }
-
-    fn check_with_output(
-        &self,
-        tool: &Toolchain,
-        room: &Path,
-        output: &Path,
-        relative: &str,
-        save_object: bool,
-        diagnostic_output: DiagnosticOutput,
-    ) -> Result<String> {
         self.check_with_output_timeout(
             tool,
             room,
             output,
             relative,
-            CheckMode::Default {
-                save_object,
-                diagnostic_output,
-            },
+            CheckMode::NonLean { save_object },
         )
     }
 
@@ -623,42 +688,58 @@ impl Broker {
         relative: &str,
         mode: CheckMode<'_>,
     ) -> Result<String> {
-        let (save_object, diagnostic_output, timeout, predecessors, deadline) = match mode {
-            CheckMode::Default {
-                save_object,
-                diagnostic_output,
-            } => (save_object, diagnostic_output, TIMEOUT, &[][..], None),
-            CheckMode::LeanAdvisory { deadline } => {
-                ensure!(
-                    tool.engine == Engine::Lean4,
-                    "advisory check requires native Lean"
-                );
-                (
-                    false,
-                    DiagnosticOutput::Text,
-                    LEAN_ADVISORY_TIMEOUT,
-                    &[][..],
-                    Some(deadline),
-                )
-            }
-            CheckMode::IsolatedLean {
-                predecessors,
-                timeout,
-                deadline,
-            } => {
-                ensure!(
-                    tool.engine == Engine::Lean4,
-                    "isolated build requires native Lean"
-                );
-                (
-                    true,
-                    DiagnosticOutput::Text,
+        let (save_object, diagnostic_output, timeout, predecessors, deadline, pin_audit_options) =
+            match mode {
+                CheckMode::NonLean { save_object } => {
+                    ensure!(
+                        tool.engine != Engine::Lean4,
+                        "Lean requires a dedicated check mode"
+                    );
+                    (
+                        save_object,
+                        DiagnosticOutput::Text,
+                        TIMEOUT,
+                        &[][..],
+                        None,
+                        false,
+                    )
+                }
+                CheckMode::LeanAdvisory { deadline } => {
+                    ensure!(
+                        tool.engine == Engine::Lean4,
+                        "advisory check requires native Lean"
+                    );
+                    (
+                        false,
+                        DiagnosticOutput::Text,
+                        LEAN_ADVISORY_TIMEOUT,
+                        &[][..],
+                        Some(deadline),
+                        false,
+                    )
+                }
+                CheckMode::IsolatedLean {
+                    predecessors,
+                    save_object,
                     timeout,
-                    std::slice::from_ref(predecessors),
                     deadline,
-                )
-            }
-        };
+                    diagnostic_output,
+                    pin_audit_options,
+                } => {
+                    ensure!(
+                        tool.engine == Engine::Lean4,
+                        "isolated build requires native Lean"
+                    );
+                    (
+                        save_object,
+                        diagnostic_output,
+                        timeout,
+                        std::slice::from_ref(predecessors),
+                        deadline,
+                        pin_audit_options,
+                    )
+                }
+            };
         let module = path_for(tool.engine, relative)?;
         let mut reads = tool.reads.clone();
         let output = output.canonicalize()?;
@@ -666,11 +747,15 @@ impl Broker {
         let mut args = Vec::<String>::new();
         match tool.engine {
             Engine::Lean4 => {
+                ensure!(
+                    !save_object || !predecessors.is_empty(),
+                    "Lean object builds require an isolated predecessor pool"
+                );
                 let imports = predecessors
                     .first()
                     .map_or(output.as_path(), PathBuf::as_path);
                 env.push(("LEAN_PATH", imports));
-                if !predecessors.is_empty() {
+                if pin_audit_options {
                     args.extend([
                         "-Ddebug.skipKernelTC=false".into(),
                         "-DElab.async=false".into(),
@@ -924,33 +1009,24 @@ impl Broker {
         ensure!(source.len() <= SOURCE_CAP, "module source exceeds limit");
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
         let room = tempfile::tempdir()?;
-        let output = room.path().join("output");
-        fs::create_dir(&output)?;
+        let mut build = ModuleBuild::new(tool, room.path())?;
         let start = Instant::now();
-        let build = self.build_modules(tool, room.path(), &output, dependencies);
+        let dependency_build = build.compile_all(self, dependencies);
         if matches!(mode, VerificationMode::AssessT3) {
-            build.context("build verification dependencies")?;
+            dependency_build.context("build verification dependencies")?;
         } else {
-            build?;
+            dependency_build?;
         }
         let checked = if tool.engine == Engine::Lean4 {
             format!("{source}\n#print axioms {}\n", target.target_id)
         } else {
             source.clone()
         };
-        stage_source(
-            tool.engine,
-            room.path(),
-            &output,
-            &target.file_path,
-            &checked,
-        )?;
         let log = if classify_lean {
-            match self.check_with_output(
-                tool,
-                room.path(),
-                &output,
+            match build.compile(
+                self,
                 &target.file_path,
+                &checked,
                 true,
                 DiagnosticOutput::LeanJson,
             ) {
@@ -966,26 +1042,27 @@ impl Broker {
                 }
             }
         } else {
-            self.check(
-                tool,
-                room.path(),
-                &output,
+            build.compile(
+                self,
                 &target.file_path,
+                &checked,
                 matches!(tool.engine, Engine::Lean4 | Engine::Rocq),
+                DiagnosticOutput::Text,
             )?
         };
+        let output = &build.output;
         let observed_axioms = match tool.engine {
             Engine::Lean4 => lean_axioms(&log, &target.target_id)?,
             Engine::Agda => vec![],
             Engine::Rocq => {
-                rocq::audit(tool, &output, target)?;
+                rocq::audit(tool, output, target)?;
                 vec![]
             }
         };
         if tool.engine == Engine::Lean4 {
             LeanKernelPolicy::replay_matching_report(
                 tool,
-                &output,
+                output,
                 path_for(Engine::Lean4, &target.file_path)?,
                 &target.target_id,
                 &observed_axioms,
@@ -1018,15 +1095,14 @@ impl Broker {
         validate_modules_for_tool(tool, modules, None)?;
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
         let room = tempfile::tempdir()?;
-        let output = room.path().join("output");
-        fs::create_dir(&output)?;
-        self.build_modules(tool, room.path(), &output, modules)?;
+        let mut build = ModuleBuild::new(tool, room.path())?;
+        build.compile_all(self, modules)?;
         if tool.engine == Engine::Lean4 {
             let modules = modules
                 .iter()
                 .map(|(path, _)| path_for(Engine::Lean4, path))
                 .collect::<Result<Vec<_>>>()?;
-            LeanKernelPolicy::replay_modules(tool, &output, &modules)?;
+            LeanKernelPolicy::replay_modules(tool, &build.output, &modules)?;
         }
         Ok(())
     }
@@ -1046,44 +1122,39 @@ impl Broker {
         check_regression_binding(candidate, modules)?;
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
         let room = tempfile::tempdir()?;
-        let output = room.path().join("output");
-        fs::create_dir(&output)?;
+        let mut build = ModuleBuild::new(tool, room.path())?;
         let mut downstream = false;
         let mut downstream_modules = Vec::new();
         for &(relative, source) in modules {
             let is_downstream = downstream;
-            stage_source(tool.engine, room.path(), &output, relative, source)?;
             if tool.engine == Engine::Lean4
                 && candidate.receipt.tier == ReceiptTier::T1Promotion
                 && is_downstream
             {
-                self.check_with_output(
-                    tool,
-                    room.path(),
-                    &output,
-                    relative,
-                    true,
-                    DiagnosticOutput::LeanJson,
-                )
-                .map_err(|err| regression_failure::classify(err, candidate, relative, source))?;
+                build
+                    .compile(self, relative, source, true, DiagnosticOutput::LeanJson)
+                    .map_err(|err| {
+                        regression_failure::classify(err, candidate, relative, source)
+                    })?;
             } else {
-                self.check(tool, room.path(), &output, relative, true)?;
+                build.compile(self, relative, source, true, DiagnosticOutput::Text)?;
             }
             downstream |= relative == candidate.receipt.file_path;
             if tool.engine == Engine::Lean4 && is_downstream {
                 downstream_modules.push(path_for(Engine::Lean4, relative)?);
             }
         }
+        let output = &build.output;
         if tool.engine == Engine::Lean4 {
             LeanKernelPolicy::replay_matching_report(
                 tool,
-                &output,
+                output,
                 path_for(Engine::Lean4, candidate.receipt.file_path())?,
                 candidate.receipt.target_id(),
                 candidate.receipt.observed_axioms(),
             )?;
             if !downstream_modules.is_empty() {
-                LeanKernelPolicy::replay_modules(tool, &output, &downstream_modules)?;
+                LeanKernelPolicy::replay_modules(tool, output, &downstream_modules)?;
             }
         }
         let extension = match tool.engine {
@@ -1097,29 +1168,7 @@ impl Broker {
                 path_for(tool.engine, name).map(|module| format!("{module}.{extension}"))
             })
             .collect::<Result<Vec<_>>>()?;
-        RegressionArtifacts::collect(&output, names, candidate)
-    }
-
-    fn build_modules(
-        &self,
-        tool: &Toolchain,
-        room: &Path,
-        output: &Path,
-        modules: &[(&str, &str)],
-    ) -> Result<()> {
-        // All callers validate the complete set (including any reserved target)
-        // before acquiring resources or creating the clean room. Keep the Lean
-        // installation check here as defense in depth for internal callers.
-        // A module sees only its predecessors; later regression modules must
-        // not widen the verified target's original import closure (notably in Agda).
-        if tool.engine == Engine::Lean4 {
-            lean_kernel::reject_installation_shadows(tool, modules)?;
-        }
-        for &(relative, source) in modules {
-            stage_source(tool.engine, room, output, relative, source)?;
-            self.check(tool, room, output, relative, true)?;
-        }
-        Ok(())
+        RegressionArtifacts::collect(output, names, candidate)
     }
 }
 

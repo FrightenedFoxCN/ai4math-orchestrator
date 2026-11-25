@@ -1,16 +1,13 @@
 //! Broker-only refutation checks against a sealed Lean proposition declaration.
 use super::{
-    Broker, DiagnosticOutput, Engine, FrozenTarget, Lane, Pressure, ProofBodySubmission,
-    SOURCE_CAP, Toolchain, dependencies_digest, digest, lean_axioms, path_for, render_proof_body,
-    stage_source, t3, validate_modules,
+    Broker, DiagnosticOutput, Engine, FrozenTarget, Lane, ModuleBuild, Pressure,
+    ProofBodySubmission, SOURCE_CAP, Toolchain, dependencies_digest, digest, lean_axioms, path_for,
+    render_proof_body, t3, validate_modules,
 };
 use ai4math_evidence::WitnessEvidence;
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
-use std::{
-    fs,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const CHECKER_FILE: &str = "Ai4mathSealedWitness.lean";
 const WITNESS: &str = "witness";
@@ -263,17 +260,15 @@ impl Broker {
 
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
         let room = tempfile::tempdir()?;
-        let output = room.path().join("output");
-        fs::create_dir(&output)?;
-        self.build_modules(tool, room.path(), &output, &trusted)
+        let mut build = ModuleBuild::new(tool, room.path())?;
+        build
+            .compile_all(self, &trusted)
             .context("build sealed proposition and verification dependencies")?;
-        stage_source(Engine::Lean4, room.path(), &output, CHECKER_FILE, &source)?;
-        let diagnostics = self
-            .check_with_output(
-                tool,
-                room.path(),
-                &output,
+        let diagnostics = build
+            .compile(
+                self,
                 CHECKER_FILE,
+                &source,
                 false,
                 DiagnosticOutput::LeanJson,
             )

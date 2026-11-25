@@ -20,6 +20,31 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked
 
+  native-lean:
+    runs-on: macos-15
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install pinned Lean 4.35.0 (arm64)
+        shell: bash
+        run: |
+          test "$(uname -m)" = arm64
+          asset=lean-4.35.0-darwin_aarch64.tar.zst
+          archive="$RUNNER_TEMP/$asset"
+          curl --fail --location --retry 3 --output "$archive" \
+            "https://github.com/leanprover/lean4/releases/download/v4.35.0/$asset"
+          printf '%s  %s\n' 'c0c6f34f35ba1dcc5c4a5fd106fefab9eb5e8469712624dd2c868d51b63177c2' "$archive" | shasum -a 256 -c -
+          prefix="$RUNNER_TEMP/ai4math-lean-4.35.0"
+          mkdir "$prefix"
+          tar --strip-components 1 -xf "$archive" -C "$prefix"
+          printf 'AI4MATH_TEST_LEAN=%s/bin/lean\n' "$prefix" >> "$GITHUB_ENV"
+      - name: Run native Lean and recovery gates
+        run: bash .github/native-lean.sh
+
   plugin:
     runs-on: ubuntu-latest
     steps:

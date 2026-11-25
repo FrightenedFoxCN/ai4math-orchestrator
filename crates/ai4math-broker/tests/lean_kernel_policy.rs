@@ -34,7 +34,13 @@ fn native_lean_t1_t3_regression_and_check_modules_accept_normal_closure() {
     let tool = native();
     let broker = Broker::new();
     let commit = "a".repeat(40);
-    let dependencies = [("Support.lean", "def current : Nat := 0\n")];
+    let dependencies = [
+        ("Base.lean", "def initial : Nat := 0\n"),
+        (
+            "Support.lean",
+            "import Base\ndef current : Nat := initial\n",
+        ),
+    ];
     let target = make_target("import Support\ntheorem checked : current = 0 := ");
     let proof = make_proof(&target, "by rfl");
 
@@ -66,7 +72,7 @@ fn native_lean_t1_t3_regression_and_check_modules_accept_normal_closure() {
     modules.push(("Target.lean", candidate.source()));
     modules.push((
         "Later.lean",
-        "import Support\ntheorem later : current = 0 := rfl\n",
+        "import Target\ntheorem later : current = 0 := checked\n",
     ));
     broker.check_modules(&tool, &modules).unwrap();
     broker.regress(&tool, &candidate, &modules).unwrap();

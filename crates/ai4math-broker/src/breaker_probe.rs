@@ -1,13 +1,12 @@
 //! Native Lean regression checks for operator-approved, committed probes.
 use super::{
-    Broker, Engine, Lane, Pressure, TIMEOUT, Toolchain, dependencies_digest, digest, path_for,
-    sandbox, stage_source, validate_modules,
+    Broker, Engine, Lane, Pressure, TIMEOUT, Toolchain, dependencies_digest, digest,
+    lean_objects::LeanObjects, path_for, sandbox, stage_source, validate_modules,
 };
 use ai4math_evidence::BreakerProbeEvidence;
 use anyhow::{Context, Result, ensure};
 use std::{
     fs,
-    io::ErrorKind,
     path::Path,
     time::{Duration, Instant},
 };
@@ -155,39 +154,6 @@ fn validate_inputs<'a>(
     Ok(module)
 }
 
-/// Only collect the module named in this invocation. A later module (including
-/// the watched one) cannot rewrite a predecessor's object or stage a builtin.
-fn commit_object_parts(
-    scratch: &Path,
-    objects: &Path,
-    module: &str,
-    remaining_bytes: &mut u64,
-) -> Result<()> {
-    for ext in ["olean", "olean.server", "olean.private", "ir.sig", "ir"] {
-        let name = format!("{module}.{ext}");
-        let path = scratch.join(&name);
-        let info = match fs::symlink_metadata(&path) {
-            Ok(info) => info,
-            Err(e) if e.kind() == ErrorKind::NotFound && ext != "olean" => continue,
-            Err(e) => return Err(e).with_context(|| format!("read Lean build artifact {name}")),
-        };
-        ensure!(info.is_file(), "invalid Lean build artifact {name}");
-        let bytes = info.len();
-        ensure!(
-            bytes <= ARTIFACT_CAP,
-            "oversized Lean build artifact {name}"
-        );
-        *remaining_bytes = remaining_bytes
-            .checked_sub(bytes)
-            .context("isolated Lean build artifacts exceed byte limit")?;
-        ensure!(
-            fs::copy(path, objects.join(&name))? == bytes,
-            "Lean build artifact changed: {name}"
-        );
-    }
-    Ok(())
-}
-
 pub(super) fn command_timeout(deadline: Instant) -> Result<Duration> {
     let remaining = deadline.saturating_duration_since(Instant::now());
     ensure!(
@@ -207,38 +173,34 @@ pub(super) fn build_committed_sources(
     prefix: Option<(usize, &Path)>,
 ) -> Result<()> {
     let objects = room.join("objects");
-    let mut remaining_bytes = TOTAL_ARTIFACT_CAP;
-    fs::create_dir(&objects)?;
+    let mut pool = LeanObjects::create(&objects, ARTIFACT_CAP, TOTAL_ARTIFACT_CAP)?;
     for (index, &(path, source)) in sources.iter().enumerate() {
         let module = path_for(Engine::Lean4, path)?;
-        let scratch = tempfile::Builder::new().prefix("build-").tempdir_in(room)?;
-        let writable = scratch.path().join("scratch");
-        fs::create_dir(&writable)?;
-        let object = writable.join(format!("{module}.olean"));
-        stage_source(Engine::Lean4, scratch.path(), &writable, path, source)?;
-        sandbox::run_with_data(
-            sandbox::Invocation {
-                executable: &tool.executable,
-                args: &[
-                    "-Ddebug.skipKernelTC=false".into(),
-                    "-DElab.async=false".into(),
-                    "-o".into(),
-                    object.to_str().context("non-UTF-8 output path")?.into(),
-                    path.into(),
-                ],
-                room: scratch.path(),
-                writable: &writable,
-                reads: &tool.reads,
-                env: &[("LEAN_PATH", &objects)],
-                timeout: command_timeout(deadline)?,
-            },
-            std::slice::from_ref(&objects),
-            &[],
-        )
-        .with_context(|| format!("build isolated Lean module {path:?}"))?;
-        command_timeout(deadline)?;
-        commit_object_parts(&writable, &objects, module, &mut remaining_bytes)?;
-        scratch.close()?;
+        pool.compile(path, source, true, |room, writable, predecessors| {
+            let object = writable.join(format!("{module}.olean"));
+            let log = sandbox::run_with_data(
+                sandbox::Invocation {
+                    executable: &tool.executable,
+                    args: &[
+                        "-Ddebug.skipKernelTC=false".into(),
+                        "-DElab.async=false".into(),
+                        "-o".into(),
+                        object.to_str().context("non-UTF-8 output path")?.into(),
+                        path.into(),
+                    ],
+                    room,
+                    writable,
+                    reads: &tool.reads,
+                    env: &[("LEAN_PATH", predecessors)],
+                    timeout: command_timeout(deadline)?,
+                },
+                std::slice::from_ref(predecessors),
+                &[],
+            )
+            .with_context(|| format!("build isolated Lean module {path:?}"))?;
+            command_timeout(deadline)?;
+            Ok(log)
+        })?;
         if let Some((len, snapshot)) = prefix.filter(|(len, _)| *len == index + 1) {
             debug_assert_eq!(len, index + 1);
             fs::create_dir(snapshot)?;
@@ -337,19 +299,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn artifact_and_deadline_budgets_fail_closed() -> Result<()> {
-        let room = tempfile::tempdir()?;
-        let objects = room.path().join("objects");
-        let artifact = room.path().join("Target.olean");
-        fs::create_dir(&objects)?;
-        fs::File::create(&artifact)?.set_len(ARTIFACT_CAP + 1)?;
-        let mut budget = TOTAL_ARTIFACT_CAP;
-        assert!(commit_object_parts(room.path(), &objects, "Target", &mut budget).is_err());
-        assert!(!objects.join("Target.olean").exists());
-        fs::write(artifact, b"test")?;
-        budget = 3;
-        assert!(commit_object_parts(room.path(), &objects, "Target", &mut budget).is_err());
-        assert!(!objects.join("Target.olean").exists());
+    fn deadline_budget_fails_closed() -> Result<()> {
         assert_eq!(command_timeout(Instant::now() + TOTAL_TIMEOUT)?, TIMEOUT);
         assert!(command_timeout(Instant::now()).is_err());
         Ok(())

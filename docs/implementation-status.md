@@ -15,7 +15,7 @@
 
 - `PromotionRepo::is_ungrafted_ancestor` 统一使用 physical ancestry：忽略 replace refs、`info/grafts` 和 commit-graph；已删除含歧义的 `is_ancestor` 包装器。
 - promotion 发布/恢复、prepared commit 原始父头、T3 discovery、reviewed spec、CORE projection、Pivot、breaker 证据入口统一物理祖先语义。
-- 新增 graft/replace/commit-graph 回归；原生 graft 恢复用例已编写，但需在非外层 Seatbelt 终端运行。
+- 新增 graft/replace/commit-graph 回归；原生 graft 恢复随后已在 Lean 前驱隔离批次通过。
 
 ### Store 证明与调度边界
 
@@ -70,6 +70,12 @@
 - Sediment 在渲染时限制源码 2 MiB、完整归档 8 MiB；在已打开的目录和文件上检查 ACL、临时名与最终名身份，保留无覆盖发布及同字节重试语义。
 - Fact Pack 保留紧凑 JSON 768 KiB 和旧版磁盘 JSON 2 MiB 上限。读写固定留存目录、检查身份及 ACL；旧版缩进 JSON 按摘要及内容核对，不改写。权威 JSON 先发布；摘要失败仍可读 JSON，处理冲突后重试可补齐 Markdown。
 - macOS Sediment 定向 14 项、Fact Pack 写入 8 项、Store 读取 5 项均通过。Rust 工作区 520 通过、0 失败、75 默认忽略，插件 55 通过，fmt、diff 与 Clippy 通过（仍有既有警告）。父路径仍需由受管部署信任；不承诺同 UID 并发修改下的文件树原子性，未实现长期保留容量策略。
+
+## 后续批次：Lean 前驱隔离
+
+- Lean T1/T3、回归和模块检查每次只把当前模块的 scratch 授权为可写。Broker 将主 `.olean` 和已知对象配套文件收集到只读导入池；下一模块不再看到前驱源码或任意临时产物。Witness 和 breaker 复用这条隔离边界；独立 kernel replay、回执 wire/哈希规则和 Golden 只留存主对象的合同不变。
+- [原生 CI](../.github/workflows/ci.yml) 用 SHA-256 固定 [Lean 4.35.0 arm64 发布包](https://github.com/leanprover/lean4/releases/tag/v4.35.0)，通过同一[测试脚本](../.github/native-lean.sh)执行。该脚本在本机 macOS 实跑 11 项全过，含 T3 错误分类、Witness、Golden 克隆、下游失败不发布和 3 项 Git 恢复（含 graft 正负例）；另单独实跑 breaker 和 T2 原生各 1 项，均通过。尚无 GitHub 托管 runner 实跑记录。
+- Rust 工作区 523 通过、0 失败、75 默认忽略；插件 55 通过；fmt、diff 与 Clippy 通过（仍有既有警告）。
 
 ## 尚未完成
 

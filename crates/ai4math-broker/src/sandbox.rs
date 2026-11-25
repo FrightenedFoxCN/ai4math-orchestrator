@@ -2,6 +2,8 @@ use anyhow::{Result, ensure};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+pub(super) const FILE_CAP: u64 = 32 * 1024 * 1024;
+
 #[derive(Debug)]
 pub(crate) struct ChildExit {
     pub status: std::process::ExitStatus,
@@ -229,7 +231,6 @@ fn run_inner(
     };
 
     // Capture through anonymous regular files, not pipes that a stuck process could keep open.
-    const FILE_CAP: u64 = 32 * 1024 * 1024;
     const LOG_CAP: usize = 256 * 1024;
     const LOG_OVERFLOW: &str = "sandbox diagnostic output exceeded limit";
     const STDOUT_OVERFLOW: &str = "sandbox stdout exceeded limit";
@@ -511,6 +512,51 @@ pub fn sandbox_self_test() -> Result<()> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn lean_predecessor_pool_has_data_read_but_no_sandbox_write_grant() -> Result<()> {
+        use crate::lean_objects::LeanObjects;
+
+        let root = tempfile::tempdir()?;
+        let mut pool = LeanObjects::create(&root.path().join("objects"), 32, 64)?;
+        pool.compile(
+            "Target.lean",
+            "def value := 0",
+            false,
+            |room, writable, objects| {
+                assert!(!objects.starts_with(room));
+                assert!(writable.starts_with(room));
+                let policy = profile(
+                    Path::new("/usr/bin/true"),
+                    room,
+                    writable,
+                    &[],
+                    std::slice::from_ref(objects),
+                    &[],
+                )?;
+                let data_grant = format!("(allow file-read* (subpath {}))", quoted(objects)?);
+                assert!(policy.lines().any(|line| line == data_grant));
+                let writes: Vec<_> = policy
+                    .lines()
+                    .filter(|line| line.starts_with("(allow file-write"))
+                    .collect();
+                assert_eq!(
+                    writes,
+                    [format!(
+                        "(allow file-write* (subpath {}))",
+                        quoted(writable)?
+                    )]
+                );
+                let object_path = quoted(objects)?;
+                assert!(!policy.lines().any(
+                    |line| line.contains("file-map-executable") && line.contains(&object_path)
+                ));
+                Ok(String::new())
+            },
+        )?;
+        Ok(())
+    }
 
     #[test]
     fn expired_deadline_does_not_enter_sandbox_prep() {

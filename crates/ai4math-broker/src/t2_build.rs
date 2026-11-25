@@ -1,6 +1,6 @@
 //! Repeatable native Lean build observation, not a proof or promotion receipt.
 use super::{
-    Broker, CheckMode, Engine, Lane, Pressure, TIMEOUT, Toolchain, breaker_probe,
+    Broker, CheckMode, DiagnosticOutput, Engine, Lane, Pressure, TIMEOUT, Toolchain, breaker_probe,
     dependencies_digest, digest, path_for, stage_source, validate_modules,
 };
 use anyhow::{Context, Result, ensure};
@@ -212,8 +212,11 @@ impl Broker {
                 path,
                 CheckMode::IsolatedLean {
                     predecessors: &predecessors,
+                    save_object: true,
                     timeout,
                     deadline,
+                    diagnostic_output: DiagnosticOutput::Text,
+                    pin_audit_options: true,
                 },
             )
             .with_context(|| format!("build isolated Lean module {path:?}"))?;
