@@ -137,6 +137,8 @@ pub struct TelemetrySnapshot {
     pub tripped_breakers: i64,
     pub half_open_breakers: i64,
     pub archived_breakers: i64,
+    pub infra_rfc_drafts: i64,
+    pub infra_rfc_approved: i64,
     pub task_scheduler: crate::TaskSchedulerStatus,
     pub last_alert: Option<PushAlert>,
 }
@@ -597,6 +599,12 @@ fn trust_transitions(
 impl StateStore {
     pub fn live_telemetry(&mut self) -> Result<TelemetrySnapshot> {
         let tx = self.db.transaction()?;
+        let (infra_rfc_drafts, infra_rfc_approved) = tx.query_row(
+            "SELECT count(*) FILTER (WHERE approved_event_seq IS NULL), count(approved_event_seq)
+             FROM infra_rfcs",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
         let value=TelemetrySnapshot { event_seq:max_seq(&tx)?,
             observed_at:tx.query_row("SELECT strftime('%Y-%m-%dT%H:%M:%fZ','now')",[],|r|r.get(0))?,
             trust:trust_counts(&tx)?,stale_claims:stale_claims(&tx)?,
@@ -604,6 +612,8 @@ impl StateStore {
             tripped_breakers:tx.query_row("SELECT count(*) FROM circuit_breakers WHERE state='TRIPPED'",[],|r|r.get(0))?,
             half_open_breakers:tx.query_row("SELECT count(*) FROM circuit_breakers WHERE state='HALF_OPEN'",[],|r|r.get(0))?,
             archived_breakers:tx.query_row("SELECT count(*) FROM circuit_breakers WHERE state='ARCHIVED'",[],|r|r.get(0))?,
+            infra_rfc_drafts,
+            infra_rfc_approved,
             task_scheduler:crate::state::scheduler_snapshot(&tx)?,
             last_alert:tx.query_row("SELECT alert_id,event_seq,created_at,reason_code,dedupe_key,headline,entity_id,briefing_id
                 FROM daemon_alerts ORDER BY event_seq DESC LIMIT 1",[],read_alert).optional()?,

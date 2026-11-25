@@ -224,6 +224,36 @@ CREATE TABLE IF NOT EXISTS state_migrations (version INTEGER PRIMARY KEY);
 -- recovery process re-verifies source rather than treating the record as evidence.
 CREATE TABLE IF NOT EXISTS managed_repo (singleton INTEGER PRIMARY KEY CHECK (singleton = 1), repo TEXT NOT NULL);
 
+-- Advisory intake only. A row is DRAFT until its one approval event is linked.
+-- Neither the immutable draft nor its approval authorizes work or changes trust.
+CREATE TABLE IF NOT EXISTS infra_rfcs (
+  rfc_id TEXT PRIMARY KEY NOT NULL CHECK(length(rfc_id) BETWEEN 1 AND 100),
+  repo TEXT NOT NULL CHECK(length(CAST(repo AS BLOB)) BETWEEN 1 AND 4096),
+  module_path TEXT NOT NULL CHECK(length(CAST(module_path AS BLOB)) BETWEEN 1 AND 256),
+  reviewed_commit TEXT NOT NULL CHECK(length(reviewed_commit) IN (40,64) AND reviewed_commit NOT GLOB '*[^0-9a-f]*'),
+  draft_sha256 TEXT NOT NULL CHECK(length(draft_sha256)=64 AND draft_sha256 NOT GLOB '*[^0-9a-f]*'),
+  consumer_sha256 TEXT NOT NULL CHECK(length(consumer_sha256)=64 AND consumer_sha256 NOT GLOB '*[^0-9a-f]*'),
+  draft_json TEXT NOT NULL CHECK(length(CAST(draft_json AS BLOB)) BETWEEN 1 AND 16384
+    AND json_valid(draft_json) AND json_type(draft_json)='object' AND json_extract(draft_json,'$.status') IS 'DRAFT'),
+  submitted_event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq) CHECK(submitted_event_seq>0),
+  approved_event_seq INTEGER UNIQUE REFERENCES events(event_seq) CHECK(approved_event_seq>submitted_event_seq)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS infra_rfcs_insert_draft BEFORE INSERT ON infra_rfcs
+WHEN NEW.approved_event_seq IS NOT NULL OR EXISTS (
+  SELECT 1 FROM infra_rfcs WHERE rfc_id=NEW.rfc_id OR submitted_event_seq=NEW.submitted_event_seq
+)
+BEGIN SELECT RAISE(ABORT, 'InfraRFC must be a new immutable draft'); END;
+CREATE TRIGGER IF NOT EXISTS infra_rfcs_approve_once BEFORE UPDATE ON infra_rfcs
+WHEN NEW.rfc_id IS NOT OLD.rfc_id OR NEW.repo IS NOT OLD.repo
+  OR NEW.module_path IS NOT OLD.module_path OR NEW.reviewed_commit IS NOT OLD.reviewed_commit
+  OR NEW.draft_sha256 IS NOT OLD.draft_sha256 OR NEW.consumer_sha256 IS NOT OLD.consumer_sha256
+  OR NEW.draft_json IS NOT OLD.draft_json OR NEW.submitted_event_seq IS NOT OLD.submitted_event_seq
+  OR OLD.approved_event_seq IS NOT NULL OR NEW.approved_event_seq IS NULL
+  OR EXISTS (SELECT 1 FROM infra_rfcs WHERE approved_event_seq=NEW.approved_event_seq)
+BEGIN SELECT RAISE(ABORT, 'InfraRFC may be approved once without modifying the draft'); END;
+CREATE TRIGGER IF NOT EXISTS infra_rfcs_no_delete BEFORE DELETE ON infra_rfcs
+BEGIN SELECT RAISE(ABORT, 'InfraRFC is immutable'); END;
+
 -- Internal regression episode state, never projected or used as trust evidence.
 -- Holds only the last observed base; a newer observed base or final promotion
 -- clears all pending and latched contexts. At most 4096 context rows per base

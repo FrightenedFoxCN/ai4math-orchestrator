@@ -27,6 +27,62 @@ function streamHandle(frames, controller) {
   return { [Symbol.asyncIterator]: () => frames, dispose: () => controller.abort() };
 }
 
+test('HUD displays only bounded RFC counts with no readiness or action', async t => {
+  const label = (drafts, approved) => 'Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run';
+  const cases = [
+    ['empty ledger', { infra_rfc_drafts: 0, infra_rfc_approved: 0 }, label(0, 0)],
+    ['recorded statuses only', { infra_rfc_drafts: 2, infra_rfc_approved: 1,
+      infra_rfcs: [{ draft: { motivation: 'PRIVATE_RFC_PROSE' }, rfc_id: 'PRIVATE_RFC_ID' }] }, label(2, 1)],
+    ['older snapshot', {}],
+    ['missing approved count', { infra_rfc_drafts: 1 }],
+    ['missing draft count', { infra_rfc_approved: 1 }],
+    ['string count', { infra_rfc_drafts: '1', infra_rfc_approved: 1 }],
+    ['negative count', { infra_rfc_drafts: 1, infra_rfc_approved: -1 }],
+    ['fractional count', { infra_rfc_drafts: 1.5, infra_rfc_approved: 1 }],
+    ['unsafe count', { infra_rfc_drafts: 0, infra_rfc_approved: Number.MAX_SAFE_INTEGER + 1 }],
+    ['counts exceed ledger', { infra_rfc_drafts: 11, infra_rfc_approved: 11 }],
+    ['counts return', { infra_rfc_drafts: 1, infra_rfc_approved: 2 }, label(1, 2)],
+  ].map(([name, data, expected], i) => ({ name, data, expected, seq: 11 + i, gate: Promise.withResolvers() }));
+  const disconnect = Promise.withResolvers();
+  const app = await browser(t, {
+    async *subscribe(params, signal) {
+      assert.deepEqual(fromWire(params), { topics });
+      if (signal.aborted) return;
+      const aborted = once(signal, 'abort');
+      yield transition('connected');
+      for (const { data, seq, gate } of cases) {
+        await Promise.race([gate.promise, aborted]);
+        if (signal.aborted) return;
+        yield { topic: 'vital_signs.tick', data: snapshot(seq, data) };
+      }
+      await Promise.race([disconnect.promise, aborted]);
+      if (signal.aborted) return;
+      yield transition('reconnecting');
+      await aborted;
+    },
+    async status() { return ok(snapshot(10)); },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+  });
+  const hud = app.mount('shell.bottom');
+  await expectText(hud, /Live .*Seq 10\b/);
+  assert.doesNotMatch(hud.text(), /Infra RFCs/, 'older status has no RFC badge');
+
+  for (const { name, seq, expected, gate } of cases) {
+    gate.resolve();
+    await expectText(hud, new RegExp('Seq ' + seq + '\\b'));
+    assert.doesNotMatch(hud.text(), /PRIVATE_RFC_PROSE|PRIVATE_RFC_ID/);
+    if (expected === undefined) {
+      assert.doesNotMatch(hud.text(), /Infra RFCs/, name);
+    } else {
+      assert.equal(hud.find('span', expected).props.onClick, undefined, name);
+      assert.throws(() => hud.find('button', expected), /render did not contain/);
+    }
+  }
+  disconnect.resolve();
+  await expectText(hud, /Reconnecting · stale/);
+  assert.doesNotMatch(hud.text(), /Infra RFCs/, 'prior RFC status is not shown as live after disconnect');
+});
+
 test('HUD shows resident T3 as a read-only last sample and clears it when unavailable', async t => {
   const channel = new AbortController()
   let report, clear;

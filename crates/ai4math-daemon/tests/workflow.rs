@@ -2026,6 +2026,431 @@ title: RouteLessonMarker
     Ok(())
 }
 
+// A real operator-enrolled Claim over a tracked, exact slot. No native engine,
+// synthetic receipt, or proof execution is needed to review advisory RFC text.
+fn infra_rfc_fixture() -> Result<(PivotWorkflow, String)> {
+    let fixture = PivotWorkflow::new(&["Other.lean"])?;
+    fs::write(
+        fixture.source.join("Spec.lean"),
+        "theorem target : True := {{PROOF_BODY}}\n",
+    )?;
+    PivotWorkflow::git(
+        &fixture.source,
+        &["commit", "-am", "registered target slot"],
+    )?;
+    let (_, bare) = fixture.paths()?;
+    PivotWorkflow::git(&fixture.source, &["push", bare, "main"])?;
+    let head = PivotWorkflow::git(&fixture.repo, &["rev-parse", "refs/heads/main"])?;
+    Ok((fixture, head.trim().to_owned()))
+}
+
+fn infra_rfc_draft(id: &str) -> ai4math_core::InfraRFC {
+    ai4math_core::InfraRFC {
+        rfc_id: id.into(),
+        requested_by_claim: "CriticalDefinition".into(),
+        engine: ai4math_core::Engine::Lean4,
+        motivation: "PrivateRfcMotivation: reduce repeated notation".into(),
+        proposed_definitions: vec!["PrivateRfcDefinition".into()],
+        required_api_lemmas: vec!["PrivateRfcLemma".into()],
+        consumer_usage_sketch: "PrivateRfcSketch: consume a local helper".into(),
+        smoke_test_criteria: vec!["PrivateRfcCriterion: document expected behavior".into()],
+        status: ai4math_core::InfraStatus::Draft,
+    }
+}
+
+fn reject_infra_rfc(fixture: &PivotWorkflow, args: &[&str]) -> Result<()> {
+    let out = Command::new(&fixture.cli).args(args).output()?;
+    ensure!(
+        !out.status.success() && out.stdout.is_empty() && !out.stderr.is_empty(),
+        "expected CLI rejection for {args:?}; stdout: {}; stderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(())
+}
+
+fn assert_infra_telemetry(frame: &Value, drafts: i64, approved: i64, secrets: &[&str]) {
+    assert_eq!(frame["infra_rfc_drafts"], drafts, "{frame}");
+    assert_eq!(frame["infra_rfc_approved"], approved, "{frame}");
+    let encoded = frame.to_string();
+    for secret in secrets {
+        assert!(
+            !encoded.contains(secret),
+            "telemetry leaked {secret}: {frame}"
+        );
+    }
+}
+
+fn infra_tick_at(listener: &mut Rpc, seq: i64) -> Result<Value> {
+    for _ in 0..20 {
+        let frame = listener.event("vital_signs.tick")?;
+        if frame["event_seq"].as_i64().context("tick event sequence")? >= seq {
+            return Ok(frame);
+        }
+    }
+    anyhow::bail!("daemon did not observe RFC event sequence {seq}")
+}
+
+#[test]
+#[ignore = "requires AI4MATH_TEST_CLI pointing to the built ai4math operator binary"]
+fn operator_infra_rfc_is_immutable_and_advisory() -> Result<()> {
+    let (fixture, head) = infra_rfc_fixture()?;
+    let (project, bare) = fixture.paths()?;
+    let runtime = fixture.root.path().join(".runtime");
+    let store = StateStore::open_readonly(runtime.join("state.sqlite"))?;
+    let draft = infra_rfc_draft("RFC-PRIVATE-ONE");
+    let body = fixture.root.path().join("draft.json");
+    fs::write(&body, serde_json::to_vec(&draft)?)?;
+    let body_name = body.to_str().context("UTF-8 draft path")?;
+    let submit = [
+        "infra-rfc-submit",
+        project,
+        bare,
+        "Spec.lean",
+        &head,
+        body_name,
+    ];
+    let inspect = ["infra-rfc-inspect", project, bare, &draft.rfc_id];
+    let unbound_seq = store.status()?.last_event_seq;
+    assert!(store.managed_repo()?.is_none());
+    let git_lock = fixture.repo.join("ai4math-promotion.lock");
+    reject_infra_rfc(&fixture, &submit)?;
+    assert!(
+        !git_lock.exists(),
+        "submission must not initialize Git coordination"
+    );
+    // A preexisting coordination file alone is not a managed ledger binding.
+    fs::write(&git_lock, [])?;
+    fs::set_permissions(&git_lock, fs::Permissions::from_mode(0o600))?;
+    reject_infra_rfc(&fixture, &submit)?;
+    assert!(store.managed_repo()?.is_none());
+    assert_eq!(store.status()?.last_event_seq, unbound_seq);
+    fixture.run(&["task-bind", project, bare, "Spec.lean", &head])?;
+    assert_eq!(
+        store.managed_repo()?.as_deref(),
+        fixture.repo.canonicalize()?.to_str()
+    );
+    fixture.run(&[
+        "task-register",
+        project,
+        bare,
+        "existing-infra-task",
+        "infrastructure",
+        "Spec.lean",
+        "target",
+    ])?;
+
+    let claim = || -> Result<Value> {
+        Ok(serde_json::to_value(
+            store.claim(&draft.requested_by_claim)?,
+        )?)
+    };
+    let tasks = || -> Result<Value> { Ok(serde_json::to_value(store.task_scheduler_status()?)?) };
+    let claim_before = claim()?;
+    assert_eq!(claim_before["formal_target"], "Spec.lean#target");
+    assert_eq!(claim_before["local_trust"], "L0");
+    assert_eq!(claim_before["receipt_id"], Value::Null);
+    let tasks_before = tasks()?;
+    let seq_before = store.status()?.last_event_seq;
+    let git = |args: &[&str]| PivotWorkflow::git(&fixture.repo, args);
+    let refs_before = git(&["show-ref"])?;
+    let objects_before = git(&["count-objects", "-v"])?;
+    let worktrees_before = git(&["worktree", "list", "--porcelain"])?;
+    let frozen_before = fs::read(fixture.source.join("Spec.lean"))?;
+
+    let mut child = boot(fixture.root.path())?;
+    let socket = runtime.join("ai4mathd.sock");
+    let mut rpc = wait_connection(&socket, &mut child)?;
+    let mut listener = Rpc::new(UnixStream::connect(socket)?)?;
+    listener.result("subscribe", json!({"topics":["vital_signs.tick"]}))?;
+    assert_infra_telemetry(&rpc.result("status", json!({}))?, 0, 0, &[]);
+    assert_infra_telemetry(&infra_tick_at(&mut listener, seq_before)?, 0, 0, &[]);
+
+    let submitted = fixture.run(&submit)?;
+    let digest = submitted["draft_sha256"]
+        .as_str()
+        .context("RFC draft digest")?;
+    assert_eq!(digest.len(), 64);
+    assert!(
+        digest
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    );
+    let draft_seq = submitted["submitted_event_seq"]
+        .as_i64()
+        .context("RFC submit event")?;
+    assert_eq!(draft_seq, seq_before + 1);
+    let canonical_body = serde_json::to_value(&draft)?;
+    assert_eq!(
+        submitted,
+        json!({
+            "schema":"ai4math.infra-rfc.v1", "module_path":"Spec.lean", "reviewed_commit":head,
+            "draft_sha256":digest, "status":"DRAFT", "draft":canonical_body,
+            "submitted_event_seq":draft_seq,
+        })
+    );
+    let mut expected_inspect = submitted.clone();
+    expected_inspect["current_main"] = json!(head);
+    expected_inspect["heads_match"] = json!(true);
+    assert_eq!(fixture.run(&inspect)?, expected_inspect);
+    fs::write(&body, serde_json::to_vec_pretty(&canonical_body)?)?;
+    assert_eq!(fixture.run(&submit)?, submitted);
+    assert_eq!(store.status()?.last_event_seq, draft_seq);
+    let secrets = [
+        draft.rfc_id.as_str(),
+        digest,
+        "PrivateRfc",
+        "draft_sha256",
+        "ai4math.infra-rfc.v1",
+    ];
+    assert_infra_telemetry(&rpc.result("status", json!({}))?, 1, 0, &secrets);
+    assert_infra_telemetry(&infra_tick_at(&mut listener, draft_seq)?, 1, 0, &secrets);
+
+    let mut changed = draft.clone();
+    changed.motivation = "Edited motivation under the same RFC ID".into();
+    fs::write(&body, serde_json::to_vec(&changed)?)?;
+    reject_infra_rfc(&fixture, &submit)?;
+    let wrong_digest = "0".repeat(64);
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-approve",
+            project,
+            bare,
+            &draft.rfc_id,
+            &head,
+            &wrong_digest,
+        ],
+    )?;
+    assert_eq!(fixture.run(&inspect)?, expected_inspect);
+    assert_eq!(store.status()?.last_event_seq, draft_seq);
+    assert_eq!(claim()?, claim_before);
+    assert_eq!(tasks()?, tasks_before);
+    fs::write(&body, serde_json::to_vec(&draft)?)?;
+
+    // This unrelated operator event must not globally invalidate the approval digest.
+    fixture.run(&[
+        "declare-claim",
+        project,
+        "UnrelatedClaim",
+        "Other.lean",
+        "target",
+        "Independent claim",
+        "Unrelated advisory scope",
+    ])?;
+    let unrelated_seq = store.status()?.last_event_seq;
+    assert!(unrelated_seq > draft_seq);
+    let approve = [
+        "infra-rfc-approve",
+        project,
+        bare,
+        &draft.rfc_id,
+        &head,
+        digest,
+    ];
+    let approved = fixture.run(&approve)?;
+    let approved_seq = approved["approved_event_seq"]
+        .as_i64()
+        .context("RFC approval event")?;
+    assert_eq!(approved_seq, unrelated_seq + 1);
+    let mut expected_approved = submitted.clone();
+    expected_approved["status"] = json!("APPROVED");
+    expected_approved["approved_event_seq"] = json!(approved_seq);
+    assert_eq!(approved, expected_approved);
+    assert_eq!(fixture.run(&approve)?, approved);
+    assert_eq!(
+        fixture.run(&submit)?,
+        approved,
+        "submit retry must not downgrade approval"
+    );
+    expected_inspect["status"] = json!("APPROVED");
+    expected_inspect["approved_event_seq"] = json!(approved_seq);
+    assert_eq!(fixture.run(&inspect)?, expected_inspect);
+    assert_infra_telemetry(&rpc.result("status", json!({}))?, 0, 1, &secrets);
+    assert_infra_telemetry(&infra_tick_at(&mut listener, approved_seq)?, 0, 1, &secrets);
+
+    for method in [
+        "infra.rfc.submit",
+        "infra.rfc.approve",
+        "infra.rfc.inspect",
+        "infraRfc.submit",
+        "infraRfc.approve",
+        "infraRfc.inspect",
+        "tasks.claim",
+        "hammer.promote",
+    ] {
+        assert_eq!(
+            rpc.call(method, json!({}))?["error"]["code"],
+            -32601,
+            "{method}"
+        );
+    }
+    assert_eq!(store.status()?.last_event_seq, approved_seq);
+    let events = store.events_after(seq_before, 16)?;
+    let mut relevant = events
+        .iter()
+        .filter(|event| event.event_type.starts_with("INFRA_RFC_"));
+    for (kind, seq) in [
+        ("INFRA_RFC_SUBMITTED", draft_seq),
+        ("INFRA_RFC_APPROVED", approved_seq),
+    ] {
+        let event = relevant.next().context("typed RFC event")?;
+        assert_eq!(event.event_type, kind);
+        assert_eq!(event.event_seq, seq);
+        assert_eq!(event.entity_id, draft.rfc_id);
+        assert_eq!(event.git_commit.as_deref(), Some(head.as_str()));
+        assert_eq!(
+            event.payload,
+            json!({"module_path":"Spec.lean", "engine":"lean4", "draft_sha256":digest})
+        );
+    }
+    assert!(relevant.next().is_none());
+    assert_eq!(claim()?, claim_before);
+    assert_eq!(tasks()?, tasks_before);
+    assert!(store.promotion_intent()?.is_none());
+    assert!(store.pivot_intent()?.is_none());
+    assert_eq!(git(&["show-ref"])?, refs_before);
+    assert_eq!(git(&["count-objects", "-v"])?, objects_before);
+    assert_eq!(git(&["worktree", "list", "--porcelain"])?, worktrees_before);
+    assert_eq!(fs::read(fixture.source.join("Spec.lean"))?, frozen_before);
+    assert_eq!(
+        PivotWorkflow::git(&fixture.source, &["status", "--porcelain"])?,
+        ""
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires AI4MATH_TEST_CLI pointing to the built ai4math operator binary"]
+fn operator_infra_rfc_rejects_invalid_drafts_and_stale_review() -> Result<()> {
+    let (fixture, head) = infra_rfc_fixture()?;
+    let (project, bare) = fixture.paths()?;
+    let runtime = fixture.root.path().join(".runtime");
+    let mut store = StateStore::open(runtime.join("state.sqlite"))?;
+    fixture.run(&["task-bind", project, bare, "Spec.lean", &head])?;
+    let before = store.status()?.last_event_seq;
+    let body = fixture.root.path().join("draft.json");
+    let body_name = body.to_str().context("UTF-8 draft path")?;
+    let draft = infra_rfc_draft("RFC-STALE-CONSUMER");
+    let submit = [
+        "infra-rfc-submit",
+        project,
+        bare,
+        "Spec.lean",
+        &head,
+        body_name,
+    ];
+
+    // A struct's positional serde representation is not a permissible draft object.
+    let positional = json!([
+        draft.rfc_id,
+        draft.requested_by_claim,
+        draft.engine,
+        draft.motivation,
+        draft.proposed_definitions,
+        draft.required_api_lemmas,
+        draft.consumer_usage_sketch,
+        draft.smoke_test_criteria,
+        draft.status,
+    ]);
+    let canonical = serde_json::to_value(&draft)?;
+    for (key, invalid) in [
+        ("status", json!("APPROVED")),
+        ("extra_field", json!(true)),
+        ("rfc_id", json!("../escape")),
+        ("motivation", json!("X".repeat(16 * 1024))),
+        ("requested_by_claim", json!("MissingClaim")),
+        ("engine", json!("rocq")),
+    ] {
+        let mut input = canonical.clone();
+        input[key] = invalid;
+        fs::write(&body, serde_json::to_vec(&input)?)?;
+        reject_infra_rfc(&fixture, &submit)?;
+    }
+    fs::write(&body, serde_json::to_vec(&positional)?)?;
+    reject_infra_rfc(&fixture, &submit)?;
+    let mut directory = submit;
+    directory[5] = project;
+    reject_infra_rfc(&fixture, &directory)?;
+    fs::write(&body, serde_json::to_vec(&draft)?)?;
+    let mut bad_head = submit;
+    bad_head[4] = "main";
+    reject_infra_rfc(&fixture, &bad_head)?;
+    assert_eq!(store.status()?.last_event_seq, before);
+
+    let submitted = fixture.run(&submit)?;
+    let digest = submitted["draft_sha256"]
+        .as_str()
+        .context("RFC draft digest")?;
+    // Change the consumer state with main untouched. An open Claim is not the
+    // same reviewed Claim after this logical change, even at the same Git head.
+    store.set_local_trust(
+        &draft.requested_by_claim,
+        ai4math_store::Trust::L1,
+        Change {
+            actor: "infra-rfc-fixture",
+            git_commit: Some(&head),
+        },
+    )?;
+    let seq_after_consumer_change = store.status()?.last_event_seq;
+    reject_infra_rfc(
+        &fixture,
+        &[
+            "infra-rfc-approve",
+            project,
+            bare,
+            &draft.rfc_id,
+            &head,
+            digest,
+        ],
+    )?;
+    assert_eq!(store.status()?.last_event_seq, seq_after_consumer_change);
+    let inspected = fixture.run(&["infra-rfc-inspect", project, bare, &draft.rfc_id])?;
+    assert_eq!(inspected["status"], "DRAFT");
+    assert_eq!(inspected["heads_match"], true);
+    assert_eq!(inspected["draft"], canonical);
+
+    let second = infra_rfc_draft("RFC-STALE-HEAD");
+    fs::write(&body, serde_json::to_vec(&second)?)?;
+    let submitted = fixture.run(&submit)?;
+    let digest = submitted["draft_sha256"]
+        .as_str()
+        .context("second RFC draft digest")?;
+    let before_advance = store.status()?.last_event_seq;
+    // Even without changes to tracked proof bytes, a new main OID invalidates a review.
+    PivotWorkflow::git(
+        &fixture.source,
+        &["commit", "--allow-empty", "-m", "advance main"],
+    )?;
+    PivotWorkflow::git(&fixture.source, &["push", bare, "main"])?;
+    let current = PivotWorkflow::git(&fixture.repo, &["rev-parse", "refs/heads/main"])?;
+    let current = current.trim();
+    assert_ne!(current, head);
+    for reviewed in [&*head, current] {
+        reject_infra_rfc(
+            &fixture,
+            &[
+                "infra-rfc-approve",
+                project,
+                bare,
+                &second.rfc_id,
+                reviewed,
+                digest,
+            ],
+        )?;
+    }
+    reject_infra_rfc(&fixture, &submit)?;
+    let mut expected_history = submitted;
+    expected_history["current_main"] = json!(current);
+    expected_history["heads_match"] = json!(false);
+    assert_eq!(
+        fixture.run(&["infra-rfc-inspect", project, bare, &second.rfc_id])?,
+        expected_history
+    );
+    assert_eq!(store.status()?.last_event_seq, before_advance);
+    Ok(())
+}
+
 #[test]
 fn operator_oracle_and_hammer_are_not_available_over_daemon_rpc() -> Result<()> {
     let dir = tempfile::Builder::new()

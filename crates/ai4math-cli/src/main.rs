@@ -1,5 +1,6 @@
 mod breaker_probes;
 mod hammer;
+mod infra_rfc;
 #[cfg(test)]
 mod managed_tests;
 mod oracle;
@@ -47,6 +48,9 @@ ai4math breaker-probes-arm ROOT BARE_REPO BREAKER APPROVAL_ID THEOREM [THEOREM]
 ai4math breaker-probes-run ROOT BARE_REPO BREAKER APPROVAL_ID NATIVE_LEAN
 ai4math task-register ROOT BARE_REPO ID TRACK MODULE TARGET [DEP_ID ...]
 ai4math tasks-status ROOT
+ai4math infra-rfc-submit ROOT BARE_REPO TARGET_MODULE REVIEWED_MAIN DRAFT_JSON
+ai4math infra-rfc-approve ROOT BARE_REPO RFC_ID REVIEWED_MAIN APPROVED_SHA256
+ai4math infra-rfc-inspect ROOT BARE_REPO RFC_ID
 ai4math task-bind ROOT BARE_REPO ANCHOR_MODULE REVIEWED_COMMIT
 ai4math task-run ROOT BARE_REPO ID CLAIM ROLE WORKER_EXE SHA256 WALL_SECONDS
 ai4math task-run-model ROOT BARE_REPO ID CLAIM ROLE WALL_SECONDS
@@ -1168,6 +1172,19 @@ fn run() -> Result<()> {
             target,
             deps,
         ),
+        ["infra-rfc-submit", root, repo, module, reviewed, input] => infra_rfc::submit(
+            Path::new(root),
+            Path::new(repo),
+            module,
+            reviewed,
+            Path::new(input),
+        ),
+        ["infra-rfc-approve", root, repo, id, reviewed, sha] => {
+            infra_rfc::approve(Path::new(root), Path::new(repo), id, reviewed, sha)
+        }
+        ["infra-rfc-inspect", root, repo, id] => {
+            infra_rfc::inspect(Path::new(root), Path::new(repo), id)
+        }
         ["task-bind", root, repo, module, reviewed] => {
             worker_dispatch::bind(Path::new(root), Path::new(repo), module, reviewed)
         }

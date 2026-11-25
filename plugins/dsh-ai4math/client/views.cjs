@@ -49,6 +49,14 @@ function BreakerTotals({ snapshot }) {
     isCount(archived) && archived > 0 && badge('ARCHIVED ' + archived + ' · Affected ordinary queues remain gated', 'warn'))
 }
 
+function InfraRfcTotals({ snapshot }) {
+  const { event_seq: seq, infra_rfc_drafts: drafts, infra_rfc_approved: approved } = snapshot ?? {}
+  // Every recorded RFC has a submission event at or before this snapshot.
+  // Reject absent, unsafe, or out-of-ledger totals without inferring zero.
+  if (!isCount(seq) || !isCount(drafts) || !isCount(approved) || drafts > seq || approved > seq - drafts) return null
+  return badge('Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run')
+}
+
 function DiscoveryBadge({ value, currentSeq }) {
   if (!value || typeof value !== 'object') return null
   if (value.status === 'starting') return labelValue('T3 discovery', 'Waiting for first sample')
@@ -174,6 +182,7 @@ function LiveHud({ live, open }) {
       phase === 'live' && h(T2AuditBadge, { value: snapshot?.t2_audit, currentSeq: snapshot?.event_seq }),
       phase === 'live' && h(DiscoveryBadge, { value: snapshot?.t3_discovery, currentSeq: snapshot?.event_seq }),
       h(BreakerTotals, { snapshot }),
+      phase === 'live' && h(InfraRfcTotals, { snapshot }),
       phase === 'live' && isCount(oracleHeld) && oracleHeld > 0 && h('span', {
         title: 'Temporary exploration scheduling hold; not a Claim refutation.',
       }, labelValue('Oracle-held exploration', count(oracleHeld))),

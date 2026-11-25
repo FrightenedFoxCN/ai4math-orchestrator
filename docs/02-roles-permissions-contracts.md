@@ -78,7 +78,7 @@
 
 ### 3.3 基建需求契约：`InfraRFC`（Explorer → Orchestrator → Infra Builder）
 
-每一份基建需求单必须同时给出**需求动机**与**消费者用法测试**，杜绝“造出优雅但下游根本调不起来的抽象”：
+每一份基建需求单必须同时给出**需求动机**与**消费者用法测试**，杜绝“造出优雅但下游根本调不起来的抽象”： [现有托管操作者入口](architecture-acceptance.md#L674) 只记录草稿和显式同意，不会执行用法草稿或启动 Builder。
 * `rfc_id`, `requested_by_claim`, `engine`, `motivation`
 * `proposed_definitions` 与 `required_api_lemmas`
 * `consumer_usage_sketch`：探索轨给出的目标调用片段（必须能在定义完成后零警告通过类型检查）

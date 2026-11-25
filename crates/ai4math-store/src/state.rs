@@ -21,6 +21,7 @@ mod claim_replay;
 mod graph_audit;
 mod graph_check;
 mod graph_replay;
+mod infra_rfc;
 mod ledger_replay;
 mod migrations;
 mod oracle;
@@ -41,6 +42,7 @@ pub use claim_replay::{ClaimReplay, ReplayedClaim};
 pub use graph_audit::{GraphAudit, GraphMismatch, GraphMismatchKind};
 pub use graph_check::{GraphSemanticCheck, GraphSemanticMismatch};
 pub use graph_replay::GraphReplay;
+pub use infra_rfc::{INFRA_RFC_MAX_BYTES, InfraRfcRecord, InfraRfcStatus, parse_infra_rfc_draft};
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{
     BreakerTripReport, PivotAction, PivotArchivePlan, PivotIntent, PivotLessonDraft,
@@ -722,6 +724,10 @@ impl StateStore {
         ensure!(
             kind != sediment_lineage::RETAINED,
             "sediment adaptation lineage events require the typed retention API"
+        );
+        ensure!(
+            !matches!(kind, infra_rfc::SUBMITTED | infra_rfc::APPROVED),
+            "InfraRFC events require the typed submission or approval API"
         );
         self.write(|tx| event(tx, change, kind, entity, id, payload))
     }
