@@ -65,8 +65,14 @@
 - 受管 CORE 发布阶段持有账本代次保留，账本已换代时不替换旧索引；外部 Git 写入仍由前后检查和读者代次门禁处理。
 - 本批 Rust 工作区 509 通过、75 默认忽略，插件 55 通过，格式和 Clippy 检查通过（仍有既有警告）。
 
+## 后续批次：Sediment 与 Fact Pack 留存
+
+- Sediment 在渲染时限制源码 2 MiB、完整归档 8 MiB；在已打开的目录和文件上检查 ACL、临时名与最终名身份，保留无覆盖发布及同字节重试语义。
+- Fact Pack 保留紧凑 JSON 768 KiB 和旧版磁盘 JSON 2 MiB 上限。读写固定留存目录、检查身份及 ACL；旧版缩进 JSON 按摘要及内容核对，不改写。权威 JSON 先发布；摘要失败仍可读 JSON，处理冲突后重试可补齐 Markdown。
+- macOS Sediment 定向 14 项、Fact Pack 写入 8 项、Store 读取 5 项均通过。Rust 工作区 520 通过、0 失败、75 默认忽略，插件 55 通过，fmt、diff 与 Clippy 通过（仍有既有警告）。父路径仍需由受管部署信任；不承诺同 UID 并发修改下的文件树原子性，未实现长期保留容量策略。
+
 ## 尚未完成
 
-- Sediment 归档、Fact Pack 和索引文件自身的路径/ACL 防护仍需逐项核对。后续验收见[交付清单](delivery-roadmap.md)。
+- Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。
 - 模型任务仍运行在 Host 进程内，无法硬抢占不合作 adapter/Agent。
 - Linux bwrap/cgroups、全主机配额、Agda/Rocq 独立 T2、生产 GUI 写闭环仍未交付。

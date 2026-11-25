@@ -9,12 +9,12 @@ use std::os::fd::RawFd;
 /// macOS extended ACLs are evaluated before BSD mode fallback and can grant
 /// write/delete while st_mode still looks private; inspect the live fd there.
 #[cfg(not(target_vendor = "apple"))]
-pub(super) fn validate(_fd: RawFd) -> Result<()> {
+pub(crate) fn validate(_fd: RawFd) -> Result<()> {
     Ok(())
 }
 
 #[cfg(target_vendor = "apple")]
-pub(super) fn validate(fd: RawFd) -> Result<()> {
+pub(crate) fn validate(fd: RawFd) -> Result<()> {
     use std::{ffi::c_void, ptr};
 
     // Darwin's libc exposes these C ABI functions, but the libc crate does not.

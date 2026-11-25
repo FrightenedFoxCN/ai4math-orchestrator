@@ -7,10 +7,17 @@ use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::{
-    fs,
-    io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::Path,
+    ffi::{CStr, CString},
+    fs::{self, File, Metadata},
+    io::{self, Read, Write},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{MetadataExt, OpenOptionsExt},
+        },
+    },
+    path::{Component, Path, PathBuf},
 };
 
 /// Compact JSON budget, leaving room for the daemon JSON-RPC envelope.
@@ -166,61 +173,210 @@ pub fn valid_id(value: &str) -> bool {
 /// Returns `Ok(None)` only when the file is absent.
 pub fn read_retained(dir: &Path, id: &str) -> Result<Option<Value>> {
     ensure!(valid_id(id), "invalid fact ID");
-    let path = dir.join(format!("{id}.json"));
-    let file = match open_retained(&path, MAX_LEGACY_FILE_BYTES) {
-        Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let pinned = match open_retained_dir(dir) {
+        Ok(dir) => dir,
+        Err(err)
+            if err
+                .downcast_ref::<io::Error>()
+                .is_some_and(|err| err.kind() == io::ErrorKind::NotFound) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err),
     };
-    let bytes = read_bounded(file, MAX_LEGACY_FILE_BYTES)?;
-    let mut value: Value = serde_json::from_slice(&bytes)?;
-    let map = value
-        .as_object_mut()
-        .context("retained payload is not an object")?;
+    let name = CString::new(format!("{id}.json"))?;
+    let value = read_retained_file(&pinned, &name, MAX_LEGACY_FILE_BYTES)?
+        .map(|bytes| decode_retained(id, &bytes))
+        .transpose()?;
+    verify_retained_dir(dir, &pinned)?;
+    Ok(value)
+}
+
+/// Check the size, content-address and compact wire budget of retained JSON.
+/// The caller must separately ensure the bytes came from an admitted file.
+pub fn decode_retained(id: &str, bytes: &[u8]) -> Result<Value> {
+    ensure!(valid_id(id), "invalid fact ID");
     ensure!(
-        map.remove("fact_sha256").as_ref().and_then(Value::as_str) == Some(id),
-        "retained ID mismatch"
+        bytes.len() as u64 <= MAX_LEGACY_FILE_BYTES,
+        "retained file exceeds limit"
     );
-    ensure!(hash_fact(&value)? == id, "retained digest mismatch");
-    value["fact_sha256"] = Value::String(id.to_owned());
+    let mut value: Value = serde_json::from_slice(bytes)?;
     ensure!(
         compact_len(&value, MAX_PACK_BYTES)?.is_some(),
         "retained fact pack exceeds compact byte budget"
     );
-    Ok(Some(value))
+    let body = value
+        .as_object_mut()
+        .context("retained payload is not an object")?;
+    let id_field = body.remove("fact_sha256").context("retained ID mismatch")?;
+    ensure!(id_field.as_str() == Some(id), "retained ID mismatch");
+    ensure!(hash_fact(&value)? == id, "retained digest mismatch");
+    value["fact_sha256"] = id_field;
+    Ok(value)
 }
 
-fn open_retained(path: &Path, max_len: u64) -> std::io::Result<fs::File> {
-    let file = fs::OpenOptions::new()
+/// Validate the effective permission boundary of an already-open inode on
+/// systems whose extended ACLs are not reflected in the Unix group mode mask.
+pub fn validate_artifact_acl(file: &File) -> Result<()> {
+    crate::wiki::scan_acl::validate(file.as_raw_fd())
+}
+
+/// Pin the final directory component. Parent path admission is the caller's
+/// responsibility; in production this sits below the admitted project root.
+pub fn open_retained_dir(path: &Path) -> Result<File> {
+    let path: PathBuf = path.components().collect();
+    ensure!(
+        matches!(
+            path.components().next_back(),
+            Some(Component::Normal(_) | Component::CurDir)
+        ),
+        "invalid retained directory path"
+    );
+    let dir = fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.nlink() != 1
-        || metadata.mode() & 0o022 != 0
-        || metadata.len() > max_len
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(&path)
+        .with_context(|| format!("open retained directory {}", path.display()))?;
+    let meta = dir.metadata()?;
+    ensure!(
+        meta.is_dir() && meta.uid() == unsafe { libc::geteuid() } && meta.mode() & 0o022 == 0,
+        "unsafe retained directory"
+    );
+    validate_artifact_acl(&dir)?;
+    Ok(dir)
+}
+
+/// Reject a path that no longer names the pinned retained directory.
+pub fn verify_retained_dir(path: &Path, dir: &File) -> Result<()> {
+    let observed = open_retained_dir(path)?.metadata()?;
+    let pinned = dir.metadata()?;
+    ensure!(
+        observed.dev() == pinned.dev() && observed.ino() == pinned.ino(),
+        "retained directory changed during operation"
+    );
+    Ok(())
+}
+
+/// Open an existing basename without following links or blocking on a FIFO.
+/// `dir` must be an admitted and pinned retained directory.
+pub fn open_retained_file(dir: &File, name: &CStr, max_len: u64) -> io::Result<File> {
+    let bytes = name.to_bytes();
+    if bytes.is_empty() || bytes == b"." || bytes == b".." || bytes.contains(&b'/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid retained basename",
+        ));
+    }
+    let mut named = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: dir and name are live, and named points to writable storage.
+    if unsafe {
+        libc::fstatat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            named.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } < 0
     {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful fstatat initialized named.
+    let named = unsafe { named.assume_init() };
+    if named.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid retained file type",
+        ));
+    }
+    // SAFETY: dir is live and name is a validated single C string component.
+    let fd = unsafe {
+        libc::openat(
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful openat returned a fresh, owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let mut opened = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fd is owned by file; opened points to writable storage.
+    if unsafe { libc::fstat(fd, opened.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful fstat initialized opened.
+    let opened = unsafe { opened.assume_init() };
+    if opened.st_mode & libc::S_IFMT != libc::S_IFREG
+        || opened.st_dev != named.st_dev
+        || opened.st_ino != named.st_ino
+        || opened.st_uid != unsafe { libc::geteuid() }
+        || opened.st_nlink != 1
+        || opened.st_mode & 0o022 != 0
+        || u64::try_from(opened.st_size).map_or(true, |len| len > max_len)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
             "invalid retained file",
         ));
     }
+    validate_artifact_acl(&file)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{err:#}")))?;
     Ok(file)
 }
 
-fn read_bounded(file: fs::File, max_len: u64) -> Result<Vec<u8>> {
+fn file_stamp(meta: &Metadata) -> (u64, u64, u64, i64, i64, i64, i64) {
+    (
+        meta.dev(),
+        meta.ino(),
+        meta.len(),
+        meta.mtime(),
+        meta.mtime_nsec(),
+        meta.ctime(),
+        meta.ctime_nsec(),
+    )
+}
+
+fn read_retained_file(dir: &File, name: &CStr, max_len: u64) -> Result<Option<Vec<u8>>> {
+    let mut file = match open_retained_file(dir, name, max_len) {
+        Ok(file) => file,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err.into()),
+    };
+    let before = file.metadata()?;
+    let limit = max_len
+        .checked_add(1)
+        .context("invalid retained byte limit")?;
     let mut bytes = Vec::new();
-    file.take(max_len + 1).read_to_end(&mut bytes)?;
+    (&mut file).take(limit).read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= max_len, "retained file exceeds limit");
-    Ok(bytes)
+    let named = open_retained_file(dir, name, max_len)?.metadata()?;
+    ensure!(
+        bytes.len() as u64 == before.len()
+            && file_stamp(&before) == file_stamp(&named)
+            && file_stamp(&before) == file_stamp(&file.metadata()?),
+        "retained file changed during read"
+    );
+    Ok(Some(bytes))
 }
 
 /// Compare an already-retained artifact with the bytes about to be retained.
 pub fn matches_retained_file(path: &Path, bytes: &[u8]) -> Result<bool> {
-    let max_len = bytes.len() as u64;
-    Ok(read_bounded(open_retained(path, max_len)?, max_len)? == bytes)
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let dir = open_retained_dir(parent)?;
+    let name = CString::new(
+        path.file_name()
+            .context("missing retained basename")?
+            .as_bytes(),
+    )?;
+    let existing =
+        read_retained_file(&dir, &name, bytes.len() as u64)?.context("retained file absent")?;
+    verify_retained_dir(parent, &dir)?;
+    Ok(existing == bytes)
 }
 
 #[cfg(test)]
@@ -237,6 +393,47 @@ mod tests {
             serde_json::to_vec_pretty(&body)?,
         )?;
         Ok(id)
+    }
+
+    #[test]
+    fn retained_reads_reject_aliases_and_directory_drift() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir()?;
+        let dir = temp.path().join("briefings");
+        fs::create_dir(&dir)?;
+        let id = retain_test_pack(&dir, json!({"payload":"intact"}))?;
+        assert!(read_retained(&dir, &id)?.is_some());
+
+        let alias = temp.path().join("alias");
+        symlink(&dir, &alias)?;
+        assert!(read_retained(&alias.join("."), &id).is_err());
+
+        let pinned = open_retained_dir(&dir)?;
+        fs::rename(&dir, temp.path().join("former"))?;
+        fs::create_dir(&dir)?;
+        assert!(verify_retained_dir(&dir, &pinned).is_err());
+        assert!(read_retained(&dir, &id)?.is_none());
+        assert!(read_retained(&temp.path().join("missing"), &id)?.is_none());
+        Ok(())
+    }
+
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn retained_reads_reject_mutating_extended_acl() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let id = retain_test_pack(dir.path(), json!({"payload":"intact"}))?;
+        let artifact = dir.path().join(format!("{id}.json"));
+        assert!(
+            std::process::Command::new("/bin/chmod")
+                .args(["+a", "everyone allow write,delete"])
+                .arg(&artifact)
+                .status()?
+                .success()
+        );
+        let err = read_retained(dir.path(), &id).unwrap_err();
+        assert!(format!("{err:#}").contains("ACL grants"), "{err:#}");
+        Ok(())
     }
 
     #[test]

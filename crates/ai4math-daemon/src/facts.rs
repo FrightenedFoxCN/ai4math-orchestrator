@@ -1,20 +1,18 @@
+#[path = "facts_retention.rs"]
+mod retention;
 #[cfg(test)]
 #[path = "facts_tests.rs"]
 mod tests;
 
 use crate::transport::MAX_FRAME_BYTES;
-#[cfg(test)]
-use ai4math_store::retained::MAX_LEGACY_FILE_BYTES;
 pub use ai4math_store::retained::{read_retained, valid_id};
 use ai4math_store::{
     FactBody, Page,
-    retained::{MAX_PACK_BYTES, compact_len, hash_fact, matches_retained_file},
+    retained::{MAX_PACK_BYTES, compact_len, hash_fact},
 };
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 use serde::Serialize;
-#[cfg(test)]
-use std::fs;
-use std::{io::Write, path::Path};
+use std::path::Path;
 
 // The shared compact budget must leave room for the JSON-RPC envelope.
 const _: () = assert!(MAX_PACK_BYTES == MAX_FRAME_BYTES * 3 / 4);
@@ -82,14 +80,7 @@ impl FactPack {
             self.body.inbox.items.len()
         );
         // This summary is intentionally plain; UI renders authentic statement/signature pairs from JSON.
-        let bytes = serde_json::to_vec(self)?;
-        ensure!(
-            bytes.len() <= MAX_PACK_BYTES,
-            "fact pack exceeds compact byte budget"
-        );
-        write_once(dir, &format!("{}.json", self.fact_sha256), &bytes)?;
-        write_once(dir, &format!("{}.md", self.fact_sha256), md.as_bytes())?;
-        Ok(())
+        retention::retain(dir, self, md.as_bytes())
     }
 }
 
@@ -107,24 +98,4 @@ fn bound_page<T: Serialize>(page: &mut Page<T>, limit: usize) -> Result<()> {
     }
     page.items = retained;
     Ok(())
-}
-
-fn write_once(dir: &Path, name: &str, bytes: &[u8]) -> Result<()> {
-    let mut staged = tempfile::NamedTempFile::new_in(dir)?;
-    staged.write_all(bytes)?;
-    staged.as_file().sync_all()?;
-    let final_path = dir.join(name);
-    match staged.persist_noclobber(&final_path) {
-        Ok(_) => std::fs::File::open(dir)?
-            .sync_all()
-            .context("sync retained fact pack directory"),
-        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
-            ensure!(
-                matches_retained_file(&final_path, bytes)?,
-                "retained artifact mismatch: {name}"
-            );
-            Ok(())
-        }
-        Err(e) => Err(e.error.into()),
-    }
 }

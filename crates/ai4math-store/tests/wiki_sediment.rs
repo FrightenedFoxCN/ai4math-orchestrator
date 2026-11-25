@@ -460,20 +460,125 @@ fn read_bounds_source_and_archive_separately() -> Result<()> {
 
     let source = format!("{source}x");
     let digest = sha(&source);
-    let large_source = render_sediment(SedimentInput {
+    let err = render_sediment(SedimentInput {
         source: &source,
         ..input(&digest)
-    })?;
-    assert!(publish_sediment(root.path(), &large_source)?);
-    let err = read_sediment(root.path(), large_source.id()).unwrap_err();
+    })
+    .unwrap_err();
     assert!(err.to_string().contains("2097152-byte limit"), "{err:#}");
 
-    File::create(root.path().join(archive.relative_path()))?.set_len(8 * 1024 * 1024 + 1)?;
+    let dest = root.path().join(archive.relative_path());
+    fs::write(
+        &dest,
+        archive
+            .markdown()
+            .replace("source_bytes: 2097152", "source_bytes: 2097153"),
+    )?;
+    let err = read_sediment(root.path(), archive.id()).unwrap_err();
+    assert!(err.to_string().contains("2097152-byte limit"), "{err:#}");
+
+    File::create(&dest)?.set_len(8 * 1024 * 1024 + 1)?;
     let err = read_sediment(root.path(), archive.id()).unwrap_err();
     assert!(
         err.to_string().contains("8388608-byte file limit"),
         "{err:#}"
     );
+    Ok(())
+}
+
+#[test]
+fn render_limits_the_complete_escaped_archive() -> Result<()> {
+    const LIMIT: usize = 8 * 1024 * 1024;
+    let root = tempfile::tempdir()?;
+    let digest = sha(SOURCE);
+    let base = input(&digest);
+    let overhead = render_sediment(base)?.markdown().len() - base.claim_id.len();
+    let mut claim = "a".repeat(LIMIT - overhead);
+    let exact = render_sediment(SedimentInput {
+        claim_id: &claim,
+        ..base
+    })?;
+    assert_eq!(exact.markdown().len(), LIMIT);
+    assert!(publish_sediment(root.path(), &exact)?);
+    assert!(!publish_sediment(root.path(), &exact)?);
+    assert_eq!(read_sediment(root.path(), exact.id())?.claim_id, claim);
+
+    claim.push('a');
+    let one_more = render_sediment(SedimentInput {
+        claim_id: &claim,
+        ..base
+    })
+    .unwrap_err();
+    assert!(
+        one_more.to_string().contains("8388608-byte file limit"),
+        "{one_more:#}"
+    );
+
+    // This raw claim is the same byte length as the passing input, but needs a
+    // longer YAML-safe escape in the final archive.
+    claim.pop();
+    claim.replace_range(..2, "\u{0085}");
+    let escaped = render_sediment(SedimentInput {
+        claim_id: &claim,
+        ..base
+    })
+    .unwrap_err();
+    assert!(
+        escaped.to_string().contains("8388608-byte file limit"),
+        "{escaped:#}"
+    );
+    Ok(())
+}
+
+#[cfg(target_vendor = "apple")]
+#[test]
+fn macos_acl_policy_checks_every_archive_boundary() -> Result<()> {
+    fn add_acl(path: &Path, entry: &str) -> Result<()> {
+        let status = std::process::Command::new("chmod")
+            .args(["+a", entry])
+            .arg(path)
+            .status()?;
+        anyhow::ensure!(status.success(), "install macOS ACL fixture");
+        assert_eq!(fs::metadata(path)?.mode() & 0o022, 0);
+        Ok(())
+    }
+
+    let digest = sha(SOURCE);
+    let archive = render_sediment(input(&digest))?;
+    let pending = render_sediment(SedimentInput {
+        claim_id: "CLM-201",
+        ..input(&digest)
+    })?;
+    for i in 0..4 {
+        let root = tempfile::tempdir()?;
+        assert!(publish_sediment(root.path(), &archive)?);
+        let dest = root.path().join(archive.relative_path());
+        let wiki = root.path().join(".mathwiki");
+        let paths = [
+            root.path(),
+            wiki.as_path(),
+            dest.parent().unwrap(),
+            dest.as_path(),
+        ];
+        add_acl(paths[i], "everyone allow read")?;
+        assert!(read_sediment(root.path(), archive.id()).is_ok());
+        assert!(!publish_sediment(root.path(), &archive)?);
+        add_acl(paths[i], "everyone allow write,delete")?;
+        for err in [
+            read_sediment(root.path(), archive.id()).unwrap_err(),
+            publish_sediment(root.path(), &archive).unwrap_err(),
+        ] {
+            assert!(
+                format!("{err:#}").contains("extended ACL grants shared Wiki mutation rights"),
+                "{err:#}"
+            );
+        }
+        if i != 3 {
+            assert!(publish_sediment(root.path(), &pending).is_err());
+            assert!(!root.path().join(pending.relative_path()).exists());
+        }
+        assert_eq!(fs::read(&dest)?, archive.markdown().as_bytes());
+    }
     Ok(())
 }
 

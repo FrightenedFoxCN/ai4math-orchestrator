@@ -13,7 +13,7 @@ use std::{
 
 mod managed_core;
 mod scan;
-mod scan_acl;
+pub(crate) mod scan_acl;
 mod sediment;
 pub use managed_core::{WikiManagedCoreEntry, WikiManagedGeneration};
 pub use sediment::{
