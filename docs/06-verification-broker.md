@@ -137,6 +137,8 @@ Print Assumptions check.
 * **Heavy Lane（严格限流，并发度 1–2）**：
   * 优先级队列：`P0: T1 Promotion` > `P1: T3 标脏重检` > `P2: Infra Builder 烟雾测试` > `P3: T2 全仓周期回归`。
 
+当前的 Lean T0 已接入 Fast Lane 内的专项租约：每个 Broker 正常上限为 4 且不超过 Fast Lane 容量；黄线折半、红线拒绝，当 Heavy 有排队者也拒绝申请。每次检查从租约获准起使用 15 秒截止，仍为独立 Seatbelt 子进程和临时目录，不复用 REPL 或编译产物。项目级跨进程原生门禁仍保留。这是预热前的准入治理，不是热启动、LRU 或主机级内存硬配额。
+
 ### 6.2 内存水位线准入控制（防单机 Swap 雪崩）
 Broker 每 2 秒采样宿主机可用内存，执行三级背压（并实时输出到常驻生命体征条）：
 * **`< 70%`（GREEN）**：正常受理 Fast 与 Heavy 租约；

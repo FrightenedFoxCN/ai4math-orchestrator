@@ -27,6 +27,74 @@ function streamHandle(frames, controller) {
   return { [Symbol.asyncIterator]: () => frames, dispose: () => controller.abort() };
 }
 
+test('broker HUD shows only bounded live Lean advisory counts, without controls', async t => {
+  const broker = { fast_busy: 3, fast_capacity: 8, heavy_running: 1, heavy_queued: 2 };
+  const advisory = { lean_advisory_busy: 1, lean_advisory_capacity: 2 };
+  const label = (busy, capacity) => 'Lean advisory · ' + busy + ' in use / ' + capacity + ' nominal cap';
+  const brokerText = 'Daemon broker fast 3/8 busy · heavy 1 running / 2 queued';
+  const cases = [
+    ['idle at minimum cap', { lean_advisory_busy: 0, lean_advisory_capacity: 1 }, label(0, 1)],
+    ['missing busy', { lean_advisory_busy: undefined }],
+    ['missing capacity', { lean_advisory_capacity: undefined }],
+    ['negative busy', { lean_advisory_busy: -1 }],
+    ['non-integer busy', { lean_advisory_busy: 1.5 }],
+    ['string capacity', { lean_advisory_capacity: '2' }],
+    ['zero capacity', { lean_advisory_capacity: 0 }],
+    ['capacity exceeds maximum', { lean_advisory_capacity: 5 }],
+    ['capacity exceeds fast capacity', { fast_capacity: 3, lean_advisory_capacity: 4 }],
+    ['busy exceeds advisory capacity', { lean_advisory_busy: 3 }],
+    ['busy exceeds fast busy', { fast_busy: 0 }],
+    ['missing fast capacity', { fast_capacity: undefined }],
+    ['unsafe fast busy', { fast_busy: Number.MAX_SAFE_INTEGER + 1 }],
+    ['live at maximum cap', { lean_advisory_busy: 3, lean_advisory_capacity: 4,
+      lean_advisory_pids: ['PRIVATE_ADVISORY_PROCESS'] }, label(3, 4)],
+  ].map(([name, overrides, expected], i) => ({ name, overrides, expected, seq: 21 + i, gate: Promise.withResolvers() }));
+  const disconnect = Promise.withResolvers();
+  const app = await browser(t, {
+    async *subscribe(params, signal) {
+      assert.deepEqual(fromWire(params), { topics });
+      if (signal.aborted) return;
+      const aborted = once(signal, 'abort');
+      yield transition('connected');
+      for (const { seq, overrides, gate } of cases) {
+        await Promise.race([gate.promise, aborted]);
+        if (signal.aborted) return;
+        yield { topic: 'vital_signs.tick', data: snapshot(seq, { broker: { ...broker, ...advisory, ...overrides } }) };
+      }
+      await Promise.race([disconnect.promise, aborted]);
+      if (signal.aborted) return;
+      yield transition('reconnecting');
+      await aborted;
+    },
+    async status() { return ok(snapshot(20, { broker })); },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+  });
+  const hud = app.mount('shell.bottom');
+  await expectText(hud, /Live .*Seq 20\b/);
+  hud.find('span', brokerText);
+  assert.doesNotMatch(hud.text(), /Lean advisory/, 'older status retains only the broker totals');
+
+  for (const { name, seq, expected, gate } of cases) {
+    gate.resolve();
+    await expectText(hud, new RegExp('Seq ' + seq + '\\b'));
+    assert.doesNotMatch(hud.text(), /PRIVATE_ADVISORY_PROCESS/);
+    if (expected === undefined) {
+      assert.doesNotMatch(hud.text(), /Lean advisory/, name);
+    } else {
+      hud.find('span', brokerText + ' ' + expected);
+      const badge = hud.find('span', expected);
+      assert.equal(badge.props.className, 'ai4m-badge', name);
+      assert.equal(badge.props.onClick, undefined, name);
+      assert.throws(() => hud.find('button', expected), /render did not contain/);
+    }
+  }
+
+  disconnect.resolve();
+  await expectText(hud, /Reconnecting · stale/);
+  hud.find('span', brokerText);
+  assert.doesNotMatch(hud.text(), /Lean advisory/, 'disconnect hides advisory counts but retains stale broker totals');
+});
+
 test('HUD displays only bounded RFC counts with no readiness or action', async t => {
   const label = (drafts, approved) => 'Infra RFCs · DRAFT ' + drafts + ' · APPROVED ' + approved + ' · Review only; not ready to run';
   const cases = [

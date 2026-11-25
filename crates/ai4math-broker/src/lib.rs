@@ -55,6 +55,7 @@ use std::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+const LEAN_ADVISORY_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_CAP: usize = 2 * 1024 * 1024;
 const MAX_MODULES: usize = 128;
 const AXIOMS: &[&str] = &["propext", "Classical.choice", "Quot.sound"];
@@ -347,6 +348,9 @@ enum CheckMode<'a> {
         save_object: bool,
         diagnostic_output: DiagnosticOutput,
     },
+    LeanAdvisory {
+        deadline: Instant,
+    },
     IsolatedLean {
         predecessors: &'a PathBuf,
         timeout: Duration,
@@ -554,6 +558,19 @@ impl Broker {
                 save_object,
                 diagnostic_output,
             } => (save_object, diagnostic_output, TIMEOUT, &[][..], None),
+            CheckMode::LeanAdvisory { deadline } => {
+                ensure!(
+                    tool.engine == Engine::Lean4,
+                    "advisory check requires native Lean"
+                );
+                (
+                    false,
+                    DiagnosticOutput::Text,
+                    LEAN_ADVISORY_TIMEOUT,
+                    &[][..],
+                    Some(deadline),
+                )
+            }
             CheckMode::IsolatedLean {
                 predecessors,
                 timeout,
@@ -694,9 +711,12 @@ impl Broker {
         path_for(tool.engine, &target.file_path)?;
         let source = render_proof_body(target, submission)?;
         ensure!(source.len() <= SOURCE_CAP, "module source exceeds limit");
-        let _lease = self
-            .resources
-            .acquire(Lane::Fast, resources::host_pressure()?)?;
+        let pressure = resources::host_pressure()?;
+        let _lease = match tool.engine {
+            Engine::Lean4 => self.resources.acquire_lean_advisory(pressure)?,
+            _ => self.resources.acquire(Lane::Fast, pressure)?,
+        };
+        let advisory_deadline = Instant::now() + LEAN_ADVISORY_TIMEOUT;
         let room = tempfile::tempdir()?;
         let output = room.path().join("output");
         fs::create_dir(&output)?;
@@ -707,7 +727,19 @@ impl Broker {
             &target.file_path,
             &source,
         )?;
-        self.check(tool, room.path(), &output, &target.file_path, false)
+        if tool.engine == Engine::Lean4 {
+            self.check_with_output_timeout(
+                tool,
+                room.path(),
+                &output,
+                &target.file_path,
+                CheckMode::LeanAdvisory {
+                    deadline: advisory_deadline,
+                },
+            )
+        } else {
+            self.check(tool, room.path(), &output, &target.file_path, false)
+        }
     }
 
     pub fn verify(

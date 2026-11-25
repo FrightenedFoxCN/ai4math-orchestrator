@@ -520,6 +520,14 @@ function T2AuditBadge({ value, currentSeq }) {
     'T2 Audit · advisory only · ' + summary + (exhausted ? ' · exhausted' : ''))
 }
 
+function leanAdvisoryBadge(broker) {
+  const { lean_advisory_busy: busy, lean_advisory_capacity: capacity, fast_busy: fastBusy, fast_capacity: fastCapacity } = broker ?? {}
+  if (!isCount(busy) || !isCount(capacity) || capacity < 1 || capacity > 4
+    || !isCount(fastCapacity) || capacity > fastCapacity
+    || !isCount(fastBusy) || busy > fastBusy || busy > capacity) return null
+  return badge('Lean advisory · ' + busy + ' in use / ' + capacity + ' nominal cap')
+}
+
 function LiveHud({ live, open }) {
   const [navigationError, setNavigationError] = useState(false)
   const state = useSyncExternalStore(live.subscribe, live.getSnapshot)
@@ -529,6 +537,7 @@ function LiveHud({ live, open }) {
   const alertText = text(alert?.headline, '')
   const memory = snapshot?.memory
   const broker = snapshot?.broker
+  const advisoryBadge = phase === 'live' ? leanAdvisoryBadge(broker) : null
   const workers = snapshot?.workers
   const oracleHeld = snapshot?.task_scheduler?.exploration?.held_for_oracle
   const brokerText = !broker ? NA
@@ -542,7 +551,7 @@ function LiveHud({ live, open }) {
       h('span', { role: 'status' }, badge(phaseLabel, phase === 'live' ? 'good' : 'warn')),
       labelValue('RAM', pct(memory?.used_percent) + (typeof memory?.pressure === 'string' ? ' · ' + memory.pressure : '')),
       h('span', { title: 'Daemon-managed work only; independent CLI processes are not counted.' },
-        labelValue('Daemon broker', brokerText)),
+        labelValue('Daemon broker', brokerText), advisoryBadge && ' ', advisoryBadge),
       labelValue('Workers', count(typeof workers === 'number' ? workers : workers?.active)),
       trustTape(snapshot?.trust),
       labelValue('Stale', count(snapshot?.stale_claims)),

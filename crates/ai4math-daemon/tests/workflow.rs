@@ -2994,13 +2994,16 @@ fn project_heavy_lease_makes_daemon_probe_unavailable_without_blocking_control()
     let busy = rpc.call("proof.submit", payload.clone())?;
     assert_eq!(busy["result"]["check"], "unavailable", "{busy}");
     assert_eq!(busy["result"]["promotion_eligible"], false);
-    let control = rpc.call("status", json!({}))?;
-    assert_eq!(control["result"]["event_seq"], 0, "{control}");
+    let control = rpc.result("status", json!({}))?;
+    assert_eq!(control["event_seq"], 0, "{control}");
+    assert_eq!(control["broker"]["lean_advisory_busy"], 0, "{control}");
     drop(heavy);
     let evaluated = rpc.call("proof.submit", payload)?;
     assert_eq!(evaluated["result"]["check"], "rejected", "{evaluated}");
     assert_eq!(evaluated["result"]["promotion_eligible"], false);
-    assert_eq!(rpc.call("status", json!({}))?["result"]["event_seq"], 0);
+    let status = rpc.result("status", json!({}))?;
+    assert_eq!(status["event_seq"], 0, "{status}");
+    assert_eq!(status["broker"]["lean_advisory_busy"], 0, "{status}");
     Ok(())
 }
 
@@ -3055,28 +3058,32 @@ fn native_daemon_checks_only_operator_frozen_slots() -> Result<()> {
         )?["error"]["code"],
         -32004
     );
-    let valid = rpc.call(
-        "proof.submit",
-        json!({"target_id":"slot-A","proof_body":"True.intro"}),
-    )?;
-    assert_eq!(
-        valid["result"],
-        json!({"target_id":"slot-A","check":"checked","promotion_eligible":false})
-    );
-    let invalid = rpc.call(
-        "proof.submit",
-        json!({"target_id":"slot-A","proof_body":"False.elim"}),
-    )?;
-    assert_eq!(invalid["result"]["check"], "rejected");
-    let status = rpc.call("status", json!({}))?;
-    assert_eq!(status["result"]["event_seq"], 0);
-    assert_eq!(status["result"]["broker"]["fast_busy"], 0);
-    assert!(
-        status["result"]["broker"]["fast_capacity"]
+    for (body, expected) in [
+        ("True.intro", "checked"),
+        ("False.elim", "rejected"),
+        ("True.intro", "checked"),
+    ] {
+        let result = rpc.result(
+            "proof.submit",
+            json!({"target_id":"slot-A","proof_body":body}),
+        )?;
+        assert_eq!(
+            result,
+            json!({"target_id":"slot-A","check":expected,"promotion_eligible":false}),
+            "{body}"
+        );
+        let status = rpc.result("status", json!({}))?;
+        assert_eq!(status["event_seq"], 0, "{status}");
+        let broker = &status["broker"];
+        assert_eq!(broker["fast_busy"], 0, "{broker}");
+        assert_eq!(broker["lean_advisory_busy"], 0, "{broker}");
+        let fast_capacity = broker["fast_capacity"].as_u64().context("fast capacity")?;
+        let advisory_capacity = broker["lean_advisory_capacity"]
             .as_u64()
-            .unwrap()
-            > 0
-    );
+            .context("Lean advisory capacity")?;
+        assert!((1..=4).contains(&advisory_capacity), "{broker}");
+        assert!(advisory_capacity <= fast_capacity, "{broker}");
+    }
     Ok(())
 }
 
