@@ -4,11 +4,11 @@
 
 ## 交接快照
 
-代码验收基线：`0d2b6d1`（相对 `f3c0a82` 有 14 个本地提交，不含本次文档整理）。自动推进已暂停，尚未达到完整交付条件。
+代码验收基线：`e5e5ef4`（在 `0d2b6d1` 之后新增 DSH 实装修复、UI 呈现重构、三期一体化工作台与中英文实时切换共 3 个插件提交）。
 
-- **本机标准套件**：Rust 工作区 577 通过、0 失败、77 默认忽略；DSH 插件 113 通过。格式和 Clippy 检查成功，保留既有警告。此处引用最后一次代码验证，不把文档整理或默认忽略计入验收。
-- **已取得的原生证据**：固定工具链的关键 Lean 回归在允许 Broker Seatbelt 的本机宿主跑通；独立安装版 DSH SDK 已核对真实 daemon 重启重连和卸载。两者均不等于托管 CI、现用浏览器页面或生产部署已通过。
-- **优先恢复项**：定位 Rocq 9.3 `coqchk` 初始化所需最小权限，并保持项目 Seatbelt；在带 cgroup v2 委派的 Linux 宿主完成 launcher、实际限额和回收的端到端验证。其余缺口见[交付清单](delivery-roadmap.md)。
+- **本机标准套件**：Rust 工作区 577 通过、0 失败、77 默认忽略（截至 `0d2b6d1`，后续未修改 Rust 代码）；DSH 插件 **119 通过 / 0 失败**（含 bundle 一致性、Host 热切桥接、多项目工作台、浏览器 VM 与中英文实时切换校验）。
+- **已取得的原生与现用 GUI 证据**：固定工具链的关键 Lean 回归在允许 Broker Seatbelt 的本机宿主跑通；独立安装版 DSH SDK 核对真实 daemon 重启重连、卸载及 Electron Host 托管启停闭环；现用 DSH Desktop GUI 已完成插件安装、全屏工作台与底部 HUD/侧栏面板、断线重连、禁用卸载、多项目创建与中英文跟随验收。
+- **优先恢复项**：定位 Rocq 9.3 `coqchk` 初始化所需最小权限并保持项目 Seatbelt；在带 cgroup v2 委派的 Linux 宿主完成 launcher、实际限额和回收的端到端验证；补齐 Guest/登出浏览器实测与独立操作者写确认边界。其余缺口见[交付清单](delivery-roadmap.md)。
 
 ## 基线批次改进
 
@@ -143,10 +143,21 @@
 - 增加固定 Git/账本代次的 Rocq T2 手动观察：从源重建，校验编译器和独立 `coqchk` 摘要，复核新对象并检查指定定理是否无未决假设。不会写账本或发回执。
 - 可移植回归通过；本机实际隔离编译成功，但独立检查器初始化因 Seatbelt 权限失败。实验入口不参与发布。参见 [Rocq T2 原生验收](rocq-t2.md)。
 
+## 后续批次：DSH 一体化工作台实装验收与中英文支持
+
+- **实装修复（`885eff6`）**：将 4 个 Host 运行时包从 `peerDependencies` 改为 `dependencies` 并锁入 `pnpm-lock.yaml`，修复 `link:` 目录安装后 Host 解析失败；Client 侧按 DSH 0.2.2-rc.5 Cordis 反射门禁改为子 fiber `$mount` + `ctx.inject(['remote.ai4math', ...])`，并在 `vm-fixture.mjs` 中补齐点号属性门禁防回退。
+- **UI 呈现重构（`97cf9b6`）**：全面切换为实时 `Theme.listTokens` 中的 `--dsw-alias-*` / `--dsw-specific-sidebar-fill` Token（零硬编码色值）；重构底部 HUD 为三区固定锚点布局、分组遥测与零值降噪；使用 `@container` 容器查询升级四个右侧栏面板的卡片、信任账本磁贴与键盘焦点环。
+- **一体化工作台与双语切换（`e5e5ef4`）**：
+  - `cordis.patch.yml` 内置 `preset-ai4math-chief`（`id: ai4math-chief`）并默认绑定 `rolePresets.chief`（`dsh-ai4math` 行本身保持默认禁用）。
+  - Host 新增热切换 `bridge.retarget/disconnect/wake` 与 Owner-only `workbench.mjs`（多项目注册表 `~/.dsh/ai4math/workbench.json`、自动探测 `ai4math`/`ai4mathd`、`ai4math init`、Unix socket 字节上限检查、Host 托管启停与外部 daemon 只读识别，永不误杀外部进程）。
+  - Client 注册左侧导航 `sidebar.panellist:ai4math`、全屏 `main:ai4math` 工作台（总览 / 简报 / 前沿 / 收件箱 / Wiki / 环境与角色、原生目录选择、关联会话与一键 **新建 Chief 主编排会话**）、会话顶栏 `conversation.session.header.utilities` 目录联动切换胶囊，以及熔断/收件箱只读操作者 CLI 命令助手（不越过 [Owner 审批边界](owner-approval-boundary.md)）。
+  - 接入 DSH `ctx.locale`，全界面支持中/英文实时无刷新切换，EN/ZH 字典键完全对等。
+- **本批验证**：DSH 插件 119 通过 / 0 失败；`installed-bundle-metadata.mjs` 官方 Loader 校验、`installed-dsh.mjs` 真实 SDK+Rust 集成测试及 Electron Host 真实托管闭环均通过；现用 Desktop GUI 已完成安装、UI 视觉、工作台建项与中英文切换验收，并经过两轮独立 UI/UX 审查与全项修复。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。
 - 常驻模型循环未配置生产凭据或部署为自动启动的服务。
-- 现用 DSH GUI 尚未实装验收。Owner 有本地签名归档闭环，但无远程写入口；仍需独立人工确认和生产权限隔离验证。
+- DSH 工作台仍待补齐 Guest / 登出态浏览器实测、非 `chief` 多角色独立生产 Preset 生命周期验收，以及托管 daemon 启用 `--proof-targets` 时与 macOS Seatbelt 嵌套的专项核对；Owner 仍仅保留本地签名归档闭环，无远程写入口。
 - Linux 仍无可用验证后端；需实现并验收 launcher、cgroup 实际入组与回收、全主机配额。
 - Agda 独立 T2 尚未实现；Rocq `coqchk` 原生端到端尚未通过。Lean 全仓覆盖与强制发布门禁尚未验收。

@@ -2,14 +2,25 @@
 
 ## 启动顺序
 
-1. 在目标项目的宿主机终端执行 `cargo run --locked -p ai4math-daemon -- --project /absolute/project`。启用实际证明检查时，daemon 自身不应处在 DSH 工具沙箱内；验证子进程仍必须由 Broker 的 Seatbelt 隔离。默认每 2 秒采样，`--tick-ms N` 可在 100–60000 毫秒间调整。
-2. Daemon 在该项目使用 `.runtime/ai4mathd.sock` 和原有 SQLite、Wiki 索引。Socket 为 `0600`，父目录 `0700`，仅接同 UID Unix peer；没有 TCP 监听端口。建议先停止 daemon 再清理；若上次退出留下节点，确认没有运行实例和连接后再由操作者清理，不自动覆盖、跟随或移除已有路径。macOS 上若绝对路径超出 Unix socket 长度，使用物理路径更短的项目目录。
-3. 经明确授权后，在 DSH 的 **插件 → 添加插件** 选择 [dsh-ai4math 包目录](../plugins/dsh-ai4math)。Bundle 插入默认关闭的插件行；先配置绝对 `socketPath`，再启用。首次只验收 Owner 工作台时保留空的 `rolePresets` 与 `proofSlots`。Host 需要 DSH 0.2.2-rc.5；Web 复用 DSH 的 Typert 网关，不新增监听或鉴权层。此实现不自行安装、不启动替代 GUI，也不修改现有 profile。
-4. 角色工具默认不注册。受信任操作者可配置 `rolePresets`，将 `chief / regional / explorer / builder / prover / automation / reviewer` 映射到互不重复的已组合 Agent preset ID；授权源是实时 Agent 绑定而不是工具参数。普通角色没有任意读写文件或命令执行入口。Reviewer 不读全局简报/Inbox；其上下文装配由上游编排器负责，不应在同一个混合权限 Agent 中启用。
+### 方式 A：DSH 一体化工作台（推荐）
+
+1. 在本仓库构建本地二进制：`cargo build --locked -p ai4math-cli -p ai4math-daemon`。
+2. 在 [plugins/dsh-ai4math](../plugins/dsh-ai4math) 目录执行一次 `pnpm install`，随后在 DSH 的 **插件 → 添加插件** 中选择该目录或打包后的 tarball。Bundle 会自动注册内置的 `AI4Math Chief` Preset（`id: ai4math-chief`）并插入默认禁用的 `dsh-ai4math` 行（默认 `rolePresets: { chief: 'ai4math-chief' }`、`proofSlots: {}`）。Host 需要 DSH 0.2.2-rc.5；Web 复用 DSH 的 Typert 网关，不新增监听或鉴权层。
+3. 启用 `dsh-ai4math` 后，点击左侧导航栏的 **AI4Math** 打开全屏工作台：
+   - 点击 **选择文件夹** 选择空目录（自动运行 `ai4math init`）或已有项目目录（自动接管），实时核对 Unix socket 路径长度（macOS/BSD ≤ 103 字节，Linux ≤ 107 字节），多项目列表持久化在 `~/.dsh/ai4math/workbench.json`。
+   - 工作台支持由 Host 托管启停 `ai4mathd`，也会自动识别并只读挂载外部终端已启动的 `ai4mathd`（绝不终止外部进程）；切换项目时 Host 热切换 UDS bridge，无需重启 DSH。
+   - 点击 **新建 Chief 主编排会话**，自动注册工作区并打开绑定该项目目录与 `ai4math-chief` Preset 的新对话；对话内底部 HUD 与右侧 4 个标签页实时伴随监控，并跟随 DSH 语言在中文/英文间无刷新切换。
+
+### 方式 B：外部终端独立启动 `ai4mathd`（含可选 T0 证明检查）
+
+1. 在目标项目的宿主机终端执行 `cargo run --locked -p ai4math-daemon -- --project /absolute/project`（需启用实际证明检查或 `--proof-targets` 时，daemon 应在非 DSH 工具沙箱的宿主机终端运行；验证子进程仍由 Broker 的 Seatbelt 隔离）。默认每 2 秒采样，`--tick-ms N` 可在 100–60000 毫秒间调整。
+2. Daemon 在该项目使用 `.runtime/ai4mathd.sock` 和原有 SQLite、Wiki 索引。Socket 为 `0600`，父目录 `0700`，仅接同 UID Unix peer；没有 TCP 监听端口。建议先停止 daemon 再清理；若上次退出留下节点，确认没有运行实例和连接后再由操作者清理，不自动覆盖、跟随或移除已有路径。
+3. 在工作台中添加该项目目录（工作台会自动识别为 **外部 · 在线** 并不接管其进程），或在 `dsh-ai4math` 插件配置中显式指定 `socketPath`（亦支持 `AI4MATH_SOCKET` 环境变量）。
+4. 其他角色工具默认不注册。受信任操作者可在 `rolePresets` 中将 `chief / regional / explorer / builder / prover / automation / reviewer` 映射到互不重复的已组合 Agent preset ID；授权源是实时 Agent 绑定而不是工具参数。普通角色没有任意读写文件或命令执行入口。Reviewer 不读全局简报/Inbox；其上下文装配由上游编排器负责，不应在同一个混合权限 Agent 中启用。
 
 ## 接口及约定
 
-Socket 接受 NDJSON JSON-RPC 2.0 对象参数：`status`、`frontier.list`、`inbox.list`、`wiki.search`、`briefing.peek`、`briefing.pull`、`briefing.get`、`alerts.list`、`subscribe`、`unsubscribe`。详细参数看 [Host 共用端点定义](../plugins/dsh-ai4math/host/remote-contract.mjs)；浏览器端不直接接触 UDS。推送主题为 `vital_signs.tick`、`alert.p0`、`breaker.state_changed`。连接、帧长度、未完成请求和各方向缓冲均有界。Host 不自动重放请求。重连后 P0 通过持久游标分页补读，超出本轮上限会明确显示；熔断事件本身只做实时通知，当前状态可从 Fact Pack 重读。
+Socket 接受 NDJSON JSON-RPC 2.0 对象参数：`status`、`frontier.list`、`inbox.list`、`wiki.search`、`briefing.peek`、`briefing.pull`、`briefing.get`、`alerts.list`、`subscribe`、`unsubscribe`。此外 Host 侧提供 6 个仅限已认证 Owner 调用的 `hostOnly` 工作台控制端点：`workbench.state`、`workbench.project_init`、`workbench.project_select`、`workbench.project_remove`、`workbench.daemon_start`、`workbench.daemon_stop`（不经过 UDS，且永不向任何 Agent 角色暴露）。详细参数看 [Host 共用端点定义](../plugins/dsh-ai4math/host/remote-contract.mjs)；浏览器端不直接接触 UDS。推送主题为 `vital_signs.tick`、`alert.p0`、`breaker.state_changed`。连接、帧长度、未完成请求和各方向缓冲均有界。Host 不自动重放请求。重连后 P0 通过持久游标分页补读，超出本轮上限会明确显示；熔断事件本身只做实时通知，当前状态可从 Fact Pack 重读。
 
 - **生命体征**：内存、信任账本、标脏、熔断/Inbox、最近 P0。配置证明槽后上报 daemon 内 Broker 的租约指标；独立 CLI 不计入，真实 worker 数缺少上游遥测时为未知。
 - **简报**：同一 SQLite 读事务内固定游标和事件头，生成有界、确定性的事实包，包括信任迁移、形式/非形式陈述、P0 源事件、前沿及依赖、风险、熔断和 Inbox。形式签名未记录时不编造。Peek 不写文件；Pull 和有效 P0 按内容哈希留存 JSON 和 Markdown；Owner 可按摘要读回并验证内容完整性。两者都不推进人类 checkpoint。当前 RPC 输出是实施版投影，不宣称与 [设计版简报 Schema](../schemas/briefing-telemetry.schema.json) 完全等价。
@@ -50,8 +61,8 @@ env -i PATH=/usr/bin:/bin ELECTRON_RUN_AS_NODE=1 "$APP/Contents/MacOS/DeepSeek H
 
 ## 尚未覆盖的完整产品设计
 
-现用 GUI 尚未安装本插件。实装验收应依次检查：启用后底栏 AI4Math 状态和会话侧栏 Briefing/Frontier/Inbox/Wiki；Owner 登录可以读取，退出或 Guest 不可以；daemon 断开时显示重连或旧数据提示，不把旧计数当现状；再启用或重连后正常恢复；禁用和卸载后面板消失、订阅停止，不停止外部 daemon，也不删除账本或留存。遇到不可用先检查插件启用状态、`socketPath`、daemon 进程和同 UID。布局、明暗主题和生产 preset 生命周期仍待真实页面验收。
+现用 DSH Desktop GUI 已完成 Owner 视角实装验收（左侧 **AI4Math** 全屏工作台、多项目初始化/热切换、托管与外部 daemon 识别、底栏 HUD 与 4 个右侧栏面板、断线自动重连、禁用热移除、一键新建 `ai4math-chief` 会话与中英文跟随）。以下边界仍待后续或目标环境单独验收：
 
-标准 Unix UID 是 daemon 的信任边界，不隔离同 UID 的其他本机进程；如给模型启用其他 shell/文件工具，部署者还需禁止其直接访问 UDS/状态库。角色授权是 preset 级别，不是完整任务租约。
-
-GUI 未接任务调度控制面、外部桌面/Webhook 通知、任意历史简报窗口、LLM 叙事，也未暴露 Pivot/熔断恢复/ADR 写事务；这些不等同于 CLI 或独立 Host 功能不存在。工作台可观察和留存 Fact Pack，但不会批准、解决 Inbox 或推进 checkpoint。后续写入口必须满足 [Owner 人工确认边界](owner-approval-boundary.md)。
+- **访客/登出态浏览器实测与多角色生产 Preset**：Owner/Guest 门禁已在安装版 SDK 测试验证，浏览器侧退出登录或 Guest 视角及 `chief` 以外的独立角色 Preset（如盲审 `reviewer`、`prover` 证明槽）仍待真实多会话验收。
+- **主机信任边界**：标准 Unix UID 是 daemon 的信任边界，不隔离同 UID 的其他本机进程；如给模型启用其他 shell/文件工具，部署者还需禁止其直接访问 UDS/状态库。角色授权是 preset 级别，不是完整任务租约。若托管 `ai4mathd` 需开启 `--proof-targets` 执行 Broker Seatbelt，仍建议先按目标系统核对 Electron Host 子进程与 Seatbelt 的兼容性，必要时采用外部终端启动 daemon。
+- **只读与写操作分离**：GUI 未接任务调度控制面、外部桌面/Webhook 通知、任意历史简报窗口、LLM 叙事，也未暴露 Pivot/熔断恢复/ADR 写事务（熔断与收件箱卡片仅提供可复制的只读操作者 CLI 模板）；这些不等同于 CLI 或独立 Host 功能不存在。工作台可观察和留存 Fact Pack，但不会批准、解决 Inbox 或推进 checkpoint。后续写入口必须满足 [Owner 人工确认边界](owner-approval-boundary.md)。

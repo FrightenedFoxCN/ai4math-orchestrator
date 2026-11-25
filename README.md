@@ -42,8 +42,14 @@
 - [x] **架构与工程选型设计完成（Docs 01–08、ADR-0001–0006、4 份 JSON Schema 与 2 份 SQLite DDL）**
 - [x] **Phase 1（Rust 核心底座 + Red-Team 闭环）**：`ai4math-core` + `ai4math-store`（`rusqlite`）+ `ai4math-broker`（Seatbelt 规范化 + APFS 黄金快照 + Lean 4/Agda/Rocq 受限洁净室 `VerificationReceipt`）+ `ai4math-cli`
 - [x] **Phase 2（本机守护进程）**：`ai4math-daemon`（UDS NDJSON JSON-RPC 2.0 + 实时生命体征推流 + 确定性 Fact Pack 编译器）
-- [x] **Phase 3（DSH 原生插件实现）**：`plugins/dsh-ai4math`（Host Cordis 角色工具面 + `TypertRemoteService` 桥接 + Client `shell.bottom` Live HUD 与 `sidebarRightTabs` 面板）
+- [x] **Phase 3（DSH 一体化工作台插件）**：`plugins/dsh-ai4math`（内置 `ai4math-chief` Preset、左侧 `sidebar.panellist` + 全屏 `main:ai4math` 多项目工作台、Host 托管/外部接管 `ai4mathd` 与热切桥接、底部 `shell.bottom` Live HUD、4 个右侧栏面板、会话目录联动、只读 CLI 助手与中英文实时切换）
 
-以上勾选表示阶段基础实现已落地，不表示生产交付。当前交接基线为 `0d2b6d1`：本机 daemon 与安装版 DSH SDK 集成测试已通过；现用 GUI 未安装验收。Owner 归档只开放本地签名 CLI，不开放远程写入口。Linux 验证后端仍禁用；Rocq 独立 T2 原生复核未通过，Agda 独立 T2 和 Lean 全仓发布门禁仍待完成。
+以上勾选表示阶段实现与本机/Desktop GUI 工作台验收已落地，不表示全平台生产交付。当前交接基线为 `e5e5ef4`：本机 daemon、安装版 DSH SDK 集成测试与现用 Desktop GUI 工作台（Owner 视角）已验收通过。Owner 归档仍只开放本地签名 CLI，不开放远程写入口；Linux 验证后端仍禁用；Rocq 独立 T2 原生复核未通过，Agda 独立 T2 和 Lean 全仓发布门禁仍待完成。
+
+### 快速开始（DSH Desktop 工作台）
+
+1. 编译本地 Rust 二进制：`cargo build --locked -p ai4math-cli -p ai4math-daemon`。
+2. 在 [plugins/dsh-ai4math](plugins/dsh-ai4math/README.md) 执行 `pnpm install`，于 DSH **插件 → 添加插件** 中添加该目录并启用 `dsh-ai4math`。
+3. 点击左侧导航栏 **AI4Math** 打开工作台 → **选择文件夹**初始化或接管数学项目（macOS 需保证 `.runtime/ai4mathd.sock` 路径 ≤ 103 字节）→ 点击 **新建 Chief 主编排会话** 即可开始编排探索。
 
 当前验证结果和恢复顺序见[交接快照](docs/implementation-status.md#交接快照)与[交付清单](docs/delivery-roadmap.md)；历史证据见[验收矩阵](docs/architecture-acceptance.md)。
