@@ -4,6 +4,7 @@ mod infra_rfc;
 #[cfg(test)]
 mod managed_tests;
 mod oracle;
+mod owner_approval;
 mod pivot;
 mod promotion;
 mod reviewed_spec;
@@ -37,6 +38,9 @@ const HELP: &str = "ai4math init ROOT [lean4|agda|rocq]\nai4math status ROOT\nai
 ai4math pivot-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
 ai4math pivot-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID
 ai4math pivot-archive-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
+ai4math owner-archive-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
+ai4math owner-archive-signing-message ROOT BARE_REPO BASE ADR_SHA256 REQUEST_ID EXPIRES_UNIX
+ai4math owner-archive-verify ROOT BARE_REPO BASE ADR_SHA256 REQUEST_ID EXPIRES_UNIX TRUSTED_PUBLIC_KEY_FILE SIGNATURE_FILE
 ai4math pivot-archive-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID
 ai4math pivot-routes-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON PLAN...
 ai4math pivot-routes-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID PLAN...
@@ -1049,6 +1053,58 @@ fn run() -> Result<()> {
             reason,
             true,
         ),
+        [
+            "owner-archive-signing-message",
+            root,
+            repo,
+            base,
+            adr,
+            request,
+            expires,
+        ] => {
+            use std::io::Write;
+            let approval = owner_approval::ArchiveApproval::new(
+                Path::new(root),
+                Path::new(repo),
+                base,
+                adr,
+                request,
+                expires.parse()?,
+            )?;
+            std::io::stdout()
+                .lock()
+                .write_all(approval.signing_bytes())?;
+            Ok(())
+        }
+        [
+            "owner-archive-verify",
+            root,
+            repo,
+            base,
+            adr,
+            request,
+            expires,
+            key,
+            sig,
+        ] => {
+            let approval = owner_approval::ArchiveApproval::new(
+                Path::new(root),
+                Path::new(repo),
+                base,
+                adr,
+                request,
+                expires.parse()?,
+            )?;
+            let key = owner_approval::TrustedOwnerKey::read(Path::new(key))?;
+            let signature = owner_approval::read_signature(Path::new(sig))?;
+            approval.verify(&key, &signature)?;
+            print_json(
+                serde_json::json!({"signature_valid":true,"diagnostic_only":true,"applied":false}),
+            )
+        }
+        ["owner-archive-preview", root, repo, fact, breaker, reason] => {
+            pivot::owner_archive_preview(Path::new(root), Path::new(repo), fact, breaker, reason)
+        }
         [
             mode @ ("pivot-preview" | "pivot-archive-preview"),
             root,

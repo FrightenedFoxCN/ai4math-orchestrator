@@ -214,6 +214,39 @@ pub(crate) fn preview_lesson(
     )
 }
 
+/// Produce an operator archive preview without creating a Git coordination file.
+/// The caller must still treat the digest as a plan identifier, not authorization.
+pub(crate) fn owner_archive_preview(
+    root: &Path,
+    repo: &Path,
+    fact: &str,
+    breaker: &str,
+    reason: &str,
+) -> Result<()> {
+    let git = PromotionRepo::try_lock_existing(repo)?;
+    let mut store = open_managed_state(root, true)?;
+    let p = plan(
+        root,
+        &git,
+        &mut store,
+        fact,
+        breaker,
+        reason,
+        Selection::just(PivotAction::ArchiveBreaker),
+    )?;
+    ensure!(
+        git.main_head()? == p.base_commit,
+        "main changed during archive preview"
+    );
+    let adr_id = p.adr_id()?;
+    let adr_sha256 = adr_id
+        .strip_prefix("ADR-PIVOT-")
+        .context("unexpected Pivot ID format")?;
+    print_json(
+        json!({"adr_id":adr_id,"adr_sha256":adr_sha256,"plan":p,"adr_markdown":markdown(&p)?}),
+    )
+}
+
 fn preview_with(
     root: &Path,
     repo: &Path,

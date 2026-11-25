@@ -1,0 +1,218 @@
+use super::*;
+use std::{
+    ffi::CString,
+    fs,
+    os::unix::fs::symlink,
+    path::PathBuf,
+    process::{Command, Stdio},
+    time::Duration,
+};
+
+const BASE: &str = "0123456789abcdef0123456789abcdef01234567";
+const DIGEST: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const REQUEST: &str = "owner_approval-1";
+
+fn create_key(dir: &Path, name: &str) -> Result<(PathBuf, TrustedOwnerKey)> {
+    let private = dir.join(name);
+    let output = Command::new(unix::SSH_KEYGEN)
+        .env_clear()
+        .args([
+            "-q",
+            "-t",
+            "ed25519",
+            "-N",
+            "",
+            "-C",
+            "synthetic test fixture",
+            "-f",
+        ])
+        .arg(&private)
+        .stdin(Stdio::null())
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "generate synthetic fixture key: {:?}",
+        output.stderr
+    );
+    let public = private.with_extension("pub");
+    Ok((private, TrustedOwnerKey::read(&public)?))
+}
+
+fn sign_fixture(
+    dir: &Path,
+    key: &Path,
+    name: &str,
+    namespace: &str,
+    data: &[u8],
+) -> Result<Vec<u8>> {
+    let path = dir.join(name);
+    fs::write(&path, data)?;
+    let output = Command::new(unix::SSH_KEYGEN)
+        .env_clear()
+        .args(["-Y", "sign", "-f"])
+        .arg(key)
+        .args(["-n", namespace])
+        .arg(&path)
+        .stdin(Stdio::null())
+        .output()?;
+    ensure!(
+        output.status.success(),
+        "sign synthetic fixture: {:?}",
+        output.stderr
+    );
+    read_signature(&path.with_extension("sig"))
+}
+
+#[test]
+fn verifies_exact_archive_context_with_only_the_pinned_key() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let root = tmp.path().join("project");
+    let repo = tmp.path().join("repo");
+    fs::create_dir(&root)?;
+    fs::create_dir(&repo)?;
+    let expires = unix_seconds()? + 600;
+    let expected = ArchiveApproval::new(&root, &repo, BASE, DIGEST, REQUEST, expires)?;
+    let (private, trusted) = create_key(tmp.path(), "trusted_key")?;
+    let (_, other) = create_key(tmp.path(), "other_key")?;
+    let sig = sign_fixture(
+        tmp.path(),
+        &private,
+        "archive",
+        NAMESPACE,
+        expected.signing_bytes(),
+    )?;
+    expected.verify(&trusted, &sig)?;
+    assert!(expected.verify(&other, &sig).is_err());
+    let expired = expected
+        .verify_at(&trusted, &sig, || Ok(expires))
+        .unwrap_err();
+    assert!(expired.to_string().contains("expired"));
+    assert!(expected.verify(&trusted, &[]).is_err());
+    assert!(
+        expected
+            .verify(&trusted, b"malformed synthetic data")
+            .is_err()
+    );
+    assert!(
+        expected
+            .verify(&trusted, &[b'A'; MAX_SIGNATURE_BYTES + 1])
+            .is_err()
+    );
+
+    let wrong_base = "f".repeat(40);
+    let wrong_digest = "f".repeat(64);
+    for (r, g, b, d, id, t) in [
+        (tmp.path(), repo.as_path(), BASE, DIGEST, REQUEST, expires),
+        (root.as_path(), tmp.path(), BASE, DIGEST, REQUEST, expires),
+        (&root, &repo, &wrong_base, DIGEST, REQUEST, expires),
+        (&root, &repo, BASE, &wrong_digest, REQUEST, expires),
+        (&root, &repo, BASE, DIGEST, "wrong-request", expires),
+        (&root, &repo, BASE, DIGEST, REQUEST, expires + 1),
+    ] {
+        assert!(
+            ArchiveApproval::new(r, g, b, d, id, t)?
+                .verify(&trusted, &sig)
+                .is_err()
+        );
+    }
+    let wrong_namespace = sign_fixture(
+        tmp.path(),
+        &private,
+        "domain",
+        "other-domain",
+        expected.signing_bytes(),
+    )?;
+    assert!(expected.verify(&trusted, &wrong_namespace).is_err());
+    let resume = std::str::from_utf8(expected.signing_bytes())?.replace(
+        "\"action\":\"archive_breaker\"",
+        "\"action\":\"resume_as_is\"",
+    );
+    let resume = sign_fixture(tmp.path(), &private, "resume", NAMESPACE, resume.as_bytes())?;
+    assert!(expected.verify(&trusted, &resume).is_err());
+    Ok(())
+}
+
+#[test]
+fn signing_bytes_are_canonical_and_directory_paths_are_bound() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo \"β\"");
+    fs::create_dir(&repo)?;
+    let link = temp.path().join("alias");
+    symlink(&repo, &link)?;
+    let expires = 1_900_000_000;
+    let signing = ArchiveApproval::new(temp.path(), &link, BASE, DIGEST, REQUEST, expires)?;
+    let root_json = serde_json::to_string(&temp.path().canonicalize()?)?;
+    let repo_json = serde_json::to_string(&repo.canonicalize()?)?;
+    let canonical = format!(
+        "{{\"schema\":\"ai4math-owner-archive-v1\",\"action\":\"archive_breaker\",\"project_root\":{root_json},\"repo\":{repo_json},\"base_commit\":\"{BASE}\",\"adr_sha256\":\"{DIGEST}\",\"request_id\":\"{REQUEST}\",\"expires_unix\":{expires}}}"
+    );
+    assert_eq!(signing.signing_bytes(), canonical.as_bytes());
+    assert!(ArchiveApproval::new(temp.path(), &repo, "a", DIGEST, REQUEST, expires).is_err());
+    assert!(
+        ArchiveApproval::new(
+            temp.path(),
+            &repo,
+            BASE,
+            &DIGEST.to_uppercase(),
+            REQUEST,
+            expires
+        )
+        .is_err()
+    );
+    assert!(ArchiveApproval::new(temp.path(), &repo, BASE, DIGEST, "id\nbad", expires).is_err());
+    assert!(
+        ArchiveApproval::new(temp.path(), &repo, BASE, DIGEST, &"a".repeat(129), expires).is_err()
+    );
+    assert!(ArchiveApproval::new(temp.path(), &repo, BASE, DIGEST, REQUEST, 0).is_err());
+    let file = temp.path().join("file");
+    fs::write(&file, [])?;
+    assert!(ArchiveApproval::new(temp.path(), &file, BASE, DIGEST, REQUEST, expires).is_err());
+    assert!(
+        ArchiveApproval::new(
+            temp.path(),
+            &temp.path().join("missing"),
+            BASE,
+            DIGEST,
+            REQUEST,
+            expires
+        )
+        .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn rejects_nonregular_oversized_and_multiple_key_inputs() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let file = tmp.path().join("input");
+    let alias = tmp.path().join("link");
+    let fifo = tmp.path().join("fifo");
+    let fifo_path = CString::new(fifo.as_os_str().as_encoded_bytes())?;
+    // SAFETY: valid, NUL-terminated path in the fixture directory.
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    fs::write(&file, [b'x'; MAX_SIGNATURE_BYTES + 1])?;
+    symlink(&file, &alias)?;
+    for invalid in [&file, &alias, &fifo, &tmp.path().to_owned()] {
+        assert!(read_signature(invalid).is_err());
+        assert!(TrustedOwnerKey::read(invalid).is_err());
+    }
+    let key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    assert!(TrustedOwnerKey::parse(format!("{key} optional comment\r\n").as_bytes()).is_ok());
+    assert!(TrustedOwnerKey::parse(format!("{key}\n{key}\n").as_bytes()).is_err());
+    assert!(TrustedOwnerKey::parse(format!("allowed-principal {key}\n").as_bytes()).is_err());
+    Ok(())
+}
+
+#[test]
+fn timed_out_child_is_terminated_and_reaped() -> Result<()> {
+    let mut child = Command::new("/bin/sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()?;
+    let err = unix::wait_bounded(&mut child, Duration::from_millis(30)).unwrap_err();
+    assert!(err.to_string().contains("timed out"));
+    assert!(!child.try_wait()?.context("child must be reaped")?.success());
+    Ok(())
+}

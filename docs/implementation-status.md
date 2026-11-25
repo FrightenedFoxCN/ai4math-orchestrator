@@ -102,6 +102,11 @@
 - 本机安装版 Electron/Cordis/Typert 实测合成 Owner/Guest 的门禁、实际 daemon 重启重连，以及插件卸载后服务注销和订阅结束。没有安装到现用 profile 或完成浏览器认证、布局和视觉验收。Rust 538 项、插件 113 项通过（Rust 75 项默认忽略）。
 - 已核对 [Owner 审批边界](owner-approval-boundary.md)：DSH Owner peer 本身不证明人在场或签署了精确计划。公开预览与状态不授权写入；未建立独立操作者确认前保持无远程 Pivot 写入口。
 
+## 后续批次：Owner 归档签名试点
+
+- 新增本地 `owner-archive-preview`（不创建缺失的 Git 锁、不修改计划状态）和固定消息/Ed25519 离线核验。签名只是相对于已选公钥的诊断结果，不消费确认、不执行写入，也不证明真人在场。持久请求绑定、已确认执行、恢复以及 GUI 接线仍未启用，见 [Owner 审批边界](owner-approval-boundary.md)。
+- 本机合成密钥、签名绑定及预览不变性回归通过；Rust 工作区 544 通过、0 失败、75 默认忽略，插件 113 通过，格式、diff 和 Clippy 通过（仍有既有警告）。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。

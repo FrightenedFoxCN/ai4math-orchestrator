@@ -66,6 +66,27 @@ fn fixture_event(store: &mut StateStore) -> Result<i64> {
 }
 
 #[test]
+fn owner_archive_preview_never_creates_a_missing_lock_or_advances_state() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let root = dir.path();
+    let repo = setup(root)?;
+    let state = root.join(".runtime/state.sqlite");
+    let mut store = StateStore::open(&state)?;
+    let facts = retain(root, serde_json::to_value(store.briefing_facts()?)?)?;
+    let before = store.status()?.last_event_seq;
+    let head = git(&repo, &["rev-parse", "refs/heads/main"]);
+    owner_archive_preview(root, &repo, &facts, B, REASON)?;
+    assert_eq!(store.status()?.last_event_seq, before);
+    assert_eq!(git(&repo, &["rev-parse", "refs/heads/main"]), head);
+    assert!(store.pivot_intent()?.is_none());
+    let lock = repo.join("ai4math-promotion.lock");
+    fs::remove_file(&lock)?;
+    assert!(owner_archive_preview(root, &repo, &facts, B, REASON).is_err());
+    assert!(!lock.exists());
+    Ok(())
+}
+
+#[test]
 fn pivot_replay_and_checkpoint_reject_grafted_main_history() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let root = temp.path();
