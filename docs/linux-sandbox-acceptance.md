@@ -20,6 +20,12 @@ AI4MATH_TEST_CGROUP_LEAF=/sys/fs/cgroup/your-delegated-leaf \
 
 计划要求所有数据和 scratch 为 `noexec`，所有挂载为 `nosuid,nodev`，只有 scratch 可写。动态库所在挂载允许可执行映射，不等于允许将库作为程序执行。后端尚未接线：未来 launcher 须独立固定和验明源路径/文件类型、排除子挂载和别名、落实最终内核挂载属性及唯一可执行入口；不能仅凭计划输出启动 verifier 或签发回执。
 
+## 内核挂载复核
+
+[Mount snapshot 校验器](../crates/ai4math-broker/src/linux_mount_audit.rs) 接受由可信 launcher 在执行目标前取得的 `mountinfo` 快照。它核对封闭的 tmpfs 根、精确的挂载集合、父子关系、私有传播及有效权限；拒绝缺项、叠挂、数据树中的额外挂载和超限/畸形快照。可写 scratch 必须在有效挂载和底层文件系统两层均可写。
+
+这一步不可信任由 verifier 或调用者提交的文本。校验器本身不读 `/proc`，不证明挂载源的 inode 或内容正确，不施加执行路径、设备、cgroup 或进程生命周期约束。真实 launcher 还须在放行前固定目标 namespace，读取可信内核快照、独立核对源身份，并防止校验后仍可修改挂载。
+
 ## 启用一个 Linux verifier 前
 
 1. 从空根建立强制隔离的 namespace，固定受管 launcher 与可信工具链清单；不整棵挂载宿主 `/`、`/usr`、`/proc` 或 `/sys`。普通 `ro-bind` 的只读属性不意味着 `noexec`。数据、房间和 scratch 须独立、不可执行，可信动态加载器及库的映射与允许执行程序的授权须分别核验。scratch 还需总容量上限。

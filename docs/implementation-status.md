@@ -126,6 +126,10 @@
 
 - 已加入确定性的纯策略编译器，划分主程序、runtime 文件、数据、合成目录和可写 scratch，拒绝冲突及超限。macOS 只验证计划和失败分支；不执行 mount、没有新增可用 Linux verifier。见 [Linux 挂载计划与验收要求](linux-sandbox-acceptance.md)。
 
+## 后续批次：Linux 挂载快照对账
+
+- 新增有界 `mountinfo` 校验，按计划核对根、挂载集合、传播、父节点及有效读写/执行标记。macOS 使用合成快照验证成功与拒绝路径；尚无可信 Linux launcher 采集快照，也没有启用后端。详见 [Linux 验收门禁](linux-sandbox-acceptance.md)。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。

@@ -15,6 +15,7 @@ use lean_objects::LeanObjects;
 mod lean_spec;
 pub use lean_spec::VerifiedLeanComparison;
 pub mod linux_cgroup;
+pub mod linux_mount_audit;
 pub mod linux_mount_plan;
 mod oracle;
 pub use oracle::{
