@@ -79,10 +79,17 @@ function readSummary(value, packet) {
  * it must provision and dispose a fresh restricted Agent and return that
  * assignment's takeResult(). Never retry automatically, including if the
  * result was sent but the acknowledgement could not be read. */
-export async function runModelTaskCli({ cliPath, root, bareRepo, taskId, claimId, role, wallSeconds, runAssignment, signal } = {}) {
+export async function runModelTaskCli({ cliPath, root, bareRepo, taskId, claimId, role, wallSeconds, runAssignment, signal, approval } = {}) {
   if (![cliPath, root, bareRepo].every(path) || !token(taskId, id) || !token(claimId, id) || !roles.has(role) ||
       !Number.isInteger(wallSeconds) || wallSeconds < 1 || wallSeconds > 60 || typeof runAssignment !== 'function' ||
       (signal !== undefined && !(signal instanceof AbortSignal))) throw failure('invalid');
+  let args = ['task-run-model', root, bareRepo, taskId, claimId, role, String(wallSeconds)];
+  if (approval !== undefined) {
+    const bound = record(approval, ['model', 'maxModelCalls']);
+    if (!bound || !token(bound.model, /^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,95}$/u) ||
+        !Number.isInteger(bound.maxModelCalls) || bound.maxModelCalls < 1 || bound.maxModelCalls > 8) throw failure('invalid');
+    args = ['task-run-approved-model', root, bareRepo, taskId, claimId, role, String(wallSeconds), bound.model, String(bound.maxModelCalls)];
+  }
   if (signal?.aborted) throw failure('cancelled');
 
   const lifetime = new AbortController();
@@ -92,7 +99,7 @@ export async function runModelTaskCli({ cliPath, root, bareRepo, taskId, claimId
   const ownGroup = process.platform !== 'win32';
   let child;
   try {
-    child = spawn(cliPath, ['task-run-model', root, bareRepo, taskId, claimId, role, String(wallSeconds)], {
+    child = spawn(cliPath, args, {
       cwd: process.platform === 'win32' ? undefined : '/', env: { PATH: '/usr/bin:/bin' }, shell: false,
       detached: ownGroup, windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'],
     });

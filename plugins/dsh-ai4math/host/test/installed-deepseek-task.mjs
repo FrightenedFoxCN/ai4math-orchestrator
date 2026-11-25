@@ -10,7 +10,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { runDeepSeekModelTask } from '../model-task-deepseek.mjs';
+import { runApprovedDeepSeekModelTask, runDeepSeekModelTask } from '../model-task-deepseek.mjs';
 
 const [dshRoot, cliPath, ...extra] = process.argv.slice(2);
 assert.ok(dshRoot && cliPath && isAbsolute(dshRoot) && isAbsolute(cliPath) && extra.length === 0,
@@ -213,6 +213,11 @@ try {
     ['fixture-reviewer', 'independent_reviewer', { kind: 'review', verdict: 'looks_consistent', rationale: 'The header matches the statement.' }],
   ]) {
     ai('task-register', bareRepo, taskId, 'infrastructure', modulePath, decl);
+    const approved = role === 'independent_reviewer';
+    if (approved) {
+      const row = JSON.parse(ai('model-dispatch-approve', bareRepo, taskId, claimId, role, base, model, String(wallSeconds), '4'));
+      assert.equal(row.state, 'approved');
+    }
     const input = role === 'prover_worker'
       ? { proof_body: suggestion.proof_body }
       : { verdict: suggestion.verdict, rationale: suggestion.rationale };
@@ -224,7 +229,8 @@ try {
       const key = fail === 'auth' ? wrongKey : apiKey;
       const expectedRequests = fail === 'auth' || fail === 'redirect' ? 1 : 3;
       scenario = { packet, input, key, expectedRequests, fail, history: [], requests: 0 };
-      const pending = runDeepSeekModelTask({
+      const runner = approved ? runApprovedDeepSeekModelTask : runDeepSeekModelTask;
+      const pending = runner({
         cliPath, root, bareRepo, taskId, claimId, role, wallSeconds, dshRoot, model, apiKey: key, baseUrl,
         // Leave room for a retry so the HTTP request counts would detect one.
         maxModelCalls: 4, signal: new AbortController().signal,
@@ -259,6 +265,7 @@ try {
     assert.equal(candidate.source, 'dsh_model');
     assert.ok(!Object.hasOwn(candidate, 'executable_sha256'));
     assert.deepEqual(JSON.parse(candidate.result_json), suggestion);
+    if (approved) assert.equal(JSON.parse(ai('model-dispatch-reconcile', taskId)).state, 'recorded');
     assert.equal(git(bareRepo, 'rev-parse', 'refs/heads/main'), base);
   }
   console.log('Installed DeepSeekAdapter + local Messages SSE + Rust CLI: exact role schemas and tool round trips; SQLite suggestions unverified; main unchanged');

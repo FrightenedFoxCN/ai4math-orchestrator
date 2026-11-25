@@ -105,16 +105,54 @@ impl Fixture {
         self.spawn_as("prover_worker", seconds)
     }
     fn spawn_as(&self, role: &str, seconds: &str) -> Result<Run> {
-        let mut child = cli()
+        self.spawn_pipe(&[
+            "task-run-model",
+            self.root(),
+            self.bare(),
+            "T",
+            "C",
+            role,
+            seconds,
+        ])
+    }
+    fn approve(&self) -> Result<Value> {
+        let r = cli()
             .args([
-                "task-run-model",
+                "model-dispatch-approve",
                 self.root(),
                 self.bare(),
                 "T",
                 "C",
-                role,
-                seconds,
+                "prover_worker",
+                &self.base,
+                "fixture-math-model",
+                "8",
+                "4",
             ])
+            .output()?;
+        ensure!(
+            r.status.success(),
+            "approval: {}",
+            String::from_utf8_lossy(&r.stderr)
+        );
+        Ok(serde_json::from_slice(&r.stdout)?)
+    }
+    fn spawn_approved(&self, model: &str) -> Result<Run> {
+        self.spawn_pipe(&[
+            "task-run-approved-model",
+            self.root(),
+            self.bare(),
+            "T",
+            "C",
+            "prover_worker",
+            "8",
+            model,
+            "4",
+        ])
+    }
+    fn spawn_pipe(&self, args: &[&str]) -> Result<Run> {
+        let mut child = cli()
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -122,11 +160,11 @@ impl Fixture {
         let out = BufReader::new(child.stdout.take().unwrap());
         let mut run = Run {
             child,
-            out,
+            out: Some(out),
             packet: Value::Null,
         };
         let mut line = String::new();
-        run.out.read_line(&mut line)?;
+        run.out.as_mut().unwrap().read_line(&mut line)?;
         run.packet =
             serde_json::from_str::<Value>(&line).context("expected one packet")?["packet"].clone();
         Ok(run)
@@ -134,7 +172,7 @@ impl Fixture {
 }
 struct Run {
     child: Child,
-    out: BufReader<ChildStdout>,
+    out: Option<BufReader<ChildStdout>>,
     packet: Value,
 }
 impl Drop for Run {
@@ -168,6 +206,67 @@ impl Run {
         }
     }
 }
+#[test]
+fn approved_dispatch_is_one_shot_even_when_acknowledgement_is_lost() -> Result<()> {
+    use ai4math_store::ModelDispatchState;
+    let f = Fixture::new()?;
+    assert_eq!(f.approve()?["state"], "approved");
+    assert!(f.spawn("8").is_err(), "old pipe bypassed approval");
+    assert!(f.spawn_approved("wrong-model").is_err());
+    assert_eq!(
+        f.db()?.get_model_dispatch("T")?.unwrap().state,
+        ModelDispatchState::Approved
+    );
+
+    let mut run = f.spawn_approved("fixture-math-model")?;
+    assert_eq!(run.packet["base_commit"], f.base);
+    assert_eq!(
+        f.db()?.get_model_dispatch("T")?.unwrap().state,
+        ModelDispatchState::Dispatched
+    );
+    assert!(f.spawn_approved("fixture-math-model").is_err());
+    drop(run.out.take()); // Corresponds to a host losing its acknowledgement channel.
+    run.send(&run.result())?;
+    assert!(!run.wait()?);
+    assert!(f.db()?.task_candidate("T")?.is_some());
+    assert!(f.spawn_approved("fixture-math-model").is_err());
+    let status = cli()
+        .args(["model-dispatch-reconcile", f.root(), "T"])
+        .output()?;
+    assert!(status.status.success());
+    let report: Value = serde_json::from_slice(&status.stdout)?;
+    assert_eq!(report["state"], "recorded");
+    assert!(!String::from_utf8(status.stdout)?.contains("True.intro"));
+    assert_eq!(f.db()?.claim("C")?.unwrap().local_trust, Trust::L0);
+    Ok(())
+}
+
+#[test]
+fn approved_dispatch_cancel_and_failed_worker_do_not_requeue() -> Result<()> {
+    use ai4math_store::ModelDispatchState;
+    let cancelled = Fixture::new()?;
+    cancelled.approve()?;
+    let r = cli()
+        .args(["model-dispatch-cancel", cancelled.root(), "T"])
+        .output()?;
+    assert!(r.status.success());
+    assert!(cancelled.spawn_approved("fixture-math-model").is_err());
+    assert!(cancelled.spawn("8").is_err());
+    let f = Fixture::new()?;
+    f.approve()?;
+    let mut run = f.spawn_approved("fixture-math-model")?;
+    drop(run.child.stdin.take());
+    assert!(!run.wait()?);
+    assert!(f.db()?.task_candidate("T")?.is_none());
+    assert_eq!(
+        f.db()?.get_model_dispatch("T")?.unwrap().state,
+        ModelDispatchState::Dispatched
+    );
+    assert!(f.spawn_approved("fixture-math-model").is_err());
+    assert!(f.spawn("8").is_err());
+    Ok(())
+}
+
 #[test]
 fn wrong_identity_cannot_write_and_success_is_untrusted_and_one_shot() -> Result<()> {
     let f = Fixture::new()?;

@@ -263,6 +263,10 @@ impl StateStore {
         };
 
         self.write(|tx| {
+            let model_binding = candidate.and_then(|(base, claim, role, executable, _)| {
+                executable.is_none().then_some((base, claim, role))
+            });
+            super::model_dispatch::check_model_dispatch_outcome(tx, &lease.id, model_binding)?;
             let seq = release_lease(tx, lease, candidate.is_some())?
                 .context("task lease is no longer valid for worker outcome")?;
             if let Some((base_commit, claim_id, role, executable_sha256, result_json)) = candidate {

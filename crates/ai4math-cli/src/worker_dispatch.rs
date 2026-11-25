@@ -18,7 +18,10 @@ use std::{path::Path, time::Duration};
 mod adaptation;
 mod model_pipe;
 pub(crate) use adaptation::run_adaptation;
-pub(crate) use model_pipe::run_model;
+pub(crate) use model_pipe::{
+    ModelApprovalOptions, approve_model, cancel_model_dispatch, model_dispatch_status,
+    reconcile_model_dispatch, run_approved_model, run_model,
+};
 
 const RESULT_CAP: usize = 32 * 1024;
 const WORKER_ACTOR: Change<'static> = Change {

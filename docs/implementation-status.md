@@ -83,6 +83,12 @@
 - 配置经有界 stdin 帧传入，不进入 argv 或子进程环境；只接受有界单帧结果和成功退出。Rust 仍核对任务/租约并只留存未验证建议。没有接入 GUI、常驻排程或环境中的生产凭据。
 - 本机 Electron/已安装 SDK 使用合成凭据和 localhost Messages 流式夹具验证了证明及审阅角色、HTTP 失败不入账与显式重试；未访问远端服务，未验收真实 GUI 或 Linux 宿主。插件测试 78 通过；Rust 工作区 523 通过、75 默认忽略，fmt、diff 与 Clippy 通过（仍有既有警告）。
 
+## 后续批次：持久单次模型派单
+
+- 操作者用 `model-dispatch-approve ROOT BARE_REPO ID CLAIM ROLE REVIEWED_COMMIT MODEL WALL_SECONDS MAX_MODEL_CALLS` 批准一个明确任务。账本不保存凭据或模型上下文；在 Git 锁内检查审核主干，随后通过同一 SQLite 事务消费审批、领取租约并写审计。只有提交后才发送任务上下文。领取仍受容量、依赖、熔断、退避和 Oracle 挂起约束。
+- `model-dispatch-status ROOT ID` 查看，`model-dispatch-cancel ROOT ID` 只取消未派发的批准，`model-dispatch-reconcile ROOT ID` 只依据精确匹配的已入账候选推进状态。已进入审批流程的任务 ID 不回旧队列；中断、缺少确认或租约过期不会自动重派。`dispatched` 不证明远端收到请求，也不等同于成功或失败。
+- 受信本地 Host 通过 `runApprovedDeepSeekModelTask` 使用私有管道命令；本机 Electron 使用合成凭据和 loopback 夹具通过审批审阅全链路。Store 定向 6 项覆盖迁移、重开、竞争与回滚；CLI 管道覆盖取消与确认丢失。Rust 工作区 531 通过、0 失败、75 默认忽略；插件 78 通过；fmt、diff 与 Clippy 通过（仍有既有警告）。未启用常驻派工、运行中远端取消或生产凭据。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。

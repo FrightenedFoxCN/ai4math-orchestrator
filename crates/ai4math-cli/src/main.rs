@@ -60,6 +60,11 @@ ai4math infra-rfc-inspect ROOT BARE_REPO RFC_ID
 ai4math task-bind ROOT BARE_REPO ANCHOR_MODULE REVIEWED_COMMIT
 ai4math task-run ROOT BARE_REPO ID CLAIM ROLE WORKER_EXE SHA256 WALL_SECONDS
 ai4math task-run-model ROOT BARE_REPO ID CLAIM ROLE WALL_SECONDS
+ai4math model-dispatch-approve ROOT BARE_REPO ID CLAIM ROLE REVIEWED_COMMIT MODEL WALL_SECONDS MAX_MODEL_CALLS
+ai4math model-dispatch-status ROOT ID
+ai4math model-dispatch-cancel ROOT ID
+ai4math model-dispatch-reconcile ROOT ID
+ai4math task-run-approved-model ROOT BARE_REPO ID CLAIM ROLE WALL_SECONDS MODEL MAX_MODEL_CALLS
 ai4math task-result ROOT ID
 ai4math refute-managed ROOT BARE_REPO ID MODULE PROPOSITION NATIVE_LEAN PROOF_BODY
 ai4math refute-pending ROOT
@@ -1278,6 +1283,61 @@ fn run() -> Result<()> {
             claim,
             role.parse()?,
             seconds.parse()?,
+        ),
+        [
+            "model-dispatch-approve",
+            root,
+            repo,
+            task,
+            claim,
+            role,
+            reviewed,
+            model,
+            seconds,
+            calls,
+        ] => worker_dispatch::approve_model(
+            Path::new(root),
+            Path::new(repo),
+            reviewed,
+            worker_dispatch::ModelApprovalOptions {
+                task,
+                claim,
+                role: role.parse()?,
+                model,
+                seconds: seconds.parse()?,
+                max_model_calls: calls.parse()?,
+            },
+        ),
+        ["model-dispatch-status", root, task] => {
+            worker_dispatch::model_dispatch_status(Path::new(root), task)
+        }
+        ["model-dispatch-cancel", root, task] => {
+            worker_dispatch::cancel_model_dispatch(Path::new(root), task)
+        }
+        ["model-dispatch-reconcile", root, task] => {
+            worker_dispatch::reconcile_model_dispatch(Path::new(root), task)
+        }
+        [
+            "task-run-approved-model",
+            root,
+            repo,
+            task,
+            claim,
+            role,
+            seconds,
+            model,
+            calls,
+        ] => worker_dispatch::run_approved_model(
+            Path::new(root),
+            Path::new(repo),
+            worker_dispatch::ModelApprovalOptions {
+                task,
+                claim,
+                role: role.parse()?,
+                model,
+                seconds: seconds.parse()?,
+                max_model_calls: calls.parse()?,
+            },
         ),
         ["task-result", root, id] => worker_dispatch::result(Path::new(root), id),
         ["promote-task-result", root, repo, id, exe] => {

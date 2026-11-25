@@ -59,8 +59,9 @@ pub use sweep::{T3SweepState, T3SweepStatus, T3SweepStep};
 pub use t3_baseline::T3DiscoveryBaseline;
 pub(crate) use tasks::scheduler_snapshot;
 pub use tasks::{
-    NewTask, OracleTaskHold, TaskCandidate, TaskCandidateSource, TaskLease, TaskRunOutcome,
-    TaskSchedulerStatus, TaskTrack, TaskTrackStatus,
+    ModelDispatchApproval, ModelDispatchState, NewModelDispatchApproval, NewTask, OracleTaskHold,
+    TaskCandidate, TaskCandidateSource, TaskLease, TaskRunOutcome, TaskSchedulerStatus, TaskTrack,
+    TaskTrackStatus,
 };
 pub use trust_debt::{
     TrustDebtCounts, TrustDebtFinding, TrustDebtKind, TrustDebtRole, TrustDebtScan,
@@ -494,6 +495,7 @@ impl StateStore {
         migrations::permit_distinct_same_head_t3_plans(&mut store.db)?;
         store.initialize_route_projection()?;
         store.initialize_refutation_outbox()?;
+        migrations::initialize_model_dispatch(&mut store.db)?;
         Ok(store)
     }
 
@@ -837,6 +839,10 @@ impl StateStore {
                     | infra_rfc::REJECTED
             ),
             "InfraRFC events require the typed lifecycle API"
+        );
+        ensure!(
+            !tasks::is_model_dispatch_event(kind),
+            "model dispatch events require the typed approval API"
         );
         self.write(|tx| event(tx, change, kind, entity, id, payload))
     }

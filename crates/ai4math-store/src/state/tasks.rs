@@ -8,8 +8,12 @@ use serde::Serialize;
 use serde_json::json;
 use std::{collections::BTreeSet, fmt, str::FromStr, time::Duration};
 
+mod model_dispatch;
 mod oracle_holds;
 mod runs;
+pub(super) use model_dispatch::is_model_dispatch_event;
+use model_dispatch::{MODEL_RESERVED, model_dispatch_table_exists};
+pub use model_dispatch::{ModelDispatchApproval, ModelDispatchState, NewModelDispatchApproval};
 mod sediment;
 mod starvation;
 pub use oracle_holds::OracleTaskHold;
@@ -334,7 +338,7 @@ impl StateStore {
                 AND (t.lease_expires_at_ms IS NULL OR t.lease_expires_at_ms <= ?1)
                 AND ((?2 AND t.track='exploration') OR (?3 AND t.track='infrastructure'))
                 AND NOT {HELD_FOR_ORACLE} AND NOT {MODULE_GATED} AND NOT {DEPENDENCY_BLOCKED}
-                AND NOT {ADAPTATION_LINKED}
+                AND NOT {ADAPTATION_LINKED} AND NOT {MODEL_RESERVED}
                 AND (coalesce(r.state,'pending') <> 'quarantined'
                      AND (r.retry_at_ms IS NULL OR r.retry_at_ms <= ?1
                           OR (?5 AND t.task_id=?6)))
@@ -398,6 +402,7 @@ impl StateStore {
                 |r| r.get::<_, bool>(0),
             )?;
             ensure!(!scoped, "sediment adaptation requires a native worker outcome");
+            model_dispatch::check_model_dispatch_outcome(tx, &lease.id, None)?;
             ensure!(
                 release_lease(tx, lease, true)?.is_some(),
                 "task lease is no longer valid for completion"
@@ -513,6 +518,11 @@ fn scheduler_snapshot_at(db: &Connection, now: i64) -> Result<TaskSchedulerStatu
     } else {
         "0"
     };
+    let model_reserved = if model_dispatch_table_exists(db)? {
+        MODEL_RESERVED
+    } else {
+        "0"
+    };
     let has_retries: bool = db.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='scheduler_task_retries')",
         [],
@@ -536,7 +546,7 @@ fn scheduler_snapshot_at(db: &Connection, now: i64) -> Result<TaskSchedulerStatu
             {MODULE_GATED} AS gated, {DEPENDENCY_BLOCKED} AS waiting, {held} AS held,
             {retry_ready} AS retry_ready, {retrying} AS retrying, {quarantined} AS quarantined
         FROM scheduler_tasks t {retry_join}
-        WHERE t.completed_at_ms IS NOT NULL OR t.lease_expires_at_ms > ?1 OR NOT {scoped}
+        WHERE t.completed_at_ms IS NOT NULL OR t.lease_expires_at_ms > ?1 OR (NOT {scoped} AND NOT {model_reserved})
     ) SELECT track,
         count(*) FILTER (WHERE NOT completed AND NOT active AND NOT held AND NOT gated AND NOT waiting AND retry_ready),
         count(*) FILTER (WHERE active), count(*) FILTER (WHERE completed),
