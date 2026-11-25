@@ -4,7 +4,8 @@ use crate::{
     promotion::{PendingRef, PromotionRepo},
 };
 use ai4math_store::{
-    PivotAction, PivotIntent, PivotPlan, PivotResult, StateStore, retained::read_retained_review,
+    PivotAction, PivotIntent, PivotLessonDraft, PivotPlan, PivotResult, StateStore,
+    retained::read_retained_review,
 };
 use anyhow::{Context, Result, bail, ensure};
 use serde_json::json;
@@ -53,6 +54,7 @@ pub(crate) fn trip(
 struct Selection<'a> {
     action: PivotAction,
     plan_ids: &'a [&'a str],
+    lesson: Option<&'a PivotLessonDraft>,
 }
 
 impl Selection<'_> {
@@ -60,6 +62,7 @@ impl Selection<'_> {
         Self {
             action,
             plan_ids: &[],
+            lesson: None,
         }
     }
 }
@@ -87,6 +90,18 @@ fn plan(
             reason,
             selection.plan_ids,
         )?,
+        PivotAction::ArchiveRoutesWithLesson => store.preview_archive_routes_with_lesson(
+            repo,
+            &base,
+            fact,
+            &review,
+            breaker,
+            reason,
+            selection.plan_ids,
+            selection
+                .lesson
+                .context("explicit route lesson is required")?,
+        )?,
         action => store.preview_pivot(repo, &base, fact, &review, breaker, reason, action)?,
     };
     if let Some(c) = plan.checkpoint.as_ref() {
@@ -112,6 +127,9 @@ fn markdown(p: &PivotPlan) -> Result<String> {
         PivotAction::ArchiveRoutes => {
             "The approved breaker remains gated as ARCHIVED. Only the explicitly selected ProofPlans are archived; dependency records are kept and derived Claim/route status is recomputed. No worktree, task, mathematical source, local Claim trust or proof receipt is changed."
         }
+        PivotAction::ArchiveRoutesWithLesson => {
+            "The approved breaker remains gated as ARCHIVED. The selected ProofPlans are archived and the expressly approved lesson is retained as an operator warning, not a refutation or proof. Dependencies, mathematical source, tasks, worktrees, local Claim trust and receipts are preserved."
+        }
     };
     let mut s = format!(
         "# {id}: {action}\n\n- Base Git commit: {}\n- Retained Fact Pack SHA-256: {}\n- Reviewed event interval: ({}, {}]\n- Pack presentation truncated: {}\n\n{effect}\n\n## Approved decision\n\n",
@@ -124,8 +142,12 @@ fn markdown(p: &PivotPlan) -> Result<String> {
     // Treat model/workspace-sourced labels and the operator's explanation as
     // literal evidence, not active Markdown or directives.
     let mut decision = json!({"breaker_id":p.breaker.breaker_id,"definition_id":p.breaker.target_definition_id,"module_path":p.breaker.module_path,"engine":p.breaker.engine,"inbox_id":p.inbox_id,"previous_checkpoint":p.checkpoint,"reason":p.decision_reason});
-    if p.action == PivotAction::ArchiveRoutes {
+    if !p.archive_plans.is_empty() {
         decision["archive_plans"] = serde_json::to_value(&p.archive_plans)?;
+    }
+    if let Some(lesson_id) = p.lesson_id()? {
+        decision["graveyard_lesson_id"] = json!(lesson_id);
+        decision["graveyard_lesson"] = serde_json::to_value(&p.lesson)?;
     }
     for line in serde_json::to_string_pretty(&decision)?.lines() {
         s.push_str("    ");
@@ -163,6 +185,30 @@ pub(crate) fn preview_routes(
         Selection {
             action: PivotAction::ArchiveRoutes,
             plan_ids,
+            lesson: None,
+        },
+    )
+}
+
+pub(crate) fn preview_lesson(
+    root: &Path,
+    repo: &Path,
+    fact: &str,
+    breaker: &str,
+    reason: &str,
+    lesson: &PivotLessonDraft,
+    plan_ids: &[&str],
+) -> Result<()> {
+    preview_with(
+        root,
+        repo,
+        fact,
+        breaker,
+        reason,
+        Selection {
+            action: PivotAction::ArchiveRoutesWithLesson,
+            plan_ids,
+            lesson: Some(lesson),
         },
     )
 }
@@ -180,8 +226,11 @@ fn preview_with(
     let p = plan(root, &git, &mut store, fact, breaker, reason, selection)?;
     let action = p.action;
     let mut preview = json!({"adr_id":p.adr_id()?,"action":action.as_str(),"to_state":action.target_state(),"probe_tasks":[],"stopped_tasks":[],"tainted_claims":[],"archived_claims":[],"new_tasks":[],"plan":p,"adr_markdown":markdown(&p)?});
-    if action == PivotAction::ArchiveRoutes {
+    if !p.archive_plans.is_empty() {
         preview["archive_plans"] = serde_json::to_value(&p.archive_plans)?;
+    }
+    if let Some(lesson_id) = p.lesson_id()? {
+        preview["lesson_id"] = json!(lesson_id);
     }
     print_json(preview)
 }
@@ -298,6 +347,32 @@ pub(crate) fn apply_routes(
         Selection {
             action: PivotAction::ArchiveRoutes,
             plan_ids,
+            lesson: None,
+        },
+    )
+}
+
+pub(crate) fn apply_lesson(
+    root: &Path,
+    repo: &Path,
+    fact: &str,
+    breaker: &str,
+    reason: &str,
+    approved_id: &str,
+    lesson: &PivotLessonDraft,
+    plan_ids: &[&str],
+) -> Result<()> {
+    apply_with(
+        root,
+        repo,
+        fact,
+        breaker,
+        reason,
+        approved_id,
+        Selection {
+            action: PivotAction::ArchiveRoutesWithLesson,
+            plan_ids,
+            lesson: Some(lesson),
         },
     )
 }
@@ -315,7 +390,10 @@ fn apply_with(
     let state_path = root.join(".runtime/state.sqlite");
     let mut store = StateStore::open(&state_path)?;
     if let Some((p, r)) = store.recorded_pivot(approved_id)? {
-        let identical_selection = if selection.action == PivotAction::ArchiveRoutes {
+        let identical_selection = if matches!(
+            selection.action,
+            PivotAction::ArchiveRoutes | PivotAction::ArchiveRoutesWithLesson
+        ) {
             p.archive_plan_ids()
                 .eq(PivotPlan::normalize_archive_plan_ids(selection.plan_ids)?)
         } else {
@@ -328,6 +406,7 @@ fn apply_with(
                 && reason == p.decision_reason
                 && p.action == selection.action
                 && identical_selection
+                && p.lesson.as_ref() == selection.lesson
                 && p.adr_id()? == approved_id,
             "Pivot replay arguments do not match the committed approval"
         );

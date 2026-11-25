@@ -409,6 +409,36 @@ test('Wiki reports explicit static-only responses without implying a daemon fail
   assert.doesNotMatch(wiki.text(), /Static Wiki|Derived CORE|Provenance for/);
 });
 
+test('Wiki renders approved L0 route lessons as plain warnings only in explicit Graveyard scope', async t => {
+  const hash = 'a'.repeat(64);
+  const good = { lesson_id: 'GRV-PIVOT-' + hash, adr_id: 'ADR-PIVOT-' + hash,
+    breaker_id: 'gate', title: 'Archived approach <b>', lesson: 'Finite witness shortcut did not help <img src=x>',
+    trust_level: 'L0', advisory_only: true, kind: 'operator_route_lesson', plan_ids: ['route-a'], event_seq: 11 };
+  const app = await browser(t, {
+    async *subscribe() {},
+    async status() { return ok(snapshot(11)); },
+    async alertsList() { return ok({ items: [], truncated: false }); },
+    async wikiSearch({ scope }) {
+      return ok({ hits: [], ...(scope === 'core' ? { managed_core: false } : {}), route_lessons: [good,
+        { ...good, title: 'Rejected L2b marker', trust_level: 'L2b' },
+        { ...good, title: 'Rejected private marker', repo: '/private/workspace' },
+        { ...good, title: 'Rejected false identity', lesson_id: 'GRV-PIVOT-' + 'b'.repeat(64) }],
+        route_lessons_truncated: true });
+    },
+  });
+  const wiki = mountTab(app, 'wiki');
+  wiki.find('input').props.onChange({ target: { value: 'finite witness' } });
+  wiki.find('form').props.onSubmit({ preventDefault() {} });
+  await expectText(wiki, /No matching records returned/);
+  assert.doesNotMatch(wiki.text(), /Operator route lessons|Archived approach/);
+  wiki.find('select').props.onChange({ target: { value: 'graveyard' } });
+  wiki.find('form').props.onSubmit({ preventDefault() {} });
+  await expectText(wiki, /Operator route lessons .*not proofs or mathematical refutations.*Archived approach <b> L0 · advisory only .*Finite witness shortcut did not help <img src=x>.*Only a bounded route lesson slice is shown/);
+  assert.doesNotMatch(wiki.text(), /No matching records|Rejected|private\/workspace/);
+  assert.throws(() => wiki.find('img'), /render did not contain img/);
+  assert.throws(() => wiki.find('a'), /render did not contain a/);
+});
+
 test('opening a retained P0 pack shows its source events outside the review window', async t => {
   const retained = 'a'.repeat(64);
   const requested = [];

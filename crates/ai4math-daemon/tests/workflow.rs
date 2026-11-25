@@ -1602,6 +1602,7 @@ fn operator_pivot_routes_observed_by_real_daemon() -> Result<()> {
     assert_eq!(applied["adr_id"], id);
     assert_eq!(applied["breaker_state"], "ARCHIVED");
     assert_eq!(applied["probes_started"], false);
+    assert!(applied.get("lesson_id").is_none());
     assert_eq!(run("pivot-routes-apply", &apply_args)?, applied);
     for plans in [&["route-b"][..], &["route-a", "route-b"][..]] {
         let args = [&[fact, "B", reason, id], plans].concat();
@@ -1735,6 +1736,293 @@ fn operator_pivot_routes_observed_by_real_daemon() -> Result<()> {
     assert_eq!(task_row()?, task_before);
     assert!(store.module_breaker_gated("lean4", "Spec.lean")?);
     assert!(store.pivot_intent()?.is_none());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires AI4MATH_TEST_CLI pointing to the built ai4math operator binary"]
+fn operator_pivot_lesson_is_advisory_only() -> Result<()> {
+    use ai4math_store::{Trust, Wiki};
+
+    let fixture = PivotWorkflow::new(&[])?;
+    let (project, bare) = fixture.paths()?;
+    let git = |args: &[&str]| PivotWorkflow::git(&fixture.repo, args);
+    let run = |command, args: &[&str]| fixture.run(&[&[command, project, bare], args].concat());
+    let reject = |command, args: &[&str]| -> Result<String> {
+        let out = Command::new(&fixture.cli)
+            .args([command, project, bare])
+            .args(args)
+            .output()?;
+        let stderr = String::from_utf8(out.stderr)?;
+        assert!(
+            !out.status.success() && out.stdout.is_empty(),
+            "{command} {args:?}: {stderr}; stdout: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        Ok(stderr)
+    };
+    let base = git(&["rev-parse", "refs/heads/main"])?;
+    let base = base.trim();
+    let runtime = fixture.root.path().join(".runtime");
+    let mut store = StateStore::open(runtime.join("state.sqlite"))?;
+    let change = Change {
+        actor: "route-lesson-fixture",
+        git_commit: Some(base),
+    };
+    store.set_local_trust("CriticalDefinition", Trust::L3, change)?;
+    for id in ["route-selected", "route-unselected"] {
+        store.create_plan(
+            NewPlan {
+                id,
+                target: "CriticalDefinition",
+                name: id,
+                track: "exploration",
+                status: PlanStatus::Active,
+                dependencies: &[],
+            },
+            change,
+        )?;
+    }
+
+    let wiki = fixture.root.path().join(".mathwiki");
+    let index = wiki.join(".index.sqlite");
+    let static_warning = "---
+id: GRV-STATIC
+stratum: graveyard
+trust_level: L2b
+engine: lean4
+status: refuted
+title: RouteLessonMarker
+---
+";
+    fs::write(wiki.join("graveyard/GRV-STATIC.md"), static_warning)?;
+    assert_eq!(Wiki::open(&index)?.rebuild(&wiki)?, 1);
+    let socket = runtime.join("ai4mathd.sock");
+    let mut child = boot(fixture.root.path())?;
+    let mut rpc = wait_connection(&socket, &mut child)?;
+    let mut listener = Rpc::new(UnixStream::connect(&socket)?)?;
+    listener.result("subscribe", json!({"topics":["alert.p0"]}))?;
+    fixture.trip_critical()?;
+    let alert = listener.event("alert.p0")?;
+    assert_eq!(alert["reason_code"], "CRITICAL_BREAKER_TRIPPED");
+    let reviewed = rpc.result("briefing.pull", json!({}))?;
+    let fact = reviewed["retained_id"]
+        .as_str()
+        .context("retained Fact Pack")?;
+    let before_seq = store.status()?.last_event_seq;
+    let alerts_before = rpc.result("alerts.list", json!({}))?;
+    assert_eq!(alerts_before["items"], json!([alert]));
+    let claim_before = store
+        .claim("CriticalDefinition")?
+        .context("fixture Claim")?;
+    let query = json!({"informal_statement":"RouteLessonMarker"});
+    let before = rpc.result("wiki.check_graveyard", query.clone())?;
+    assert_eq!(before["warnings"][0]["id"], "GRV-STATIC");
+    assert!(before.get("route_lessons").is_none());
+    assert!(before.get("route_lessons_truncated").is_none());
+    let index_before = fs::read(&index)?;
+    let refs_before = git(&["show-ref"])?;
+    let objects_before = git(&["count-objects", "-v"])?;
+
+    let reason = "Archive the selected route but keep the independent alternative";
+    let title = "RouteLessonMarker guidance";
+    let lesson = "Inspect the LessonBodyMarker before revisiting this route.";
+    let other_lesson = "Use a different lesson even though the route selection is identical.";
+    let route = "route-selected";
+    let old = run("pivot-routes-preview", &[fact, "B", reason, route])?;
+    let old_id = old["adr_id"].as_str().context("legacy route approval ID")?;
+    assert!(old.get("lesson_id").is_none());
+    assert!(old["plan"].get("lesson").is_none());
+
+    let preview_args = [fact, "B", reason, title, lesson, route];
+    let preview = run("pivot-lesson-preview", &preview_args)?;
+    assert_eq!(preview, run("pivot-lesson-preview", &preview_args)?);
+    let id = preview["adr_id"].as_str().context("lesson approval ID")?;
+    assert_ne!(id, old_id);
+    let sha = id.strip_prefix("ADR-PIVOT-").context("approval digest")?;
+    let lesson_id = format!("GRV-PIVOT-{sha}");
+    assert_eq!(preview["lesson_id"], lesson_id);
+    assert_eq!(preview["action"], "ARCHIVE_ROUTES_WITH_LESSON");
+    assert_eq!(preview["to_state"], "ARCHIVED");
+    assert_eq!(preview["archive_plans"], old["archive_plans"]);
+    assert_eq!(
+        preview["plan"]["lesson"],
+        json!({"title":title,"lesson":lesson})
+    );
+    let adr_preview = preview["adr_markdown"].as_str().context("ADR preview")?;
+    assert!(adr_preview.contains(title) && adr_preview.contains(lesson));
+    let changed = run(
+        "pivot-lesson-preview",
+        &[fact, "B", reason, title, other_lesson, route],
+    )?;
+    assert_ne!(changed["adr_id"], id);
+    assert_ne!(changed["lesson_id"], lesson_id);
+
+    for (approved, body) in [(old_id, lesson), (id, other_lesson)] {
+        let error = reject(
+            "pivot-lesson-apply",
+            &[fact, "B", reason, approved, title, body, route],
+        )?;
+        assert!(error.contains("approval ID does not match"), "{error}");
+    }
+    let error = reject("pivot-routes-apply", &[fact, "B", reason, id, route])?;
+    assert!(error.contains("approval ID does not match"), "{error}");
+    reject(
+        "pivot-lesson-preview",
+        &[fact, "B", reason, title, "not a\nsingle line", route],
+    )?;
+    reject(
+        "pivot-lesson-preview",
+        &[fact, "B", reason, title, lesson, route, route],
+    )?;
+    assert_eq!(rpc.result("wiki.check_graveyard", query.clone())?, before);
+    assert!(store.pivot_lessons("LessonBodyMarker", 8)?.items.is_empty());
+    assert!(store.recorded_pivot(id)?.is_none());
+    assert!(store.pivot_intent()?.is_none());
+    assert_eq!(store.status()?.last_event_seq, before_seq);
+    assert_eq!(git(&["show-ref"])?, refs_before);
+    assert_eq!(git(&["count-objects", "-v"])?, objects_before);
+
+    let apply_args = [fact, "B", reason, id, title, lesson, route];
+    let applied = run("pivot-lesson-apply", &apply_args)?;
+    assert_eq!(applied["adr_id"], id);
+    assert_eq!(applied["lesson_id"], lesson_id);
+    assert_eq!(applied["breaker_state"], "ARCHIVED");
+    assert_eq!(applied["probes_started"], false);
+    let landed_seq = store.status()?.last_event_seq;
+    assert_eq!(run("pivot-lesson-apply", &apply_args)?, applied);
+    let error = reject(
+        "pivot-lesson-apply",
+        &[fact, "B", reason, id, title, other_lesson, route],
+    )?;
+    assert!(error.contains("replay arguments do not match"), "{error}");
+    assert_eq!(store.status()?.last_event_seq, landed_seq);
+    assert!(store.pivot_intent()?.is_none());
+
+    let expected_warning = json!({
+        "lesson_id":lesson_id,"kind":"operator_route_lesson","trust_level":"L0",
+        "advisory_only":true,"adr_id":id,"breaker_id":"B","title":title,"lesson":lesson,
+        "plan_ids":[route],"event_seq":applied["event_seq"],
+    });
+    let page = store.pivot_lessons("LessonBodyMarker", 8)?;
+    assert_eq!(serde_json::to_value(page.items)?, json!([expected_warning]));
+    assert!(!page.truncated);
+    let mut matched = rpc.result("wiki.check_graveyard", query)?;
+    assert_eq!(
+        matched.as_object_mut().unwrap().remove("route_lessons"),
+        Some(json!([expected_warning]))
+    );
+    assert_eq!(
+        matched
+            .as_object_mut()
+            .unwrap()
+            .remove("route_lessons_truncated"),
+        Some(json!(false))
+    );
+    assert_eq!(
+        matched, before,
+        "the static warnings and pagination must not change"
+    );
+    let matched = rpc.result(
+        "wiki.check_graveyard",
+        json!({"informal_statement":"RouteLessonMarker","formal_signature":"LessonBodyMarker"}),
+    )?;
+    assert_eq!(
+        matched["route_lessons"],
+        json!([expected_warning]),
+        "dedupe the two retrieval signals"
+    );
+    let unmatched = rpc.result(
+        "wiki.check_graveyard",
+        json!({"informal_statement":"LessonBody%"}),
+    )?;
+    assert!(unmatched.get("route_lessons").is_none());
+    assert!(unmatched.get("route_lessons_truncated").is_none());
+    let signature_match = rpc.result(
+        "wiki.check_graveyard",
+        json!({"informal_statement":"LessonBody%","formal_signature":"LessonBodyMarker"}),
+    )?;
+    assert_eq!(signature_match["route_lessons"], json!([expected_warning]));
+    assert_eq!(signature_match["warnings"], json!([]));
+
+    let graveyard = rpc.result(
+        "wiki.search",
+        json!({"text":"LessonBodyMarker","scope":"graveyard"}),
+    )?;
+    assert_eq!(graveyard["route_lessons"], json!([expected_warning]));
+    assert_eq!(graveyard["hits"], json!([]));
+    for scope in ["core", "sediment"] {
+        let hits = rpc.result(
+            "wiki.search",
+            json!({"text":"LessonBodyMarker","scope":scope}),
+        )?;
+        assert_eq!(hits["hits"], json!([]));
+        assert!(hits.get("route_lessons").is_none());
+        assert!(hits.get("route_lessons_truncated").is_none());
+        assert!(!hits.to_string().contains(&lesson_id));
+    }
+    let provenance = rpc.result("wiki.provenance", json!({"id":lesson_id}))?;
+    assert_eq!(provenance["edges"], json!([]));
+    assert_eq!(fs::read(&index)?, index_before);
+    assert_eq!(fs::read_dir(wiki.join("graveyard"))?.count(), 1);
+    for stratum in ["core", "sediment"] {
+        assert_eq!(fs::read_dir(wiki.join(stratum))?.count(), 0);
+    }
+
+    assert_eq!(
+        store.plan_state(route)?,
+        Some(("ARCHIVED_BY_ADR".into(), Trust::L0))
+    );
+    assert_eq!(
+        store
+            .plan_state("route-unselected")?
+            .context("unselected route")?
+            .0,
+        "ACTIVE"
+    );
+    let claim_after = store
+        .claim("CriticalDefinition")?
+        .context("archived route Claim")?;
+    assert_eq!(claim_after.local_trust, claim_before.local_trust);
+    assert_eq!(claim_after.receipt_id, claim_before.receipt_id);
+    assert_eq!(rpc.result("alerts.list", json!({}))?, alerts_before);
+    let events = store.events_after(before_seq, 32)?;
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e.event_type.as_str())
+            .collect::<Vec<_>>(),
+        ["PIVOT_APPLIED", "BREAKER_ARCHIVED", "PLAN_ARCHIVED"]
+    );
+    assert_eq!(
+        events[0].event_seq,
+        applied["event_seq"].as_i64().context("pivot event")?
+    );
+
+    let commit = applied["git_commit"]
+        .as_str()
+        .context("landed ADR commit")?;
+    let adr = format!("docs/adr/{id}.md");
+    assert_eq!(
+        git(&[
+            "diff-tree",
+            "--no-commit-id",
+            "--name-status",
+            "-r",
+            base,
+            commit
+        ])?,
+        format!("A\t{adr}\n")
+    );
+    assert_eq!(git(&["show", &format!("{commit}:{adr}")])?, adr_preview);
+    assert_eq!(git(&["rev-parse", &format!("{commit}^1")])?.trim(), base);
+    assert_eq!(
+        git(&["show-ref"])?,
+        refs_before.replace(
+            &format!("{base} refs/heads/main"),
+            &format!("{commit} refs/heads/main")
+        )
+    );
     Ok(())
 }
 

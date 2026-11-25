@@ -478,6 +478,7 @@ fn approved_route_batch_recovers_after_git_cas_and_replays_exact_ids() -> Result
         let choose = |plan_ids| Selection {
             action: PivotAction::ArchiveRoutes,
             plan_ids,
+            lesson: None,
         };
         let p = plan(
             root,
@@ -567,5 +568,131 @@ fn approved_route_batch_recovers_after_git_cas_and_replays_exact_ids() -> Result
         &approved_plans,
     )?;
     assert_eq!(state.status()?.last_event_seq, done);
+    Ok(())
+}
+
+#[test]
+fn route_lesson_is_published_once_only_after_recovering_exact_git_adr() -> Result<()> {
+    use ai4math_store::{NewPlan, PlanStatus};
+    let temp = tempfile::tempdir()?;
+    let root = temp.path();
+    let repo = setup(root)?;
+    let state_path = root.join(".runtime/state.sqlite");
+    let draft = PivotLessonDraft::new(
+        "Exceptional branch",
+        "The rank shortcut omitted a boundary assumption.",
+    )?;
+    let request = Selection {
+        action: PivotAction::ArchiveRoutesWithLesson,
+        plan_ids: &["one-route"],
+        lesson: Some(&draft),
+    };
+    let (intent, lesson_id, unreviewed) = {
+        let mut state = StateStore::open(&state_path)?;
+        let git = PromotionRepo::lock(&repo)?;
+        let base = git.main_head()?;
+        state.create_plan(
+            NewPlan {
+                id: "one-route",
+                target: "CriticalDefinition",
+                name: "Short attempt",
+                track: "exploration",
+                status: PlanStatus::Active,
+                dependencies: &[],
+            },
+            Change {
+                actor: "archive-lesson-fixture",
+                git_commit: Some(&base),
+            },
+        )?;
+        let fact = retain(root, serde_json::to_value(state.briefing_facts()?)?)?;
+        let no_lesson = plan(
+            root,
+            &git,
+            &mut state,
+            &fact,
+            B,
+            REASON,
+            Selection {
+                action: PivotAction::ArchiveRoutes,
+                plan_ids: &["one-route"],
+                lesson: None,
+            },
+        )?;
+        let selected = plan(root, &git, &mut state, &fact, B, REASON, request)?;
+        assert_ne!(no_lesson.adr_id()?, selected.adr_id()?);
+        assert!(no_lesson.lesson_id()?.is_none());
+        assert!(state.pivot_lessons("rank shortcut", 8)?.items.is_empty());
+        let lesson_id = selected.lesson_id()?.context("missing preview lesson ID")?;
+        let md = markdown(&selected)?;
+        assert!(
+            md.contains(&lesson_id)
+                && md.contains(&draft.lesson)
+                && md.contains("ARCHIVE_ROUTES_WITH_LESSON")
+        );
+        let pin = git.pivot_pending_ref(&state_path)?;
+        let intent = prepare(&mut state, &git, &pin, selected)?;
+        git.advance_adr(&base, &intent.new_commit, &intent.adr_id, &md)?;
+        assert!(state.pivot_lessons("rank shortcut", 8)?.items.is_empty());
+        assert_eq!(state.plan_state("one-route")?.unwrap().0, "ACTIVE");
+        let unreviewed = fixture_event(&mut state)?;
+        (intent, lesson_id, unreviewed)
+    };
+    recover(root, &repo)?;
+    let mut store = StateStore::open(&state_path)?;
+    let page = store.pivot_lessons("rank shortcut", 8)?;
+    assert_eq!(page.items.len(), 1);
+    let row = serde_json::to_value(&page.items[0])?;
+    assert_eq!(row["lesson_id"], lesson_id);
+    assert_eq!(row["adr_id"], intent.adr_id);
+    assert_eq!(row["kind"], "operator_route_lesson");
+    assert_eq!(row["trust_level"], "L0");
+    assert_eq!(row["advisory_only"], true);
+    assert_eq!(row["plan_ids"], json!(["one-route"]));
+    assert!(
+        store
+            .briefing_facts()?
+            .events
+            .items
+            .iter()
+            .any(|e| e.event_seq == unreviewed)
+    );
+    assert_eq!(store.plan_state("one-route")?.unwrap().0, "ARCHIVED_BY_ADR");
+    assert!(store.audit_graph()?.consistent);
+    assert!(
+        !root
+            .join(".mathwiki/graveyard")
+            .read_dir()?
+            .any(|item| item.is_ok())
+    );
+    let wrong =
+        PivotLessonDraft::new(&draft.title, "Replacement lesson is not the approved text.")?;
+    let done = store.status()?.last_event_seq;
+    assert!(
+        apply_lesson(
+            root,
+            &repo,
+            &intent.plan.fact_sha256,
+            B,
+            REASON,
+            &intent.adr_id,
+            &wrong,
+            request.plan_ids
+        )
+        .is_err()
+    );
+    apply_lesson(
+        root,
+        &repo,
+        &intent.plan.fact_sha256,
+        B,
+        REASON,
+        &intent.adr_id,
+        &draft,
+        request.plan_ids,
+    )?;
+    recover(root, &repo)?;
+    assert_eq!(store.status()?.last_event_seq, done);
+    assert_eq!(store.pivot_lessons("rank shortcut", 8)?.items.len(), 1);
     Ok(())
 }

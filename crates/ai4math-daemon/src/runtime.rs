@@ -6,7 +6,9 @@ use crate::{
     t3_worker,
     transport::{self, Connection, Hub, RpcError},
 };
-use ai4math_store::{StateStore, Wiki, WikiManagedGeneration, WikiQuery};
+use ai4math_store::{
+    PivotLessonWarning, StateStore, Wiki, WikiManagedGeneration, WikiQuery, WikiStratum,
+};
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
@@ -20,6 +22,8 @@ use std::{
 };
 
 pub(crate) mod managed_wiki;
+#[cfg(test)]
+mod route_lessons_tests;
 
 const TOPICS: [&str; 3] = ["vital_signs.tick", "alert.p0", "breaker.state_changed"];
 
@@ -200,6 +204,47 @@ fn wiki_page<T: serde::Serialize>(
     page.insert("truncated".into(), Value::Bool(truncated));
     Ok(Value::Object(page))
 }
+
+const ROUTE_LESSON_MAX_ROWS: usize = 16;
+// Worst-case punctuation and fields added to an existing, nonempty page object.
+const ROUTE_LESSON_FIELDS_BYTES: usize =
+    ",\"route_lessons\":[],\"route_lessons_truncated\":false".len();
+
+fn wiki_add_route_lessons(
+    page: &mut Value,
+    mut rows: Vec<PivotLessonWarning>,
+    limit: usize,
+    mut truncated: bool,
+) -> std::result::Result<(), RpcError> {
+    if rows.is_empty() && !truncated {
+        return Ok(());
+    }
+    rows.sort_unstable_by(|a, b| {
+        b.event_seq
+            .cmp(&a.event_seq)
+            .then_with(|| a.lesson_id.cmp(&b.lesson_id))
+    });
+    rows.dedup_by(|a, b| a.lesson_id == b.lesson_id);
+    truncated |= rows.len() > limit;
+
+    // Do not reduce the static warning/search page to make room for the new fields.
+    let mut remaining = wiki_fit(page, WIKI_REPLY_BYTES - ROUTE_LESSON_FIELDS_BYTES)
+        .context("static Wiki page left insufficient reply metadata space")
+        .map_err(internal)?;
+    let mut bounded = Vec::new();
+    for row in rows.into_iter().take(limit) {
+        let Some(next) = wiki_fit(&row, remaining.saturating_sub(1)) else {
+            truncated = true;
+            break;
+        };
+        remaining = next;
+        bounded.push(response(row)?);
+    }
+    page["route_lessons"] = Value::Array(bounded);
+    page["route_lessons_truncated"] = Value::Bool(truncated);
+    Ok(())
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Proof {
@@ -285,6 +330,26 @@ impl Project {
         }
         let wiki = self.wiki()?;
         Ok((read(&wiki, None)?, false))
+    }
+
+    fn append_route_lessons<'a>(
+        &self,
+        page: &mut Value,
+        queries: impl IntoIterator<Item = &'a str>,
+        limit: usize,
+    ) -> std::result::Result<(), RpcError> {
+        let limit = limit.min(ROUTE_LESSON_MAX_ROWS);
+        let mut rows = Vec::new();
+        let mut truncated = false;
+        {
+            let store = self.store().map_err(internal)?;
+            for query in queries {
+                let lesson_page = store.pivot_lessons(query, limit).map_err(internal)?;
+                truncated |= lesson_page.truncated;
+                rows.extend(lesson_page.items);
+            }
+        }
+        wiki_add_route_lessons(page, rows, limit, truncated)
     }
 
     fn status(&self) -> Result<Value> {
@@ -435,7 +500,14 @@ impl Project {
                 q.hypothesis_heads = &hypotheses;
                 q.typeclasses = &classes;
                 q.include_shadow_hint = args.include_shadow_hint.unwrap_or(true);
-                let core = q.scope == ai4math_store::WikiStratum::Core;
+                let core = q.scope == WikiStratum::Core;
+                // The operator lesson ledger is a separate advisory response, not an index.
+                let include_route_lessons = args.scope == Some(WikiStratum::Graveyard)
+                    && !q.query.trim().is_empty()
+                    && q.engine.is_none()
+                    && q.conclusion_head.is_none()
+                    && q.hypothesis_heads.is_empty()
+                    && q.typeclasses.is_empty();
                 let (result, managed) = self
                     .wiki_read(core, |wiki, generation| match generation {
                         Some(generation) => wiki.search_at(q, generation),
@@ -445,6 +517,8 @@ impl Project {
                 let mut page = wiki_page("hits", result.hits, limit, false, result.shadow_hint)?;
                 if core {
                     page["managed_core"] = Value::Bool(managed);
+                } else if include_route_lessons {
+                    self.append_route_lessons(&mut page, [args.text.as_str()], limit)?;
                 }
                 Ok(page)
             }
@@ -463,11 +537,11 @@ impl Project {
                 let mut warnings = Vec::new();
                 // Treat the optional signature as another retrieval signal, not a
                 // required substring of the informal statement. Never search Core.
-                for text in std::iter::once(args.informal_statement.as_str())
-                    .chain(args.formal_signature.as_deref())
-                {
+                let queries = std::iter::once(args.informal_statement.as_str())
+                    .chain(args.formal_signature.as_deref());
+                for text in queries.clone() {
                     let mut q = WikiQuery::new(text);
-                    q.scope = ai4math_store::WikiStratum::Graveyard;
+                    q.scope = WikiStratum::Graveyard;
                     q.include_shadow_hint = false;
                     q.limit = (limit + 1) as u32;
                     for hit in wiki.search(q).map_err(internal)?.hits {
@@ -477,7 +551,9 @@ impl Project {
                     }
                 }
                 drop(wiki);
-                wiki_page("warnings", warnings, limit, false, None)
+                let mut page = wiki_page("warnings", warnings, limit, false, None)?;
+                self.append_route_lessons(&mut page, queries, limit)?;
+                Ok(page)
             }
             "wiki.provenance" => {
                 let args: WikiProvenanceArgs = parse(params)?;

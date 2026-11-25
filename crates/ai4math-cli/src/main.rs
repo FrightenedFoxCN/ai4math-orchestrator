@@ -38,6 +38,8 @@ ai4math pivot-archive-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
 ai4math pivot-archive-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID
 ai4math pivot-routes-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON PLAN...
 ai4math pivot-routes-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID PLAN...
+ai4math pivot-lesson-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON TITLE LESSON PLAN...
+ai4math pivot-lesson-apply ROOT BARE_REPO FACT_SHA256 BREAKER REASON APPROVED_ADR_ID TITLE LESSON PLAN...
 ai4math pivot-recover ROOT BARE_REPO
 ai4math pivot-abandon ROOT BARE_REPO APPROVED_ADR_ID
 ai4math breaker-probes-preview ROOT BARE_REPO BREAKER THEOREM [THEOREM]
@@ -1087,6 +1089,52 @@ fn run() -> Result<()> {
             approved,
             plans,
         ),
+        [
+            "pivot-lesson-preview",
+            root,
+            repo,
+            fact,
+            id,
+            reason,
+            title,
+            lesson,
+            plans @ ..,
+        ] => {
+            let draft = ai4math_store::PivotLessonDraft::new(title, lesson)?;
+            pivot::preview_lesson(
+                Path::new(root),
+                Path::new(repo),
+                fact,
+                id,
+                reason,
+                &draft,
+                plans,
+            )
+        }
+        [
+            "pivot-lesson-apply",
+            root,
+            repo,
+            fact,
+            id,
+            reason,
+            approved,
+            title,
+            lesson,
+            plans @ ..,
+        ] => {
+            let draft = ai4math_store::PivotLessonDraft::new(title, lesson)?;
+            pivot::apply_lesson(
+                Path::new(root),
+                Path::new(repo),
+                fact,
+                id,
+                reason,
+                approved,
+                &draft,
+                plans,
+            )
+        }
         ["pivot-recover", root, repo] => pivot::recover(Path::new(root), Path::new(repo)),
         ["pivot-abandon", root, repo, id] => pivot::abandon(Path::new(root), Path::new(repo), id),
         ["breaker-probes-preview", root, repo, id, cases @ ..] => {

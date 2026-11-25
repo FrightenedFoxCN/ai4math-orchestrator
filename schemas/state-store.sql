@@ -267,6 +267,32 @@ CREATE TABLE IF NOT EXISTS recorded_pivots (
   event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq),
   reviewed_through INTEGER NOT NULL REFERENCES events(event_seq)
 );
+-- Advisory ledger only: no Claim, Wiki index, receipt, or source content.
+CREATE TABLE IF NOT EXISTS pivot_route_lessons (
+  event_seq INTEGER PRIMARY KEY REFERENCES recorded_pivots(event_seq) CHECK(event_seq>0),
+  adr_id TEXT NOT NULL UNIQUE REFERENCES recorded_pivots(adr_id),
+  lesson_id TEXT NOT NULL UNIQUE CHECK(
+    length(adr_id)=74 AND substr(adr_id,1,10)='ADR-PIVOT-'
+    AND substr(adr_id,11) NOT GLOB '*[^0-9a-f]*'
+    AND lesson_id='GRV-PIVOT-' || substr(adr_id,11)
+  ),
+  breaker_id TEXT NOT NULL CHECK(length(CAST(breaker_id AS BLOB)) BETWEEN 1 AND 100),
+  title TEXT NOT NULL CHECK(length(CAST(title AS BLOB)) BETWEEN 1 AND 120),
+  lesson TEXT NOT NULL CHECK(length(CAST(lesson AS BLOB)) BETWEEN 1 AND 512),
+  plan_ids_json TEXT NOT NULL CHECK(
+    length(CAST(plan_ids_json AS BLOB)) BETWEEN 1 AND 8192
+    AND json_valid(plan_ids_json) AND json_type(plan_ids_json)='array'
+    AND json_array_length(plan_ids_json) BETWEEN 1 AND 8
+  )
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS pivot_route_lessons_no_update BEFORE UPDATE ON pivot_route_lessons
+BEGIN SELECT RAISE(ABORT, 'Pivot route lessons are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS pivot_route_lessons_no_delete BEFORE DELETE ON pivot_route_lessons
+BEGIN SELECT RAISE(ABORT, 'Pivot route lessons are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS pivot_route_lessons_no_replace BEFORE INSERT ON pivot_route_lessons
+WHEN EXISTS (SELECT 1 FROM pivot_route_lessons
+             WHERE event_seq=NEW.event_seq OR adr_id=NEW.adr_id OR lesson_id=NEW.lesson_id)
+BEGIN SELECT RAISE(ABORT, 'Pivot route lessons are immutable'); END;
 -- One approved whole-batch native probe plan at a time per breaker. Old
 -- plans remain audit history; a fresh approval supersedes them by event order.
 CREATE TABLE IF NOT EXISTS breaker_probe_batches (

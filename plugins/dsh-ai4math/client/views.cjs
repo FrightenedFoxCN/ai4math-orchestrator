@@ -530,6 +530,32 @@ function WikiProvenance({ target, query }) {
     query.value?.truncated === true && note('Only a bounded provenance slice is shown.'))
 }
 
+function validRouteLesson(record) {
+  if (!hasExactOwnKeys(record, 'lesson_id', 'kind', 'trust_level', 'advisory_only', 'adr_id',
+    'breaker_id', 'title', 'lesson', 'plan_ids', 'event_seq')) return false
+  const bounded = (value, max) => typeof value === 'string' && value.length > 0
+    && value.trim() === value && !/[\x00-\x1f\x7f-\x9f]/u.test(value)
+    && new TextEncoder().encode(value).byteLength <= max
+  return record.kind === 'operator_route_lesson' && record.advisory_only === true
+    && record.trust_level === 'L0' && typeof record.adr_id === 'string'
+    && /^ADR-PIVOT-[0-9a-f]{64}$/.test(record.adr_id) && record.lesson_id === 'GRV-PIVOT-' + record.adr_id.slice(10)
+    && bounded(record.breaker_id, 100) && bounded(record.title, 120) && bounded(record.lesson, 512)
+    && isCount(record.event_seq) && record.event_seq > 0
+    && Array.isArray(record.plan_ids) && record.plan_ids.length >= 1 && record.plan_ids.length <= 8
+    && Array.from(record.plan_ids).every(id => bounded(id, 256)) && new Set(record.plan_ids).size === record.plan_ids.length
+}
+
+function RouteLessons({ entries, truncated }) {
+  if (entries.length === 0 && !truncated) return null
+  return h(Section, { title: 'Operator route lessons' },
+    note('Historical warnings only. These lessons are not proofs or mathematical refutations.'),
+    ...entries.map(item => h('article', { key: item.lesson_id, className: 'ai4m-card' },
+      h('h4', null, item.title), badge('L0 · advisory only'), h('p', null, item.lesson),
+      labelValue('Lesson', h('code', null, item.lesson_id)), labelValue('Approved ADR', h('code', null, item.adr_id)),
+      labelValue('Archived routes', item.plan_ids.join(', ')))),
+    truncated && note('Only a bounded route lesson slice is shown.'))
+}
+
 function Wiki({ remote }) {
   const query = useQuery(remote)
   const provenance = useQuery(remote)
@@ -542,6 +568,8 @@ function Wiki({ remote }) {
   const invalid = new TextEncoder().encode(term).byteLength > 512 || term.includes('\0')
   const shadow = query.value?.shadow_hint
   const hits = rows(query.value?.hits, 32)
+  const lessonRows = searched?.stratum === 'graveyard' ? rows(query.value?.route_lessons, 16).filter(validRouteLesson) : []
+  const routeLessonsTruncated = searched?.stratum === 'graveyard' && query.value?.route_lessons_truncated === true
   const submit = (term, stratum) => {
     if (!term || busy || new TextEncoder().encode(term).byteLength > 512 || term.includes('\0')) return
     setSearched({ term, stratum })
@@ -566,7 +594,9 @@ function Wiki({ remote }) {
     query.value && searched?.stratum === 'graveyard' && note('Graveyard matches are historical warnings, not verified evidence.'),
     provenanceTarget && h(WikiProvenance, { target: provenanceTarget, query: provenance }),
     query.value && (hits.length > 0 ? h('div', { className: 'ai4m-stack' },
-      hits.map((hit, index) => h(WikiCard, { key: text(hit.id, 'hit') + ':' + index, hit, inspectProvenance }))) : empty('No matching records returned.')),
+      hits.map((hit, index) => h(WikiCard, { key: text(hit.id, 'hit') + ':' + index, hit, inspectProvenance })))
+      : (lessonRows.length === 0 && !routeLessonsTruncated && empty('No matching records returned.'))),
+    h(RouteLessons, { entries: lessonRows, truncated: routeLessonsTruncated }),
     query.value?.truncated === true && note('Only a bounded search slice is shown.'),
     shadow && searched && h('details', null,
       h('summary', null, 'Shadow hint · SEDIMENT ' + count(shadow.sediment_count) + ' / GRAVEYARD ' + count(shadow.graveyard_count)),

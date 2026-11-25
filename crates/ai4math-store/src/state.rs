@@ -43,7 +43,8 @@ pub use graph_check::{GraphSemanticCheck, GraphSemanticMismatch};
 pub use graph_replay::GraphReplay;
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{
-    BreakerTripReport, PivotAction, PivotArchivePlan, PivotIntent, PivotPlan, PivotResult,
+    BreakerTripReport, PivotAction, PivotArchivePlan, PivotIntent, PivotLessonDraft,
+    PivotLessonPage, PivotLessonWarning, PivotPlan, PivotResult,
 };
 pub use plan_replay::{PlanReplay, ReplayedPlan, ReplayedPlanDependency};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};

@@ -10,7 +10,9 @@ use sha2::{Digest, Sha256};
 
 mod archive_routes;
 mod critical_routes;
+mod lessons;
 pub use archive_routes::PivotArchivePlan;
+pub use lessons::{PivotLessonDraft, PivotLessonPage, PivotLessonWarning};
 
 pub(crate) const CRITICAL_BREAKER_TRIPPED: &str = "CRITICAL_BREAKER_TRIPPED";
 
@@ -29,6 +31,7 @@ pub enum PivotAction {
     ResumeAsIs,
     ArchiveBreaker,
     ArchiveRoutes,
+    ArchiveRoutesWithLesson,
 }
 
 impl PivotAction {
@@ -37,14 +40,21 @@ impl PivotAction {
             Self::ResumeAsIs => "RESUME_AS_IS",
             Self::ArchiveBreaker => "ARCHIVE_BREAKER",
             Self::ArchiveRoutes => "ARCHIVE_ROUTES",
+            Self::ArchiveRoutesWithLesson => "ARCHIVE_ROUTES_WITH_LESSON",
         }
     }
 
     pub const fn target_state(self) -> &'static str {
         match self {
             Self::ResumeAsIs => "HALF_OPEN",
-            Self::ArchiveBreaker | Self::ArchiveRoutes => "ARCHIVED",
+            Self::ArchiveBreaker | Self::ArchiveRoutes | Self::ArchiveRoutesWithLesson => {
+                "ARCHIVED"
+            }
         }
+    }
+
+    pub const fn archives_routes(self) -> bool {
+        matches!(self, Self::ArchiveRoutes | Self::ArchiveRoutesWithLesson)
     }
 
     fn is_resume(&self) -> bool {
@@ -56,6 +66,7 @@ impl PivotAction {
             Self::ResumeAsIs => "RESUME_AS_IS/v1",
             Self::ArchiveBreaker => "ARCHIVE_BREAKER/v1",
             Self::ArchiveRoutes => "ARCHIVE_ROUTES/v1",
+            Self::ArchiveRoutesWithLesson => "ARCHIVE_ROUTES_WITH_LESSON/v1",
         }
     }
 }
@@ -78,6 +89,8 @@ pub struct PivotPlan {
     pub action: PivotAction,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub archive_plans: Vec<PivotArchivePlan>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lesson: Option<PivotLessonDraft>,
     target_sha256: String,
 }
 
@@ -103,7 +116,7 @@ impl PivotPlan {
     }
 
     fn validate_archive_selection(&self) -> Result<()> {
-        if self.action == PivotAction::ArchiveRoutes {
+        if self.action.archives_routes() {
             let ids: Vec<_> = self.archive_plan_ids().collect();
             ensure!(
                 Self::normalize_archive_plan_ids(&ids)? == ids,
@@ -112,18 +125,39 @@ impl PivotPlan {
         } else {
             ensure!(
                 self.archive_plans.is_empty(),
-                "route selection requires ARCHIVE_ROUTES"
+                "route selection requires ARCHIVE_ROUTES or ARCHIVE_ROUTES_WITH_LESSON"
             );
         }
         Ok(())
     }
 
-    pub fn adr_id(&self) -> Result<String> {
+    fn validate_approval(&self) -> Result<()> {
         self.validate_archive_selection()?;
+        match (self.action, &self.lesson) {
+            (PivotAction::ArchiveRoutesWithLesson, Some(draft)) => draft.validate(),
+            (PivotAction::ArchiveRoutesWithLesson, None) => {
+                anyhow::bail!("ARCHIVE_ROUTES_WITH_LESSON requires a lesson draft")
+            }
+            (_, Some(_)) => anyhow::bail!("lesson draft requires ARCHIVE_ROUTES_WITH_LESSON"),
+            (_, None) => Ok(()),
+        }
+    }
+
+    pub fn adr_id(&self) -> Result<String> {
+        self.validate_approval()?;
         Ok(format!(
             "ADR-PIVOT-{}",
             digest(&(self.action.adr_domain(), self))?
         ))
+    }
+
+    /// The advisory Graveyard lesson ID shares the exact approval digest.
+    pub fn lesson_id(&self) -> Result<Option<String>> {
+        if self.lesson.is_none() {
+            self.validate_approval()?;
+            return Ok(None);
+        }
+        Ok(Some(lessons::id_for_adr(&self.adr_id()?)?))
     }
 }
 
@@ -142,6 +176,8 @@ pub struct PivotResult {
     pub reviewed_through: i64,
     pub breaker_state: &'static str,
     pub probes_started: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub lesson_id: Option<String>,
 }
 
 fn digest(x: &impl Serialize) -> Result<String> {
@@ -162,9 +198,14 @@ pub(super) fn read_pending(db: &Connection) -> Result<Option<PivotIntent>> {
     )
     .optional()?
     .map(|(adr_id, plan, new_commit)| {
+        let plan: PivotPlan = serde_json::from_str(&plan)?;
+        ensure!(
+            plan.adr_id()? == adr_id,
+            "pending Pivot approval ID does not match its plan"
+        );
         Ok(PivotIntent {
             adr_id,
-            plan: serde_json::from_str(&plan)?,
+            plan,
             new_commit,
         })
     })
@@ -235,8 +276,7 @@ fn confirm_context(db: &Connection, plan: &PivotPlan, before_cas: bool) -> Resul
         breaker == plan.breaker && inbox.inbox_id == plan.inbox_id,
         "selected Pivot target changed since review"
     );
-    plan.validate_archive_selection()?;
-    let hash = if plan.action == PivotAction::ArchiveRoutes {
+    let hash = if plan.action.archives_routes() {
         archive_routes::confirm(db, &breaker, &hash, &plan.archive_plans)?
     } else {
         hash
@@ -355,10 +395,18 @@ impl StateStore {
         action: PivotAction,
     ) -> Result<PivotPlan> {
         ensure!(
-            action != PivotAction::ArchiveRoutes,
-            "ARCHIVE_ROUTES requires explicit route IDs"
+            !action.archives_routes(),
+            "route archive requires explicit route IDs"
         );
-        self.preview_selection(repo, base, fact, review, breaker_id, reason, (action, &[]))
+        self.preview_selection(
+            repo,
+            base,
+            fact,
+            review,
+            breaker_id,
+            reason,
+            (action, &[], None),
+        )
     }
 
     /// Preview an operator archive of an exact, reviewed proof-plan selection.
@@ -380,7 +428,32 @@ impl StateStore {
             review,
             breaker_id,
             reason,
-            (PivotAction::ArchiveRoutes, &sorted),
+            (PivotAction::ArchiveRoutes, &sorted, None),
+        )
+    }
+
+    /// Preview an exact reviewed archive and bind the advisory lesson to the same approval.
+    pub fn preview_archive_routes_with_lesson(
+        &mut self,
+        repo: &str,
+        base: &str,
+        fact: &str,
+        review: &RetainedReview,
+        breaker_id: &str,
+        reason: &str,
+        plan_ids: &[&str],
+        lesson: &PivotLessonDraft,
+    ) -> Result<PivotPlan> {
+        lesson.validate()?;
+        let sorted = PivotPlan::normalize_archive_plan_ids(plan_ids)?;
+        self.preview_selection(
+            repo,
+            base,
+            fact,
+            review,
+            breaker_id,
+            reason,
+            (PivotAction::ArchiveRoutesWithLesson, &sorted, Some(lesson)),
         )
     }
 
@@ -392,7 +465,7 @@ impl StateStore {
         review: &RetainedReview,
         breaker_id: &str,
         reason: &str,
-        (action, plan_ids): (PivotAction, &[&str]),
+        (action, plan_ids, lesson): (PivotAction, &[&str], Option<&PivotLessonDraft>),
     ) -> Result<PivotPlan> {
         ensure!(
             oid(base) && fact.len() == 64 && oid(fact) && valid_id(breaker_id) && reason_ok(reason),
@@ -424,7 +497,7 @@ impl StateStore {
                 && review.reviewed_inbox(&inbox.inbox_id) == Some(&inbox),
             "selected breaker and linked inbox must both appear unchanged in retained review"
         );
-        let (archive_plans, target_sha256) = if action == PivotAction::ArchiveRoutes {
+        let (archive_plans, target_sha256) = if action.archives_routes() {
             archive_routes::preview(&tx, &breaker, &target_sha256, review, plan_ids)?
         } else {
             (Vec::new(), target_sha256)
@@ -442,6 +515,7 @@ impl StateStore {
             decision_reason: reason.into(),
             action,
             archive_plans,
+            lesson: lesson.cloned(),
             target_sha256,
         };
         tx.commit()?;
@@ -462,6 +536,11 @@ impl StateStore {
             .optional()?
             .map(|(plan, git_commit, event_seq, reviewed_through)| {
                 let plan: PivotPlan = serde_json::from_str(&plan)?;
+                ensure!(plan.adr_id()? == adr_id, "recorded Pivot approval ID does not match its plan");
+                let lesson_id = plan.lesson_id()?;
+                if let Some(id) = &lesson_id {
+                    lessons::confirm_recorded(&self.db, &plan, adr_id, id, event_seq)?;
+                }
                 let result = PivotResult {
                     adr_id: adr_id.into(),
                     git_commit,
@@ -469,6 +548,7 @@ impl StateStore {
                     reviewed_through,
                     breaker_state: plan.action.target_state(),
                     probes_started: false,
+                    lesson_id,
                 };
                 Ok((plan, result))
             })
@@ -498,11 +578,16 @@ impl StateStore {
             ensure!(read_pending(tx)?.as_ref()==Some(intent),"Pivot intent changed or is missing");
             let p=&intent.plan;
             confirm_context(tx,p,!already_adopted)?;
+            let lesson_id = p.lesson_id()?;
             adopt()?;
             let change=Change{actor:"operator:pivot",git_commit:Some(&intent.new_commit)};
             let id=&intent.adr_id;
             let breaker_state = p.action.target_state();
-            let seq=event(tx,change,"PIVOT_APPLIED","adr",id,json!({"action":p.action.as_str(),"fact_sha256":p.fact_sha256,"reviewed_through":p.reviewed_through,"breaker_id":p.breaker.breaker_id,"inbox_id":p.inbox_id,"probes_started":false}))?;
+            let mut applied = json!({"action":p.action.as_str(),"fact_sha256":p.fact_sha256,"reviewed_through":p.reviewed_through,"breaker_id":p.breaker.breaker_id,"inbox_id":p.inbox_id,"probes_started":false});
+            if lesson_id.is_some() {
+                applied["lesson_sha256"] = json!(lessons::plan_digest(p, id)?);
+            }
+            let seq = event(tx, change, "PIVOT_APPLIED", "adr", id, applied)?;
             tx.execute(&format!("UPDATE circuit_breakers SET state=?2,updated_at={NOW} WHERE breaker_id=?1"),params![p.breaker.breaker_id,breaker_state])?;
             let mut transition = json!({"previous_state":"TRIPPED","state":breaker_state,"adr_id":id});
             let breaker_event = match p.action {
@@ -510,10 +595,10 @@ impl StateStore {
                     transition["probe_status"] = json!("AWAITING_REVIEW");
                     "BREAKER_STATE_CHANGED"
                 }
-                PivotAction::ArchiveBreaker | PivotAction::ArchiveRoutes => "BREAKER_ARCHIVED",
+                PivotAction::ArchiveBreaker | PivotAction::ArchiveRoutes | PivotAction::ArchiveRoutesWithLesson => "BREAKER_ARCHIVED",
             };
             event(tx,change,breaker_event,"breaker",&p.breaker.breaker_id,transition)?;
-            if p.action == PivotAction::ArchiveRoutes {
+            if p.action.archives_routes() {
                 archive_routes::land(tx, change, id, &p.archive_plans)?;
             }
             tx.execute(&format!("UPDATE decision_inbox SET status='RESOLVED',resolved_adr=?2,resolved_at={NOW} WHERE inbox_id=?1"),params![p.inbox_id,id])?;
@@ -521,8 +606,11 @@ impl StateStore {
             // Never hide events that arrived between a successful CAS and recovery.
             tx.execute(&format!("INSERT INTO human_checkpoints(cursor_id,updated_at,event_seq,git_commit,last_adr_id,is_current) VALUES(?1,{NOW},?2,?3,?1,1)"),params![id,p.reviewed_through,intent.new_commit])?;
             tx.execute("INSERT INTO recorded_pivots(adr_id,plan_json,git_commit,event_seq,reviewed_through) VALUES(?1,?2,?3,?4,?5)",params![id,serde_json::to_string(p)?,intent.new_commit,seq,p.reviewed_through])?;
+            if let Some(lesson_id) = &lesson_id {
+                lessons::insert(tx, p, id, lesson_id, seq)?;
+            }
             tx.execute("DELETE FROM pivot_resume_intent WHERE singleton=1",[])?;
-            Ok(PivotResult{adr_id:id.clone(),git_commit:intent.new_commit.clone(),event_seq:seq,reviewed_through:p.reviewed_through,breaker_state,probes_started:false})
+            Ok(PivotResult{adr_id:id.clone(),git_commit:intent.new_commit.clone(),event_seq:seq,reviewed_through:p.reviewed_through,breaker_state,probes_started:false,lesson_id})
         })
     }
 
