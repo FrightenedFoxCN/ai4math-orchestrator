@@ -2,6 +2,8 @@ use super::*;
 use crate::state::{NewClaim, NewTask, TaskCandidateSource, TaskRunOutcome, Trust};
 use std::sync::{Arc, Barrier};
 
+mod resident;
+
 const ACTOR: Change<'static> = Change {
     actor: "operator:test-model",
     git_commit: None,
@@ -9,6 +11,8 @@ const ACTOR: Change<'static> = Change {
 const BASE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const OTHER_BASE: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 const REPO: &str = "/managed/repo.git";
+const MODEL: &str = "deepseek:deepseek-test";
+const OTHER_MODEL: &str = "deepseek:another";
 const MODULE: &str = "Fixture.lean";
 const ID: &str = "model-fixture";
 const CLAIM: &str = "fixture-claim";
@@ -22,7 +26,7 @@ fn new(task_id: &str) -> NewModelDispatchApproval<'_> {
         role: "prover_worker",
         repo: REPO,
         base_commit: BASE,
-        model: "deepseek:deepseek-test",
+        model: MODEL,
         max_wall_seconds: 60,
         max_model_calls: 8,
     }
@@ -87,7 +91,7 @@ fn reopen_migrates_additively_and_retains_exact_binding_and_candidate() -> Resul
     // Model a pre-v4 ledger with pre-existing tasks, Claim and audit sequence.
     store.db.execute_batch(
         "DROP TABLE scheduler_model_dispatch_approvals;
-        DELETE FROM state_migrations WHERE version=4;",
+        DELETE FROM state_migrations WHERE version IN (4,5);",
     )?;
     let pre_migration = store.status()?.last_event_seq;
     drop(store);

@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::fd::{AsRawFd, FromRawFd, RawFd},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 const PACKET_MAX: usize = 128 * 1024;
@@ -41,11 +41,11 @@ fn nonblocking_stream(fd: RawFd) -> Result<File> {
     Ok(file)
 }
 
-fn ready(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<()> {
+fn ready(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<bool> {
     loop {
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .context("DSH model pipe deadline elapsed")?;
+        let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+            return Ok(false);
+        };
         let ms = remaining
             .as_millis()
             .saturating_add(1)
@@ -64,7 +64,9 @@ fn ready(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<()> {
             }
             return Err(e).context("poll DSH coordinator stream");
         }
-        ensure!(Instant::now() < deadline, "DSH model pipe deadline elapsed");
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
         if result == 0 {
             continue;
         }
@@ -72,7 +74,7 @@ fn ready(fd: RawFd, events: libc::c_short, deadline: Instant) -> Result<()> {
             entry.revents & libc::POLLNVAL == 0,
             "invalid DSH coordinator stream"
         );
-        return Ok(()); // On HUP/ERR, read/write observes EOF or the concrete failure.
+        return Ok(true); // On HUP/ERR, read/write observes EOF or the concrete failure.
     }
 }
 
@@ -92,7 +94,10 @@ impl Wire {
         );
         let mut remaining = bytes.as_slice();
         while !remaining.is_empty() {
-            ready(self.output.as_raw_fd(), libc::POLLOUT, deadline)?;
+            ensure!(
+                ready(self.output.as_raw_fd(), libc::POLLOUT, deadline)?,
+                "DSH model pipe deadline elapsed"
+            );
             match self.output.write(remaining) {
                 Ok(0) => bail!("closed DSH coordinator output"),
                 Ok(n) => remaining = &remaining[n..],
@@ -109,11 +114,28 @@ impl Wire {
         }
         Ok(())
     }
-    pub(super) fn receive(&mut self, deadline: Instant) -> Result<Vec<u8>> {
+    pub(super) fn receive(
+        &mut self,
+        deadline: Instant,
+        mut check: impl FnMut() -> Result<()>,
+    ) -> Result<Vec<u8>> {
         let mut bytes = Vec::new();
         let mut chunk = [0u8; 4096];
+        let mut next_check = Instant::now();
         loop {
-            ready(self.input.as_raw_fd(), libc::POLLIN, deadline)?;
+            let now = Instant::now();
+            ensure!(now < deadline, "DSH model pipe deadline elapsed");
+            if now >= next_check {
+                check()?;
+                next_check = Instant::now() + Duration::from_millis(250);
+            }
+            if !ready(
+                self.input.as_raw_fd(),
+                libc::POLLIN,
+                deadline.min(next_check),
+            )? {
+                continue;
+            }
             match self.input.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {

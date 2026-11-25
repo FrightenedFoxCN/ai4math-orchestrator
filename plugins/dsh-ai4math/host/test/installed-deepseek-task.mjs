@@ -10,7 +10,8 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
-import { runApprovedDeepSeekModelTask, runDeepSeekModelTask } from '../model-task-deepseek.mjs';
+import { runDeepSeekModelTask } from '../model-task-deepseek.mjs';
+import { runDeepSeekModelResident } from '../model-task-resident.mjs';
 
 const [dshRoot, cliPath, ...extra] = process.argv.slice(2);
 assert.ok(dshRoot && cliPath && isAbsolute(dshRoot) && isAbsolute(cliPath) && extra.length === 0,
@@ -225,12 +226,15 @@ try {
       version: 1, task_id: taskId, claim_id: claimId, role, engine: 'lean4', module_path: modulePath,
       target_decl: decl, base_commit: base, max_wall_seconds: wallSeconds, informal_statement: 'True', formal_header: formalHeader,
     };
+    const residentOptions = {
+      cliPath, root, bareRepo, dshRoot, model, apiKey, baseUrl, maxCycles: 2, maxLaunches: 1,
+      pollIntervalMs: 10, scanTimeoutMs: 5000, scanLimit: 8, signal: new AbortController().signal,
+    };
     async function runScenario({ fail } = {}) {
       const key = fail === 'auth' ? wrongKey : apiKey;
       const expectedRequests = fail === 'auth' || fail === 'redirect' ? 1 : 3;
       scenario = { packet, input, key, expectedRequests, fail, history: [], requests: 0 };
-      const runner = approved ? runApprovedDeepSeekModelTask : runDeepSeekModelTask;
-      const pending = runner({
+      const pending = approved ? runDeepSeekModelResident(residentOptions) : runDeepSeekModelTask({
         cliPath, root, bareRepo, taskId, claimId, role, wallSeconds, dshRoot, model, apiKey: key, baseUrl,
         // Leave room for a retry so the HTTP request counts would detect one.
         maxModelCalls: 4, signal: new AbortController().signal,
@@ -252,10 +256,19 @@ try {
       await runScenario({ fail: firstFailure });
       run(cliPath, ['task-result', root, taskId], dir, { absent: true });
     }
-    // An explicit retry of that same task demonstrates no stranded lease.
-    assert.deepEqual(await runScenario(), {
-      task_id: taskId, base_commit: base, role, source: 'dsh_model', suggestion_recorded: true, proof_verified: false,
-    });
+    const accepted = await runScenario();
+    if (approved) {
+      assert.deepEqual(accepted, { cycles: 1, attempted: 1, recorded: 1, unconfirmed: 0, reconciled: 0, reason: 'launch_budget' });
+      const restarted = await runDeepSeekModelResident(residentOptions);
+      assert.deepEqual(restarted, { cycles: 2, attempted: 0, recorded: 0, unconfirmed: 0, reconciled: 0, reason: 'cycle_budget' });
+      assert.equal(scenario.requests, 3);
+      if (scenario.failure) throw scenario.failure;
+    } else {
+      // An explicit retry of the same old-path task demonstrates no stranded lease.
+      assert.deepEqual(accepted, {
+        task_id: taskId, base_commit: base, role, source: 'dsh_model', suggestion_recorded: true, proof_verified: false,
+      });
+    }
     const { candidate, proof_verified } = JSON.parse(ai('task-result', taskId));
     assert.equal(proof_verified, false);
     assert.equal(candidate.task_id, taskId);

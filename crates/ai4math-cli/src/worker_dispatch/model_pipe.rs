@@ -163,6 +163,41 @@ pub(crate) fn cancel_model_dispatch(root: &Path, task: &str) -> Result<()> {
     print_json(store.cancel_model_dispatch(task, MODEL_ACTOR)?)
 }
 
+pub(crate) fn cancel_running_model_dispatch(root: &Path, task: &str) -> Result<()> {
+    let mut store = open_managed_state(root, false)?;
+    print_json(store.cancel_running_model_dispatch(task, MODEL_ACTOR)?)
+}
+
+/// Operator-only finite scan. Returns metadata hints, not a lease/authorizing token.
+pub(crate) fn resident_model_dispatch_scan(
+    root: &Path,
+    repo: &Path,
+    model: &str,
+    limit: usize,
+) -> Result<()> {
+    ensure!(
+        (1..=16).contains(&limit),
+        "resident model scan limit must be in 1..=16"
+    );
+    let git = PromotionRepo::try_lock(repo)?;
+    let repo = repo_name(&git)?;
+    let mut store = open_managed_state(root, false)?;
+    ensure!(
+        store.managed_repo()?.as_deref() == Some(repo),
+        "resident model scan requires its bound repository"
+    );
+    let base = git.main_head()?;
+    let reconciled = store
+        .reconcile_model_dispatches(repo, model, limit, MODEL_ACTOR)?
+        .len();
+    let pending = store.list_ready_model_dispatches(repo, &base, model, limit)?;
+    ensure!(
+        git.main_head()? == base,
+        "reviewed main changed during resident model scan"
+    );
+    print_json(json!({"pending": pending, "reconciled": reconciled}))
+}
+
 pub(crate) fn reconcile_model_dispatch(root: &Path, task: &str) -> Result<()> {
     let mut store = open_managed_state(root, false)?;
     print_json(store.reconcile_model_dispatch(task, MODEL_ACTOR)?)
@@ -325,7 +360,15 @@ fn run_model_inner(root: &Path, repo: &Path, request: Run<'_>) -> Result<()> {
     let outcome = (|| {
         let expected = packet(&subject, task, claim, role, seconds)?;
         wire.send(json!({"packet":expected}), deadline)?;
-        let raw = wire.receive(deadline)?;
+        let raw = wire.receive(deadline, || {
+            if approved_base.is_some() {
+                ensure!(
+                    store.model_dispatch_lease_is_live(&lease)?,
+                    "approved model dispatch was cancelled or its lease was invalidated"
+                );
+            }
+            Ok(())
+        })?;
         let result_json = validate_reply(&raw, &expected, &subject)?;
         let git = PromotionRepo::try_lock(repo)?;
         let current = prepare(root, &git, &store, task, claim, role, seconds)?;

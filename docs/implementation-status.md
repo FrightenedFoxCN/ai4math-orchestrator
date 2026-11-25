@@ -89,8 +89,15 @@
 - `model-dispatch-status ROOT ID` 查看，`model-dispatch-cancel ROOT ID` 只取消未派发的批准，`model-dispatch-reconcile ROOT ID` 只依据精确匹配的已入账候选推进状态。已进入审批流程的任务 ID 不回旧队列；中断、缺少确认或租约过期不会自动重派。`dispatched` 不证明远端收到请求，也不等同于成功或失败。
 - 受信本地 Host 通过 `runApprovedDeepSeekModelTask` 使用私有管道命令；本机 Electron 使用合成凭据和 loopback 夹具通过审批审阅全链路。Store 定向 6 项覆盖迁移、重开、竞争与回滚；CLI 管道覆盖取消与确认丢失。Rust 工作区 531 通过、0 失败、75 默认忽略；插件 78 通过；fmt、diff 与 Clippy 通过（仍有既有警告）。未启用常驻派工、运行中远端取消或生产凭据。
 
+## 后续批次：有界常驻模型调度
+
+- 受信操作者程序可调用 [`runDeepSeekModelResident`](../plugins/dsh-ai4math/host/model-task-resident.mjs)，必须指定 SDK、CLI、项目、仓库、模型、凭据和有限轮数/派发次数/轮询间隔/扫描时限。进程内只运行一个循环，每次至多一个任务；扫描不接收凭据，不挂载到 GUI 或代理工具。无后台自启动。
+- 每轮只列出当前仓库、Git 主干和模型下已批准、符合现有门禁的任务，真正派发仍原子重查。重启可跨旧基线确认精确的持久候选；不会重复派发已消费审批。普通扫描/派发失败不可当成已入账。
+- `model-dispatch-cancel-running ROOT ID` 与候选提交在 SQLite 中仲裁；运行中取消或熔断作废租约后，保持打开的协调管道也会被主动断开，推动本地 worker 回收。这不是远端 HTTP 服务承诺中止或撤销已开始的调用。乱序、确认丢失、断开与晚到结果不提升信任。
+- 本机已安装 Electron 用合成凭据和 localhost 夹具完成驻留审批派发与重启后零额外请求。未验证生产凭据、远端服务、Linux 宿主或系统服务部署。Rust 工作区 538 通过、0 失败、75 默认忽略；插件 111 通过；fmt、diff 与 Clippy 通过（仍有既有警告）。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。
-- 显式 DeepSeek 任务已有可回收进程；基于持久租约的常驻调度、跨进程重启恢复与生产凭据接线仍待交付。
+- 常驻模型循环未配置生产凭据或部署为自动启动的服务。
 - Linux bwrap/cgroups、全主机配额、Agda/Rocq 独立 T2、生产 GUI 写闭环仍未交付。

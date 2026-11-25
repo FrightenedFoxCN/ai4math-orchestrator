@@ -268,6 +268,72 @@ fn approved_dispatch_cancel_and_failed_worker_do_not_requeue() -> Result<()> {
 }
 
 #[test]
+fn resident_scan_is_scoped_and_running_cancel_or_breaker_ends_open_pipe() -> Result<()> {
+    for by_breaker in [false, true] {
+        let f = Fixture::new()?;
+        f.approve()?;
+        let scan = |model, limit| -> Result<Value> {
+            let result = cli()
+                .args([
+                    "model-dispatch-resident-scan",
+                    f.root(),
+                    f.bare(),
+                    model,
+                    limit,
+                ])
+                .output()?;
+            ensure!(
+                result.status.success(),
+                "scan: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            Ok(serde_json::from_slice(&result.stdout)?)
+        };
+        assert_eq!(scan("other-model", "1")?["pending"], json!([]));
+        assert_eq!(
+            scan("fixture-math-model", "1")?["pending"][0]["task_id"],
+            "T"
+        );
+        assert!(scan("fixture-math-model", "17").is_err());
+        let mut run = f.spawn_approved("fixture-math-model")?;
+        let result = if by_breaker {
+            cli()
+                .args([
+                    "trip-breaker",
+                    f.root(),
+                    f.bare(),
+                    "during-resident",
+                    "Proof.lean",
+                    "target",
+                    "fixture gate",
+                ])
+                .output()?
+        } else {
+            cli()
+                .args(["model-dispatch-cancel-running", f.root(), "T"])
+                .output()?
+        };
+        ensure!(
+            result.status.success(),
+            "invalidation: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        // No reply or EOF: the coordinator must terminate before its wall timeout.
+        assert!(!run.wait()?);
+        assert!(f.db()?.task_candidate("T")?.is_none());
+        assert_eq!(scan("fixture-math-model", "1")?["pending"], json!([]));
+        assert!(f.spawn_approved("fixture-math-model").is_err());
+        if !by_breaker {
+            assert_eq!(
+                serde_json::from_slice::<Value>(&result.stdout)?["state"],
+                "cancelled"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
 fn wrong_identity_cannot_write_and_success_is_untrusted_and_one_shot() -> Result<()> {
     let f = Fixture::new()?;
     let seq = f.db()?.status()?.last_event_seq;

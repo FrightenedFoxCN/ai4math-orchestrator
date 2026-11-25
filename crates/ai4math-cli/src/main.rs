@@ -63,7 +63,9 @@ ai4math task-run-model ROOT BARE_REPO ID CLAIM ROLE WALL_SECONDS
 ai4math model-dispatch-approve ROOT BARE_REPO ID CLAIM ROLE REVIEWED_COMMIT MODEL WALL_SECONDS MAX_MODEL_CALLS
 ai4math model-dispatch-status ROOT ID
 ai4math model-dispatch-cancel ROOT ID
+ai4math model-dispatch-cancel-running ROOT ID
 ai4math model-dispatch-reconcile ROOT ID
+ai4math model-dispatch-resident-scan ROOT BARE_REPO MODEL LIMIT
 ai4math task-run-approved-model ROOT BARE_REPO ID CLAIM ROLE WALL_SECONDS MODEL MAX_MODEL_CALLS
 ai4math task-result ROOT ID
 ai4math refute-managed ROOT BARE_REPO ID MODULE PROPOSITION NATIVE_LEAN PROOF_BODY
@@ -1316,6 +1318,17 @@ fn run() -> Result<()> {
         }
         ["model-dispatch-reconcile", root, task] => {
             worker_dispatch::reconcile_model_dispatch(Path::new(root), task)
+        }
+        ["model-dispatch-cancel-running", root, task] => {
+            worker_dispatch::cancel_running_model_dispatch(Path::new(root), task)
+        }
+        ["model-dispatch-resident-scan", root, repo, model, limit] => {
+            worker_dispatch::resident_model_dispatch_scan(
+                Path::new(root),
+                Path::new(repo),
+                model,
+                limit.parse()?,
+            )
         }
         [
             "task-run-approved-model",

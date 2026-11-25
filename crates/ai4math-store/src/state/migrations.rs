@@ -4,11 +4,19 @@ use rusqlite::{Connection, TransactionBehavior};
 
 pub(super) fn initialize_model_dispatch(db: &mut Connection) -> Result<()> {
     const PENDING: &str = "SELECT NOT EXISTS(SELECT 1 FROM state_migrations WHERE version=4)";
-    if db.query_row(PENDING, [], |r| r.get::<_, bool>(0))? {
+    const RESIDENT_PENDING: &str =
+        "SELECT NOT EXISTS(SELECT 1 FROM state_migrations WHERE version=5)";
+    if db.query_row(RESIDENT_PENDING, [], |r| r.get::<_, bool>(0))? {
         let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if tx.query_row(PENDING, [], |r| r.get::<_, bool>(0))? {
             tx.execute_batch(include_str!("../../../../schemas/model-dispatch.sql"))?;
             tx.execute("INSERT INTO state_migrations(version) VALUES(4)", [])?;
+        }
+        if tx.query_row(RESIDENT_PENDING, [], |r| r.get::<_, bool>(0))? {
+            tx.execute_batch(include_str!(
+                "../../../../schemas/model-dispatch-resident.sql"
+            ))?;
+            tx.execute("INSERT INTO state_migrations(version) VALUES(5)", [])?;
         }
         tx.commit()?;
     }

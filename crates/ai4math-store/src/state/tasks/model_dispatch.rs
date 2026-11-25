@@ -6,7 +6,7 @@ use super::{
     issue_lease, lease_duration_with_submission_grace, now_ms, release_lease, valid_token,
 };
 use anyhow::{Context, Result, ensure};
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Row, Transaction, params};
 use serde::Serialize;
 use serde_json::json;
 use std::{path::Path, time::Duration};
@@ -112,51 +112,77 @@ fn model_id(id: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
 }
 
+const APPROVAL_COLUMNS: &str = "a.task_id,a.claim_id,a.role,a.repo,a.base_commit,a.model,
+    a.max_wall_seconds,a.max_model_calls,a.state,a.event_seq";
+const MODEL_DISPATCH_BATCH_LIMIT: usize = 64;
+
+fn decode_approval(r: &Row<'_>) -> rusqlite::Result<ModelDispatchApproval> {
+    Ok(ModelDispatchApproval {
+        task_id: r.get(0)?,
+        claim_id: r.get(1)?,
+        role: r.get(2)?,
+        repo: r.get(3)?,
+        base_commit: r.get(4)?,
+        model: r.get(5)?,
+        max_wall_seconds: r.get(6)?,
+        max_model_calls: r.get(7)?,
+        state: ModelDispatchState::parse(&r.get::<_, String>(8)?)?,
+        event_seq: r.get(9)?,
+    })
+}
+
 fn read(db: &Connection, id: &str) -> Result<Option<ModelDispatchApproval>> {
     Ok(db.query_row(
-        "SELECT task_id,claim_id,role,repo,base_commit,model,max_wall_seconds,max_model_calls,state,event_seq
-         FROM scheduler_model_dispatch_approvals WHERE task_id=?1",
-        [id],
-        |r| {
-            Ok(ModelDispatchApproval {
-                task_id: r.get(0)?,
-                claim_id: r.get(1)?,
-                role: r.get(2)?,
-                repo: r.get(3)?,
-                base_commit: r.get(4)?,
-                model: r.get(5)?,
-                max_wall_seconds: r.get(6)?,
-                max_model_calls: r.get(7)?,
-                state: ModelDispatchState::parse(&r.get::<_, String>(8)?)?,
-                event_seq: r.get(9)?,
-            })
-        },
+        &format!("SELECT {APPROVAL_COLUMNS} FROM scheduler_model_dispatch_approvals a WHERE a.task_id=?1"),
+        [id], decode_approval,
     ).optional()?)
+}
+
+fn validate_scope(repo: &str, model: &str) -> Result<()> {
+    ensure!(
+        Path::new(repo).is_absolute() && !repo.chars().any(char::is_control),
+        "expected canonical managed repository path"
+    );
+    ensure!(valid_token(model, 100), "invalid DSH model identifier");
+    Ok(())
+}
+
+fn validate_base(base: &str) -> Result<()> {
+    ensure!(
+        matches!(base.len(), 40 | 64)
+            && base.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+        "expected full lowercase Git base commit"
+    );
+    Ok(())
+}
+
+fn validate_batch_limit(limit: usize) -> Result<i64> {
+    ensure!(
+        (1..=MODEL_DISPATCH_BATCH_LIMIT).contains(&limit),
+        "model dispatch batch limit must be in 1..={MODEL_DISPATCH_BATCH_LIMIT}"
+    );
+    Ok(limit as i64)
 }
 
 fn require(db: &Connection, id: &str) -> Result<ModelDispatchApproval> {
     read(db, id)?.context("no model dispatch approval for this task")
 }
 
+const EXACT_MODEL_CANDIDATE: &str = "EXISTS(SELECT 1 FROM scheduler_tasks t
+    JOIN scheduler_model_task_candidates m ON m.task_seq=t.queue_seq
+    JOIN claims c ON c.claim_id=m.claim_id
+    JOIN managed_repo b ON b.singleton=1
+    WHERE t.task_id=a.task_id AND m.base_commit=a.base_commit AND m.claim_id=a.claim_id
+    AND m.role=a.role AND b.repo=a.repo
+    AND t.completed_at_ms IS NOT NULL AND t.track='infrastructure' AND t.engine='lean4'
+    AND c.engine=t.engine AND c.module_path=t.module_path
+    AND c.formal_target=(t.module_path || '#' || t.target)
+    AND NOT EXISTS(SELECT 1 FROM scheduler_task_candidates n WHERE n.task_seq=t.queue_seq))";
+
 fn has_exact_candidate(db: &Connection, row: &ModelDispatchApproval) -> Result<bool> {
     Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM scheduler_model_task_candidates m
-          JOIN scheduler_tasks t ON t.queue_seq=m.task_seq
-          JOIN claims c ON c.claim_id=m.claim_id
-          JOIN managed_repo b ON b.singleton=1
-          WHERE t.task_id=?1 AND m.base_commit=?2 AND m.claim_id=?3 AND m.role=?4 AND b.repo=?5
-          AND t.completed_at_ms IS NOT NULL AND t.track='infrastructure' AND t.engine='lean4'
-          AND c.engine=t.engine AND c.module_path=t.module_path
-          AND c.formal_target=(t.module_path || '#' || t.target)
-          AND NOT EXISTS(SELECT 1 FROM scheduler_task_candidates n WHERE n.task_seq=t.queue_seq))",
-        params![
-            row.task_id,
-            row.base_commit,
-            row.claim_id,
-            row.role,
-            row.repo
-        ],
-        |r| r.get(0),
+        &format!("SELECT {EXACT_MODEL_CANDIDATE} FROM scheduler_model_dispatch_approvals a WHERE a.task_id=?1"),
+        [&row.task_id], |r| r.get(0),
     )?)
 }
 
@@ -168,32 +194,55 @@ fn check_recorded_binding(db: &Connection, row: &ModelDispatchApproval) -> Resul
     Ok(())
 }
 
+fn repo_matches(db: &Connection, repo: &str) -> Result<bool> {
+    Ok(db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM managed_repo WHERE singleton=1 AND repo=?1)",
+        [repo],
+        |r| r.get(0),
+    )?)
+}
+
+fn git_available(db: &Connection) -> Result<bool> {
+    Ok(
+        crate::state::read_intent(db)?.is_none()
+            && crate::state::pivot::read_pending(db)?.is_none(),
+    )
+}
+
 fn require_available(db: &Connection, repo: &str) -> Result<()> {
-    let current = db
-        .query_row("SELECT repo FROM managed_repo WHERE singleton=1", [], |r| {
-            r.get::<_, String>(0)
-        })
-        .optional()?;
     ensure!(
-        current.as_deref() == Some(repo),
+        repo_matches(db, repo)?,
         "model dispatch managed repository binding mismatch"
     );
     ensure!(
-        crate::state::read_intent(db)?.is_none()
-            && crate::state::pivot::read_pending(db)?.is_none(),
+        git_available(db)?,
         "recover the pending Git transaction before model dispatch"
     );
     Ok(())
 }
 
+fn lease_capacity(db: &Connection, now: i64) -> Result<bool> {
+    let (exploration, infrastructure) = active_counts(db, now)?;
+    Ok(exploration + infrastructure < ACTIVE_LIMIT && infrastructure < TRACK_ACTIVE_LIMIT)
+}
+
 // The Claim must identify the same target as the immutable task enrollment;
 // recheck trust and identity under the dispatch writer lock as well as on approval.
-const RUNNABLE_MODEL_SUBJECT: &str =
-    "t.task_id=?2 AND t.track='infrastructure' AND t.engine='lean4'
-    AND c.claim_id=?3 AND c.engine=t.engine AND c.module_path=t.module_path
+const MODEL_SUBJECT: &str = "t.track='infrastructure' AND t.engine='lean4'
+    AND c.engine=t.engine AND c.module_path=t.module_path
     AND c.formal_target=(t.module_path || '#' || t.target)
     AND c.stale=0 AND c.effective_stale=0 AND c.effective_trust_level NOT IN ('L2b','L3')
-    AND t.completed_at_ms IS NULL AND (t.lease_expires_at_ms IS NULL OR t.lease_expires_at_ms<=?1)";
+    AND t.completed_at_ms IS NULL";
+const MODEL_SLOT_FREE: &str = "(t.lease_expires_at_ms IS NULL OR t.lease_expires_at_ms<=?1)";
+
+// Use the same eligibility predicate for a read hint and dispatch under the writer lock.
+fn model_dispatch_gate() -> String {
+    format!(
+        "{MODEL_SUBJECT} AND {MODEL_SLOT_FREE} AND NOT {ADAPTATION_LINKED}
+        AND NOT {MODULE_GATED} AND NOT {HELD_FOR_ORACLE} AND NOT {DEPENDENCY_BLOCKED}
+        AND {RETRY_READY}"
+    )
+}
 
 fn transition(
     tx: &Transaction<'_>,
@@ -239,6 +288,50 @@ impl StateStore {
         Ok(row)
     }
 
+    /// Read up to `limit` (1..=64) eligible approvals in ascending approval
+    /// event order at one snapshot. The caller supplies the canonical managed
+    /// repository and observed current Git base; Store never consults Git.
+    /// These are hints, not reservations or a guarantee of capacity for the
+    /// entire batch. Dispatch must arbitrate again under the writer lock.
+    pub fn list_ready_model_dispatches(
+        &self,
+        repo: &str,
+        base_commit: &str,
+        model: &str,
+        limit: usize,
+    ) -> Result<Vec<ModelDispatchApproval>> {
+        validate_scope(repo, model)?;
+        validate_base(base_commit)?;
+        let limit = validate_batch_limit(limit)?;
+        let snapshot = self.db.unchecked_transaction()?;
+        let now = now_ms(&snapshot)?;
+        if !model_dispatch_table_exists(&snapshot)?
+            || !repo_matches(&snapshot, repo)?
+            || !git_available(&snapshot)?
+            || !lease_capacity(&snapshot, now)?
+        {
+            return Ok(Vec::new());
+        }
+        let rows = {
+            let mut stmt = snapshot.prepare(&format!(
+                "SELECT {APPROVAL_COLUMNS} FROM scheduler_model_dispatch_approvals a
+                 JOIN scheduler_tasks t ON t.task_id=a.task_id
+                 JOIN claims c ON c.claim_id=a.claim_id
+                 LEFT JOIN scheduler_task_retries r ON r.task_seq=t.queue_seq
+                 WHERE a.state='APPROVED' AND a.repo=?2 AND a.base_commit=?3 AND a.model=?4
+                 AND {} ORDER BY a.event_seq LIMIT ?5",
+                model_dispatch_gate()
+            ))?;
+            stmt.query_map(
+                params![now, repo, base_commit, model, limit],
+                decode_approval,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        snapshot.commit()?;
+        Ok(rows)
+    }
+
     /// First approval reserves a free, enrolled task from ordinary FIFO. An exact
     /// retry returns the original row in its current state without reapproving it;
     /// any change to the saved inputs is rejected, including after cancellation.
@@ -255,22 +348,8 @@ impl StateStore {
             matches!(input.role, "prover_worker" | "independent_reviewer"),
             "unsupported DSH model role"
         );
-        ensure!(
-            Path::new(input.repo).is_absolute() && !input.repo.chars().any(char::is_control),
-            "expected canonical managed repository path"
-        );
-        ensure!(
-            matches!(input.base_commit.len(), 40 | 64)
-                && input
-                    .base_commit
-                    .bytes()
-                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-            "expected full lowercase Git base commit"
-        );
-        ensure!(
-            valid_token(input.model, 100),
-            "invalid DSH model identifier"
-        );
+        validate_scope(input.repo, input.model)?;
+        validate_base(input.base_commit)?;
         ensure!(
             (1..=60).contains(&input.max_wall_seconds),
             "DSH model wall seconds must be in 1..=60"
@@ -288,7 +367,7 @@ impl StateStore {
             require_available(tx, input.repo)?;
             let runnable: bool = tx.query_row(
                 &format!("SELECT EXISTS(SELECT 1 FROM scheduler_tasks t JOIN claims c ON c.claim_id=?3
-                  WHERE {RUNNABLE_MODEL_SUBJECT} AND NOT {ADAPTATION_LINKED})"),
+                  WHERE t.task_id=?2 AND {MODEL_SUBJECT} AND {MODEL_SLOT_FREE} AND NOT {ADAPTATION_LINKED})"),
                 params![now_ms(tx)?, input.task_id, input.claim_id],
                 |r| r.get(0),
             )?;
@@ -333,9 +412,8 @@ impl StateStore {
             );
             require_available(tx, expected_repo)?;
             let now = now_ms(tx)?;
-            let (exploration, infrastructure) = active_counts(tx, now)?;
             ensure!(
-                exploration + infrastructure < ACTIVE_LIMIT && infrastructure < TRACK_ACTIVE_LIMIT,
+                lease_capacity(tx, now)?,
                 "no scheduler lease capacity for model dispatch"
             );
             let (seq, engine, module_path, target) = tx
@@ -344,8 +422,8 @@ impl StateStore {
                         "SELECT t.queue_seq,t.engine,t.module_path,t.target
                   FROM scheduler_tasks t JOIN claims c ON c.claim_id=?3
                   LEFT JOIN scheduler_task_retries r ON r.task_seq=t.queue_seq
-                  WHERE {RUNNABLE_MODEL_SUBJECT} AND NOT {ADAPTATION_LINKED} AND NOT {MODULE_GATED}
-                  AND NOT {HELD_FOR_ORACLE} AND NOT {DEPENDENCY_BLOCKED} AND {RETRY_READY}"
+                  WHERE t.task_id=?2 AND {}",
+                        model_dispatch_gate()
                     ),
                     params![now, task_id, row.claim_id],
                     |r| Ok((r.get::<_, i64>(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
@@ -382,6 +460,29 @@ impl StateStore {
         })
     }
 
+    /// Read-only observation of the exact coordinator-local model lease at one
+    /// snapshot, without renewal, release, or reconciliation. A live result
+    /// does not reserve the fence against cancellation or expiry after return.
+    pub fn model_dispatch_lease_is_live(&self, lease: &TaskLease) -> Result<bool> {
+        let snapshot = self.db.unchecked_transaction()?;
+        if !model_dispatch_table_exists(&snapshot)? {
+            return Ok(false);
+        }
+        let now = now_ms(&snapshot)?;
+        let live = snapshot.query_row(
+            &format!("SELECT EXISTS(SELECT 1 FROM scheduler_tasks t
+                JOIN scheduler_model_dispatch_approvals a ON a.task_id=t.task_id
+                WHERE a.state='DISPATCHED' AND t.task_id=?2 AND t.last_fence=?3
+                AND t.completed_at_ms IS NULL AND t.lease_expires_at_ms>?1
+                AND NOT {MODULE_GATED} AND NOT {HELD_FOR_ORACLE}
+                AND EXISTS(SELECT 1 FROM task_scheduler_control WHERE singleton=1 AND scope_id=?4))"),
+            params![now, lease.id, lease.fence.generation, lease.fence.scope_id],
+            |r| r.get(0),
+        )?;
+        snapshot.commit()?;
+        Ok(live)
+    }
+
     /// Release an in-flight model lease without recording a failure or making the
     /// task eligible for another dispatch. An expired/frozen/released lease is a no-op.
     pub fn release_model_dispatch_lease(&mut self, lease: &TaskLease) -> Result<bool> {
@@ -410,6 +511,65 @@ impl StateStore {
                 "only an APPROVED model dispatch can be cancelled"
             );
             transition(tx, row, ModelDispatchState::Cancelled, CANCELLED, change)
+        })
+    }
+
+    /// Tombstone a dispatched ID and revoke its lease under the same writer
+    /// lock as model candidate submission. A durable outcome which wins first
+    /// is never altered, even if reconciliation has not marked it RECORDED.
+    /// A repeated cancellation is a no-op; neither path permits redispatch.
+    pub fn cancel_running_model_dispatch(
+        &mut self,
+        task_id: &str,
+        change: Change<'_>,
+    ) -> Result<ModelDispatchApproval> {
+        ensure!(model_id(task_id), "invalid DSH model task ID");
+        self.write(|tx| {
+            let row = require(tx, task_id)?;
+            if row.state == ModelDispatchState::Cancelled {
+                return Ok(row);
+            }
+            ensure!(row.state == ModelDispatchState::Dispatched,
+                "only a DISPATCHED model dispatch can be cancelled while running");
+            let revoked = tx.execute(
+                "UPDATE scheduler_tasks AS t SET lease_expires_at_ms=NULL
+                 WHERE t.task_id=?1 AND t.completed_at_ms IS NULL
+                 AND NOT EXISTS(SELECT 1 FROM scheduler_model_task_candidates m WHERE m.task_seq=t.queue_seq)
+                 AND NOT EXISTS(SELECT 1 FROM scheduler_task_candidates n WHERE n.task_seq=t.queue_seq)",
+                [task_id],
+            )?;
+            ensure!(revoked == 1, "cannot cancel a model dispatch with a durable outcome");
+            transition(tx, row, ModelDispatchState::Cancelled, CANCELLED, change)
+        })
+    }
+
+    /// Record up to `limit` (1..=64) already durable exact DshModel candidates
+    /// in DISPATCHED event order. Scope is repository and model, deliberately
+    /// not current Git HEAD: each candidate must match its approval's old base.
+    /// Non-matches are filtered before LIMIT; no leases are issued or reset.
+    /// The return value contains only approvals newly advanced to RECORDED.
+    pub fn reconcile_model_dispatches(
+        &mut self,
+        repo: &str,
+        model: &str,
+        limit: usize,
+        change: Change<'_>,
+    ) -> Result<Vec<ModelDispatchApproval>> {
+        validate_scope(repo, model)?;
+        let limit = validate_batch_limit(limit)?;
+        self.write(|tx| {
+            let rows = {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {APPROVAL_COLUMNS} FROM scheduler_model_dispatch_approvals a
+                     WHERE a.state='DISPATCHED' AND a.repo=?1 AND a.model=?2
+                     AND {EXACT_MODEL_CANDIDATE} ORDER BY a.event_seq LIMIT ?3"
+                ))?;
+                stmt.query_map(params![repo, model, limit], decode_approval)?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            rows.into_iter()
+                .map(|row| transition(tx, row, ModelDispatchState::Recorded, RECORDED, change))
+                .collect()
         })
     }
 
