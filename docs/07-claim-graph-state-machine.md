@@ -103,3 +103,13 @@ L0 (Conjecture)
 | `decision_inbox` & `human_checkpoints` | 非阻塞决策收件箱与人类检查点游标（`cursor_id`, `event_seq`, `git_commit`） |
 
 当前已提供 [单 Claim 历史事件重放](architecture-acceptance.md#L458)和 [单 ProofPlan 历史事件重放](architecture-acceptance.md#L466)；也支持 [同一事件截点的 AND-OR 整图重放](architecture-acceptance.md#L474) 与拓扑校验。这些视图不依赖当前的图表数据，也不等同于从事件恢复整库。 另有 [当前图投影对账](architecture-acceptance.md#L482)，在同一 SQLite 读事务内核对账本与物化行，不修复数据。 [账本头 AND-OR 语义检查](architecture-acceptance.md#L490) 另行重算图的派生状态，不将账本/物化表相符等同于推导正确。
+
+---
+
+## 6. 泛型状态图与双通道 Belief Propagation 演进（[ADR-0007](adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md) D32）
+
+面向跨学科科学验证与带条件标签的外部文献引用，主状态图按 [09-scientific-generalization-and-belief-vault.md §4](09-scientific-generalization-and-belief-vault.md#4-泛型主状态图与双通道-belief-propagation) 平滑演进：
+1. **泛型化表结构（迁移 9）**：为 `claims` 引入 `domain_id`（旧行默认 `'itp'`）、`epistemic_debts_json`、`source_entry_id` 与 `belief_json`，并通过 SQLite 触发器保证 `domain_id='itp'` 严锁 `L0..L5`、非 ITP 领域使用 `E0..E5`；新增 `claim_conflict_edges` 表达 `contradicts` / `replicates` 因子；
+2. **双通道传播模型**：
+   * **通道 1（硬底线）**：继续严格执行不可抵消的离散认识论格聚合、全量债务并集与硬证伪/撤稿否决；
+   * **通道 2（Subjective Logic BP）**：为节点与证据引入 `(belief, disbelief, uncertainty)` 三元组 + 标签确定性衰减（如 `incomplete_conditions` / `unreproduced_literature` / `secondary_citation` 准入打标后自动折损）+ 共享祖先去重的阻尼因子图消息传递，输出冲突度、归因链与驱动空闲复现排期的反向敏感度 `VoI`。

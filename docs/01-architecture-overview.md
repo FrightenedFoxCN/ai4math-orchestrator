@@ -121,3 +121,12 @@
 工程阶段以 [08. 工程实现架构 §5](08-engineering-architecture.md#5-分阶段实现顺序) 为准：**Phase 1：Rust 核心 + CLI 验证闭环 → Phase 2：常驻守护进程 → Phase 3：DSH 插件与 Live HUD**。阶段状态见 [README](../README.md)，首阶段验收见 [Phase 1 清单](phase-1.md)。
 
 探索/基建双轨、异步共驾与多引擎是产品能力，不另设同名阶段。Phase 1 先用 Lean 4 / Agda 建立可信验证与状态底座；常驻协作、人工交互和其余引擎适配随工程交付逐步接入。
+
+---
+
+## 8. 跨学科泛化演进（计算化学 / 计算生物学与通用科学验证）
+
+在保持上述 ITP（Lean 4 / Agda / Rocq）所有形式化不变量零回归的前提下，系统已将核心控制面抽离为领域无关架构，详见 [09. 跨学科科学验证泛化、多维算力调度、四层知识库与双通道信念传播](09-scientific-generalization-and-belief-vault.md) 及 [ADR-0007](adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md)（D28–D33）：
+
+* **已落地底座**：`DomainPack` / `EpistemicLevel` / `ScientificTrust (E0–E5)` / `SealedReceipt`、反漂移 `ProtocolSpec` 引擎（冻结模板 + 健全性门禁 + 盲测对照 + 预注册试错账本），以及本地 GPU 逐卡/统一内存池 + 双层 `ComputeBackend` / `SlurmTransport`（本地 CLI + 受控 SSH + 持久作业账本）。
+* **下一阶段抽象（先通用内核、再数学基线文献验证、后化生扩展）**：① 双通道信念传播（Subjective Logic `(b, d, u)` + 标签衰减 + 反向 VoI）与知识本体；② 泛型主状态图 + 平滑演进四层知识库（新增 `LITERATURE`、通用 `entry_facets` 与可插拔向量检索）；③ 空闲算力复现/形式化排期（含人类显式队列）；④ 先对已建立的数学基线相关文献落地抽取溯源门禁与漂移验证；⑤ 随后再扩展 CompChem / CompBio 领域文献卡型与计算试点。

@@ -4,9 +4,9 @@
 
 ## 交接快照
 
-代码验收基线：`e5e5ef4`（在 `0d2b6d1` 之后新增 DSH 实装修复、UI 呈现重构、三期一体化工作台与中英文实时切换共 3 个插件提交）。
+代码验收基线：`97a5028`（在 `e5e5ef4` 之后新增跨学科领域包与反漂移 `ProtocolSpec` 底座 `7648418`，以及多维 GPU 资源池与统一 SLURM 后端 `97a5028` 共 2 个 Rust 抽象提交）。
 
-- **本机标准套件**：Rust 工作区 577 通过、0 失败、77 默认忽略（截至 `0d2b6d1`，后续未修改 Rust 代码）；DSH 插件 **119 通过 / 0 失败**（含 bundle 一致性、Host 热切桥接、多项目工作台、浏览器 VM 与中英文实时切换校验）。
+- **本机标准套件**：Rust 工作区 **68 套件、614 通过、0 失败、77 默认忽略**（截至 `97a5028`，`cargo fmt` 与新增模块 Clippy 零警告，架构依赖守卫全通）；DSH 插件 **119 通过 / 0 失败**（含 bundle 一致性、Host 热切桥接、多项目工作台、浏览器 VM 与中英文实时切换校验）。
 - **已取得的原生与现用 GUI 证据**：固定工具链的关键 Lean 回归在允许 Broker Seatbelt 的本机宿主跑通；独立安装版 DSH SDK 核对真实 daemon 重启重连、卸载及 Electron Host 托管启停闭环；现用 DSH Desktop GUI 已完成插件安装、全屏工作台与底部 HUD/侧栏面板、断线重连、禁用卸载、多项目创建与中英文跟随验收。
 - **优先恢复项**：定位 Rocq 9.3 `coqchk` 初始化所需最小权限并保持项目 Seatbelt；在带 cgroup v2 委派的 Linux 宿主完成 launcher、实际限额和回收的端到端验证；补齐 Guest/登出浏览器实测与独立操作者写确认边界。其余缺口见[交付清单](delivery-roadmap.md)。
 
@@ -153,6 +153,28 @@
   - Client 注册左侧导航 `sidebar.panellist:ai4math`、全屏 `main:ai4math` 工作台（总览 / 简报 / 前沿 / 收件箱 / Wiki / 环境与角色、原生目录选择、关联会话与一键 **新建 Chief 主编排会话**）、会话顶栏 `conversation.session.header.utilities` 目录联动切换胶囊，以及熔断/收件箱只读操作者 CLI 命令助手（不越过 [Owner 审批边界](owner-approval-boundary.md)）。
   - 接入 DSH `ctx.locale`，全界面支持中/英文实时无刷新切换，EN/ZH 字典键完全对等。
 - **本批验证**：DSH 插件 119 通过 / 0 失败；`installed-bundle-metadata.mjs` 官方 Loader 校验、`installed-dsh.mjs` 真实 SDK+Rust 集成测试及 Electron Host 真实托管闭环均通过；现用 Desktop GUI 已完成安装、UI 视觉、工作台建项与中英文切换验收，并经过两轮独立 UI/UX 审查与全项修复。
+
+## 后续批次：跨学科领域包与反漂移 `ProtocolSpec` 底座（`7648418`）
+
+- 在 `ai4math-core` 抽离 `EpistemicLevel`、`EpistemicDebt`、`EpistemicAssessment`、`ScientificTrust (E0–E5)`、`BackendDescriptor` 正向/证伪双上限与 `DomainPack` trait，将既有 ITP 封装为内置 `ItpDomainPack`，并补充 64 组偏序矩阵全覆盖回归。
+- 在 `ai4math-evidence` 新增零 IO 的 `SealedReceipt` / `ProtocolRunEvidence` 端口与 `ProtocolSpec` 单遍槽位编译、物理健全性门禁、正交多验证器分歧判定、无环 Merkle `BlindedControlPack`、`PreRegistrationSpec` 与协议异味（含 `SurrogateGoodhartCollapse`）审计；原有 ITP `VerificationReceipt` 无侵入实现 `SealedReceipt` 且 wire 格式零变化。
+- 在 `ai4math-broker` 落地 `Broker::verify_protocol` 与 `SandboxedExecutableRunner`；在 `ai4math-store` 以迁移 7（`schemas/protocol-verification.sql`）落地不可变预注册与只追加 `protocol_trials` 账本。
+- **验证**：新增 CompChem / CompBio 端到端反漂移与只读旧库回归，Rust 596 通过 / 0 失败，插件 119 通过 / 0 失败。
+
+## 后续批次：多维 GPU 资源池与统一 SLURM 后端（`97a5028`）
+
+- 在 `ai4math-core` 新增 `ResourceRequest`（CPU/RAM/GPU/scratch/walltime）、`SlurmClusterPolicy`、`ExecutionTargetKind`、`ComputeJobStatus` 与 `ComputePoolSnapshot`；在 `ai4math-evidence` 新增可选 `ProtocolSpec.resource_ceiling`、`StagedJobBundle`、`ClusterMountMap`、匿名 Fisher-Yates `BlindedArrayPlan` 及防注入 `SlurmJobId` / `SlurmFlag`。
+- 在 `ai4math-broker` 落地 `LocalComputePool` + RAII `ComputeLease`（逐卡独占/共享显存分配、Apple Silicon 统一内存联动扣减、强制 `CUDA_VISIBLE_DEVICES` 注入与 CPU-only 置空、`Static/NvidiaSmi/AppleUnified` 探测）、上层 `ComputeBackend`（`LocalComputeBackend` / `SlurmComputeBackend<T>`）、下层窄接口 `SlurmTransport`（`LocalSlurmCli` + 固定 `BatchMode`/`StrictHostKeyChecking=yes` + 纯 Rust 有界 ustar tar 的 `SshSlurmTransport`），以及 `Broker` 三阶段异步协议验证（远端 SLURM 自动挂载 `unattested_remote_hpc` 债）。
+- 在 `ai4math-store` 以迁移 8（`schemas/compute-jobs.sql`）持久化在途异步作业、私有解盲表、重启配额恢复与按分支标签批量 `scancel`。
+- **验证**：本机单测与合成集群测试通过（涵盖本地多卡 GPU 绑定、SLURM 盲测 Job Array 重启恢复、熔断按分支 `scancel` 与 OOM 封印为 `VerifierError`）；Rust **614 通过 / 0 失败 / 77 默认忽略**，插件 119 通过 / 0 失败。尚未在真实生产 SLURM 集群或 Linux CUDA 宿主做原生实跑验收。
+
+## 后续规划（架构已定稿于 [ADR-0007](adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md)，尚未代码实施）
+
+- 阶段 1：`ai4math-core::belief`（双通道 Subjective Logic `(b, d, u)` 因子图 BP、标签衰减、共享祖先去重与反向 VoI）+ `ai4math-core::knowledge`。
+- 阶段 2：`ai4math-store` 迁移 9 泛型主状态图 + 平滑演进四层 `KnowledgeVault`（新增 `LITERATURE`、通用 `entry_facets` 与可插拔 `EmbeddingProvider`/`SemanticIndex` 向量检索）。
+- 阶段 3：`IdleVerificationScheduler`（VoI 自动队列 + 人类显式待核验队列 + 空闲算力护栏与 `replicates`/`contradicts` 闭环）。
+- 阶段 4（后置 · 先数学基线）：`ai4math-evidence::literature` 通用溯源门禁、数学文献卡型与 6 维离线漂移测试床，并先针对已建立的数学基线相关论文做抽取与空闲形式化验证（暂不接 CompChem / CompBio）。
+- 阶段 5（非 ITP 拓展）：在数学基线文献抽取验证稳定后，再扩展 CompChem / CompBio 文献卡型（单位归一化、实验条件与对照配方）并接入首个计算化生试点。
 
 ## 尚未完成
 

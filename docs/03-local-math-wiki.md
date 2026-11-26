@@ -141,3 +141,13 @@ lemma haar_conv_l2_bound ... := by ...
   * `wiki_check_graveyard(informal_statement, formal_signature?)`
   * `wiki_ingest(entry_payload)`
   * `wiki_rehydrate(sediment_id, target_module)`
+
+---
+
+## 7. 向通用四层科学知识库平滑演进（[ADR-0007](adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md) D31 / D33）
+
+为支撑计算化学/计算生物学以及论文知识摄入，且不破坏现有 `.mathwiki` 兼容基线，本知识库按 [09-scientific-generalization-and-belief-vault.md §3](09-scientific-generalization-and-belief-vault.md#3-知识库平滑演进四层-knowledgevault-与可插拔向量检索) 做四项平滑扩展：
+1. **新增第 4 层 `LITERATURE`（`literature/`）**：隔离存放外部文献结构化参考卡（永久携带 `unreproduced_literature` 债，不冒充 `CORE`）；对标记为可形式化/可复现的条目，可通过空闲算力排期（BP 反向 VoI 自动队列 + 人类显式队列）复现通过后经 `replicates` 边纳入 `CORE`；
+2. **通用分面倒排 `entry_facets`**：在兼容保留 ITP 四类 `entry_symbols` 与旧 `WikiQuery` 的同时，支持按领域包注册的分面（如 `inchikey` / `smiles` / `pdb_id` / `uniprot_id` / `level_of_theory` / `doi`）检索；
+3. **三通道 Shadow Hint 与冲突簇**：查 `CORE` 时同步静默提示 `SEDIMENT`、`GRAVEYARD` 与 `LITERATURE`（含撤稿/冲突标记）；
+4. **可插拔向量检索抽象**：通过 `EmbeddingProvider` 与 `SemanticIndex`（默认 `NoopSemanticIndex` 保持纯离线确定性，内置内存余弦实现，后续可接 `sqlite-vec`）补齐三路 RRF 混合召回。
