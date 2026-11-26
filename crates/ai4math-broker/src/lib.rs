@@ -1,5 +1,13 @@
 mod breaker_probe;
 pub use breaker_probe::{VerifiedBreakerProbes, lean_breaker_sources_sha256};
+pub mod compute;
+pub use compute::{
+    AppleUnifiedGpuInventory, ComputeBackend, ComputeJobPoll, ComputeLease, GpuDeviceSpec,
+    GpuInventoryProvider, LocalComputeBackend, LocalComputeCapacity, LocalComputePool,
+    LocalSlurmCli, LocalTaskExecutor, NvidiaSmiInventory, SlurmComputeBackend,
+    SlurmContainerRuntime, SlurmExecutionProfile, SlurmTransport, SshSlurmConfig,
+    SshSlurmTransport, StaticGpuInventory, SubmittedComputeJob, TaskExecutionObservation,
+};
 pub mod git_policy;
 mod golden;
 mod infra_smoke;
@@ -27,6 +35,10 @@ mod protocol;
 pub use protocol::{
     ProtocolBackendRunner, ProtocolLane, ProtocolVerificationRequest, RawBackendOutput,
     SandboxedExecutableRunner, VerifiedProtocolRun,
+};
+mod protocol_async;
+pub use protocol_async::{
+    AsyncProtocolSubmitRequest, PendingProtocolJob, UNATTESTED_REMOTE_HPC_DEBT,
 };
 mod regression_failure;
 pub use regression_failure::RegressionFailure;

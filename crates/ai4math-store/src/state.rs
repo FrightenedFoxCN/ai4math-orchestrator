@@ -19,6 +19,7 @@ use std::{
 };
 
 mod claim_replay;
+mod compute_jobs;
 mod graph_audit;
 mod graph_check;
 mod graph_replay;
@@ -41,6 +42,7 @@ mod t3_follow;
 mod tasks;
 mod trust_debt;
 pub use claim_replay::{ClaimReplay, ReplayedClaim};
+pub use compute_jobs::{ActiveComputeQuota, NewComputeJob, RetainedComputeJob};
 pub use graph_audit::{GraphAudit, GraphMismatch, GraphMismatchKind};
 pub use graph_check::{GraphSemanticCheck, GraphSemanticMismatch};
 pub use graph_replay::GraphReplay;
@@ -501,6 +503,7 @@ impl StateStore {
         migrations::initialize_model_dispatch(&mut store.db)?;
         migrations::initialize_owner_archive_requests(&mut store.db)?;
         migrations::initialize_protocol_verification(&mut store.db)?;
+        migrations::initialize_compute_jobs(&mut store.db)?;
         Ok(store)
     }
 

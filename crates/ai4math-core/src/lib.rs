@@ -1,5 +1,6 @@
 //! Typed orchestration data and static admission for phase one.
 
+pub mod compute;
 pub mod contracts;
 pub mod domain;
 pub mod pack_itp;
@@ -7,6 +8,10 @@ pub mod preflight;
 pub mod proof;
 pub mod trust;
 
+pub use compute::{
+    ComputeJobStatus, ComputePoolSnapshot, ExecutionTargetKind, GpuDeviceSnapshot, GpuKind,
+    GpuRequest, ResourcePolicyError, ResourceRequest, SlurmClusterPolicy,
+};
 pub use contracts::*;
 pub use domain::{
     BackendDescriptor, DomainPack, EpistemicAssessment, EpistemicCeilingViolation, EpistemicDebt,

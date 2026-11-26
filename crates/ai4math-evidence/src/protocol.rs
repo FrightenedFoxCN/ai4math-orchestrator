@@ -7,7 +7,7 @@
 //! computational science workflows (e.g. computational chemistry and biology).
 
 use crate::ordered_source_set_sha256;
-use ai4math_core::{EpistemicLevel, ScientificTrust};
+use ai4math_core::{EpistemicLevel, ResourceRequest, ScientificTrust};
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -639,6 +639,8 @@ pub struct ProtocolSpec {
     pub control_policy: BlindedControlPolicy,
     #[serde(default)]
     pub preregistration_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_ceiling: Option<ResourceRequest>,
 }
 
 impl ProtocolSpec {
@@ -784,6 +786,11 @@ impl ProtocolSpec {
             );
         }
         self.control_policy.validate()?;
+        if let Some(ceiling) = &self.resource_ceiling {
+            ceiling
+                .validate()
+                .map_err(|e| anyhow::anyhow!("invalid protocol resource_ceiling: {e}"))?;
+        }
         Ok(())
     }
 
@@ -1716,6 +1723,7 @@ mod tests {
             orthogonal_policy: OrthogonalPolicy::default(),
             control_policy: BlindedControlPolicy::default(),
             preregistration_required: true,
+            resource_ceiling: None,
         }
     }
 

@@ -4,12 +4,20 @@
 //! exposes only read-only ports. Implementing a port is unsafe because a false
 //! implementation can fabricate proof, refutation, or admission evidence.
 
+pub mod compute;
 mod oracle;
 pub mod protocol;
 mod sealed;
 
 use ai4math_core::Engine;
 use anyhow::Result;
+pub use compute::{
+    BlindedArrayBundleRequest, BlindedArrayPlan, BlindedArrayRole, ClusterMountEntry,
+    ClusterMountMap, ComputeExecutionAttestation, FetchedJobOutputs, MAX_ARRAY_LEN,
+    MAX_STAGED_BUNDLE_BYTES, SlurmFlag, SlurmJobId, SlurmJobObservation, SlurmJobState,
+    StagedJobBundle, build_blinded_array_bundle, is_safe_compute_token,
+    is_safe_relative_bundle_path, is_safe_remote_abs_path,
+};
 pub use oracle::{
     ExactCheck, MAX_ORACLE_QUERY_BYTES, OracleOutcome, OracleQuery, PreparedOracleQuery,
 };

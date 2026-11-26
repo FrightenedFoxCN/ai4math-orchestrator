@@ -276,6 +276,94 @@ impl VerifiedProtocolRun {
     pub fn receipt_sha256(&self) -> &str {
         &self.receipt_sha256
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seal_from_broker(
+        domain_id: String,
+        backend_id: String,
+        protocol_id: String,
+        protocol_sha256: String,
+        base_commit: String,
+        candidate_id: String,
+        candidate_sha256: String,
+        rendered_artifacts_sha256: String,
+        pinned_inputs_sha256: String,
+        verifier_sha256: String,
+        verdict: ProtocolVerdict,
+        epistemic_level: ScientificTrust,
+        epistemic_debts: Vec<String>,
+        control_summary: BlindedControlSummary,
+        verifier_reports: Vec<VerifierReport>,
+        aggregated_diagnostics: ParsedDiagnostics,
+        failure_reasons: Vec<String>,
+        elapsed_seconds: f64,
+    ) -> Result<Self> {
+        #[derive(Serialize)]
+        struct Preimage<'a> {
+            domain: &'static str,
+            domain_id: &'a str,
+            backend_id: &'a str,
+            protocol_id: &'a str,
+            protocol_sha256: &'a str,
+            base_commit: &'a str,
+            candidate_id: &'a str,
+            candidate_sha256: &'a str,
+            rendered_artifacts_sha256: &'a str,
+            pinned_inputs_sha256: &'a str,
+            verifier_sha256: &'a str,
+            verdict: ProtocolVerdict,
+            epistemic_level: ScientificTrust,
+            epistemic_debts: &'a [String],
+            control_summary: &'a BlindedControlSummary,
+            verifier_reports: &'a [VerifierReport],
+            failure_reasons: &'a [String],
+        }
+        let receipt_sha256 = digest(&serde_json::to_vec(&Preimage {
+            domain: "ai4math:protocol-run-receipt:v1",
+            domain_id: &domain_id,
+            backend_id: &backend_id,
+            protocol_id: &protocol_id,
+            protocol_sha256: &protocol_sha256,
+            base_commit: &base_commit,
+            candidate_id: &candidate_id,
+            candidate_sha256: &candidate_sha256,
+            rendered_artifacts_sha256: &rendered_artifacts_sha256,
+            pinned_inputs_sha256: &pinned_inputs_sha256,
+            verifier_sha256: &verifier_sha256,
+            verdict,
+            epistemic_level,
+            epistemic_debts: &epistemic_debts,
+            control_summary: &control_summary,
+            verifier_reports: &verifier_reports,
+            failure_reasons: &failure_reasons,
+        })?);
+        let issued_unix_seconds = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        Ok(Self {
+            domain_id,
+            backend_id,
+            protocol_id,
+            protocol_sha256,
+            base_commit,
+            candidate_id,
+            candidate_sha256,
+            rendered_artifacts_sha256,
+            pinned_inputs_sha256,
+            verifier_sha256,
+            verdict,
+            epistemic_level,
+            epistemic_debts,
+            control_summary,
+            verifier_reports,
+            aggregated_diagnostics,
+            failure_reasons,
+            issued_unix_seconds,
+            elapsed_seconds,
+            receipt_sha256,
+        })
+    }
 }
 
 // SAFETY: Constructed exclusively inside `Broker::verify_protocol` after validating
@@ -978,6 +1066,7 @@ mod tests {
             orthogonal_policy: OrthogonalPolicy::default(),
             control_policy: BlindedControlPolicy::default(),
             preregistration_required: true,
+            resource_ceiling: None,
         }
     }
 

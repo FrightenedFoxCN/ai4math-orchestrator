@@ -172,6 +172,7 @@ fn end_to_end_compchem_anti_drift_pipeline_from_broker_to_store() -> Result<()> 
             min_negative_controls: 1,
         },
         preregistration_required: true,
+        resource_ceiling: None,
     };
     let protocol_sha256 = protocol.protocol_sha256()?;
 
@@ -463,6 +464,7 @@ fn end_to_end_compbio_orthogonal_e4b_and_goodhart_collapse_detection() -> Result
         },
         control_policy: BlindedControlPolicy::default(),
         preregistration_required: true,
+        resource_ceiling: None,
     };
     let protocol_sha256 = protocol.protocol_sha256()?;
     let prereg = PreRegistrationSpec {
