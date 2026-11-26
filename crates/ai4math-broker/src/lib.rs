@@ -10,6 +10,11 @@ pub use compute::{
 };
 pub mod git_policy;
 mod golden;
+mod idle_scheduler;
+pub use idle_scheduler::{
+    IdleAdmissionPolicy, IdleBudgetPolicy, IdleCandidate, IdleDispatchDecision, IdleSystemSnapshot,
+    IdleVerificationScheduler,
+};
 mod infra_smoke;
 pub use infra_smoke::{VerifiedInfraCompletion, VerifiedInfraSmoke, lean_infra_sources_sha256};
 mod lean_hammer;

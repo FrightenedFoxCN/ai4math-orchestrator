@@ -289,6 +289,58 @@ fn generalized_claim_graph_lifts_legacy_itp_enforces_domain_triggers_and_persist
     Ok(())
 }
 
+#[test]
+fn idle_verification_queue_triggers_block_delete_and_legacy_readonly_reads_empty() -> Result<()> {
+    let dir = tempdir()?;
+    let db_path = dir.path().join("idle.sqlite");
+    let mut store = StateStore::open(&db_path)?;
+    let actor = Change {
+        actor: "human",
+        git_commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+    };
+    let ticket = store.enqueue_idle_verification(
+        actor,
+        &ai4math_store::NewIdleVerificationTicket {
+            ticket_id: "idle-human-1",
+            source: ai4math_store::IdleTicketSource::Human,
+            entry_id: "LIT-001",
+            epistemic_node_id: None,
+            domain_id: "itp",
+            reproducibility_class: ReproducibilityClass::FormalizableInItp,
+            target_protocol_or_engine: "lean4",
+            priority_score: 0.9,
+            human_note: Some("check lemma 3.2"),
+        },
+    )?;
+    assert_eq!(ticket.status, ai4math_store::IdleTicketStatus::Queued);
+    store.cancel_idle_ticket(actor, "idle-human-1", "superseded")?;
+    drop(store);
+
+    let raw = Connection::open(&db_path)?;
+    assert!(
+        raw.execute("DELETE FROM idle_verification_queue", [])
+            .is_err()
+    );
+    assert!(
+        raw.execute(
+            "UPDATE idle_verification_queue SET status='queued' WHERE ticket_id='idle-human-1'",
+            []
+        )
+        .is_err()
+    );
+
+    // Simulate legacy DB without migration 10 -> readonly returns empty cleanly.
+    raw.execute_batch(
+        "DROP TABLE idle_verification_queue; DELETE FROM state_migrations WHERE version=10;",
+    )?;
+    drop(raw);
+    let ro = StateStore::open_readonly(&db_path)?;
+    assert!(ro.list_queued_idle_tickets()?.is_empty());
+    assert!(ro.read_idle_ticket("idle-human-1")?.is_none());
+    assert_eq!(ro.idle_usage_totals()?.executed_tickets, 0);
+    Ok(())
+}
+
 struct ToyEmbeddingProvider;
 impl EmbeddingProvider for ToyEmbeddingProvider {
     fn model_id(&self) -> &str {

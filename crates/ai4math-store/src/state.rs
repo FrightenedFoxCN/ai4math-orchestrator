@@ -24,6 +24,7 @@ mod epistemic_graph;
 mod graph_audit;
 mod graph_check;
 mod graph_replay;
+mod idle_queue;
 mod infra_rfc;
 mod ledger_replay;
 mod migrations;
@@ -51,6 +52,10 @@ pub use epistemic_graph::{
 pub use graph_audit::{GraphAudit, GraphMismatch, GraphMismatchKind};
 pub use graph_check::{GraphSemanticCheck, GraphSemanticMismatch};
 pub use graph_replay::GraphReplay;
+pub use idle_queue::{
+    IdleTicketSource, IdleTicketStatus, IdleUsageTotals, NewIdleVerificationTicket,
+    RetainedIdleTicket,
+};
 pub use infra_rfc::{INFRA_RFC_MAX_BYTES, InfraRfcRecord, InfraRfcStatus, parse_infra_rfc_draft};
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{
@@ -510,6 +515,7 @@ impl StateStore {
         migrations::initialize_protocol_verification(&mut store.db)?;
         migrations::initialize_compute_jobs(&mut store.db)?;
         migrations::initialize_epistemic_graph(&mut store.db)?;
+        migrations::initialize_idle_verification(&mut store.db)?;
         Ok(store)
     }
 

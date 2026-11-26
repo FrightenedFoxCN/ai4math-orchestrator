@@ -79,6 +79,19 @@ pub(super) fn initialize_epistemic_graph(db: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+pub(super) fn initialize_idle_verification(db: &mut Connection) -> Result<()> {
+    const PENDING: &str = "SELECT NOT EXISTS(SELECT 1 FROM state_migrations WHERE version=10)";
+    if db.query_row(PENDING, [], |r| r.get::<_, bool>(0))? {
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if tx.query_row(PENDING, [], |r| r.get::<_, bool>(0))? {
+            tx.execute_batch(include_str!("../../../../schemas/idle-verification.sql"))?;
+            tx.execute("INSERT INTO state_migrations(version) VALUES(10)", [])?;
+        }
+        tx.commit()?;
+    }
+    Ok(())
+}
+
 pub(super) fn pending(db: &Connection) -> rusqlite::Result<bool> {
     db.query_row(
         "SELECT NOT EXISTS(SELECT 1 FROM state_migrations WHERE version=2)",
