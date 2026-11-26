@@ -1,6 +1,7 @@
 //! Disposable metadata projected only from a caller-validated Git/ledger view.
-use super::{UNKNOWN_DATE, WikiStratum, sediment};
+use super::{UNKNOWN_DATE, sediment};
 use crate::retained::valid_id as valid_sha256;
+use ai4math_core::KnowledgeStratum;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::collections::BTreeMap;
@@ -97,8 +98,13 @@ impl<'a> Archives<'a> {
         Ok(Self(needed))
     }
 
-    pub(super) fn observe(&mut self, id: &str, stratum: WikiStratum, source: &str) -> Result<()> {
-        if stratum == WikiStratum::Sediment
+    pub(super) fn observe(
+        &mut self,
+        id: &str,
+        stratum: KnowledgeStratum,
+        source: &str,
+    ) -> Result<()> {
+        if stratum == KnowledgeStratum::Sediment
             && let Some(claim_id) = self.0.get_mut(id)
         {
             *claim_id = Some(sediment::parse_sediment(id, source)?.claim_id);

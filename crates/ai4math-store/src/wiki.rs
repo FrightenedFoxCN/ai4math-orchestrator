@@ -1,10 +1,13 @@
 use crate::{Trust, open_db};
-pub use ai4math_core::{ClaimEngine, WikiStratum};
+use ai4math_core::{CitationStatus, EpistemicTag, KnowledgeSourceKind, ReproducibilityClass};
+pub use ai4math_core::{ClaimEngine, KnowledgeStratum, WikiStratum};
+use ai4math_evidence::is_safe_compute_token;
 use anyhow::{Context, Result, ensure};
 use rusqlite::{
     Connection, Transaction, TransactionBehavior, params, params_from_iter, types::Value,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     path::Path,
@@ -15,17 +18,27 @@ mod managed_core;
 mod scan;
 pub(crate) mod scan_acl;
 mod sediment;
+mod semantic;
+mod vault;
 pub use managed_core::{WikiManagedCoreEntry, WikiManagedGeneration};
 pub use sediment::{
     SedimentArtifact, SedimentInput, StoredSediment, publish_sediment, read_sediment,
     render_sediment,
 };
+pub use semantic::{
+    EmbeddingProvider, InMemoryCosineIndex, NoopEmbeddingProvider, NoopSemanticIndex,
+    SemanticIndex, SemanticSyncStats, rrf_fuse,
+};
+pub use vault::{
+    AutomatableLiteratureEntry, ConflictCluster, VaultHit, VaultQuery, VaultSearchResult,
+};
 
 const DDL: &str = include_str!("../../../schemas/wiki-index.sql");
-const STRATA: [WikiStratum; 3] = [
-    WikiStratum::Core,
-    WikiStratum::Sediment,
-    WikiStratum::Graveyard,
+const STRATA: [KnowledgeStratum; 4] = [
+    KnowledgeStratum::Core,
+    KnowledgeStratum::Sediment,
+    KnowledgeStratum::Graveyard,
+    KnowledgeStratum::Literature,
 ];
 const HIGH_SCORE: f64 = 0.82;
 const MAX_PROVENANCE_DEPTH: u32 = 16;
@@ -110,7 +123,7 @@ pub struct WikiHit {
     pub file_path: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct WikiHitSummary {
     pub id: String,
     pub title: String,
@@ -120,13 +133,21 @@ pub struct WikiHitSummary {
     pub score: f64,
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 /// The cold-stratum teaser deliberately has no statement, signature, source path or notes.
-#[derive(Debug, Default, Serialize)]
+#[derive(Debug, Default, Clone, Serialize)]
 pub struct ShadowHint {
     pub sediment_count: usize,
     pub top_sediment: Option<WikiHitSummary>,
     pub graveyard_count: usize,
     pub top_graveyard_id: Option<String>,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub literature_count: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_literature_id: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -225,7 +246,7 @@ impl Wiki {
                 "frontmatter stratum does not match the directory"
             );
             archives.observe(&entry.id, stratum, source)?;
-            markdown.push(PreparedEntry::new(entry, body, relative)?);
+            markdown.push(PreparedEntry::new(entry, body, relative, source)?);
             Ok(())
         })?;
         let managed = if let Some(generation) = generation {
@@ -316,6 +337,9 @@ impl Wiki {
             let graveyard = search.candidates(&db, WikiStratum::Graveyard, false, true, true, 1)?;
             hint.graveyard_count = graveyard.high_count;
             hint.top_graveyard_id = graveyard.rows.into_iter().next().map(|row| row.id);
+            let (lit_count, top_lit) = vault::literature_shadow_teaser(&db, query.query, &[])?;
+            hint.literature_count = lit_count;
+            hint.top_literature_id = top_lit;
         }
         let mut hits = Vec::new();
         {
@@ -345,7 +369,10 @@ impl Wiki {
         db.commit()?;
         Ok(WikiSearchResult {
             hits,
-            shadow_hint: (hint.sediment_count > 0 || hint.graveyard_count > 0).then_some(hint),
+            shadow_hint: (hint.sediment_count > 0
+                || hint.graveyard_count > 0
+                || hint.literature_count > 0)
+                .then_some(hint),
         })
     }
 
@@ -398,6 +425,8 @@ impl Wiki {
                 FROM entry_edges e JOIN entries src ON src.id=e.src_id
                 LEFT JOIN entries dst ON dst.id=e.dst_id
                 WHERE (e.src_id=?1 OR e.dst_id=?1)
+                  AND src.stratum <> 'literature'
+                  AND (dst.stratum IS NULL OR dst.stratum <> 'literature')
                   AND (?3 OR (upper(e.src_id) NOT GLOB 'CORE-ADAPT-*'
                           AND upper(e.dst_id) NOT GLOB 'CORE-ADAPT-*'))
                 ORDER BY e.src_id,e.dst_id,e.edge_type LIMIT ?2",
@@ -451,9 +480,10 @@ impl Wiki {
 #[derive(Deserialize)]
 struct Frontmatter {
     id: String,
-    stratum: WikiStratum,
-    trust_level: Trust,
-    engine: ClaimEngine,
+    stratum: KnowledgeStratum,
+    domain_id: Option<String>,
+    trust_level: String,
+    engine: String,
     status: String,
     #[serde(default)]
     pinned: bool,
@@ -470,6 +500,13 @@ struct Frontmatter {
     compat_status: Option<String>,
     created_at: Option<String>,
     updated_at: Option<String>,
+    source_kind: Option<KnowledgeSourceKind>,
+    reproducibility_class: Option<ReproducibilityClass>,
+    citation_status: Option<CitationStatus>,
+    #[serde(default)]
+    condition_tags: Vec<String>,
+    #[serde(default)]
+    facets: BTreeMap<String, Vec<String>>,
     #[serde(default)]
     symbols: Symbols,
     #[serde(default)]
@@ -577,6 +614,11 @@ impl Body {
 
 struct PreparedEntry {
     entry: Frontmatter,
+    domain_id: String,
+    source_kind: KnowledgeSourceKind,
+    condition_tags_json: String,
+    content_sha256: String,
+    facets: Vec<(String, String)>,
     relative: String,
     title: String,
     gloss: String,
@@ -597,7 +639,12 @@ fn symbol_groups(entry: &Frontmatter) -> [(&'static str, &[String]); 4] {
 }
 
 impl PreparedEntry {
-    fn new(mut entry: Frontmatter, markdown: &str, relative: &str) -> Result<Self> {
+    fn new(
+        mut entry: Frontmatter,
+        markdown: &str,
+        relative: &str,
+        raw_source: &str,
+    ) -> Result<Self> {
         ensure!(!entry.id.trim().is_empty(), "Wiki entry ID cannot be blank");
         ensure!(
             !managed_core::reserved_id(&entry.id),
@@ -610,21 +657,110 @@ impl PreparedEntry {
                 "Wiki Markdown origin claim uses the reserved Core ID namespace"
             );
         }
-        if let Some(statuses) = positive_statuses(entry.stratum) {
+        let domain_id = entry.domain_id.take().unwrap_or_else(|| "itp".to_owned());
+        let epistemic = EpistemicTag::parse(&domain_id, &entry.trust_level)
+            .map_err(|e| anyhow::anyhow!("Wiki entry {} has {e}", entry.id))?;
+        if domain_id == "itp" && entry.engine != "literature" {
+            entry
+                .engine
+                .parse::<ClaimEngine>()
+                .with_context(|| format!("invalid ITP Wiki engine {:?}", entry.engine))?;
+        } else {
             ensure!(
-                entry.trust_level != Trust::L2b && statuses.contains(&entry.status.as_str()),
+                is_safe_compute_token(&entry.engine, 64),
+                "invalid Wiki backend/engine {:?}",
+                entry.engine
+            );
+        }
+
+        let source_kind = entry.source_kind.unwrap_or(match entry.stratum {
+            KnowledgeStratum::Core => KnowledgeSourceKind::ProjectVerified,
+            KnowledgeStratum::Sediment => KnowledgeSourceKind::ProjectArchived,
+            KnowledgeStratum::Graveyard => KnowledgeSourceKind::ProjectRefuted,
+            KnowledgeStratum::Literature => KnowledgeSourceKind::LiteratureExtracted,
+        });
+        if entry.stratum == KnowledgeStratum::Literature {
+            ensure!(
+                matches!(
+                    source_kind,
+                    KnowledgeSourceKind::LiteratureExtracted | KnowledgeSourceKind::HumanCurated
+                ),
+                "LITERATURE entry {} must have literature_extracted or human_curated source_kind",
+                entry.id
+            );
+            if source_kind == KnowledgeSourceKind::LiteratureExtracted {
+                ensure!(
+                    epistemic.positive_rank().is_none_or(|r| r < 5),
+                    "LITERATURE entry {} cannot claim terminal L5/E5 without local replication",
+                    entry.id
+                );
+            }
+            ensure!(
+                matches!(
+                    entry.status.as_str(),
+                    "active" | "unreferenced" | "superseded" | "retracted"
+                ),
+                "invalid status {:?} in LITERATURE stratum",
+                entry.status
+            );
+        } else if let Ok(wiki_stratum) = WikiStratum::try_from(entry.stratum)
+            && let Some(statuses) = positive_statuses(wiki_stratum)
+        {
+            ensure!(
+                !epistemic.is_hard_refutation() && statuses.contains(&entry.status.as_str()),
                 "Wiki entry {} with trust {} and status {} is not valid in stratum {}",
                 entry.id,
-                entry.trust_level.as_str(),
+                entry.trust_level,
                 entry.status,
                 entry.stratum.as_str(),
             );
         }
+
         for (role, values) in symbol_groups(&entry) {
             for symbol in values {
                 ensure!(!symbol.trim().is_empty(), "blank Wiki {role} symbol");
             }
         }
+        let mut condition_tags: BTreeSet<String> = entry
+            .condition_tags
+            .iter()
+            .map(|t| {
+                ensure!(is_safe_compute_token(t, 64), "invalid condition_tag {t:?}");
+                Ok(t.clone())
+            })
+            .collect::<Result<_>>()?;
+        if entry.stratum == KnowledgeStratum::Literature
+            && source_kind == KnowledgeSourceKind::LiteratureExtracted
+        {
+            condition_tags.insert("unreproduced_literature".to_owned());
+        }
+        if entry.citation_status == Some(CitationStatus::Retracted) || entry.status == "retracted" {
+            condition_tags.insert("retracted".to_owned());
+        }
+
+        let mut facet_set: BTreeSet<(String, String)> = BTreeSet::new();
+        for (role, values) in symbol_groups(&entry) {
+            for symbol in values {
+                facet_set.insert((role.to_owned(), symbol.clone()));
+            }
+        }
+        for (key, vals) in std::mem::take(&mut entry.facets) {
+            ensure!(is_safe_compute_token(&key, 64), "invalid facet key {key:?}");
+            for val in vals {
+                ensure!(
+                    !val.trim().is_empty() && val.len() <= 512,
+                    "invalid facet value for {key:?}"
+                );
+                facet_set.insert((key.clone(), val));
+            }
+        }
+        if let Some(cs) = entry.citation_status {
+            facet_set.insert(("citation_status".to_owned(), cs.as_str().to_owned()));
+        }
+        if let Some(rc) = entry.reproducibility_class {
+            facet_set.insert(("reproducibility_class".to_owned(), rc.as_str().to_owned()));
+        }
+
         let mut edges = Vec::new();
         for edge in std::mem::take(&mut entry.edges) {
             ensure!(
@@ -661,8 +797,15 @@ impl PreparedEntry {
             .unwrap_or_else(|| body.informal.trim().to_owned());
         let tags = std::mem::take(&mut entry.tags);
         let fingerprints = std::mem::take(&mut entry.def_fingerprints);
+        let content_sha256 = format!("{:x}", Sha256::digest(raw_source.as_bytes()));
+        let condition_tags_vec: Vec<String> = condition_tags.into_iter().collect();
         Ok(Self {
             entry,
+            domain_id,
+            source_kind,
+            condition_tags_json: serde_json::to_string(&condition_tags_vec)?,
+            content_sha256,
+            facets: facet_set.into_iter().collect(),
             relative: relative.to_owned(),
             title,
             gloss,
@@ -682,13 +825,26 @@ impl PreparedEntry {
             formal_signature,tags_json,verified_at_commit,origin_branch,origin_claim,def_fingerprints_json,
             compat_status,created_at,updated_at,file_path)
             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
-            params![entry.id,entry.stratum.as_str(),entry.trust_level.as_str(),entry.engine.as_str(),entry.status,
+            params![entry.id,entry.stratum.as_str(),entry.trust_level,entry.engine,entry.status,
                 entry.pinned,self.title,self.gloss,entry.formal_signature,self.tags_json,entry.verified_at_commit,
                 entry.origin_branch,entry.origin_claim,self.fingerprints_json,
                 entry.compat_status.as_deref().unwrap_or("unknown"),created,updated,self.relative])?;
         tx.execute("INSERT INTO entries_fts (entry_id,stratum,title,informal_gloss,tags,formal_signature,notes)
             VALUES (?1,?2,?3,?4,?5,?6,?7)", params![entry.id,entry.stratum.as_str(),self.title,self.gloss,
                 self.fts_tags,entry.formal_signature,self.fts_notes])?;
+        tx.execute(
+            "INSERT INTO entry_vault_meta (entry_id,domain_id,source_kind,reproducibility_class,citation_status,condition_tags_json,content_sha256)
+             VALUES (?1,?2,?3,?4,?5,?6,?7)",
+            params![
+                entry.id,
+                self.domain_id,
+                self.source_kind.as_str(),
+                entry.reproducibility_class.map(ReproducibilityClass::as_str),
+                entry.citation_status.map(CitationStatus::as_str),
+                self.condition_tags_json,
+                self.content_sha256,
+            ],
+        )?;
 
         let mut symbols = tx.prepare_cached(
             "INSERT INTO entry_symbols (entry_id,role,symbol) VALUES (?1,?2,?3)
@@ -698,6 +854,13 @@ impl PreparedEntry {
             for symbol in values {
                 symbols.execute(params![entry.id, role, symbol])?;
             }
+        }
+        let mut facets = tx.prepare_cached(
+            "INSERT INTO entry_facets (entry_id,facet_key,facet_value) VALUES (?1,?2,?3)
+            ON CONFLICT(entry_id,facet_key,facet_value) DO NOTHING",
+        )?;
+        for (k, v) in &self.facets {
+            facets.execute(params![entry.id, k, v])?;
         }
         let mut edges = tx.prepare_cached(
             "INSERT INTO entry_edges (src_id,dst_id,edge_type,metadata_json) VALUES (?1,?2,?3,?4)",
@@ -817,7 +980,10 @@ impl<'a> Search<'a> {
         sql.push_str(", matches AS (SELECT e.id,e.title,e.engine,e.verified_at_commit,l.rank,
             (upper(e.id) NOT GLOB 'CORE-ADAPT-*') AS static_entry,
             CASE WHEN s.entry_id IS NOT NULL THEN ? WHEN l.entry_id IS NOT NULL THEN max(?,0.65) ELSE ? END AS score
-            FROM entries e LEFT JOIN lexical l ON l.entry_id=e.id LEFT JOIN strong s ON s.entry_id=e.id WHERE e.stratum=?");
+            FROM entries e LEFT JOIN lexical l ON l.entry_id=e.id LEFT JOIN strong s ON s.entry_id=e.id
+            WHERE e.stratum=?
+              AND e.trust_level IN ('L0','L1','L2a','L2b','L3','L4a','L4b','L5')
+              AND e.engine IN ('lean4','rocq','agda','smt','atp','cas','informal')");
         args.extend([
             combined.into(),
             symbolic.into(),

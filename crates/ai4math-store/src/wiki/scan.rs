@@ -1,6 +1,7 @@
 //! Bounded, descriptor-relative Wiki tree reads. Two observations detect ordinary
 //! filesystem drift but do not constitute a simultaneous snapshot of the tree.
-use super::{STRATA, WikiStratum, sediment};
+use super::{STRATA, sediment};
+use ai4math_core::KnowledgeStratum;
 use anyhow::{Context, Result, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -26,7 +27,7 @@ const O_SAFE_DIR: libc::c_int = O_SAFE_FILE | libc::O_DIRECTORY;
 
 pub(super) fn stage(
     root: &Path,
-    mut stage_entry: impl FnMut(WikiStratum, &Path, &str) -> Result<()>,
+    mut stage_entry: impl FnMut(KnowledgeStratum, &Path, &str) -> Result<()>,
 ) -> Result<()> {
     // Strip trailing `/` and `/.`, which could otherwise defeat O_NOFOLLOW on
     // the final name. The caller supplies the root's path prefix (e.g. /tmp).
@@ -141,7 +142,7 @@ enum Node {
 
 fn scan(
     root: &Path,
-    mut visit: impl FnMut(WikiStratum, &Path, Node, Stamp) -> Result<()>,
+    mut visit: impl FnMut(KnowledgeStratum, &Path, Node, Stamp) -> Result<()>,
 ) -> Result<()> {
     // SAFETY: geteuid has no preconditions.
     let uid = unsafe { libc::geteuid() };
@@ -158,7 +159,12 @@ fn scan(
         walker.validate(stamp, libc::S_IFDIR, &dir)?;
         // The root is not enumerated: only known strata are inputs. Check its
         // full stamp conservatively, including changes to its directory entries.
-        (walker.visit)(WikiStratum::Core, Path::new(""), Node::Directory, stamp)?;
+        (walker.visit)(
+            KnowledgeStratum::Core,
+            Path::new(""),
+            Node::Directory,
+            stamp,
+        )?;
         for stratum in STRATA {
             let path = Path::new(stratum.as_str());
             let name = CString::new(stratum.as_str())?;
@@ -186,7 +192,7 @@ struct Walker<'a, F> {
     visit: &'a mut F,
 }
 
-impl<F: FnMut(WikiStratum, &Path, Node, Stamp) -> Result<()>> Walker<'_, F> {
+impl<F: FnMut(KnowledgeStratum, &Path, Node, Stamp) -> Result<()>> Walker<'_, F> {
     fn validate(&mut self, stamp: Stamp, kind: libc::mode_t, file: &File) -> Result<()> {
         validate_named(stamp, kind, self.uid)?;
         ensure!(
@@ -198,7 +204,7 @@ impl<F: FnMut(WikiStratum, &Path, Node, Stamp) -> Result<()>> Walker<'_, F> {
 
     fn directory(
         &mut self,
-        stratum: WikiStratum,
+        stratum: KnowledgeStratum,
         path: &Path,
         parent: &File,
         name: &CStr,
@@ -247,7 +253,7 @@ impl<F: FnMut(WikiStratum, &Path, Node, Stamp) -> Result<()>> Walker<'_, F> {
 
     fn markdown(
         &mut self,
-        stratum: WikiStratum,
+        stratum: KnowledgeStratum,
         path: &Path,
         dir: &File,
         name: &CStr,

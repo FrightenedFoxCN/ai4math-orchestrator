@@ -20,6 +20,7 @@ use std::{
 
 mod claim_replay;
 mod compute_jobs;
+mod epistemic_graph;
 mod graph_audit;
 mod graph_check;
 mod graph_replay;
@@ -43,6 +44,10 @@ mod tasks;
 mod trust_debt;
 pub use claim_replay::{ClaimReplay, ReplayedClaim};
 pub use compute_jobs::{ActiveComputeQuota, NewComputeJob, RetainedComputeJob};
+pub use epistemic_graph::{
+    NewConflictEdge, NewEpistemicNode, NewEpistemicPlan, RetainedBeliefSnapshot,
+    RetainedEpistemicNode,
+};
 pub use graph_audit::{GraphAudit, GraphMismatch, GraphMismatchKind};
 pub use graph_check::{GraphSemanticCheck, GraphSemanticMismatch};
 pub use graph_replay::GraphReplay;
@@ -504,6 +509,7 @@ impl StateStore {
         migrations::initialize_owner_archive_requests(&mut store.db)?;
         migrations::initialize_protocol_verification(&mut store.db)?;
         migrations::initialize_compute_jobs(&mut store.db)?;
+        migrations::initialize_epistemic_graph(&mut store.db)?;
         Ok(store)
     }
 
