@@ -4,9 +4,9 @@
 
 ## 交接快照
 
-代码验收基线：`97a5028`（在 `e5e5ef4` 之后新增跨学科领域包与反漂移 `ProtocolSpec` 底座 `7648418`，以及多维 GPU 资源池与统一 SLURM 后端 `97a5028` 共 2 个 Rust 抽象提交）。
+代码验收基线：`67876ec`（在 `e5e5ef4` 之后连续完成跨学科领域包与 `ProtocolSpec` `7648418`、GPU/SLURM 算力抽象 `97a5028`、架构文档 `419aa0a`，以及 ADR-0007 阶段 1–3 信念传播/知识库/空闲复现闭环 `1bd8ef3` / `dac6274` / `67876ec`）。
 
-- **本机标准套件**：Rust 工作区 **68 套件、614 通过、0 失败、77 默认忽略**（截至 `97a5028`，`cargo fmt` 与新增模块 Clippy 零警告，架构依赖守卫全通）；DSH 插件 **119 通过 / 0 失败**（含 bundle 一致性、Host 热切桥接、多项目工作台、浏览器 VM 与中英文实时切换校验）。
+- **本机标准套件**：Rust 工作区 **70 套件、626 通过、0 失败、77 默认忽略**（截至 `67876ec`，`cargo fmt` 与全部新增/修改模块 Clippy 零警告，架构依赖守卫全通）；DSH 插件 **119 通过 / 0 失败**（含 bundle 一致性、Host 热切桥接、多项目工作台、浏览器 VM 与中英文实时切换校验）。
 - **已取得的原生与现用 GUI 证据**：固定工具链的关键 Lean 回归在允许 Broker Seatbelt 的本机宿主跑通；独立安装版 DSH SDK 核对真实 daemon 重启重连、卸载及 Electron Host 托管启停闭环；现用 DSH Desktop GUI 已完成插件安装、全屏工作台与底部 HUD/侧栏面板、断线重连、禁用卸载、多项目创建与中英文跟随验收。
 - **优先恢复项**：定位 Rocq 9.3 `coqchk` 初始化所需最小权限并保持项目 Seatbelt；在带 cgroup v2 委派的 Linux 宿主完成 launcher、实际限额和回收的端到端验证；补齐 Guest/登出浏览器实测与独立操作者写确认边界。其余缺口见[交付清单](delivery-roadmap.md)。
 
@@ -168,12 +168,16 @@
 - 在 `ai4math-store` 以迁移 8（`schemas/compute-jobs.sql`）持久化在途异步作业、私有解盲表、重启配额恢复与按分支标签批量 `scancel`。
 - **验证**：本机单测与合成集群测试通过（涵盖本地多卡 GPU 绑定、SLURM 盲测 Job Array 重启恢复、熔断按分支 `scancel` 与 OOM 封印为 `VerifierError`）；Rust **614 通过 / 0 失败 / 77 默认忽略**，插件 119 通过 / 0 失败。尚未在真实生产 SLURM 集群或 Linux CUDA 宿主做原生实跑验收。
 
-## 后续规划（架构已定稿于 [ADR-0007](adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md)，尚未代码实施）
+## 后续批次：ADR-0007 阶段 1–3 信念传播、四层知识库与空闲复现闭环（`1bd8ef3` / `dac6274` / `67876ec`）
 
-- 阶段 1：`ai4math-core::belief`（双通道 Subjective Logic `(b, d, u)` 因子图 BP、标签衰减、共享祖先去重与反向 VoI）+ `ai4math-core::knowledge`。
-- 阶段 2：`ai4math-store` 迁移 9 泛型主状态图 + 平滑演进四层 `KnowledgeVault`（新增 `LITERATURE`、通用 `entry_facets` 与可插拔 `EmbeddingProvider`/`SemanticIndex` 向量检索）。
-- 阶段 3：`IdleVerificationScheduler`（VoI 自动队列 + 人类显式待核验队列 + 空闲算力护栏与 `replicates`/`contradicts` 闭环）。
-- 阶段 4（后置 · 先数学基线）：`ai4math-evidence::literature` 通用溯源门禁、数学文献卡型与 6 维离线漂移测试床，并先针对已建立的数学基线相关论文做抽取与空闲形式化验证（暂不接 CompChem / CompBio）。
+- **阶段 1（`1bd8ef3`）**：`ai4math-core::knowledge`（四层 `KnowledgeStratum`、`KnowledgeSourceKind`、`ReproducibilityClass`、`ExtractionStance`、`CitationStatus`、`DomainKnowledgeProfile`、域限定 `EpistemicTag`）与 `ai4math-core::belief`（双通道 Subjective Logic `(b, d, u)`、交换律标签衰减、菱形共享祖先防重复计票、阻尼因子图 BP、硬撤稿否决与精确反事实 `VoI` 排序）。
+- **阶段 2（`dac6274`）**：`ai4math-store` 迁移 9（`schemas/claim-graph-v2.sql`）泛化主图（SQLite 触发器强锁 `itp => L0..L5`、非 `itp => E0..E5`，无缝提升存量 ITP `claims` 入统一 BP 图并持久化快照）；平滑演进 `Wiki` 为四层 `KnowledgeVault`（`literature/` 防洗白、通用 `entry_facets`、三通道 Shadow Hint、冲突簇、可插拔 `EmbeddingProvider`/`SemanticIndex` + SQLite 向量缓存 + 三路 RRF，旧库只读与存量 Wiki 测试全绿）。
+- **阶段 3（`67876ec`）**：迁移 10（`schemas/idle-verification.sql`）+ `ai4math-broker::idle_scheduler::IdleVerificationScheduler`，融合 BP 反向 `VoI` 自动队列与人类显式待核验队列、前台 Heavy/内存/GPU/SLURM 零饿死水位线、独立空闲预算与原子 `replicates`（节点升级清标签 + 置信度跃升）/ `contradicts`（自动挂冲突边拉升 `conflict_mass`）闭环。
+- **验证**：Rust **70 套件、626 通过 / 0 失败 / 77 默认忽略**，DSH 插件 **119 通过 / 0 失败**，`cargo fmt` 与新增模块 Clippy 零警告。
+
+## 后续规划（[ADR-0007](adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md) 阶段 4–5，尚未代码实施）
+
+- 阶段 4（先数学基线）：`ai4math-evidence::literature` 通用溯源门禁、数学文献卡型与 6 维离线漂移测试床，并先针对已建立的数学基线相关论文做抽取与空闲形式化验证（暂不接 CompChem / CompBio）。
 - 阶段 5（非 ITP 拓展）：在数学基线文献抽取验证稳定后，再扩展 CompChem / CompBio 文献卡型（单位归一化、实验条件与对照配方）并接入首个计算化生试点。
 
 ## 尚未完成

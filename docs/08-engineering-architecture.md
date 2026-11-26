@@ -56,16 +56,15 @@ crates/
 │   ├── compute         # 多维 ResourceRequest (CPU/RAM/GPU/Scratch/Wall) 与 SlurmClusterPolicy
 │   ├── trust           # L0–L5 偏序、AND-OR effective_trust_level 聚合纯函数（委托 domain 通用代数）
 │   ├── preflight       # Lean 4 / Agda / Rocq 静态禁入扫描器与 Diff 范围审计
-│   └── [规划] belief / knowledge # 双通道 Subjective Logic BP 引擎与四层知识本体（ADR-0007 阶段 1）
+│   └── belief / knowledge # 双通道 Subjective Logic BP 引擎与四层知识本体（ADR-0007 阶段 1，已落地）
 ├── ai4math-evidence/   # 零 IO 证据 wire/hash、ProtocolSpec 编译与 unsafe 只读封印端口；不持有构造权
 │   ├── sealed          # 领域无关 SealedReceipt 与 ProtocolRunEvidence 封印端口
 │   ├── protocol        # 冻结 ProtocolSpec、单遍槽位编译、物理健全性门禁、盲测对照与预注册审计
 │   ├── compute         # StagedJobBundle、BlindedArrayPlan、ClusterMountMap 与防注入 SLURM 原语
 │   └── [规划] literature # 领域特异论文抽取溯源门禁与 6 维离线漂移测试床（ADR-0007 阶段 4 后置）
 ├── ai4math-store/      # rusqlite (bundled + fts5) WAL 持久化层，只依赖 core/evidence（严禁依赖 broker）
-│   ├── state           # state-store.sql + 迁移 1–8（含 protocol_trials 迁移 7 与 compute_jobs 迁移 8）
-│   └── wiki            # wiki-index.sql、.mathwiki/*.md 双向同步、符号/FTS5 混合检索与 Shadow Hint
-│                       # [规划] 迁移 9 泛型主图 + 平滑演进四层 KnowledgeVault 与可插拔 SemanticIndex（阶段 2）
+│   ├── state           # state-store.sql + 迁移 1–10（含 protocol_trials / compute_jobs / epistemic_graph / idle_queue）
+│   └── wiki            # 四层 KnowledgeVault（含 literature/、entry_facets、3 通道 Shadow Hint 与可插拔 SemanticIndex/RRF）
 ├── ai4math-broker/     # 验证、沙箱、多维 GPU/SLURM 算力与洁净室准入引擎；独占构造封印证据
 │   ├── sandbox         # macOS Seatbelt (canonicalize)；Linux bwrap 后端尚未实现
 │   ├── resources       # 既有 ITP Fast/Heavy 双车道优先级队列与内存水位线准入控制
@@ -73,7 +72,7 @@ crates/
 │   ├── protocol / protocol_async # 同步与 3 阶段异步协议验证 + 匿名盲测 Job Array 解盲封印
 │   ├── golden_cache    # Commit-keyed 黄金快照池（APFS cp -cR / clonefile + pinned 保活 + LRU GC）
 │   ├── cleanroom       # Lean Comparator / Agda --safe / Rocq Print Assumptions 裁判包装器与 Receipt 签发
-│   └── [规划] idle_scheduler # 空闲算力复现/形式化排期器（VoI + 人类队列，ADR-0007 阶段 3）
+│   └── idle_scheduler  # 空闲算力复现/形式化排期器（VoI + 人类队列 + 零饿死水位线，ADR-0007 阶段 3，已落地）
 ├── ai4math-project/    # 项目根/runtime/SQLite 安全门禁与原生租约门面
 ├── ai4math-daemon/     # 二进制 ai4mathd：UDS JSON-RPC 2.0 + 实时生命体征流 + Fact Pack 编译器
 └── ai4math-cli/        # 二进制 ai4math：项目初始化 / 状态查询 / Wiki 索引重建 / Red-Team 安全自检

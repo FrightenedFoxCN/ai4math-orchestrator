@@ -1,7 +1,7 @@
 # 09. 跨学科科学验证泛化、多维算力调度、四层知识库与双通道信念传播（Scientific Generalization, Compute, Vault & Belief Propagation）
 
 > 本文档定义系统从**形式化数学（ITP：Lean 4 / Agda / Rocq）**平滑泛化至**计算化学 / 计算生物学及通用计算科学**的完整架构扩展。
-> 本文严格区分 **「已实现并验证的抽象底座」**（提交 `7648418`、`97a5028`）与 **「已完成架构定稿、按阶段实施的扩展层」**（对应 [ADR-0007](adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md) D28–D33）。
+> 本文严格区分 **「已实现并验证的抽象底座与阶段 1–3」**（提交 `7648418`、`97a5028`、`1bd8ef3`、`dac6274`、`67876ec`）与 **「后续阶段 4–5（论文抽取门禁与外围试点）」**（对应 [ADR-0007](adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md) D28–D33）。
 
 ---
 

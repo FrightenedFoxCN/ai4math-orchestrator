@@ -38,6 +38,8 @@
 | [schemas/state-store.sql](schemas/state-store.sql) | 运行时状态与 Append-Only Event Log SQLite DDL（Claims / ProofPlans / Golden Snapshots / Receipts / Breakers / Inbox / Cursors） |
 | [schemas/protocol-verification.sql](schemas/protocol-verification.sql) | 迁移 7：不可变预注册与只追加协议试错账本 DDL（`protocol_preregistrations` / `protocol_trials`） |
 | [schemas/compute-jobs.sql](schemas/compute-jobs.sql) | 迁移 8：本地 GPU 与 SLURM 异步作业持久状态与重启恢复账本 DDL（`compute_jobs`） |
+| [schemas/claim-graph-v2.sql](schemas/claim-graph-v2.sql) | 迁移 9：泛型多领域 AND-OR-Conflict 因子图与 BP 快照 DDL（`epistemic_nodes` / `epistemic_plans` / `epistemic_conflict_edges` / `epistemic_belief_snapshots`） |
+| [schemas/idle-verification.sql](schemas/idle-verification.sql) | 迁移 10：空闲算力复现/形式化队列（BP VoI + 人类队列）与空闲预算账本 DDL（`idle_verification_queue`） |
 
 ## 阶段状态（Roadmap）
 
@@ -49,9 +51,10 @@
 - [x] **Phase 3（DSH 一体化工作台插件）**：`plugins/dsh-ai4math`（内置 `ai4math-chief` Preset、左侧 `sidebar.panellist` + 全屏 `main:ai4math` 多项目工作台、Host 托管/外部接管 `ai4mathd` 与热切桥接、底部 `shell.bottom` Live HUD、4 个右侧栏面板、会话目录联动、只读 CLI 助手与中英文实时切换）
 
 - [x] **跨学科泛化底座（[ADR-0007](docs/adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md) D28–D30）**：`DomainPack` / `EpistemicLevel` / `ScientificTrust` / `SealedReceipt`、反漂移 `ProtocolSpec` 引擎 + 迁移 7 试错账本（`7648418`），以及本地 GPU 逐卡/统一内存池 + 双层 `ComputeBackend` / `SlurmTransport` + 迁移 8 异步作业账本（`97a5028`）
-- [ ] **泛化后续阶段（[09 §7](docs/09-scientific-generalization-and-belief-vault.md#7-分阶段实施路线图)）**：阶段 1（双通道 Subjective Logic BP 与知识本体）→ 阶段 2（泛型主状态图迁移 9 + 平滑演进四层知识库与可插拔向量检索）→ 阶段 3（空闲算力复现排期 + 人类队列）→ 阶段 4（先针对数学基线文献验证论文抽取溯源门禁与漂移测试）→ 阶段 5（拓展 CompChem / CompBio 文献卡型与计算试点）
+- [x] **泛化阶段 1–3（[ADR-0007](docs/adr/ADR-0007-scientific-generalization-compute-vault-and-belief.md) D31–D33）**：双通道 Subjective Logic BP + 四层知识本体（`1bd8ef3`）→ 迁移 9 泛型主状态图 + 四层 `KnowledgeVault` / `entry_facets` / 可插拔 `SemanticIndex` 向量检索（`dac6274`）→ 迁移 10 + `IdleVerificationScheduler`（VoI + 人类队列 + 空闲水位线与 `replicates`/`contradicts` 闭环，`67876ec`）
+- [ ] **泛化阶段 4–5（[09 §7](docs/09-scientific-generalization-and-belief-vault.md#7-分阶段实施路线图)）**：阶段 4（先针对数学基线文献验证论文抽取溯源门禁与 6 维离线漂移测试床）→ 阶段 5（拓展 CompChem / CompBio 文献卡型与首个非 ITP 计算试点）
 
-以上勾选表示阶段实现与本机/Desktop GUI 工作台验收已落地，不表示全平台生产交付。当前交接基线为 `97a5028`：Rust 标准套件 614 通过 / 0 失败 / 77 默认忽略，DSH 插件 119 通过 / 0 失败；本机 daemon、安装版 DSH SDK 集成测试与现用 Desktop GUI 工作台（Owner 视角）已验收通过。Owner 归档仍只开放本地签名 CLI，不开放远程写入口；Linux 验证后端与真实 SLURM 集群实跑仍待验收；Rocq 独立 T2 原生复核未通过，Agda 独立 T2 和 Lean 全仓发布门禁仍待完成。
+以上勾选表示阶段实现与本机/Desktop GUI 工作台验收已落地，不表示全平台生产交付。当前交接基线为 `67876ec`：Rust 标准套件 626 通过 / 0 失败 / 77 默认忽略，DSH 插件 119 通过 / 0 失败；本机 daemon、安装版 DSH SDK 集成测试与现用 Desktop GUI 工作台（Owner 视角）已验收通过。Owner 归档仍只开放本地签名 CLI，不开放远程写入口；Linux 验证后端与真实 SLURM 集群实跑仍待验收；Rocq 独立 T2 原生复核未通过，Agda 独立 T2 和 Lean 全仓发布门禁仍待完成。
 
 ### 快速开始（DSH Desktop 工作台）
 
