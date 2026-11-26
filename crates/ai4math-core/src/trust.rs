@@ -1,4 +1,7 @@
-use crate::wire_enum;
+use crate::{
+    domain::{EpistemicLevel, aggregate_epistemic_plan, best_epistemic_plan, compare_epistemic},
+    wire_enum,
+};
 use std::cmp::Ordering;
 
 wire_enum!(
@@ -30,19 +33,35 @@ impl Default for Trust {
     }
 }
 
+impl EpistemicLevel for Trust {
+    fn positive_rank(self) -> Option<u8> {
+        self.proof_rank()
+    }
+
+    fn refutation_rank(self) -> Option<u8> {
+        match self {
+            Self::L2a => Some(1),
+            Self::L2b => Some(2),
+            _ => None,
+        }
+    }
+
+    fn is_hard_refutation(self) -> bool {
+        Trust::is_hard_refutation(self)
+    }
+
+    fn implies_debt(self) -> bool {
+        matches!(self, Self::L4a | Self::L4b)
+    }
+
+    fn wire_name(self) -> &'static str {
+        self.as_str()
+    }
+}
+
 impl PartialOrd for Trust {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        match (self.proof_rank(), other.proof_rank()) {
-            (Some(a), Some(b)) => Some(a.cmp(&b)),
-            _ if self == other => Some(Ordering::Equal),
-            (Some(rank), None) if rank <= 1 => Some(Ordering::Less),
-            (None, Some(rank)) if rank <= 1 => Some(Ordering::Greater),
-            _ => match (self, other) {
-                (Self::L2a, Self::L2b) => Some(Ordering::Less),
-                (Self::L2b, Self::L2a) => Some(Ordering::Greater),
-                _ => None,
-            },
-        }
+        compare_epistemic(*self, *other)
     }
 }
 
@@ -52,25 +71,12 @@ pub fn aggregate_plan(
     local: Trust,
     dependencies: impl IntoIterator<Item = Trust>,
 ) -> Option<Trust> {
-    let mut best = local;
-    let mut rank = best.proof_rank()?;
-    for dependency in dependencies {
-        let next = dependency.proof_rank()?;
-        if next < rank {
-            best = dependency;
-            rank = next;
-        }
-    }
-    Some(best)
+    aggregate_epistemic_plan(local, dependencies)
 }
 
 /// OR: choose the strongest surviving proof route, never a refutation.
 pub fn best_proof_plan(plans: impl IntoIterator<Item = Trust>) -> Option<Trust> {
-    plans
-        .into_iter()
-        .filter_map(|trust| trust.proof_rank().map(|rank| (rank, trust)))
-        .max_by_key(|(rank, _)| *rank)
-        .map(|(_, trust)| trust)
+    best_epistemic_plan(plans)
 }
 
 #[cfg(test)]
@@ -94,5 +100,26 @@ mod tests {
         assert_eq!(aggregate_plan(L5, [L4a, L2a]), None);
         assert_eq!(best_proof_plan([L2b, L4b, L4a]), Some(L4b));
         assert_eq!(best_proof_plan([L2b, L2a]), None);
+    }
+
+    #[test]
+    fn delegated_partial_order_matches_historical_trust_matrix() {
+        let all = [L0, L1, L2a, L2b, L3, L4a, L4b, L5];
+        let legacy_cmp = |a: Trust, b: Trust| match (a.proof_rank(), b.proof_rank()) {
+            (Some(x), Some(y)) => Some(x.cmp(&y)),
+            _ if a == b => Some(Ordering::Equal),
+            (Some(rank), None) if rank <= 1 => Some(Ordering::Less),
+            (None, Some(rank)) if rank <= 1 => Some(Ordering::Greater),
+            _ => match (a, b) {
+                (L2a, L2b) => Some(Ordering::Less),
+                (L2b, L2a) => Some(Ordering::Greater),
+                _ => None,
+            },
+        };
+        for a in all {
+            for b in all {
+                assert_eq!(a.partial_cmp(&b), legacy_cmp(a, b), "pair ({a}, {b})");
+            }
+        }
     }
 }

@@ -29,6 +29,7 @@ mod oracle;
 mod pivot;
 mod plan_replay;
 mod probes;
+mod protocol;
 pub(crate) mod regression;
 mod reviewed_lean;
 mod sediment_adaptation;
@@ -52,6 +53,7 @@ pub use pivot::{
 };
 pub use plan_replay::{PlanReplay, ReplayedPlan, ReplayedPlanDependency};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
+pub use protocol::{RetainedPreRegistration, RetainedProtocolTrial};
 pub use reviewed_lean::{LeanSpecComparison, LeanSpecRecheck, ReviewedLeanSpec};
 pub use sediment_adaptation::{SedimentAdaptationApproval, SedimentAdaptationPlan};
 pub use sediment_lineage::{SedimentCoreEvidence, SedimentLineage, SedimentLineageInput};
@@ -498,6 +500,7 @@ impl StateStore {
         store.initialize_refutation_outbox()?;
         migrations::initialize_model_dispatch(&mut store.db)?;
         migrations::initialize_owner_archive_requests(&mut store.db)?;
+        migrations::initialize_protocol_verification(&mut store.db)?;
         Ok(store)
     }
 

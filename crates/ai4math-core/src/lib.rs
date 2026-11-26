@@ -1,11 +1,20 @@
 //! Typed orchestration data and static admission for phase one.
 
 pub mod contracts;
+pub mod domain;
+pub mod pack_itp;
 pub mod preflight;
 pub mod proof;
 pub mod trust;
 
 pub use contracts::*;
+pub use domain::{
+    BackendDescriptor, DomainPack, EpistemicAssessment, EpistemicCeilingViolation, EpistemicDebt,
+    EpistemicLevel, ScientificTrust, aggregate_assessment_plan, aggregate_epistemic_plan,
+    best_assessment_plan, best_epistemic_plan, compare_epistemic,
+    validate_backend_descriptor_ceiling,
+};
+pub use pack_itp::ItpDomainPack;
 pub use preflight::{
     PreFlightScanResult, PreFlightSeverity, PreFlightViolation, scan_source, validate_source_path,
 };

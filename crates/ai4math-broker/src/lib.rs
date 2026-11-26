@@ -23,6 +23,11 @@ pub use oracle::{
 };
 mod project_native_gate;
 pub use project_native_gate::{ProjectNativeBusy, ProjectNativeGate, ProjectNativeLease};
+mod protocol;
+pub use protocol::{
+    ProtocolBackendRunner, ProtocolLane, ProtocolVerificationRequest, RawBackendOutput,
+    SandboxedExecutableRunner, VerifiedProtocolRun,
+};
 mod regression_failure;
 pub use regression_failure::RegressionFailure;
 mod resources;
@@ -344,6 +349,67 @@ unsafe impl ai4math_evidence::ReceiptEvidence for VerificationReceipt {
 
     fn matches(&self, base_commit: &str, file_path: &str, candidate_bytes: &[u8]) -> bool {
         VerificationReceipt::matches(self, base_commit, file_path, candidate_bytes)
+    }
+
+    fn raw_json(&self) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(self)?)
+    }
+}
+
+// SAFETY: Same broker-exclusive construction invariant as `ReceiptEvidence`.
+// Bridges ITP kernel receipts onto the domain-agnostic `SealedReceipt` port
+// without changing the persisted wire format of `VerificationReceipt`.
+unsafe impl ai4math_evidence::SealedReceipt for VerificationReceipt {
+    fn domain_id(&self) -> &str {
+        ai4math_core::ItpDomainPack::DOMAIN_ID
+    }
+
+    fn backend_id(&self) -> &str {
+        self.engine.as_str()
+    }
+
+    fn target_id(&self) -> &str {
+        self.target_id()
+    }
+
+    fn base_commit(&self) -> &str {
+        self.base_commit()
+    }
+
+    fn spec_sha256(&self) -> &str {
+        self.dependencies_sha256()
+    }
+
+    fn candidate_sha256(&self) -> &str {
+        self.patch_sha256()
+    }
+
+    fn inputs_sha256(&self) -> &str {
+        self.dependencies_sha256()
+    }
+
+    fn verifier_sha256(&self) -> &str {
+        &self.compiler_sha256
+    }
+
+    fn epistemic_level(&self) -> &str {
+        ai4math_core::Trust::L5.as_str()
+    }
+
+    fn epistemic_debts(&self) -> &[String] {
+        &[]
+    }
+
+    fn issued_unix_seconds(&self) -> u64 {
+        self.issued_unix_seconds()
+    }
+
+    fn elapsed_seconds(&self) -> f64 {
+        self.compile_seconds()
+    }
+
+    fn receipt_sha256(&self) -> &str {
+        self.receipt_sha256()
     }
 
     fn raw_json(&self) -> Result<serde_json::Value> {
@@ -1278,6 +1344,12 @@ mod tests {
         let evidence: &dyn ai4math_evidence::ReceiptEvidence = &receipt;
         assert_eq!(evidence.compiler_sha256(), &"3".repeat(64));
         assert_eq!(evidence.raw_json()?, serde_json::to_value(&receipt)?);
+        let sealed: &dyn ai4math_evidence::SealedReceipt = &receipt;
+        assert_eq!(sealed.domain_id(), "itp");
+        assert_eq!(sealed.backend_id(), "lean4");
+        assert_eq!(sealed.epistemic_level(), "L5");
+        assert!(sealed.epistemic_debts().is_empty());
+        assert_eq!(sealed.verifier_sha256(), &"3".repeat(64));
         Ok(())
     }
 

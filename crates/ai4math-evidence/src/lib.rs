@@ -5,12 +5,25 @@
 //! implementation can fabricate proof, refutation, or admission evidence.
 
 mod oracle;
+pub mod protocol;
+mod sealed;
 
 use ai4math_core::Engine;
 use anyhow::Result;
 pub use oracle::{
     ExactCheck, MAX_ORACLE_QUERY_BYTES, OracleOutcome, OracleQuery, PreparedOracleQuery,
 };
+pub use protocol::{
+    ArtifactTemplate, BlindedControlCase, BlindedControlPack, BlindedControlPolicy,
+    BlindedControlSummary, CandidateSubmission, CompiledControlSet, CompiledProtocolRun,
+    CorrectionMethod, DiagnosticValue, GateFailure, MAX_CONTROL_PACK_BYTES, MAX_PREREG_BYTES,
+    MAX_PROTOCOL_SPEC_BYTES, MAX_RENDERED_PROTOCOL_BYTES, MAX_SUBMISSION_BYTES, MetricRule,
+    NamedMetricRule, OrthogonalPolicy, ParamValue, ParsedDiagnostics, PreRegistrationSpec,
+    ProtocolSmellPolicy, ProtocolSmellSignal, ProtocolSpec, ProtocolVerdict, SlotKind, SlotSpec,
+    SlotValue, TextProfile, TrialAuditSummary, TrialSample, VerifierReport, compute_trial_audit,
+    evaluate_acceptance_criteria, evaluate_orthogonal_agreement, evaluate_sanity_gates,
+};
+pub use sealed::{ProtocolRunEvidence, SealedReceipt};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
