@@ -1,13 +1,21 @@
 //! Typed orchestration data and static admission for phase one.
 
+pub mod belief;
 pub mod compute;
 pub mod contracts;
 pub mod domain;
+pub mod knowledge;
 pub mod pack_itp;
 pub mod preflight;
 pub mod proof;
 pub mod trust;
 
+pub use belief::{
+    AttenuationRule, BeliefConflictEdge, BeliefError, BeliefGraph, BeliefNodeInput,
+    BeliefPlanInput, BeliefPropagationConfig, BeliefPropagationReport, BeliefPropagator,
+    ConflictEdgeKind, NodeBeliefState, Opinion, SubjectiveLogicPropagator, TagAttenuationPolicy,
+    VoIRanking,
+};
 pub use compute::{
     ComputeJobStatus, ComputePoolSnapshot, ExecutionTargetKind, GpuDeviceSnapshot, GpuKind,
     GpuRequest, ResourcePolicyError, ResourceRequest, SlurmClusterPolicy,
@@ -18,6 +26,11 @@ pub use domain::{
     EpistemicLevel, ScientificTrust, aggregate_assessment_plan, aggregate_epistemic_plan,
     best_assessment_plan, best_epistemic_plan, compare_epistemic,
     validate_backend_descriptor_ceiling,
+};
+pub use knowledge::{
+    CitationStatus, DomainKnowledgeProfile, EpistemicTag, ExtractionStance, FacetDescriptor,
+    ITP_KNOWLEDGE_FACETS, ITP_KNOWLEDGE_PROFILE, InvalidEpistemicTag, KnowledgeEdgeKind,
+    KnowledgeSourceKind, KnowledgeStratum, LITERATURE_COMMON_FACETS, ReproducibilityClass,
 };
 pub use pack_itp::ItpDomainPack;
 pub use preflight::{

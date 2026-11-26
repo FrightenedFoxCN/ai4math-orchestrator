@@ -72,6 +72,10 @@ impl ItpDomainPack {
         Self
     }
 
+    pub const fn knowledge_profile(&self) -> &'static crate::DomainKnowledgeProfile {
+        &crate::ITP_KNOWLEDGE_PROFILE
+    }
+
     pub fn validate_source_path(
         &self,
         engine: Engine,
