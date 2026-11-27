@@ -614,6 +614,10 @@ fn trust_error(error: anyhow::Error) -> RpcError {
                 -32006,
                 "Oracle outcome does not authorize a trust transition",
             ),
+            TrustTransitionError::SketchEvidenceMismatch => RpcError::new(
+                -32002,
+                "formal sketch evidence does not match the live Claim context",
+            ),
         }
     } else {
         internal(error)

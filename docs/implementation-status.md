@@ -246,6 +246,14 @@
 - 实际执行固定调用 `promote-task-result ROOT BARE_REPO TASK NATIVE_LEAN`，daemon 不读取或序列化 proof body。
 - Store、真实 Ed25519 + 假 CLI/UDS 测试覆盖签名、固定 argv、角色隔离、一次性消费与 proof body 不泄露；真实 Lean 4.35.0 的 daemon 端到端验收已在本机无外层 Seatbelt 环境通过，覆盖签名授权、原生验证、Git main 发布、recorded promotion 与一次性重放，并加入 `.github/native-lean.sh`；其他宿主仍需单独验收。
 
+## L3 formal-sketch Store evidence gate（2026-11-28）
+
+- 新增 `formal_sketch_evidence` 不可变证据表与 `StateStore::apply_formal_sketch_evidence`。
+- L3 只接受三类同时匹配 live Claim/repo/HEAD 的证据：assessed T3 candidate（axioms 含 `sorryAx`）、sealed reviewed-spec comparison、retained `NoCounterexampleWithinBounds` Oracle probe。
+- 任一证据缺失、spec 不匹配、非 T3、HEAD/Claim 上下文变化或 Claim 已 stale/refuted/higher-trust 都会拒绝；proof body 不进入证据表或响应，只保留 source/receipt/probe 哈希。
+- receipt、evidence、trust change 与 graph recompute 在同一事务完成，按 sketch ID 精确幂等；`proof_verified:false`，不授予 L4a/L4b/L5。
+- Store 正反例覆盖三证据齐全、重放、缺失 probe、spec 不匹配与非 T3 receipt。当前尚未暴露 Agent RPC，需下一轮受信 CLI/Broker 入口。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。

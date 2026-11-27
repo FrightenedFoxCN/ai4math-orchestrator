@@ -92,7 +92,7 @@ pub use tasks::{
 pub use trust_debt::{
     TrustDebtCounts, TrustDebtFinding, TrustDebtKind, TrustDebtRole, TrustDebtScan,
 };
-pub use trust_transition::TrustTransitionError;
+pub use trust_transition::{FormalSketchEvidence, TrustTransitionError};
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 const DDL: &str = include_str!("../../../schemas/state-store.sql");
