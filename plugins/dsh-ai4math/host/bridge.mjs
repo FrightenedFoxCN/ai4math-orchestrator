@@ -343,7 +343,7 @@ export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reco
           const operationSignal = withLifetime(lifetime.signal, signal);
           if (operationSignal.aborted) throw new BridgeError('cancelled');
           let result;
-          if (REMOTE_METHODS[key].agentWrite) {
+          if (REMOTE_METHODS[key].agentWrite || REMOTE_METHODS[key].principalBound) {
             result = await boundWrite(writeKey, role, bindingId, REMOTE_METHODS[key].method, args, operationSignal);
           } else if (key === 'proofSubmit') {
             if (proofCalls >= 4) throw new BridgeError('busy');

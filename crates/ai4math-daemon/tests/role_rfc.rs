@@ -404,6 +404,8 @@ fn rfc_submit_and_approval_use_bound_git_and_principal_actors() -> Result<()> {
     );
     let mut builder = Rpc::new(UnixStream::connect(&socket)?)?;
     builder.bind("builder")?;
+    let mut owner = Rpc::new(UnixStream::connect(&socket)?)?;
+    owner.bind("owner")?;
     assert_eq!(chief.call("rfc.submit", json!({"module_path":"Demo.lean","reviewed_commit":head,"draft":{
         "rfc_id":"RFC-1","requested_by_claim":"C1","engine":"lean4","motivation":"Need a definition",
         "proposed_definitions":["def demo : Nat := 0"],"required_api_lemmas":[],
@@ -589,6 +591,23 @@ fn rfc_submit_and_approval_use_bound_git_and_principal_actors() -> Result<()> {
         "C1"
     );
     assert_eq!(promotion_status["status"]["state"], "pending");
+    assert_eq!(
+        chief.call("promotion.recover", json!({}))?["error"]["code"],
+        -32003
+    );
+    let recovered = owner.result("promotion.recover", json!({}))?;
+    assert_eq!(recovered["recovery"]["fixture"], true);
+    let recover_argv = fs::read_to_string(&argv_log)?;
+    let recover_lines: Vec<&str> = recover_argv.lines().collect();
+    assert_eq!(
+        recover_lines,
+        [
+            "recover-promotion",
+            project.canonicalize()?.to_str().context("project path")?,
+            repo.to_str().context("repo path")?,
+            fake_lean.to_str().context("lean path")?,
+        ]
+    );
     assert_eq!(promotion_status["status"]["recovery"]["kind"], "prepared");
     git(
         &repo_path,

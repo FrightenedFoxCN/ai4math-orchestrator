@@ -230,6 +230,13 @@
 - RPC 在调用前复核 RFC 状态、engine、digest、smoke commit 与 Git HEAD；未配置受信工具时返回 `-32006`，不会回退到 unsandboxed 或调用方指定路径。
 - 单元与假 CLI/UDS 夹具验证固定 argv、环境清理、角色/schema 门禁和状态前置检查；另有 ignored 的真实 Lean 4.35.0 端到端验收，覆盖 submit → approve → smoke-start → freeze → complete 与两类 receipt。该测试已在本机无外层 Seatbelt 环境通过，并加入 `.github/native-lean.sh`；其他宿主仍需单独验收。
 
+## Owner-only promotion recover（2026-11-28）
+
+- 新增 Owner-only Typert `promotion.recover`，不注册为任何 Agent 工具；请求不接受 repo、root、proof body、base/new commit 或 executable。
+- daemon 先确认存在 pending promotion intent，再通过受信 CLI/Lean 配置调用现有 `recover-promotion ROOT BARE_REPO NATIVE_LEAN`；CLI 继续负责同一 intent 的 Git/ledger 恢复语义。
+- Owner bridge 使用独立 Principal-bound 连接；Chief、Builder、Prover、Reviewer 等角色均无法调用。
+- 假 CLI/UDS 夹具验证固定 argv、Owner 权限、无参数注入与 pending 前置门禁；真实恢复语义仍由 CLI 既有 native/恢复测试覆盖。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。

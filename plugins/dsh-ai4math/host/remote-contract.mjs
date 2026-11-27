@@ -24,6 +24,7 @@ const empty = object();
 const endpoint = (method, description, params, stream) => Object.freeze({ method, description, params, ...(stream ? { stream: true } : {}) });
 const hostEndpoint = (method, description, params) => Object.freeze({ ...endpoint(method, description, params), hostOnly: true });
 const agentEndpoint = (method, description, params) => Object.freeze({ ...endpoint(method, description, params), agentOnly: true });
+const principalEndpoint = (method, description, params) => Object.freeze({ ...endpoint(method, description, params), principalBound: true });
 const writeEndpoint = (method, description, params) => Object.freeze({ ...agentEndpoint(method, description, params), agentWrite: true });
 const id = (maximum = 128) => Object.freeze({ type:'string', minLength:1, maxLength:maximum, pattern:'^[A-Za-z0-9_.:-]+$' });
 const roleText = (maximum) => Object.freeze({ type:'string', minLength:1, maxLength:maximum, 'x-ai4math-maxUtf8Bytes':maximum, pattern:'^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$' });
@@ -44,6 +45,7 @@ const infraDraft = object({
 }, ['rfc_id','requested_by_claim','engine','motivation','proposed_definitions','required_api_lemmas','consumer_usage_sketch','smoke_test_criteria','status']);
 
 export const REMOTE_METHODS = Object.freeze({
+  promotionRecover: principalEndpoint('promotion.recover', 'Owner-only recovery of an existing pending promotion intent through trusted CLI tooling.', empty),
   promotionPreview: writeEndpoint('promotion.preview', 'Read a redacted proof-body candidate preview; never returns proof text or authorizes promotion.', object({task_id:id(100)}, ['task_id'])),
   promotionStatus: writeEndpoint('promotion.status', 'Read redacted pending-promotion and managed-HEAD status; no execution or recovery is exposed.', empty),
   workerAcquire: writeEndpoint('worker.acquire', 'Atomically acquire one request-bound infrastructure worker attempt; never returns a lease fence.', object({

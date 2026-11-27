@@ -108,6 +108,23 @@ impl Config {
         ))
     }
 
+    pub fn recover_promotion(&self, root: &Path, repo: &Path) -> Result<Value> {
+        let mut command = Command::new(&self.cli);
+        command
+            .arg("recover-promotion")
+            .arg(root)
+            .arg(repo)
+            .arg(&self.lean)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir("/")
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        self.run(command)
+    }
+
     pub fn complete(
         &self,
         root: &Path,

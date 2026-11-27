@@ -1062,6 +1062,34 @@ impl Project {
                 }
                 Ok(json!({"preview":preview}))
             }
+
+            "promotion.recover" => {
+                let _: Empty = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["owner"], "promotion.recover")?;
+                if self
+                    .store()
+                    .map_err(internal)?
+                    .promotion_intent()
+                    .map_err(internal)?
+                    .is_none()
+                {
+                    return Err(RpcError::new(
+                        -32002,
+                        "no pending promotion intent to recover",
+                    ));
+                }
+                let config = self.native_rfc.as_ref().ok_or_else(|| {
+                    RpcError::new(-32006, "trusted promotion tooling is not configured")
+                })?;
+                let repo = self.managed_repo_name()?;
+                let record = config
+                    .recover_promotion(&self.root, Path::new(&repo))
+                    .map_err(native_rfc_error)?;
+                Ok(json!({"recovery":record}))
+            }
             "promotion.status" => {
                 let _: Empty = parse(params)?;
                 let role = connection

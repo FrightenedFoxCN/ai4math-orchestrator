@@ -76,16 +76,17 @@ class Ai4mathRemote extends TypertRemoteService {
   async projectRemove(params) { return callWorkbench(this, 'projectRemove', 'projectRemove', params); }
   async daemonStart(params) { return callWorkbench(this, 'daemonStart', 'daemonStart', params); }
   async daemonStop(params) { return callWorkbench(this, 'daemonStop', 'daemonStop', params); }
-  async status(params, signal) { return callOwner(this, 'status', params, signal); }
-  async briefingPeek(params, signal) { return callOwner(this, 'briefingPeek', params, signal); }
-  async briefingPull(params, signal) { return callOwner(this, 'briefingPull', params, signal); }
-  async briefingGet(params, signal) { return callOwner(this, 'briefingGet', params, signal); }
-  async frontierList(params, signal) { return callOwner(this, 'frontierList', params, signal); }
-  async inboxList(params, signal) { return callOwner(this, 'inboxList', params, signal); }
-  async alertsList(params, signal) { return callOwner(this, 'alertsList', params, signal); }
-  async wikiSearch(params, signal) { return callOwner(this, 'wikiSearch', params, signal); }
-  async wikiCheckGraveyard(params, signal) { return callOwner(this, 'wikiCheckGraveyard', params, signal); }
-  async wikiProvenance(params, signal) { return callOwner(this, 'wikiProvenance', params, signal); }
+  async promotionRecover(params, signal) { return callOwner(this, 'promotionRecover', 'promotion.recover', params, signal); }
+  async status(params, signal) { return callOwner(this, undefined, 'status', params, signal); }
+  async briefingPeek(params, signal) { return callOwner(this, undefined, 'briefingPeek', params, signal); }
+  async briefingPull(params, signal) { return callOwner(this, undefined, 'briefingPull', params, signal); }
+  async briefingGet(params, signal) { return callOwner(this, undefined, 'briefingGet', params, signal); }
+  async frontierList(params, signal) { return callOwner(this, undefined, 'frontierList', params, signal); }
+  async inboxList(params, signal) { return callOwner(this, undefined, 'inboxList', params, signal); }
+  async alertsList(params, signal) { return callOwner(this, undefined, 'alertsList', params, signal); }
+  async wikiSearch(params, signal) { return callOwner(this, undefined, 'wikiSearch', params, signal); }
+  async wikiCheckGraveyard(params, signal) { return callOwner(this, undefined, 'wikiCheckGraveyard', params, signal); }
+  async wikiProvenance(params, signal) { return callOwner(this, undefined, 'wikiProvenance', params, signal); }
   async *subscribe(params, signal) {
     requireOwner(this.ctx);
     try { yield* this.owner.subscribe(params, signal); }
@@ -103,9 +104,12 @@ async function callWorkbench(service, key, handler, params) {
   }
 }
 
-async function callOwner(service, method, params, signal) {
+async function callOwner(service, key, method, params, signal) {
   requireOwner(service.ctx);
-  try { return await service.owner.call(method, params, signal); }
+  try {
+    if (key !== undefined) params = parseParams(key, params);
+    return await service.owner.call(method, params, signal);
+  }
   catch (error) { throw asRemoteError(error); }
 }
 

@@ -351,7 +351,7 @@ test('lazy browser bundle mounts shell.bottom and four sidebar tabs with owned c
   assert.deepEqual(Array.from(registration.descriptors, descriptor => descriptor.method).sort(),
     ['alertsList', 'briefingGet', 'briefingPeek', 'briefingPull',
       'daemonStart', 'daemonStop', 'frontierList', 'inboxList',
-      'projectInit', 'projectRemove', 'projectSelect', 'status', 'subscribe', 'wikiCheckGraveyard',
+      'projectInit', 'projectRemove', 'projectSelect', 'promotionRecover', 'status', 'subscribe', 'wikiCheckGraveyard',
       'wikiProvenance', 'wikiSearch', 'workbenchState']);
   const subscription = registration.descriptors.find(d => d.method === 'subscribe');
   assert.equal(subscription.mode, 'stream');

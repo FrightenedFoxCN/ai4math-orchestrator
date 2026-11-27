@@ -322,6 +322,25 @@ test('typed Oracle trust tools are Chief-only and reject caller-selected levels'
   ]);
 });
 
+
+test('promotion recovery is Owner-only and never appears as an Agent tool', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    assert.equal(methodsForRole(role).includes('promotionRecover'), role === 'owner', role + '/promotionRecover');
+  }
+  await bridge.bind('owner').call('promotionRecover', {});
+  await assert.rejects(bridge.bind('owner').call('promotionRecover', { proof_body:'secret' }), fails('invalid'));
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'owner' }], ['promotion.recover', {}],
+  ]);
+});
+
 test('promotion tools are Chief-only redacted reads with no execution surface', async t => {
   const seen = [];
   const socketPath = await fixture(t, ({ id, method, params }, socket) => {
