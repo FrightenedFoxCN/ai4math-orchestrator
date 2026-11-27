@@ -331,6 +331,23 @@ struct InboxPush {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PromotionApprovalArgs {
+    task_id: String,
+    request_id: String,
+    expires_unix: u64,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromotionExecuteArgs {
+    task_id: String,
+    request_id: String,
+    expires_unix: u64,
+    signature_hex: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct PromotionPreviewArgs {
     task_id: String,
 }
@@ -540,6 +557,14 @@ fn cap(arg: Option<usize>, default: usize, max: usize) -> std::result::Result<us
 fn internal(error: anyhow::Error) -> RpcError {
     eprintln!("ai4mathd: {error:#}");
     RpcError::new(-32603, "local state operation failed")
+}
+
+fn owner_promotion_error(error: anyhow::Error) -> RpcError {
+    eprintln!("ai4mathd Owner promotion: {error:#}");
+    RpcError::new(
+        -32003,
+        "Owner promotion authorization is invalid, expired, or unavailable",
+    )
 }
 
 fn native_rfc_error(error: anyhow::Error) -> RpcError {
@@ -1063,6 +1088,136 @@ impl Project {
                 Ok(json!({"preview":preview}))
             }
 
+            "promotion.approval" => {
+                let args: PromotionApprovalArgs = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["owner"], "promotion.approval")?;
+                rpc_id("task_id", &args.task_id, 100)?;
+                rpc_id("request_id", &args.request_id, 128)?;
+                if args.expires_unix == 0 {
+                    return Err(RpcError::new(
+                        -32602,
+                        "expiry must be positive Unix seconds",
+                    ));
+                }
+                let config = self.native_rfc.as_ref().ok_or_else(|| {
+                    RpcError::new(-32006, "trusted promotion tooling is not configured")
+                })?;
+                let (cli_sha256, lean_sha256) = config.fingerprints().map_err(native_rfc_error)?;
+                let repo = self.managed_repo_name()?;
+                let git = lock_managed_git(&repo)?;
+                let head = git.main_head().map_err(native_rfc_error)?;
+                let preview = self
+                    .store()
+                    .map_err(internal)?
+                    .promotion_preview(&args.task_id, &head)
+                    .map_err(internal)?;
+                let approval = crate::owner_promotion::PromotionApproval::new(
+                    &self.root,
+                    Path::new(&repo),
+                    &preview,
+                    &cli_sha256,
+                    &lean_sha256,
+                    &args.request_id,
+                    args.expires_unix,
+                )
+                .map_err(owner_promotion_error)?;
+                Ok(json!({
+                    "message_hex":crate::owner_promotion::hex_encode(approval.signing_bytes()),
+                    "message_sha256":approval.message_sha256(),
+                    "preview":preview,
+                }))
+            }
+            "promotion.execute" => {
+                let args: PromotionExecuteArgs = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["owner"], "promotion.execute")?;
+                rpc_id("task_id", &args.task_id, 100)?;
+                rpc_id("request_id", &args.request_id, 128)?;
+                if args.expires_unix == 0 {
+                    return Err(RpcError::new(
+                        -32602,
+                        "expiry must be positive Unix seconds",
+                    ));
+                }
+                if args.signature_hex.is_empty() || args.signature_hex.len() > 8192 {
+                    return Err(RpcError::new(-32602, "invalid signature size"));
+                }
+                let signature = crate::owner_promotion::hex_decode(&args.signature_hex)
+                    .map_err(owner_promotion_error)?;
+                let config = self.native_rfc.as_ref().ok_or_else(|| {
+                    RpcError::new(-32006, "trusted promotion tooling is not configured")
+                })?;
+                let (cli_sha256, lean_sha256) = config.fingerprints().map_err(native_rfc_error)?;
+                let repo = self.managed_repo_name()?;
+                let git = lock_managed_git(&repo)?;
+                let head = git.main_head().map_err(native_rfc_error)?;
+                let preview = self
+                    .store()
+                    .map_err(internal)?
+                    .promotion_preview(&args.task_id, &head)
+                    .map_err(internal)?;
+                let approval = crate::owner_promotion::PromotionApproval::new(
+                    &self.root,
+                    Path::new(&repo),
+                    &preview,
+                    &cli_sha256,
+                    &lean_sha256,
+                    &args.request_id,
+                    args.expires_unix,
+                )
+                .map_err(owner_promotion_error)?;
+                approval
+                    .verify_fresh(&self.root, &signature)
+                    .map_err(owner_promotion_error)?;
+                if self
+                    .store()
+                    .map_err(internal)?
+                    .promotion_intent()
+                    .map_err(internal)?
+                    .is_some()
+                {
+                    return Err(RpcError::new(
+                        -32002,
+                        "a promotion intent is already pending",
+                    ));
+                }
+                let consumed_unix = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|error| internal(error.into()))?
+                    .as_secs();
+                let actor = actor(&role);
+                let consumed = self
+                    .store()
+                    .map_err(internal)?
+                    .consume_promotion_approval(
+                        &args.request_id,
+                        &approval.message_sha256(),
+                        &preview.candidate_sha256,
+                        &args.task_id,
+                        consumed_unix,
+                        Change {
+                            actor: &actor,
+                            git_commit: Some(&head),
+                        },
+                    )
+                    .map_err(internal)?;
+                if !consumed {
+                    return Ok(
+                        json!({"accepted":false,"replayed":true,"message":"approval already consumed; inspect promotion status"}),
+                    );
+                }
+                approval.check_fresh().map_err(owner_promotion_error)?;
+                drop(git);
+                let record = config
+                    .promote_task_result(&self.root, Path::new(&repo), &args.task_id)
+                    .map_err(native_rfc_error)?;
+                Ok(json!({"accepted":true,"replayed":false,"promotion":record}))
+            }
             "promotion.recover" => {
                 let _: Empty = parse(params)?;
                 let role = connection

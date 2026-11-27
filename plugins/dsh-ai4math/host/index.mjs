@@ -76,6 +76,8 @@ class Ai4mathRemote extends TypertRemoteService {
   async projectRemove(params) { return callWorkbench(this, 'projectRemove', 'projectRemove', params); }
   async daemonStart(params) { return callWorkbench(this, 'daemonStart', 'daemonStart', params); }
   async daemonStop(params) { return callWorkbench(this, 'daemonStop', 'daemonStop', params); }
+  async promotionApproval(params, signal) { return callOwner(this, 'promotionApproval', 'promotion.approval', params, signal); }
+  async promotionExecute(params, signal) { return callOwner(this, 'promotionExecute', 'promotion.execute', params, signal); }
   async promotionRecover(params, signal) { return callOwner(this, 'promotionRecover', 'promotion.recover', params, signal); }
   async status(params, signal) { return callOwner(this, undefined, 'status', params, signal); }
   async briefingPeek(params, signal) { return callOwner(this, undefined, 'briefingPeek', params, signal); }

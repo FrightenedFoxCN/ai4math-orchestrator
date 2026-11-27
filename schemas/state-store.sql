@@ -307,6 +307,18 @@ CREATE TABLE IF NOT EXISTS promotion_intent (
   target_decl TEXT NOT NULL,
   proof_body TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS promotion_approval_requests (
+  request_id TEXT PRIMARY KEY CHECK(length(request_id) BETWEEN 1 AND 128),
+  message_sha256 TEXT NOT NULL CHECK(length(message_sha256)=64 AND message_sha256 NOT GLOB '*[^0-9a-f]*'),
+  candidate_sha256 TEXT NOT NULL CHECK(length(candidate_sha256)=64 AND candidate_sha256 NOT GLOB '*[^0-9a-f]*'),
+  task_id TEXT NOT NULL CHECK(length(task_id) BETWEEN 1 AND 100),
+  consumed_unix INTEGER NOT NULL CHECK(consumed_unix >= 0),
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS promotion_approval_requests_no_update BEFORE UPDATE ON promotion_approval_requests
+BEGIN SELECT RAISE(ABORT, 'promotion approval requests are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS promotion_approval_requests_no_delete BEFORE DELETE ON promotion_approval_requests
+BEGIN SELECT RAISE(ABORT, 'promotion approval requests are immutable'); END;
 -- Single in-flight cross-resource ADR transaction; not an event and not an approval by itself.
 CREATE TABLE IF NOT EXISTS pivot_resume_intent (
   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),

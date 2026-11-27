@@ -7,6 +7,7 @@
 use crate::resident_process::capture_stdout_limited;
 use anyhow::{Context, Result, ensure};
 use serde_json::Value;
+use sha2::Digest;
 use std::{
     fs,
     os::unix::{fs::PermissionsExt, process::CommandExt},
@@ -46,6 +47,14 @@ impl Config {
             lean,
             timeout: Duration::from_secs(timeout_secs),
         })
+    }
+
+    pub fn fingerprints(&self) -> Result<(String, String)> {
+        let digest = |path: &Path| -> Result<String> {
+            let bytes = fs::read(path).context("read trusted tool for fingerprint")?;
+            Ok(format!("{:x}", sha2::Sha256::digest(bytes)))
+        };
+        Ok((digest(&self.cli)?, digest(&self.lean)?))
     }
 
     fn command(
@@ -106,6 +115,24 @@ impl Config {
             digest,
             lemmas,
         ))
+    }
+
+    pub fn promote_task_result(&self, root: &Path, repo: &Path, task_id: &str) -> Result<Value> {
+        let mut command = Command::new(&self.cli);
+        command
+            .arg("promote-task-result")
+            .arg(root)
+            .arg(repo)
+            .arg(task_id)
+            .arg(&self.lean)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir("/")
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        self.run(command)
     }
 
     pub fn recover_promotion(&self, root: &Path, repo: &Path) -> Result<Value> {

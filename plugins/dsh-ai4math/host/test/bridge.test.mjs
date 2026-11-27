@@ -323,6 +323,33 @@ test('typed Oracle trust tools are Chief-only and reject caller-selected levels'
 });
 
 
+
+test('promotion approval and execute are Owner-only signed control methods', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    assert.equal(methodsForRole(role).includes('promotionApproval'), role === 'owner', role + '/promotionApproval');
+    assert.equal(methodsForRole(role).includes('promotionExecute'), role === 'owner', role + '/promotionExecute');
+  }
+  const approval = { task_id:'T1', request_id:'REQ-1', expires_unix:2000000000 };
+  const execute = { ...approval, signature_hex:'aabb' };
+  await bridge.bind('owner').call('promotionApproval', approval);
+  await bridge.bind('owner').call('promotionExecute', execute);
+  for (const invalid of [
+    { ...approval, expires_unix:0 },
+    { ...execute, proof_body:'secret' },
+    { ...execute, signature_hex:'zz' },
+  ]) await assert.rejects(bridge.bind('owner').call(invalid.signature_hex ? 'promotionExecute' : 'promotionApproval', invalid), fails('invalid'));
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'owner' }], ['promotion.approval', approval], ['promotion.execute', execute],
+  ]);
+});
+
 test('promotion recovery is Owner-only and never appears as an Agent tool', async t => {
   const seen = [];
   const socketPath = await fixture(t, ({ id, method, params }, socket) => {

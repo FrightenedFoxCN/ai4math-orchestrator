@@ -4,9 +4,9 @@
 //! authorization. They describe what an operator could review; they do not
 //! prepare, publish, recover, or promote anything.
 
-use super::{ClaimState, StateStore};
+use super::{Change, ClaimState, StateStore};
 use anyhow::{Context, Result, ensure};
-use rusqlite::OptionalExtension;
+use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -224,6 +224,61 @@ impl StateStore {
         Ok(preview)
     }
 
+    /// Atomically consume one Owner approval request. Exact replay returns false;
+    /// reuse for another message, candidate or task is refused.
+    pub fn consume_promotion_approval(
+        &mut self,
+        request_id: &str,
+        message_sha256: &str,
+        candidate_sha256: &str,
+        task_id: &str,
+        consumed_unix: u64,
+        change: Change<'_>,
+    ) -> Result<bool> {
+        ensure!(
+            !request_id.is_empty()
+                && request_id.len() <= 128
+                && request_id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-')),
+            "invalid promotion approval request ID"
+        );
+        ensure!(
+            message_sha256.len() == 64 && candidate_sha256.len() == 64,
+            "invalid promotion approval digest"
+        );
+        self.write(|tx| {
+            let existing: Option<(String, String, String)> = tx
+                .query_row(
+                    "SELECT message_sha256,candidate_sha256,task_id FROM promotion_approval_requests WHERE request_id=?1",
+                    [request_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            if let Some((message, candidate, task)) = existing {
+                ensure!(
+                    message == message_sha256 && candidate == candidate_sha256 && task == task_id,
+                    "promotion approval request ID already identifies different input"
+                );
+                return Ok(false);
+            }
+            let seq = super::event(
+                tx,
+                change,
+                "PROMOTION_APPROVAL_CONSUMED",
+                "promotion_approval",
+                request_id,
+                json!({"message_sha256":message_sha256,"candidate_sha256":candidate_sha256,"task_id":task_id}),
+            )?;
+            tx.execute(
+                "INSERT INTO promotion_approval_requests(request_id,message_sha256,candidate_sha256,task_id,consumed_unix,event_seq)
+                 VALUES(?1,?2,?3,?4,?5,?6)",
+                params![request_id, message_sha256, candidate_sha256, task_id, consumed_unix, seq],
+            )?;
+            Ok(true)
+        })
+    }
+
     pub fn promotion_status(&self, current_head: &str) -> Result<PromotionStatus> {
         let tx = self.db.unchecked_transaction()?;
         let pending_intent = self
@@ -313,6 +368,25 @@ mod tests {
             },
         )?;
         Ok((store, "a".repeat(40)))
+    }
+
+    #[test]
+    fn owner_approval_consumption_is_exactly_idempotent() -> Result<()> {
+        let (mut store, _head) = fixture()?;
+        let change = Change {
+            actor: "owner",
+            git_commit: None,
+        };
+        let message = "a".repeat(64);
+        let candidate = "b".repeat(64);
+        assert!(store.consume_promotion_approval("REQ-1", &message, &candidate, "T1", 1, change)?);
+        assert!(!store.consume_promotion_approval("REQ-1", &message, &candidate, "T1", 1, change)?);
+        assert!(
+            store
+                .consume_promotion_approval("REQ-1", &"c".repeat(64), &candidate, "T1", 1, change)
+                .is_err()
+        );
+        Ok(())
     }
 
     #[test]

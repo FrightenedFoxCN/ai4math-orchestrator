@@ -9,6 +9,8 @@ mod facts;
 #[cfg(unix)]
 mod native_rfc;
 #[cfg(unix)]
+mod owner_promotion;
+#[cfg(unix)]
 mod proofs;
 #[cfg(unix)]
 mod resident_paths;

@@ -200,6 +200,37 @@ fn boot_with_native(project: &Path, cli: &Path, lean: &Path) -> Result<Server> {
     boot_with_native_timeout(project, cli, lean, "10")
 }
 
+fn decode_hex(text: &str) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 2);
+    for pair in text.as_bytes().as_chunks::<2>().0 {
+        let digit = |b: u8| -> Result<u8> {
+            match b {
+                b'0'..=b'9' => Ok(b - b'0'),
+                b'a'..=b'f' => Ok(b - b'a' + 10),
+                _ => anyhow::bail!("invalid hex"),
+            }
+        };
+        out.push((digit(pair[0])? << 4) | digit(pair[1])?);
+    }
+    Ok(out)
+}
+
+fn sign_promotion(project: &Path, key: &Path, message_hex: &str) -> Result<Vec<u8>> {
+    let message = project.join("owner-message");
+    fs::write(&message, decode_hex(message_hex)?)?;
+    let status = Command::new("/usr/bin/ssh-keygen")
+        .args(["-Y", "sign", "-f"])
+        .arg(key)
+        .args(["-I", "ai4math", "-n", "ai4math-promotion"])
+        .arg(&message)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    ensure!(status.success(), "sign Owner promotion fixture");
+    Ok(fs::read(project.join("owner-message.sig"))?)
+}
+
 fn connect(project: &Path, child: &mut Server) -> Result<Rpc> {
     let socket = project.join(".runtime/ai4mathd.sock");
     let until = Instant::now() + Duration::from_secs(5);
@@ -367,6 +398,24 @@ fn rfc_submit_and_approval_use_bound_git_and_principal_actors() -> Result<()> {
         .record_oracle_observation(&approval, &OracleEvidence::new()?)?
         .id;
     drop(store);
+
+    let owner_key = project.join("owner-ed25519");
+    let keygen = Command::new("/usr/bin/ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-f"])
+        .arg(&owner_key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    ensure!(keygen.success(), "generate Owner Ed25519 fixture key");
+    fs::copy(
+        project.join("owner-ed25519.pub"),
+        runtime.join("owner-promotion.pub"),
+    )?;
+    fs::set_permissions(
+        runtime.join("owner-promotion.pub"),
+        fs::Permissions::from_mode(0o600),
+    )?;
 
     let fake_cli = project.join("fake-ai4math");
     let fake_lean = project.join("fake-lean");
@@ -572,6 +621,48 @@ fn rfc_submit_and_approval_use_bound_git_and_principal_actors() -> Result<()> {
     assert!(preview.get("proof_body").is_none());
     assert!(!preview.to_string().contains("by rfl"));
     assert!(chief.result("promotion.status", json!({}))?["status"]["pending_intent"].is_null());
+
+    let expires_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 300;
+    let approval_args =
+        json!({"task_id":"T1","request_id":"REQ-EXEC-1","expires_unix":expires_unix});
+    let approval_packet = owner.result("promotion.approval", approval_args.clone())?;
+    assert!(!approval_packet.to_string().contains("by rfl"));
+    let signature = sign_promotion(
+        project,
+        &owner_key,
+        approval_packet["message_hex"]
+            .as_str()
+            .context("message hex")?,
+    )?;
+    let signature_hex: String = signature.iter().map(|b| format!("{b:02x}")).collect();
+    let execute_args = json!({
+        "task_id":"T1","request_id":"REQ-EXEC-1","expires_unix":expires_unix,"signature_hex":signature_hex,
+    });
+    assert_eq!(
+        chief.call("promotion.execute", execute_args.clone())?["error"]["code"],
+        -32003
+    );
+    let executed = owner.result("promotion.execute", execute_args.clone())?;
+    assert_eq!(executed["accepted"], true);
+    assert_eq!(executed["replayed"], false);
+    let execute_argv = fs::read_to_string(&argv_log)?;
+    assert_eq!(
+        execute_argv.lines().collect::<Vec<_>>(),
+        [
+            "promote-task-result",
+            project.canonicalize()?.to_str().context("project path")?,
+            repo.to_str().context("repo path")?,
+            "T1",
+            fake_lean.to_str().context("lean path")?,
+        ]
+    );
+    let replay = owner.result("promotion.execute", execute_args)?;
+    assert_eq!(replay["accepted"], false);
+    assert_eq!(replay["replayed"], true);
+    assert_eq!(fs::read_to_string(&argv_log)?, execute_argv);
 
     let db = rusqlite::Connection::open(runtime.join("state.sqlite"))?;
     db.execute(

@@ -45,6 +45,12 @@ const infraDraft = object({
 }, ['rfc_id','requested_by_claim','engine','motivation','proposed_definitions','required_api_lemmas','consumer_usage_sketch','smoke_test_criteria','status']);
 
 export const REMOTE_METHODS = Object.freeze({
+  promotionApproval: principalEndpoint('promotion.approval', 'Build the exact Owner signing message for one retained candidate; this does not execute or grant authority.', object({
+    task_id:id(100), request_id:id(128), expires_unix:Object.freeze({type:'integer',minimum:1,maximum:9007199254740991}),
+  }, ['task_id','request_id','expires_unix'])),
+  promotionExecute: principalEndpoint('promotion.execute', 'Verify a fresh Owner Ed25519 signature, consume its request ID once, and invoke trusted task promotion.', object({
+    task_id:id(100), request_id:id(128), expires_unix:Object.freeze({type:'integer',minimum:1,maximum:9007199254740991}), signature_hex:Object.freeze({type:'string',pattern:'^[0-9a-f]+$',minLength:2,maxLength:8192}),
+  }, ['task_id','request_id','expires_unix','signature_hex'])),
   promotionRecover: principalEndpoint('promotion.recover', 'Owner-only recovery of an existing pending promotion intent through trusted CLI tooling.', empty),
   promotionPreview: writeEndpoint('promotion.preview', 'Read a redacted proof-body candidate preview; never returns proof text or authorizes promotion.', object({task_id:id(100)}, ['task_id'])),
   promotionStatus: writeEndpoint('promotion.status', 'Read redacted pending-promotion and managed-HEAD status; no execution or recovery is exposed.', empty),

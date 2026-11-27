@@ -237,6 +237,15 @@
 - Owner bridge 使用独立 Principal-bound 连接；Chief、Builder、Prover、Reviewer 等角色均无法调用。
 - 假 CLI/UDS 夹具验证固定 argv、Owner 权限、无参数注入与 pending 前置门禁；真实恢复语义仍由 CLI 既有 native/恢复测试覆盖。
 
+## Owner-signed promotion execute（2026-11-28）
+
+- 新增 Owner-only `promotion.approval` / `promotion.execute`，不注册为 Agent 工具。
+- approval 返回 canonical JSON 的 hex 签名消息与脱敏 preview；消息绑定 project root、repo、task/claim/engine/module/target/base、candidate SHA-256、CLI/Lean SHA-256、request ID 和到期 Unix 秒。
+- Owner 公钥只从 `.runtime/owner-promotion.pub` 读取，要求单链接普通文件、当前 UID、无 group/world 写权限；签名通过 `/usr/bin/ssh-keygen -Y verify` 离线验证，有效期最多 10 分钟。
+- execute 在调用 CLI 前原子消费 request ID；同一消息重放返回 `replayed:true` 且不会再次执行，冲突复用返回错误。CLI 失败后该授权仍保持已消费，必须重新审批。
+- 实际执行固定调用 `promote-task-result ROOT BARE_REPO TASK NATIVE_LEAN`，daemon 不读取或序列化 proof body。
+- Store、真实 Ed25519 + 假 CLI/UDS 测试覆盖签名、固定 argv、角色隔离、一次性消费与 proof body 不泄露；真实候选的原生提升仍由 CLI 既有 native promotion 测试覆盖，daemon 端到端原生提升尚需单独验收。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。
