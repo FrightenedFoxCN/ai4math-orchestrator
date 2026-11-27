@@ -1,6 +1,6 @@
 #![cfg(unix)]
 use ai4math_evidence::{OracleObservationEvidence, OracleOutcome};
-use ai4math_store::{Change, NewClaim, StateStore};
+use ai4math_store::{Change, NewClaim, NewTask, StateStore, TaskRunOutcome, TaskTrack};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -70,6 +70,11 @@ impl Rpc {
             next: 0,
         })
     }
+    fn set_timeout(&self, timeout: Duration) -> Result<()> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        self.reader.get_ref().set_read_timeout(Some(timeout))?;
+        Ok(())
+    }
     fn call(&mut self, method: &str, params: Value) -> Result<Value> {
         self.next += 1;
         let id = self.next;
@@ -138,21 +143,25 @@ fn git(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
     Ok(output.stdout)
 }
 
-fn bare_with_source(path: &Path, source: &[u8]) -> Result<String> {
+fn bare_with_files(path: &Path, files: &[(&str, &[u8])]) -> Result<String> {
     fs::create_dir_all(path)?;
     git(path, &["init", "--bare", "--initial-branch=main"], None)?;
-    let blob = git(path, &["hash-object", "-w", "--stdin"], Some(source))?;
-    let blob = String::from_utf8(blob)?.trim().to_owned();
-    let tree = git(
-        path,
-        &["mktree"],
-        Some(format!("100644 blob {blob}\tDemo.lean\n").as_bytes()),
-    )?;
+    let mut entries = String::new();
+    for (name, source) in files {
+        let blob = git(path, &["hash-object", "-w", "--stdin"], Some(source))?;
+        let blob = String::from_utf8(blob)?.trim().to_owned();
+        entries.push_str(&format!("100644 blob {blob}\t{name}\n"));
+    }
+    let tree = git(path, &["mktree"], Some(entries.as_bytes()))?;
     let tree = String::from_utf8(tree)?.trim().to_owned();
     let commit = git(path, &["commit-tree", &tree, "-m", "initial"], None)?;
     let commit = String::from_utf8(commit)?.trim().to_owned();
     git(path, &["update-ref", "refs/heads/main", &commit], None)?;
     Ok(commit)
+}
+
+fn bare_with_source(path: &Path, source: &[u8]) -> Result<String> {
+    bare_with_files(path, &[("Demo.lean", source)])
 }
 
 fn bare_with_module(path: &Path) -> Result<String> {
@@ -346,6 +355,173 @@ fn native_rfc_freeze_and_complete_with_real_lean() -> Result<()> {
     )?;
     assert_eq!(completed["rfc"]["status"], "COMPLETED");
     assert!(completed["rfc"]["completion_receipt_sha256"].is_string());
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires native macOS Seatbelt, real Lean 4.35.0 and a built ai4math CLI"]
+fn native_owner_promotion_execute_with_real_lean() -> Result<()> {
+    let lean = PathBuf::from(
+        std::env::var_os("AI4MATH_TEST_LEAN")
+            .context("set AI4MATH_TEST_LEAN to the real Lean binary")?,
+    );
+    let version = Command::new(&lean).arg("--version").output()?;
+    ensure!(version.status.success(), "Lean version query failed");
+    ensure!(
+        String::from_utf8_lossy(&version.stdout).contains("version 4.35.0,"),
+        "native promotion acceptance requires Lean 4.35.0"
+    );
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_ai4mathd"))
+        .parent()
+        .context("daemon parent")?
+        .join("ai4math");
+    ensure!(
+        cli.is_file(),
+        "build ai4math before running native promotion acceptance"
+    );
+
+    let dir = tempfile::Builder::new()
+        .prefix("a4promote-native")
+        .rand_bytes(4)
+        .tempdir()?;
+    let project = dir.path();
+    let runtime = project.join(".runtime");
+    fs::create_dir_all(&runtime)?;
+    fs::write(runtime.join("primary_engine"), "lean4\n")?;
+    let repo_path = project.join("repo.git");
+    let head = bare_with_files(
+        &repo_path,
+        &[
+            (
+                "Demo.lean",
+                b"theorem demo : (2 : Nat) = 2 := {{PROOF_BODY}}\n",
+            ),
+            ("ai4math-modules.txt", b"Demo.lean\n"),
+        ],
+    )?;
+    fs::write(repo_path.join("ai4math-promotion.lock"), "")?;
+    fs::set_permissions(
+        repo_path.join("ai4math-promotion.lock"),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    let repo = repo_path.canonicalize()?;
+    let mut store = StateStore::open(runtime.join("state.sqlite"))?;
+    store.bind_task_repository(repo.to_str().context("repo path")?, &head)?;
+    store.create_claim(
+        NewClaim {
+            id: "C1",
+            title: "Claim",
+            informal_statement: "2 = 2",
+            engine: "lean4",
+            formal_target: Some("Demo.lean#demo"),
+            module_path: Some("Demo.lean"),
+            critical: false,
+        },
+        Change {
+            actor: "test",
+            git_commit: None,
+        },
+    )?;
+    store.register_task(
+        NewTask {
+            id: "T1",
+            track: TaskTrack::Infrastructure,
+            engine: "lean4",
+            module_path: "Demo.lean",
+            target: "demo",
+            dependencies: &[],
+        },
+        Change {
+            actor: "test",
+            git_commit: None,
+        },
+    )?;
+    let lease = store
+        .claim_task(
+            Some(TaskTrack::Infrastructure),
+            Duration::from_secs(60),
+            Change {
+                actor: "test",
+                git_commit: None,
+            },
+        )?
+        .context("lease")?;
+    store.finish_task_run(
+        &lease,
+        TaskRunOutcome::ModelCandidate {
+            base_commit: &head,
+            claim_id: "C1",
+            role: "prover_worker",
+            result_json: r#"{"kind":"proof_body","proof_body":"by\n  rfl"}"#,
+        },
+        Change {
+            actor: "test",
+            git_commit: None,
+        },
+    )?;
+    drop(store);
+
+    let owner_key = project.join("owner-ed25519");
+    let keygen = Command::new("/usr/bin/ssh-keygen")
+        .args(["-t", "ed25519", "-N", "", "-f"])
+        .arg(&owner_key)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    ensure!(keygen.success(), "generate Owner Ed25519 fixture key");
+    fs::copy(
+        project.join("owner-ed25519.pub"),
+        runtime.join("owner-promotion.pub"),
+    )?;
+    fs::set_permissions(
+        runtime.join("owner-promotion.pub"),
+        fs::Permissions::from_mode(0o600),
+    )?;
+
+    let mut child = boot_with_native_timeout(project, &cli, &lean, "600")?;
+    let mut owner = connect(project, &mut child)?;
+    owner.set_timeout(Duration::from_secs(620))?;
+    owner.bind("owner")?;
+    let mut chief = Rpc::new(UnixStream::connect(runtime.join("ai4mathd.sock"))?)?;
+    chief.bind("chief")?;
+    let expires_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs()
+        + 300;
+    let approval = owner.result(
+        "promotion.approval",
+        json!({"task_id":"T1","request_id":"REQ-NATIVE","expires_unix":expires_unix}),
+    )?;
+    assert!(!approval.to_string().contains("rfl"));
+    let signature = sign_promotion(
+        project,
+        &owner_key,
+        approval["message_hex"].as_str().context("message hex")?,
+    )?;
+    let signature_hex: String = signature.iter().map(|b| format!("{b:02x}")).collect();
+    let args = json!({"task_id":"T1","request_id":"REQ-NATIVE","expires_unix":expires_unix,"signature_hex":signature_hex});
+    let executed = owner.result("promotion.execute", args.clone())?;
+    assert_eq!(executed["accepted"], true);
+    let commit = executed["promotion"]["commit"]
+        .as_str()
+        .context("promoted commit")?;
+    assert_ne!(commit, head);
+    assert_eq!(
+        String::from_utf8(git(&repo_path, &["rev-parse", "refs/heads/main"], None)?)?.trim(),
+        commit
+    );
+    let status = chief.result("promotion.status", json!({}))?;
+    assert_eq!(status["status"]["state"], "recorded");
+    assert_eq!(
+        status["status"]["latest_recorded"]["promoted_commit"],
+        commit
+    );
+    assert_eq!(owner.result("promotion.execute", args)?["replayed"], true);
+    assert_eq!(
+        String::from_utf8(git(&repo_path, &["rev-parse", "refs/heads/main"], None)?)?.trim(),
+        commit
+    );
     Ok(())
 }
 

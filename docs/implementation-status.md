@@ -244,7 +244,7 @@
 - Owner 公钥只从 `.runtime/owner-promotion.pub` 读取，要求单链接普通文件、当前 UID、无 group/world 写权限；签名通过 `/usr/bin/ssh-keygen -Y verify` 离线验证，有效期最多 10 分钟。
 - execute 在调用 CLI 前原子消费 request ID；同一消息重放返回 `replayed:true` 且不会再次执行，冲突复用返回错误。CLI 失败后该授权仍保持已消费，必须重新审批。
 - 实际执行固定调用 `promote-task-result ROOT BARE_REPO TASK NATIVE_LEAN`，daemon 不读取或序列化 proof body。
-- Store、真实 Ed25519 + 假 CLI/UDS 测试覆盖签名、固定 argv、角色隔离、一次性消费与 proof body 不泄露；真实候选的原生提升仍由 CLI 既有 native promotion 测试覆盖，daemon 端到端原生提升尚需单独验收。
+- Store、真实 Ed25519 + 假 CLI/UDS 测试覆盖签名、固定 argv、角色隔离、一次性消费与 proof body 不泄露；真实 Lean 4.35.0 的 daemon 端到端验收已在本机无外层 Seatbelt 环境通过，覆盖签名授权、原生验证、Git main 发布、recorded promotion 与一次性重放，并加入 `.github/native-lean.sh`；其他宿主仍需单独验收。
 
 ## 尚未完成
 
