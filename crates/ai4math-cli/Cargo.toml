@@ -17,6 +17,6 @@ ai4math-store.workspace = true
 ai4math-broker.workspace = true
 ai4math-evidence.workspace = true
 ai4math-project.workspace = true
-fs2.workspace = true
+ai4math-git.workspace = true
 libc.workspace = true
 tempfile.workspace = true

@@ -180,6 +180,56 @@
 - 阶段 4（先数学基线）：`ai4math-evidence::literature` 通用溯源门禁、数学文献卡型与 6 维离线漂移测试床，并先针对已建立的数学基线相关论文做抽取与空闲形式化验证（暂不接 CompChem / CompBio）。
 - 阶段 5（非 ITP 拓展）：在数学基线文献抽取验证稳定后，再扩展 CompChem / CompBio 文献卡型（单位归一化、实验条件与对照配方）并接入首个计算化生试点。
 
+## 角色化受控写 RPC 与 Chief 只读工具面（2026-11-28）
+
+- daemon 新增连接级、一次性 `session.bind` Principal；业务写请求不再接受 `role` 字段，审计 actor 由 Principal 派生。未绑定、越权、重复绑定均 fail closed。该机制是 Host 角色绑定，不是同 UID 强认证。
+- 新增 `claim.create` / `claim.read` / `plan.create` / `plan.read` / `inbox.push`。Claim 与 ProofPlan 按自然 ID + 不可变创建事件精确重放；Inbox 保持同 ID 同内容幂等，冲突返回稳定 `-32005`。
+- 新增 Store `push_decision`：2–8 个决策选项、有界 details、已知 Claim 引用检查、row/event 同事务；不解决 Inbox、不推进 checkpoint、不改变 trust。
+- 插件新增递归严格 schema 校验、校验后深拷贝、同角色写连接单飞绑定；Agent-only 写工具不进入 Owner Remote。Chief preset 移除 shell，FS 只读，并增加 Agent scope allowlist/guard。
+- 裸 `claim.set_trust` 未暴露：L1/L2a/L3/L4a 需要 typed evidence transition，L2b/L4b/L5 继续由 Broker/ADR 门禁。
+- 验证：`cargo test --workspace --locked` 通过；`cargo clippy --workspace --all-targets --locked` 通过（仅有既有警告）；插件 `npm test` 123/123；安装版 Cordis + Typert + Rust UDS 集成测试通过。
+
+## 共享 ManagedGit、RFC 与任务控制面（2026-11-28）
+
+- 新增 `ai4math-git` crate，将 CLI `PromotionRepo` 与 daemon 的 bare-repo 校验、协调锁、直接 main HEAD、精确 tracked-path 检查统一为同一 `ManagedGit` 实现；CLI 原有 CAS/发布/恢复逻辑不变。
+- daemon 新增 `rfc.submit` / `rfc.approve` / `rfc.smoke_start` / `rfc.reject` / `rfc.supersede` / `rfc.inspect`：Explorer 提交 DRAFT，Chief 审批/拒绝/替代，Builder 按精确审批快照进入 BUILDING_SMOKE；repo、HEAD、模块跟踪状态来自受管绑定，Agent 不能传 repo 路径或绕过 Git 锁。RFC 事件 payload 绑定协调者 actor，原有回放防伪回归保持通过。
+- daemon 新增 `task.register` / `task.status`：Chief 按当前受管 HEAD 注册调度元数据，注册不派发、不授予证明权；Store 按自然 ID 与不可变元数据精确重放，冲突 fail closed。
+- 真实 bare Git + UDS 集成测试覆盖 Explorer 提交、Chief 审批/拒绝/替代、Builder smoke-start、RFC 精确重放、任务注册重放与 scheduler ready 状态；共享 Git 锁与 InfraRFC Store 回归分别通过。
+- 验证：`cargo test --workspace --locked` 通过；`cargo clippy --workspace --all-targets --locked` 通过（新增 `ai4math-git` 无警告，其余为既有警告）；插件 `npm test` 125/125；安装版 Cordis + Typert + Rust UDS 集成测试通过。
+
+## 持久化 worker attempt 与安全派单（2026-11-28）
+
+- 新增 `worker_attempts` 与事务内 `claim_task_in_tx`：acquire 在有 runnable Claim 的 Infrastructure 任务中选择一个，lease 与 RUNNING attempt 同事务提交；request ID 指纹覆盖 principal、role、base commit 与 wall budget。
+- submit/cancel 按 attempt + Principal 校验，在同一 IMMEDIATE 事务内恢复私有 fence、消费精确 lease 并写终态；candidate 与 attempt SUBMITTED 同事务落库，取消不完成任务。旧 attempt 通过 expiry 代次检查不能释放重领后的新 lease。
+- Prover 只能提交 proof body，Reviewer 只能提交结构化 review；完整规范化 suggestion 摘要用于幂等，冲突返回 `-32005`，越权/终态使用稳定 typed RPC 错误。
+- Host 将 Agent ID 作为连接 Principal binding，同角色不同 Agent 使用独立写连接；worker packet 不含 fence、scope、repo 路径、凭据或 candidate readback。该 binding 不是同 UID 密码学身份，cancel 只撤销后续提交权。
+- Store 与真实 bare Git + UDS 测试覆盖 acquire 重放、base 冲突、submit 重放/冲突、cancel、旧 attempt 不劫领新 lease（私有 fence + expiry 双绑定）、同角色不同 Principal 越权，以及 candidate 不授予证明权。
+- 验证：`cargo test --workspace --locked -- --test-threads=1` 完整通过；Clippy 通过（仅既有警告）；插件 `npm test` 127/127；安装版 DSH 集成测试通过。
+
+## 脱敏 promotion 控制面（2026-11-28）
+
+- 新增 Store `promotion_preview` / `promotion_status` 与 daemon `promotion.preview` / `promotion.status`，仅 Chief 可调用。
+- preview 在同一读事务内从 retained proof-body candidate 生成版本化 candidate/preview SHA-256、字节数、Claim 信任摘要、当前 HEAD、账本代次与 pending 门禁；严格拒绝未知字段与超过 8 KiB 的 body。proof body 只参与哈希，不进入响应。status 额外返回 latest recorded 脱敏摘要，不返回 repo 绝对路径、proof body、receipt 或 fence；daemon 在 Git 锁内核对读取前后 HEAD 不变。
+- status 以 `idle/pending/recorded` 表达持久状态，并用 `ManagedGit` 物理祖先查询分类 `prepared/published_unrecorded/main_diverged/git_unobserved`；recorded 的 `on_main` 为可选观察值，Git 查询失败不会被当成 false。
+- 两个 RPC 都走 Principal-bound 连接；未注册 execute/recover，不会准备 Git transaction、消费 Owner 授权或授予 trust。
+- Store 单测与真实 bare Git + UDS 测试验证响应不含 proof body / repo 路径，pending intent 仅返回脱敏摘要。
+
+## Typed Oracle trust transition（2026-11-28）
+
+- 新增 Chief-only `claim.apply_oracle {claim_id, observation_id}`；调用方不能选择目标信任等级。
+- Store 从 retained bounded Oracle observation 派生目标：`NoCounterexampleWithinBounds → L1`、`Counterexample → L2a`；`Disagreement/Unavailable` 返回稳定错误且不改状态。
+- transition 在同一写事务内核对 observation approval 与 live Claim 的 repo、HEAD、engine、formal target、informal statement，并按 observation ID 精确重放；事件记录 `proof_verified:false`。
+- L3/L4a/L4b/L5 没有对应 typed evidence path 前仍不可写；现有 `set_local_trust` 仅是 Store 低层 API，不是 Agent 授权。
+- Store 与真实 bare Git + UDS 测试覆盖 L1/L2a 映射、重放、HEAD/Claim 上下文不匹配、unsupported outcome 与角色越权。
+
+## 原生 RFC freeze/complete 受信适配器（2026-11-28）
+
+- daemon 新增 `--rfc-cli PATH --rfc-lean PATH [--rfc-timeout-secs N]`；两者必须同时配置，路径必须为绝对可执行文件。
+- Builder-only `rfc.freeze` / `rfc.complete` 只接受 RFC ID、精确 reviewed commit、draft digest 与 smoke lemma 名称；repo、project root、CLI、Lean executable 均由服务端固定。
+- 适配器使用清空环境、`cwd=/`、独立进程组、stdin lifeline、stdout 上限与硬超时调用现有 CLI；CLI 继续负责原生 Broker 证据生产和 Store transition，daemon 不接收或伪造 receipt。
+- RPC 在调用前复核 RFC 状态、engine、digest、smoke commit 与 Git HEAD；未配置受信工具时返回 `-32006`，不会回退到 unsandboxed 或调用方指定路径。
+- 单元与假 CLI/UDS 夹具验证固定 argv、环境清理、角色/schema 门禁和状态前置检查；另有 ignored 的真实 Lean 4.35.0 端到端验收，覆盖 submit → approve → smoke-start → freeze → complete 与两类 receipt。该测试已在本机无外层 Seatbelt 环境通过，并加入 `.github/native-lean.sh`；其他宿主仍需单独验收。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。

@@ -23,8 +23,85 @@ const list = object({ limit: limit(64) });
 const empty = object();
 const endpoint = (method, description, params, stream) => Object.freeze({ method, description, params, ...(stream ? { stream: true } : {}) });
 const hostEndpoint = (method, description, params) => Object.freeze({ ...endpoint(method, description, params), hostOnly: true });
+const agentEndpoint = (method, description, params) => Object.freeze({ ...endpoint(method, description, params), agentOnly: true });
+const writeEndpoint = (method, description, params) => Object.freeze({ ...agentEndpoint(method, description, params), agentWrite: true });
+const id = (maximum = 128) => Object.freeze({ type:'string', minLength:1, maxLength:maximum, pattern:'^[A-Za-z0-9_.:-]+$' });
+const roleText = (maximum) => Object.freeze({ type:'string', minLength:1, maxLength:maximum, 'x-ai4math-maxUtf8Bytes':maximum, pattern:'^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$' });
+const strings = (item, maximum) => Object.freeze({ type:'array', items:item, maxItems:maximum, uniqueItems:true });
+const commit = Object.freeze({type:'string',minLength:40,maxLength:64,pattern:'^[0-9a-f]{40}([0-9a-f]{24})?$'});
+const sha256 = Object.freeze({type:'string',minLength:64,maxLength:64,pattern:'^[0-9a-f]{64}$'});
+const workerSuggestion = object({
+  kind:Object.freeze({type:'string',enum:Object.freeze(['proof_body','review'])}),
+  proof_body:roleText(8192), verdict:Object.freeze({type:'string',enum:Object.freeze(['looks_consistent','needs_changes','insufficient_context'])}),
+  rationale:roleText(8192),
+}, ['kind']);
+const infraDraft = object({
+  rfc_id:id(100), requested_by_claim:id(256), engine:Object.freeze({type:'string',enum:primaryEngines}),
+  motivation:roleText(2048), proposed_definitions:Object.freeze({...strings(roleText(512),16),minItems:1}),
+  required_api_lemmas:strings(roleText(512),16), consumer_usage_sketch:roleText(4096),
+  smoke_test_criteria:Object.freeze({...strings(roleText(512),16),minItems:1}),
+  status:Object.freeze({type:'string',enum:Object.freeze(['DRAFT'])}),
+}, ['rfc_id','requested_by_claim','engine','motivation','proposed_definitions','required_api_lemmas','consumer_usage_sketch','smoke_test_criteria','status']);
 
 export const REMOTE_METHODS = Object.freeze({
+  promotionPreview: writeEndpoint('promotion.preview', 'Read a redacted proof-body candidate preview; never returns proof text or authorizes promotion.', object({task_id:id(100)}, ['task_id'])),
+  promotionStatus: writeEndpoint('promotion.status', 'Read redacted pending-promotion and managed-HEAD status; no execution or recovery is exposed.', empty),
+  workerAcquire: writeEndpoint('worker.acquire', 'Atomically acquire one request-bound infrastructure worker attempt; never returns a lease fence.', object({
+    request_id:id(128), wall_seconds:Object.freeze({type:'integer',minimum:10,maximum:600}),
+  }, ['request_id','wall_seconds'])),
+  workerSubmit: writeEndpoint('worker.submit', 'Submit one role-checked untrusted suggestion and atomically complete the attempt.', object({
+    attempt_id:id(128), suggestion:workerSuggestion,
+  }, ['attempt_id','suggestion'])),
+  workerCancel: writeEndpoint('worker.cancel', 'Cancel a running attempt and release its exact scheduler lease.', object({attempt_id:id(128)}, ['attempt_id'])),
+  workerStatus: agentEndpoint('worker.status', 'Read one attempt owned by the bound role; candidate content and fences are never returned.', object({attempt_id:id(128)}, ['attempt_id'])),
+  taskRegister: writeEndpoint('task.register', 'Register scheduler metadata against the bound managed Git HEAD; never dispatches work.', object({
+    task_id:id(100), track:Object.freeze({type:'string',enum:Object.freeze(['exploration','infrastructure'])}),
+    module_path:id(256), target_decl:id(256), dependencies:strings(id(100),32),
+  }, ['task_id','track','module_path','target_decl'])),
+  taskStatus: agentEndpoint('task.status', 'Read the current scheduler snapshot; this is not a reservation or worker count.', empty),
+  rfcSubmit: writeEndpoint('rfc.submit', 'Submit an immutable DRAFT InfraRFC against the bound managed Git HEAD.', object({
+    module_path:id(256), reviewed_commit:commit, draft:infraDraft,
+  }, ['module_path','reviewed_commit','draft'])),
+  rfcApprove: writeEndpoint('rfc.approve', 'Approve the exact reviewed InfraRFC draft without admitting work or trust.', object({
+    rfc_id:id(100), reviewed_commit:commit, draft_sha256:sha256,
+  }, ['rfc_id','reviewed_commit','draft_sha256'])),
+  rfcSmokeStart: writeEndpoint('rfc.smoke_start', 'Move an APPROVED InfraRFC into BUILDING_SMOKE at its exact reviewed snapshot.', object({
+    rfc_id:id(100), reviewed_commit:commit, draft_sha256:sha256,
+  }, ['rfc_id','reviewed_commit','draft_sha256'])),
+  rfcFreeze: writeEndpoint('rfc.freeze', 'Run the operator-configured native Lean smoke verifier and freeze the exact approved InfraRFC.', object({
+    rfc_id:id(100), reviewed_commit:commit, draft_sha256:sha256,
+    smoke_lemmas:Object.freeze({...strings(roleText(512),16),minItems:1}),
+  }, ['rfc_id','reviewed_commit','draft_sha256','smoke_lemmas'])),
+  rfcComplete: writeEndpoint('rfc.complete', 'Run the operator-configured native Lean completion verifier for a frozen InfraRFC.', object({
+    rfc_id:id(100), reviewed_commit:commit, draft_sha256:sha256,
+  }, ['rfc_id','reviewed_commit','draft_sha256'])),
+  rfcReject: writeEndpoint('rfc.reject', 'Reject a DRAFT, APPROVED, or BUILDING_SMOKE InfraRFC with a bounded reason.', object({
+    rfc_id:id(100), reviewed_commit:commit, draft_sha256:sha256, reason:roleText(512),
+  }, ['rfc_id','reviewed_commit','draft_sha256','reason'])),
+  rfcSupersede: writeEndpoint('rfc.supersede', 'Supersede an active InfraRFC with a same-consumer replacement.', object({
+    rfc_id:id(100), reviewed_commit:commit, draft_sha256:sha256, replacement_rfc_id:id(100), reason:roleText(512),
+  }, ['rfc_id','reviewed_commit','draft_sha256','replacement_rfc_id','reason'])),
+  rfcInspect: agentEndpoint('rfc.inspect', 'Read one InfraRFC lifecycle record from the bound managed repository.', object({rfc_id:id(100)}, ['rfc_id'])),
+  claimCreate: writeEndpoint('claim.create', 'Create a new L0 mathematical claim in the managed project ledger.', object({
+    claim_id:id(), title:roleText(512), informal_statement:roleText(16384), module_path:id(256), target_decl:id(256), critical:Object.freeze({type:'boolean'}),
+  }, ['claim_id','title','informal_statement','module_path','target_decl'])),
+  claimApplyOracle: writeEndpoint('claim.apply_oracle', 'Apply the trust level derived from a retained bounded Oracle observation; no caller-selected level is accepted.', object({
+    claim_id:id(128), observation_id:sha256,
+  }, ['claim_id','observation_id'])),
+  claimRead: agentEndpoint('claim.read', 'Read one claim and its current local/effective trust state.', object({claim_id:id()}, ['claim_id'])),
+  planCreate: writeEndpoint('plan.create', 'Create an active AND proof plan for an existing claim.', object({
+    plan_id:id(), target_claim_id:id(), name:roleText(512), track:Object.freeze({type:'string',enum:Object.freeze(['exploration','infrastructure'])}),
+    dependencies:Object.freeze({type:'array',maxItems:64,items:object({claim_id:id(),kind:Object.freeze({type:'string',enum:Object.freeze(['lemma','definition','oracle_placeholder'])})}, ['claim_id','kind'])}),
+  }, ['plan_id','target_claim_id','name','track'])),
+  planRead: agentEndpoint('plan.read', 'Read one proof plan status and effective trust.', object({plan_id:id()}, ['plan_id'])),
+  inboxPush: writeEndpoint('inbox.push', 'Append an immutable non-blocking decision request; never resolves or advances a human checkpoint.', object({
+    inbox_id:id(), priority:Object.freeze({type:'string',enum:Object.freeze(['P0','P1','P2'])}),
+    category:Object.freeze({type:'string',enum:Object.freeze(['breaking_def_change','strategy_branch_pruning','hard_bottleneck_escalation','cross_engine_admission','oracle_debt_waiver'])}),
+    summary:roleText(4096), leverage_score:Object.freeze({type:'number',minimum:0,maximum:1}),
+    related_claims:strings(id(),32), evidence_refs:strings(roleText(512),64),
+    options:Object.freeze({type:'array',minItems:2,maxItems:8,items:object({label:roleText(256),tradeoff:roleText(2048),recommended:Object.freeze({type:'boolean'})}, ['label','tradeoff'])}),
+    details:Object.freeze({type:'object',additionalProperties:true}),
+  }, ['inbox_id','priority','category','summary'])),
   workbenchState: hostEndpoint('workbench.state', 'Read local AI4Math workbench projects, binaries, role bindings, and managed daemon status.', empty),
   projectInit: hostEndpoint('workbench.project_init', 'Initialize or adopt a local AI4Math project directory and select it in the workbench.', object({
     root: projectRoot,

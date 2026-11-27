@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/ai4math-core", "crates/ai4math-store", "crates/ai4math-broker", "crates/ai4math-evidence", "crates/ai4math-project", "crates/ai4math-cli", "crates/ai4math-daemon"]
+members = ["crates/ai4math-core", "crates/ai4math-store", "crates/ai4math-broker", "crates/ai4math-evidence", "crates/ai4math-project", "crates/ai4math-git", "crates/ai4math-cli", "crates/ai4math-daemon"]
 resolver = "3"
 
 [workspace.package]
@@ -21,3 +21,4 @@ ai4math-store = { path = "crates/ai4math-store" }
 ai4math-broker = { path = "crates/ai4math-broker" }
 ai4math-evidence = { path = "crates/ai4math-evidence" }
 ai4math-project = { path = "crates/ai4math-project" }
+ai4math-git = { path = "crates/ai4math-git" }

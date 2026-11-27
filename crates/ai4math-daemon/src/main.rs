@@ -7,6 +7,8 @@ fn main() -> std::process::ExitCode {
 #[cfg(unix)]
 mod facts;
 #[cfg(unix)]
+mod native_rfc;
+#[cfg(unix)]
 mod proofs;
 #[cfg(unix)]
 mod resident_paths;
@@ -26,7 +28,7 @@ mod transport;
 #[cfg(unix)]
 fn main() -> std::process::ExitCode {
     use std::{env, path::PathBuf, process::ExitCode, time::Duration};
-    const USAGE: &str = "ai4mathd --project ROOT [--tick-ms N] [--proof-targets PATH] [--t3-autosweep PATH] [--t3-discovery PATH] [--t2-audit PATH]";
+    const USAGE: &str = "ai4mathd --project ROOT [--tick-ms N] [--proof-targets PATH] [--t3-autosweep PATH] [--t3-discovery PATH] [--t2-audit PATH] [--rfc-cli PATH --rfc-lean PATH [--rfc-timeout-secs N]]";
     let cmd = || -> anyhow::Result<()> {
         let mut args = env::args_os().skip(1);
         let Some(first) = args.next() else {
@@ -46,6 +48,9 @@ fn main() -> std::process::ExitCode {
         let mut t3_config = None;
         let mut discovery_config = None;
         let mut audit_config = None;
+        let mut rfc_cli = None;
+        let mut rfc_lean = None;
+        let mut rfc_timeout = None;
         while let Some(flag) = args.next() {
             if flag == "--tick-ms" && tick.is_none() {
                 let ms: u64 = args
@@ -75,6 +80,22 @@ fn main() -> std::process::ExitCode {
                     Some(PathBuf::from(args.next().ok_or_else(|| {
                         anyhow::anyhow!("missing --t2-audit configuration path")
                     })?));
+            } else if flag == "--rfc-cli" && rfc_cli.is_none() {
+                rfc_cli = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("missing --rfc-cli path"))?,
+                ));
+            } else if flag == "--rfc-lean" && rfc_lean.is_none() {
+                rfc_lean = Some(PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| anyhow::anyhow!("missing --rfc-lean path"))?,
+                ));
+            } else if flag == "--rfc-timeout-secs" && rfc_timeout.is_none() {
+                rfc_timeout = Some(
+                    args.next()
+                        .and_then(|x| x.to_str().and_then(|x| x.parse().ok()))
+                        .ok_or_else(|| anyhow::anyhow!("invalid --rfc-timeout-secs"))?,
+                );
             } else {
                 anyhow::bail!("unknown or repeated argument");
             }
@@ -91,6 +112,14 @@ fn main() -> std::process::ExitCode {
             .as_deref()
             .map(t2_audit::Config::load)
             .transpose()?;
+        anyhow::ensure!(
+            rfc_cli.is_some() == rfc_lean.is_some(),
+            "--rfc-cli and --rfc-lean must be configured together"
+        );
+        let native_rfc = rfc_cli
+            .zip(rfc_lean)
+            .map(|(cli, lean)| native_rfc::Config::new(cli, lean, rfc_timeout.unwrap_or(600)))
+            .transpose()?;
         runtime::run(
             &root,
             tick.unwrap_or(Duration::from_secs(2)),
@@ -98,6 +127,7 @@ fn main() -> std::process::ExitCode {
             worker,
             discovery,
             audit,
+            native_rfc,
         )
     };
     match cmd() {

@@ -1,7 +1,7 @@
 //! Metadata-only scheduling. Only trusted operator/coordinator code may call the
 //! mutators; Change is audit attribution, not authorization. These routines do
 //! not dispatch work, change proof trust, or authorize a promotion.
-use super::{Change, StateStore, event};
+use super::{Change, IdempotencyConflict, StateStore, event};
 use anyhow::{Context, Result, ensure};
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::Serialize;
@@ -11,6 +11,7 @@ use std::{collections::BTreeSet, fmt, str::FromStr, time::Duration};
 mod model_dispatch;
 mod oracle_holds;
 mod runs;
+pub mod workers;
 pub(super) use model_dispatch::is_model_dispatch_event;
 use model_dispatch::{MODEL_RESERVED, model_dispatch_table_exists};
 pub use model_dispatch::{ModelDispatchApproval, ModelDispatchState, NewModelDispatchApproval};
@@ -241,6 +242,33 @@ impl StateStore {
             "task ID uses the reserved sediment adaptation namespace"
         );
         self.write(|tx| {
+            let existing: Option<(String, String, String, String)> = tx
+                .query_row(
+                    "SELECT track,engine,module_path,target FROM scheduler_tasks WHERE task_id=?1",
+                    [task.id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+            if let Some((track, engine, module, target)) = existing {
+                let mut stored_deps = Vec::new();
+                let mut rows = tx.prepare(
+                    "SELECT d.task_id FROM scheduler_task_dependencies x JOIN scheduler_tasks d ON d.queue_seq=x.dep_seq WHERE x.task_seq=(SELECT queue_seq FROM scheduler_tasks WHERE task_id=?1) ORDER BY d.task_id",
+                )?;
+                for id in rows.query_map([task.id], |r| r.get::<_, String>(0))? {
+                    stored_deps.push(id?);
+                }
+                let mut requested_deps = task.dependencies.to_vec();
+                requested_deps.sort_unstable();
+                if track != task.track.as_str()
+                    || engine != task.engine
+                    || module != task.module_path
+                    || target != task.target
+                    || stored_deps != requested_deps
+                {
+                    return Err(IdempotencyConflict.into());
+                }
+                return Ok(());
+            }
             let count: i64 = tx.query_row("SELECT count(*) FROM scheduler_tasks", [], |r| r.get(0))?;
             ensure!(count < TASK_LIMIT, "task scheduler registry is full");
             let dep_seqs = task.dependencies.iter().map(|dependency| {
@@ -309,29 +337,38 @@ impl StateStore {
         lease_for: Duration,
         change: Change<'_>,
     ) -> Result<Option<TaskLease>> {
-        validate_lease_duration(lease_for)?;
-        self.write(|tx| {
-            let now = now_ms(tx)?;
-            let (exploration, infrastructure) = active_counts(tx, now)?;
-            if exploration + infrastructure >= ACTIVE_LIMIT {
-                return Ok(None);
-            }
-            let can_explore =
-                exploration < TRACK_ACTIVE_LIMIT && track != Some(TaskTrack::Infrastructure);
-            let can_build =
-                infrastructure < TRACK_ACTIVE_LIMIT && track != Some(TaskTrack::Exploration);
-            if !can_explore && !can_build {
-                return Ok(None);
-            }
-            let last_track: Option<String> = tx.query_row(
-                "SELECT last_track FROM task_scheduler_control WHERE singleton=1",
-                [],
-                |r| r.get(0),
-            )?;
-            let candidate = tx
-                .query_row(
-                    &format!(
-                        "SELECT t.queue_seq,t.task_id,t.track,t.engine,t.module_path,t.target
+        self.write(|tx| claim_task_in_tx(tx, track, expected_id, false, lease_for, change))
+    }
+}
+
+fn claim_task_in_tx(
+    tx: &Transaction<'_>,
+    track: Option<TaskTrack>,
+    expected_id: Option<&str>,
+    require_runnable_claim: bool,
+    lease_for: Duration,
+    change: Change<'_>,
+) -> Result<Option<TaskLease>> {
+    validate_lease_duration(lease_for)?;
+    let now = now_ms(tx)?;
+    let (exploration, infrastructure) = active_counts(tx, now)?;
+    if exploration + infrastructure >= ACTIVE_LIMIT {
+        return Ok(None);
+    }
+    let can_explore = exploration < TRACK_ACTIVE_LIMIT && track != Some(TaskTrack::Infrastructure);
+    let can_build = infrastructure < TRACK_ACTIVE_LIMIT && track != Some(TaskTrack::Exploration);
+    if !can_explore && !can_build {
+        return Ok(None);
+    }
+    let last_track: Option<String> = tx.query_row(
+        "SELECT last_track FROM task_scheduler_control WHERE singleton=1",
+        [],
+        |r| r.get(0),
+    )?;
+    let candidate = tx
+        .query_row(
+            &format!(
+                "SELECT t.queue_seq,t.task_id,t.track,t.engine,t.module_path,t.target
                 FROM scheduler_tasks t
                 LEFT JOIN scheduler_task_retries r ON r.task_seq=t.queue_seq
                 WHERE t.completed_at_ms IS NULL
@@ -339,59 +376,66 @@ impl StateStore {
                 AND ((?2 AND t.track='exploration') OR (?3 AND t.track='infrastructure'))
                 AND NOT {HELD_FOR_ORACLE} AND NOT {MODULE_GATED} AND NOT {DEPENDENCY_BLOCKED}
                 AND NOT {ADAPTATION_LINKED} AND NOT {MODEL_RESERVED}
+                AND (NOT {require_runnable_claim} OR EXISTS (
+                    SELECT 1 FROM claims c
+                    WHERE c.engine=t.engine AND c.module_path=t.module_path
+                      AND c.formal_target=(t.module_path || '#' || t.target)
+                      AND c.stale=0 AND c.effective_stale=0
+                      AND c.effective_trust_level NOT IN ('L2b','L3')
+                ))
                 AND (coalesce(r.state,'pending') <> 'quarantined'
                      AND (r.retry_at_ms IS NULL OR r.retry_at_ms <= ?1
                           OR (?5 AND t.task_id=?6)))
                 ORDER BY CASE WHEN t.track=?4 THEN 1 ELSE 0 END,t.queue_seq LIMIT 1"
-                    ),
-                    params![
-                        now,
-                        can_explore,
-                        can_build,
-                        last_track,
-                        expected_id.is_some(),
-                        expected_id
-                    ],
-                    |r| {
-                        Ok((
-                            r.get::<_, i64>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get(3)?,
-                            r.get(4)?,
-                            r.get(5)?,
-                        ))
-                    },
-                )
-                .optional()?;
-            let Some((seq, id, track, engine, module_path, target)) = candidate else {
-                return Ok(None);
-            };
-            if expected_id.is_some_and(|expected| expected != id) {
-                return Ok(None);
-            }
-            let track: TaskTrack = track.parse()?;
-            let (fence, expires_at_ms) = issue_lease(tx, seq, Some(track), lease_for)?;
-            event(
-                tx,
-                change,
-                "TASK_LEASED",
-                "task",
-                &id,
-                json!({"track":track, "expires_at_ms":expires_at_ms}),
-            )?;
-            Ok(Some(TaskLease {
-                id,
-                track,
-                engine,
-                module_path,
-                target,
-                expires_at_ms,
-                fence,
-            }))
-        })
+            ),
+            params![
+                now,
+                can_explore,
+                can_build,
+                last_track,
+                expected_id.is_some(),
+                expected_id
+            ],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((seq, id, track, engine, module_path, target)) = candidate else {
+        return Ok(None);
+    };
+    if expected_id.is_some_and(|expected| expected != id) {
+        return Ok(None);
     }
+    let track: TaskTrack = track.parse()?;
+    let (fence, expires_at_ms) = issue_lease(tx, seq, Some(track), lease_for)?;
+    event(
+        tx,
+        change,
+        "TASK_LEASED",
+        "task",
+        &id,
+        json!({"track":track, "expires_at_ms":expires_at_ms}),
+    )?;
+    Ok(Some(TaskLease {
+        id,
+        track,
+        engine,
+        module_path,
+        target,
+        expires_at_ms,
+        fence,
+    }))
+}
 
+impl StateStore {
     /// Complete ordinary scheduler bookkeeping only. This confirms neither a proof nor a
     /// worker output. Expired, reclaimed, frozen, foreign, and replayed leases fail.
     pub fn complete_task(&mut self, lease: &TaskLease, change: Change<'_>) -> Result<()> {

@@ -76,6 +76,10 @@ impl Rpc {
         ensure!(response.get("result").is_some(), "{method}: {response}");
         Ok(response["result"].take())
     }
+    fn bind(&mut self, role: &str) -> Result<()> {
+        self.result("session.bind", json!({"role":role}))?;
+        Ok(())
+    }
     fn event(&mut self, kind: &str) -> Result<Value> {
         for _ in 0..50 {
             let m = self.receive()?;
@@ -221,6 +225,146 @@ fn wiki_rpc_is_read_only_strict_and_bounded() -> Result<()> {
         -32601
     );
     assert_eq!(fs::read_dir(wiki.join("sediment"))?.count(), 1);
+    Ok(())
+}
+
+#[test]
+fn role_rpc_claim_plan_and_inbox_writes_are_checked_and_audited() -> Result<()> {
+    let dir = tempfile::Builder::new()
+        .prefix("a4")
+        .rand_bytes(4)
+        .tempdir()?;
+    let runtime = dir.path().join(".runtime");
+    fs::create_dir_all(&runtime)?;
+    fs::write(runtime.join("primary_engine"), "lean4\n")?;
+    let mut child = boot(dir.path())?;
+    let mut rpc = wait_connection(&runtime.join("ai4mathd.sock"), &mut child)?;
+
+    let claim = |id: &str| {
+        json!({
+            "claim_id":id,
+            "title":format!("Claim {id}"),
+            "informal_statement":"For every n, n + 0 = n.",
+            "module_path":"Demo.lean",
+            "target_decl":"demo",
+            "critical":false,
+        })
+    };
+    let socket = runtime.join("ai4mathd.sock");
+    let mut unbound = Rpc::new(UnixStream::connect(&socket)?)?;
+    assert_eq!(
+        unbound.call("claim.create", claim("C1"))?["error"]["code"],
+        -32003
+    );
+    let mut explorer = Rpc::new(UnixStream::connect(&socket)?)?;
+    explorer.bind("explorer")?;
+    assert_eq!(
+        explorer.call("claim.create", claim("C1"))?["error"]["code"],
+        -32003
+    );
+    rpc.bind("chief")?;
+    assert_eq!(
+        rpc.call("session.bind", json!({"role":"owner"}))?["error"]["code"],
+        -32003
+    );
+    assert_eq!(
+        rpc.call("claim.create", json!({"claim_id":"C1"}))?["error"]["code"],
+        -32602
+    );
+    let mut forged_role = claim("C1");
+    forged_role["role"] = json!("owner");
+    assert_eq!(
+        rpc.call("claim.create", forged_role)?["error"]["code"],
+        -32602
+    );
+    assert_eq!(
+        rpc.result("claim.create", claim("C1"))?["claim"]["local_trust"],
+        "L0"
+    );
+    rpc.result("claim.create", claim("C2"))?;
+    let plan_input = json!({
+        "plan_id":"P1",
+        "target_claim_id":"C1",
+        "name":"Induction",
+        "track":"infrastructure",
+        "dependencies":[{"claim_id":"C2","kind":"lemma"}],
+    });
+    let plan = rpc.result("plan.create", plan_input.clone())?;
+    assert_eq!(plan["status"], "ACTIVE");
+    assert_eq!(
+        rpc.result("claim.create", claim("C1"))?["claim"]["id"],
+        "C1"
+    );
+    assert_eq!(rpc.result("plan.create", plan_input)?["plan_id"], "P1");
+    let mut conflicting_claim = claim("C1");
+    conflicting_claim["title"] = json!("Different");
+    assert_eq!(
+        rpc.call("claim.create", conflicting_claim)?["error"]["code"],
+        -32005
+    );
+    assert_eq!(
+        rpc.call(
+            "claim.set_trust",
+            json!({"claim_id":"C2","trust_level":"L1"})
+        )?["error"]["code"],
+        -32601
+    );
+    let decision = json!({
+        "inbox_id":"DEC-1",
+        "priority":"P1",
+        "category":"hard_bottleneck_escalation",
+        "summary":"Choose the next proof route",
+        "leverage_score":0.75,
+        "related_claims":["C1"],
+        "evidence_refs":["event:1"],
+        "options":[
+            {"label":"Continue","tradeoff":"Uses more budget","recommended":true},
+            {"label":"Pivot","tradeoff":"Archives the current route","recommended":false},
+        ],
+        "details":{"reason":"two viable routes"},
+    });
+    let mut bad_details = decision.clone();
+    bad_details["details"] = json!([]);
+    assert_eq!(
+        rpc.call("inbox.push", bad_details)?["error"]["code"],
+        -32602
+    );
+    let first = rpc.result("inbox.push", decision.clone())?;
+    let replay = rpc.result("inbox.push", decision.clone())?;
+    assert_eq!(first, replay);
+    let mut conflict = decision;
+    conflict["summary"] = json!("Different route");
+    assert_eq!(rpc.call("inbox.push", conflict)?["error"]["code"], -32005);
+    assert_eq!(
+        rpc.result("claim.read", json!({"claim_id":"C1"}))?["claim"]["id"],
+        "C1"
+    );
+    assert_eq!(
+        rpc.result("plan.read", json!({"plan_id":"P1"}))?["plan_id"],
+        "P1"
+    );
+    let inbox = rpc.result("inbox.list", json!({}))?;
+    assert_eq!(inbox["items"][0]["inbox_id"], "DEC-1");
+
+    let db = rusqlite::Connection::open(runtime.join("state.sqlite"))?;
+    let actors: Vec<String> = {
+        let mut stmt = db.prepare("SELECT DISTINCT actor FROM events WHERE event_type IN ('CLAIM_CREATED','PLAN_CREATED','INBOX_CREATED') ORDER BY actor")?;
+        stmt.query_map([], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    assert_eq!(actors, ["agent:chief"]);
+    let claim_events: i64 = db.query_row(
+        "SELECT count(*) FROM events WHERE event_type='CLAIM_CREATED' AND entity_id='C1'",
+        [],
+        |r| r.get(0),
+    )?;
+    let plan_events: i64 = db.query_row(
+        "SELECT count(*) FROM events WHERE event_type='PLAN_CREATED' AND entity_id='P1'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert_eq!(claim_events, 1);
+    assert_eq!(plan_events, 1);
     Ok(())
 }
 

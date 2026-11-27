@@ -24,10 +24,10 @@ dependencies = [
  "ai4math-broker",
  "ai4math-core",
  "ai4math-evidence",
+ "ai4math-git",
  "ai4math-project",
  "ai4math-store",
  "anyhow",
- "fs2",
  "libc",
  "serde",
  "serde_json",
@@ -50,6 +50,8 @@ version = "0.1.0"
 dependencies = [
  "ai4math-broker",
  "ai4math-core",
+ "ai4math-evidence",
+ "ai4math-git",
  "ai4math-store",
  "anyhow",
  "libc",
@@ -69,6 +71,17 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+]
+
+[[package]]
+name = "ai4math-git"
+version = "0.1.0"
+dependencies = [
+ "ai4math-broker",
+ "anyhow",
+ "fs2",
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

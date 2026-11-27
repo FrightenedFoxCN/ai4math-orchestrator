@@ -292,19 +292,43 @@ fn event_matches(
     review: &str,
     payload: &Value,
 ) -> Result<bool> {
-    Ok(db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM events WHERE event_seq=?1 AND event_type=?2 AND entity_type=?3 AND entity_id=?4 AND git_commit=?5 AND actor=?6 AND payload_json=?7)",
-        params![
-            seq,
-            kind,
-            ENTITY,
-            id,
-            review,
-            ACTOR,
-            serde_json::to_string(payload)?
-        ],
-        |r| r.get(0),
-    )?)
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT actor,payload_json FROM events WHERE event_seq=?1 AND event_type=?2 AND entity_type=?3 AND entity_id=?4 AND git_commit=?5",
+            params![seq, kind, ENTITY, id, review],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((actual_actor, raw)) = row else {
+        return Ok(false);
+    };
+    let mut stored: Value = serde_json::from_str(&raw)?;
+    let bound_actor = stored
+        .get("actor")
+        .and_then(Value::as_str)
+        .unwrap_or(ACTOR)
+        .to_owned();
+    let valid_actor = match kind {
+        SUBMITTED => matches!(bound_actor.as_str(), ACTOR | "agent:explorer"),
+        APPROVED | REJECTED | SUPERSEDED => {
+            matches!(bound_actor.as_str(), ACTOR | "agent:chief")
+        }
+        SMOKE_STARTED => matches!(bound_actor.as_str(), ACTOR | "agent:builder"),
+        _ => bound_actor == ACTOR,
+    };
+    if !valid_actor {
+        return Ok(false);
+    }
+    if actual_actor != bound_actor {
+        return Ok(false);
+    }
+    if stored.get("actor").is_some() {
+        stored
+            .as_object_mut()
+            .context("stored InfraRFC payload is not an object")?
+            .remove("actor");
+    }
+    Ok(&stored == payload)
 }
 
 struct Stored {
@@ -673,7 +697,36 @@ fn record_transition(
     reason: Option<&str>,
     confirm_git: impl FnOnce() -> Result<()>,
 ) -> Result<InfraRfcRecord> {
-    let payload = transition_event_payload(
+    record_transition_actor(
+        tx,
+        repo,
+        row,
+        to,
+        event_type,
+        ACTOR,
+        git_commit,
+        evidence_sha256,
+        superseded_by,
+        reason,
+        confirm_git,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_transition_actor(
+    tx: &Transaction<'_>,
+    repo: &str,
+    row: &InfraRfcRecord,
+    to: InfraRfcStatus,
+    event_type: &str,
+    actor: &str,
+    git_commit: &str,
+    evidence_sha256: Option<&str>,
+    superseded_by: Option<&str>,
+    reason: Option<&str>,
+    confirm_git: impl FnOnce() -> Result<()>,
+) -> Result<InfraRfcRecord> {
+    let mut payload = transition_event_payload(
         &row.module_path,
         row.draft.engine,
         &row.draft_sha256,
@@ -683,10 +736,13 @@ fn record_transition(
         superseded_by,
         reason,
     );
+    if actor != ACTOR {
+        payload["actor"] = json!(actor);
+    }
     let seq = event(
         tx,
         Change {
-            actor: ACTOR,
+            actor,
             git_commit: Some(git_commit),
         },
         event_type,
@@ -733,6 +789,20 @@ impl StateStore {
         draft: &InfraRFC,
         confirm_git: impl FnOnce() -> Result<()>,
     ) -> Result<InfraRfcRecord> {
+        self.submit_infra_rfc_actor(ACTOR, repo, review, module, draft, confirm_git)
+    }
+
+    /// Coordinator-facing variant. The caller still has to hold the managed
+    /// Git lock and prove the reviewed snapshot through `confirm_git`.
+    pub fn submit_infra_rfc_actor(
+        &mut self,
+        actor: &str,
+        repo: &str,
+        review: &str,
+        module: &str,
+        draft: &InfraRFC,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
         let body = canonical(draft)?;
         valid_module(module, draft.engine)?;
         self.write(|tx| {
@@ -748,16 +818,20 @@ impl StateStore {
                 confirm_git()?;
                 return Ok(stored.row);
             }
+            let mut payload = event_payload(module, draft.engine, &digest);
+            if actor != ACTOR {
+                payload["actor"] = json!(actor);
+            }
             let seq = event(
                 tx,
                 Change {
-                    actor: ACTOR,
+                    actor,
                     git_commit: Some(review),
                 },
                 SUBMITTED,
                 ENTITY,
                 rfc,
-                event_payload(module, draft.engine, &digest),
+                payload,
             )?;
             tx.execute(
                 "INSERT INTO infra_rfcs(rfc_id,repo,module_path,reviewed_commit,draft_sha256,consumer_sha256,draft_json,submitted_event_seq) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",
@@ -774,6 +848,18 @@ impl StateStore {
     /// Approval is compare-and-set against the draft and consumer snapshot, not a build readiness flag.
     pub fn approve_infra_rfc(
         &mut self,
+        repo: &str,
+        review: &str,
+        rfc_id: &str,
+        approval: &str,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        self.approve_infra_rfc_actor(ACTOR, repo, review, rfc_id, approval, confirm_git)
+    }
+
+    pub fn approve_infra_rfc_actor(
+        &mut self,
+        actor: &str,
         repo: &str,
         review: &str,
         rfc_id: &str,
@@ -806,16 +892,20 @@ impl StateStore {
                 consumer(tx, &row.draft)? == stored.consumer_sha,
                 "InfraRFC consumer changed since submission"
             );
+            let mut payload = event_payload(&row.module_path, row.draft.engine, approval);
+            if actor != ACTOR {
+                payload["actor"] = json!(actor);
+            }
             let seq = event(
                 tx,
                 Change {
-                    actor: ACTOR,
+                    actor,
                     git_commit: Some(review),
                 },
                 APPROVED,
                 ENTITY,
                 rfc_id,
-                event_payload(&row.module_path, row.draft.engine, approval),
+                payload,
             )?;
             ensure!(
                 tx.execute(
@@ -835,6 +925,25 @@ impl StateStore {
     /// Transition an APPROVED InfraRFC into BUILDING_SMOKE.
     pub fn start_infra_rfc_smoke(
         &mut self,
+        repo: &str,
+        reviewed_main: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        self.start_infra_rfc_smoke_actor(
+            ACTOR,
+            repo,
+            reviewed_main,
+            rfc_id,
+            draft_sha256,
+            confirm_git,
+        )
+    }
+
+    pub fn start_infra_rfc_smoke_actor(
+        &mut self,
+        actor: &str,
         repo: &str,
         reviewed_main: &str,
         rfc_id: &str,
@@ -869,12 +978,13 @@ impl StateStore {
                 consumer(tx, &row.draft)? == stored.consumer_sha,
                 "InfraRFC consumer changed since submission"
             );
-            record_transition(
+            record_transition_actor(
                 tx,
                 repo,
                 row,
                 InfraRfcStatus::BuildingSmoke,
                 SMOKE_STARTED,
+                actor,
                 reviewed_main,
                 None,
                 None,
@@ -1084,6 +1194,28 @@ impl StateStore {
         reason: &str,
         confirm_git: impl FnOnce() -> Result<()>,
     ) -> Result<InfraRfcRecord> {
+        self.reject_infra_rfc_actor(
+            ACTOR,
+            repo,
+            reviewed_main,
+            rfc_id,
+            draft_sha256,
+            reason,
+            confirm_git,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reject_infra_rfc_actor(
+        &mut self,
+        actor: &str,
+        repo: &str,
+        reviewed_main: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        reason: &str,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
         ensure!(
             id(rfc_id, 100) && hex(draft_sha256, 64),
             "invalid InfraRFC ID or draft digest"
@@ -1118,12 +1250,13 @@ impl StateStore {
                 ),
                 "InfraRFC can only be rejected from DRAFT, APPROVED, or BUILDING_SMOKE status"
             );
-            record_transition(
+            record_transition_actor(
                 tx,
                 repo,
                 row,
                 InfraRfcStatus::Rejected,
                 REJECTED,
+                actor,
                 reviewed_main,
                 None,
                 None,
@@ -1137,6 +1270,30 @@ impl StateStore {
     #[allow(clippy::too_many_arguments)]
     pub fn supersede_infra_rfc(
         &mut self,
+        repo: &str,
+        reviewed_main: &str,
+        rfc_id: &str,
+        draft_sha256: &str,
+        replacement_rfc_id: &str,
+        reason: &str,
+        confirm_git: impl FnOnce() -> Result<()>,
+    ) -> Result<InfraRfcRecord> {
+        self.supersede_infra_rfc_actor(
+            ACTOR,
+            repo,
+            reviewed_main,
+            rfc_id,
+            draft_sha256,
+            replacement_rfc_id,
+            reason,
+            confirm_git,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn supersede_infra_rfc_actor(
+        &mut self,
+        actor: &str,
         repo: &str,
         reviewed_main: &str,
         rfc_id: &str,
@@ -1197,12 +1354,13 @@ impl StateStore {
                 ),
                 "replacement InfraRFC cannot be REJECTED or SUPERSEDED"
             );
-            record_transition(
+            record_transition_actor(
                 tx,
                 repo,
                 row,
                 InfraRfcStatus::Superseded,
                 SUPERSEDED,
+                actor,
                 reviewed_main,
                 None,
                 Some(replacement_rfc_id),

@@ -12,7 +12,7 @@ const RESULT_LIMIT: usize = 32 * 1024;
 pub(super) const DEFAULT_MAX_ATTEMPTS: i64 = 3;
 pub(super) const INITIAL_RETRY_BACKOFF_MS: i64 = 1_000;
 const MAX_RETRY_BACKOFF_MS: i64 = 60_000;
-const RUNNABLE_CLAIM: &str = "FROM scheduler_tasks t JOIN claims c ON c.claim_id=?3
+pub(super) const RUNNABLE_CLAIM: &str = "FROM scheduler_tasks t JOIN claims c ON c.claim_id=?3
     WHERE t.queue_seq=?1 AND c.engine=t.engine
     AND c.module_path=t.module_path AND c.formal_target=(t.module_path || '#' || t.target)
     AND c.stale=0 AND c.effective_stale=0
@@ -181,6 +181,50 @@ fn record_task_failure(
             quarantined_at_ms,
             failure_seq
         ],
+    )?;
+    Ok(())
+}
+
+/// Transactional model-candidate completion used by durable worker attempts.
+/// The candidate is untrusted and completes scheduler bookkeeping only.
+pub(super) fn finish_model_task_run_in_tx(
+    tx: &Transaction<'_>,
+    lease: &TaskLease,
+    base_commit: &str,
+    claim_id: &str,
+    role: &str,
+    result_json: &str,
+    change: Change<'_>,
+) -> Result<()> {
+    validate_candidate(base_commit, claim_id, result_json)?;
+    ensure!(
+        matches!(role, "prover_worker" | "independent_reviewer"),
+        "invalid model candidate role"
+    );
+    super::model_dispatch::check_model_dispatch_outcome(
+        tx,
+        &lease.id,
+        Some((base_commit, claim_id, role)),
+    )?;
+    let seq = release_lease(tx, lease, true)?
+        .context("task lease is no longer valid for worker outcome")?;
+    sediment::check_candidate_scope(tx, seq, lease, base_commit, claim_id, role, false)?;
+    let recorded = tx.execute(
+        &format!(
+            "INSERT INTO scheduler_model_task_candidates
+             (task_seq,base_commit,claim_id,role,result_json)
+             SELECT t.queue_seq,?2,c.claim_id,?4,?5 {RUNNABLE_CLAIM}"
+        ),
+        params![seq, base_commit, claim_id, role, result_json],
+    )?;
+    ensure!(recorded == 1, "worker Claim is not runnable for this task");
+    event(
+        tx,
+        change,
+        "TASK_COMPLETED",
+        "task",
+        &lease.id,
+        json!({"untrusted_candidate": true}),
     )?;
     Ok(())
 }

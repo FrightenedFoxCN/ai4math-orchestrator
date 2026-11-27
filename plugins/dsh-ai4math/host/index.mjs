@@ -8,6 +8,14 @@ import { BridgeError } from './connection.mjs';
 import { REMOTE_METHODS, REMOTE_NAMESPACE, REMOTE_PACKAGE } from './remote-contract.mjs';
 import { createWorkbench } from './workbench.mjs';
 
+const CHIEF_SAFE_TOOLS = Object.freeze([
+  'read', 'read_image', 'glob', 'grep', 'subagent', 'subagent_fork', 'send_message', 'list_agents',
+  'workflow', 'web_search', 'web_fetch', 'ask_user_question', 'todo_write', 'present', 'skill',
+]);
+const READ_SAFE_TOOLS = Object.freeze(['read', 'read_image', 'glob', 'grep', 'web_search', 'web_fetch', 'skill']);
+const safeToolsForRole = (role) => role === 'chief' || role === 'regional' ? CHIEF_SAFE_TOOLS
+  : role === 'explorer' || role === 'builder' ? READ_SAFE_TOOLS : Object.freeze([]);
+
 export const name = 'dsh-ai4math';
 export const inject = ['typert', 'typertGateway'];
 export const Config = Schema.object({
@@ -137,18 +145,32 @@ function installTools(ctx, bridge, roleByPreset, proofSlots) {
       if (role === undefined) return;
       const owned = { role, scope: createScope(agent.ctx, agent), controller: new AbortController() };
       live.set(agent, owned);
+      const safeNames = new Set(safeToolsForRole(role));
+      const visible = typeof agent.ctx.tools.definitions === 'function' ? agent.ctx.tools.definitions(agent) : [];
+      const safe = [...new Set(visible.map(tool => tool.name).filter(name => safeNames.has(name)))];
+      const registered = new Set();
+      owned.scope.ctx.tools.restrict({ allow:safe });
+      owned.scope.ctx.tools.guard((execution) => {
+        if (execution.agent !== agent || live.get(agent) !== owned || resolveRole(agent) !== role) {
+          return 'AI4Math role capability is no longer active.';
+        }
+        return safeNames.has(execution.name) || registered.has(execution.name)
+          ? undefined : 'Tool is outside this AI4Math role capability.';
+      });
       owned.scope.ctx.effect(() => () => {
         owned.controller.abort();
         if (live.get(agent) === owned) live.delete(agent);
       }, 'ai4math.agent-tools');
       const slots = proofSlots[role] ?? [];
-      const capability = bridge.bind(role,{proofSlots:slots});
+      const capability = bridge.bind(role,{proofSlots:slots,bindingId:String(agent.id)});
       try {
         for (const key of methodsForRole(role)) {
           const endpoint = REMOTE_METHODS[key];
-          if (endpoint.stream || (endpoint.agentOnly && slots.length === 0)) continue;
+          if (endpoint.stream || (key === 'proofSubmit' && slots.length === 0)) continue;
+          const toolName = 'ai4math_' + endpoint.method.replaceAll('.', '_');
+          registered.add(toolName);
           owned.scope.ctx.tools.register({
-            name: 'ai4math_' + endpoint.method.replaceAll('.', '_'),
+            name: toolName,
             description: endpoint.description,
             parameters: endpoint.params,
             output: { schema: { type: 'object' }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },

@@ -27,6 +27,22 @@ pub(super) fn take(store: &mut StateStore, track: Option<TaskTrack>) -> Result<T
 }
 
 #[test]
+fn registration_replays_exact_metadata_and_rejects_conflicts() -> Result<()> {
+    let mut store = StateStore::open(":memory:")?;
+    store.register_task(task("a", Exploration, &[]), ACTOR)?;
+    let before = store.status()?.last_event_seq;
+    store.register_task(task("a", Exploration, &[]), ACTOR)?;
+    assert_eq!(store.status()?.last_event_seq, before);
+    assert!(
+        store
+            .register_task(task("a", Infrastructure, &[]), ACTOR)
+            .is_err()
+    );
+    assert_eq!(store.status()?.last_event_seq, before);
+    Ok(())
+}
+
+#[test]
 fn track_filtered_fifo_and_global_alternation_survive_reopen() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("scheduler.sqlite");

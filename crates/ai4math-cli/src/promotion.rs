@@ -1,10 +1,10 @@
 //! Locked Git transactions for bounded, operator-trusted modules and Pivot ADRs.
+use ai4math_git::ManagedGit;
 use anyhow::{Context, Result, bail, ensure};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    fs::{File, OpenOptions},
     io::{Read, Write},
-    path::{Path, PathBuf},
+    path::Path,
     process::{Child, Command, Output, Stdio},
     sync::mpsc::{self, Receiver},
     thread,
@@ -26,8 +26,7 @@ const MAX_ADR_BYTES: usize = 64 * 1024;
 const MAX_TREE_BYTES: usize = 64 * 1024;
 
 pub struct PromotionRepo {
-    path: PathBuf,
-    _lock: File,
+    git: ManagedGit,
 }
 
 pub(crate) struct LocalReleaseTag {
@@ -484,78 +483,32 @@ fn text(bytes: Vec<u8>) -> Result<String> {
 
 impl PromotionRepo {
     pub fn lock(repo: &Path) -> Result<Self> {
-        Self::acquire_lock(repo, false, true)
+        Ok(Self {
+            git: ManagedGit::lock(repo)?,
+        })
     }
 
     /// Do not wait behind a native promotion after issuing an expiring lease.
     pub(crate) fn try_lock(repo: &Path) -> Result<Self> {
-        Self::acquire_lock(repo, true, true)
+        Ok(Self {
+            git: ManagedGit::try_lock(repo)?,
+        })
     }
 
     /// Starter/supervisor paths can observe only a project whose operator
     /// already initialized the coordination file; they must not recreate it.
     pub(crate) fn try_lock_existing(repo: &Path) -> Result<Self> {
-        Self::acquire_lock(repo, true, false)
-    }
-
-    fn acquire_lock(repo: &Path, no_wait: bool, create: bool) -> Result<Self> {
-        let path = repo.canonicalize()?;
-        ensure!(
-            text(git(
-                &path,
-                &["rev-parse", "--is-bare-repository"],
-                None,
-                None
-            )?)? == "true",
-            "promotion requires an operator-owned bare Git repository"
-        );
-        let mut options = OpenOptions::new();
-        options.write(true).create(create).truncate(false);
-        #[cfg(unix)]
-        if !create {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let lock = options.open(path.join("ai4math-promotion.lock"))?;
-        if !create {
-            let metadata = lock.metadata()?;
-            ensure!(
-                metadata.is_file(),
-                "expected an existing regular Git coordination file"
-            );
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::MetadataExt;
-                ensure!(
-                    metadata.nlink() == 1
-                        && metadata.uid() == unsafe { libc::geteuid() }
-                        && metadata.mode() & 0o022 == 0,
-                    "unsafe managed Git coordination file"
-                );
-            }
-        }
-        if no_wait {
-            fs2::FileExt::try_lock_exclusive(&lock).context("managed Git coordination is busy")?;
-        } else {
-            fs2::FileExt::lock_exclusive(&lock)?;
-        }
-        Ok(Self { path, _lock: lock })
+        Ok(Self {
+            git: ManagedGit::try_lock_existing(repo)?,
+        })
     }
 
     pub fn path(&self) -> &Path {
-        &self.path
+        self.git.path()
     }
 
     pub fn main_head(&self) -> Result<String> {
-        reject_symbolic_ref(self.path(), MAIN)?;
-        let head = text(git(
-            self.path(),
-            &["rev-parse", "--verify", MAIN],
-            None,
-            None,
-        )?)?;
-        self.require_commit(&head)?;
-        Ok(head)
+        self.git.main_head()
     }
 
     /// Create a local, annotated tag for the exact reviewed tip, without moving main.
@@ -1356,6 +1309,7 @@ fn valid_commit(commit: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs::File;
 
     fn bare() -> Result<(tempfile::TempDir, PromotionRepo)> {
         let temp = tempfile::tempdir()?;

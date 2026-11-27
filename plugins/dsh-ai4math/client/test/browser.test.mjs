@@ -349,9 +349,10 @@ test('lazy browser bundle mounts shell.bottom and four sidebar tabs with owned c
   assert.equal(app.registrations.length, 1);
   assert.equal(registration.package, 'dsh-ai4math');
   assert.deepEqual(Array.from(registration.descriptors, descriptor => descriptor.method).sort(),
-    ['alertsList', 'briefingGet', 'briefingPeek', 'briefingPull', 'daemonStart', 'daemonStop',
-      'frontierList', 'inboxList', 'projectInit', 'projectRemove', 'projectSelect', 'status', 'subscribe',
-      'wikiCheckGraveyard', 'wikiProvenance', 'wikiSearch', 'workbenchState']);
+    ['alertsList', 'briefingGet', 'briefingPeek', 'briefingPull',
+      'daemonStart', 'daemonStop', 'frontierList', 'inboxList',
+      'projectInit', 'projectRemove', 'projectSelect', 'status', 'subscribe', 'wikiCheckGraveyard',
+      'wikiProvenance', 'wikiSearch', 'workbenchState']);
   const subscription = registration.descriptors.find(d => d.method === 'subscribe');
   assert.equal(subscription.mode, 'stream');
   assert.equal(subscription.cancellation.parameter, 'signal');

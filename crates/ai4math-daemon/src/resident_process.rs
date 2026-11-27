@@ -26,6 +26,15 @@ pub(super) fn capture_stdout(
     started: Instant,
     timeout: Duration,
 ) -> Result<Vec<u8>> {
+    capture_stdout_limited(child, started, timeout, MAX_STDOUT_BYTES)
+}
+
+pub(super) fn capture_stdout_limited(
+    child: &mut Child,
+    started: Instant,
+    timeout: Duration,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
     // Keep this writer outside Child; wait must not close it before the child exits.
     let lifeline = child.stdin.take();
     let mut may_signal = true;
@@ -36,18 +45,18 @@ pub(super) fn capture_stdout(
             .take()
             .context("missing resident worker output pipe")?;
         set_nonblocking(&pipe)?;
-        let mut bytes = Vec::with_capacity(MAX_STDOUT_BYTES);
+        let mut bytes = Vec::with_capacity(max_bytes);
         let mut buffer = [0u8; 1024];
         let mut eof = false;
         loop {
             ensure!(started.elapsed() < timeout, "resident worker timed out");
             if !eof {
-                let len = buffer.len().min(MAX_STDOUT_BYTES + 1 - bytes.len());
+                let len = buffer.len().min(max_bytes + 1 - bytes.len());
                 match pipe.read(&mut buffer[..len]) {
                     Ok(0) => eof = true,
                     Ok(n) => {
                         ensure!(
-                            bytes.len() + n <= MAX_STDOUT_BYTES,
+                            bytes.len() + n <= max_bytes,
                             "resident worker output too large"
                         );
                         bytes.extend_from_slice(&buffer[..n]);

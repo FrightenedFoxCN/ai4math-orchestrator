@@ -54,11 +54,64 @@ impl RpcError {
 /// Subscription view for this connection, scoped to one handler invocation.
 /// Changes commit atomically after a successful reply is queued (or after a
 /// successful client notification). Failed handlers do not change subscriptions.
+#[derive(Clone)]
+struct Principal {
+    role: String,
+    id: String,
+}
+
 pub struct Connection {
     topics: RefCell<BTreeSet<String>>,
+    principal: RefCell<Option<Principal>>,
 }
 
 impl Connection {
+    /// Host-asserted principal for this connection. It is bound once and is
+    /// never read from a business request body. The UDS same-UID boundary still
+    /// applies: this is not a cryptographic identity mechanism.
+    pub fn bind_principal(&self, role: &str, binding_id: Option<&str>) -> Result<(), RpcError> {
+        let valid = |value: &str, max: usize| {
+            !value.is_empty()
+                && value.len() <= max
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+        };
+        if !valid(role, 32) || binding_id.is_some_and(|id| !valid(id, 128)) {
+            return Err(RpcError::new(-32602, "invalid principal"));
+        }
+        let mut current = self.principal.borrow_mut();
+        if current.is_some() {
+            return Err(RpcError::new(
+                -32003,
+                "connection principal is already bound",
+            ));
+        }
+        *current = Some(Principal {
+            role: role.to_owned(),
+            id: binding_id.unwrap_or(role).to_owned(),
+        });
+        Ok(())
+    }
+
+    pub fn principal(&self) -> Option<String> {
+        self.principal
+            .borrow()
+            .as_ref()
+            .map(|principal| principal.role.clone())
+    }
+
+    /// Stable Host binding used to separate same-role Agent capabilities.
+    pub fn principal_key(&self) -> Option<String> {
+        self.principal.borrow().as_ref().map(|principal| {
+            if principal.id == principal.role {
+                principal.role.clone()
+            } else {
+                format!("{}:{}", principal.role, principal.id)
+            }
+        })
+    }
+
     pub fn subscribe(&self, topic: &str) -> Result<bool, RpcError> {
         if topic.is_empty() || topic.len() > 128 {
             return Err(RpcError::new(-32602, "Invalid subscription topic"));
@@ -322,13 +375,16 @@ fn handle_connection(
     let mut reader = BufReader::new(stream);
     let mut frame = Vec::new();
     let mut topics = BTreeSet::new();
+    let mut principal = None;
     while read_frame(&mut reader, &mut frame)? {
         let connection = Connection {
             topics: RefCell::new(topics.clone()),
+            principal: RefCell::new(principal.clone()),
         };
         let (reply, success) = dispatch(&frame, &connection, handler);
         if success {
             topics = connection.topics.into_inner();
+            principal = connection.principal.into_inner();
         }
         if !session
             .hub

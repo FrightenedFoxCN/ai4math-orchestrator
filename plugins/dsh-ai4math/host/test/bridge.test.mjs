@@ -2,8 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { BridgeError, MAX_PENDING, NdjsonConnection, requireSocketPath } from '../connection.mjs';
-import { createBridge, MAX_STREAMS, methodsForRole, parseParams } from '../bridge.mjs';
+import { AGENT_ROLES, createBridge, MAX_STREAMS, methodsForRole, parseParams } from '../bridge.mjs';
 import { fixture, line, push, reply } from './fixture.mjs';
+import { REMOTE_METHODS } from '../remote-contract.mjs';
+import { readFileSync } from 'node:fs';
 
 const event = 'vital_signs.tick';
 const topics = [event];
@@ -105,6 +107,291 @@ test('allows only individually bound role operations and rejects role/command fi
     { method: 'proof.submit', params: proof }, { method: 'briefing.pull', params: {} }, { method: 'wiki.search', params: { text: 'lemma' } },
     { method: 'wiki.search', params: { text: 'lemma', scope: 'graveyard' } }, { method: 'alerts.list', params: { after: 0 } },
   ]);
+});
+
+
+
+test('Owner Remote descriptors and handlers match, while role tools stay agent-only', () => {
+  const source = readFileSync(new URL('../index.mjs', import.meta.url), 'utf8');
+  for (const [key, route] of Object.entries(REMOTE_METHODS)) {
+    assert.equal(Object.hasOwn(REMOTE_METHODS, 'session.bind'), false);
+    if (route.agentOnly) {
+      assert.equal(methodsForRole('owner').includes(key), false, key + ' must not be an Owner Remote method');
+    } else {
+      assert.match(source, new RegExp('\\b' + key + '\\s*\\('), key + ' needs an Owner Remote handler');
+    }
+  }
+});
+
+test('role graph and inbox tools are host-bound, schema-checked, and audited', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  const writeRoles = ['chief'];
+  const readRoles = ['chief', 'regional', 'explorer', 'builder', 'reviewer'];
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    for (const [key, roles] of [
+      ['claimCreate', writeRoles], ['planCreate', writeRoles], ['inboxPush', writeRoles],
+      ['claimRead', readRoles], ['planRead', readRoles],
+    ]) assert.equal(methodsForRole(role).includes(key), roles.includes(role), role + '/' + key);
+  }
+  const claim = { claim_id:'C1', title:'Claim', informal_statement:'Statement', module_path:'Demo.lean', target_decl:'demo' };
+  await assert.rejects(bridge.bind('explorer').call('claimCreate', claim), fails('denied'));
+  await assert.rejects(bridge.bind('chief').call('claimCreate', { ...claim, role:'owner' }), fails('invalid'));
+  await bridge.bind('chief').call('claimCreate', claim);
+  const plan = { plan_id:'P1', target_claim_id:'C1', name:'Induction', track:'infrastructure',
+    dependencies:[{claim_id:'C2',kind:'lemma'}] };
+  await bridge.bind('chief').call('planCreate', plan);
+  const inbox = { inbox_id:'DEC-1', priority:'P1', category:'hard_bottleneck_escalation', summary:'Choose route',
+    leverage_score:0.5, related_claims:['C1'], evidence_refs:['event:1'],
+    options:[{label:'Continue',tradeoff:'More budget',recommended:true},{label:'Pivot',tradeoff:'Archive route',recommended:false}], details:{reason:'two routes'} };
+  await bridge.bind('chief').call('inboxPush', inbox);
+  for (const invalid of [
+    { ...inbox, leverage_score:Number.NaN },
+    { ...inbox, leverage_score:1.1 },
+    { ...inbox, details:[] },
+    { ...inbox, options:[{label:'Continue'}] },
+    { ...inbox, options:[] },
+    { ...plan, dependencies:[{claim_id:'C2',kind:'guess'}] },
+    { ...plan, dependencies:[{claim_id:'C2',kind:'lemma'},{claim_id:'C2',kind:'definition'}] },
+  ]) await assert.rejects(bridge.bind('chief').call(invalid.plan_id ? 'planCreate' : 'inboxPush', invalid), fails('invalid'));
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'chief' }],
+    ['claim.create', claim],
+    ['plan.create', plan],
+    ['inbox.push', inbox],
+  ]);
+});
+
+
+
+test('RFC role tools are strict and use the reviewed managed-Git schema', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    assert.equal(methodsForRole(role).includes('rfcSubmit'), role === 'explorer', role + '/rfcSubmit');
+    assert.equal(methodsForRole(role).includes('rfcApprove'), role === 'chief', role + '/rfcApprove');
+    assert.equal(methodsForRole(role).includes('rfcReject'), role === 'chief', role + '/rfcReject');
+    assert.equal(methodsForRole(role).includes('rfcSupersede'), role === 'chief', role + '/rfcSupersede');
+    assert.equal(methodsForRole(role).includes('rfcSmokeStart'), role === 'builder', role + '/rfcSmokeStart');
+    assert.equal(methodsForRole(role).includes('rfcInspect'),
+      ['chief','regional','explorer','builder','reviewer'].includes(role), role + '/rfcInspect');
+  }
+  const draft = { rfc_id:'RFC-1', requested_by_claim:'C1', engine:'lean4', motivation:'Need a definition',
+    proposed_definitions:['def demo : Nat := 0'], required_api_lemmas:[],
+    consumer_usage_sketch:'example : demo = 0 := rfl', smoke_test_criteria:['nonempty'], status:'DRAFT' };
+  const submit = { module_path:'Demo.lean', reviewed_commit:'a'.repeat(40), draft };
+  await bridge.bind('explorer').call('rfcSubmit', submit);
+  await bridge.bind('chief').call('rfcApprove', { rfc_id:'RFC-1', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64) });
+  await bridge.bind('chief').call('rfcInspect', { rfc_id:'RFC-1' });
+  await bridge.bind('chief').call('rfcReject', { rfc_id:'RFC-1', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64), reason:'not needed' });
+  await bridge.bind('chief').call('rfcSupersede', { rfc_id:'RFC-1', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64), replacement_rfc_id:'RFC-2', reason:'replacement' });
+  await bridge.bind('builder').call('rfcSmokeStart', { rfc_id:'RFC-2', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64) });
+  for (const invalid of [
+    { ...submit, reviewed_commit:'A'.repeat(40) },
+    { ...submit, draft:{ ...draft, status:'APPROVED' } },
+    { ...submit, draft:{ ...draft, proposed_definitions:[] } },
+    { ...submit, draft:{ ...draft, required_api_lemmas:Array.from({length:17}, (_, i) => 'L' + i) } },
+  ]) await assert.rejects(bridge.bind('explorer').call('rfcSubmit', invalid), fails('invalid'));
+  await assert.rejects(bridge.bind('chief').call('rfcReject', {
+    rfc_id:'RFC-1', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64), reason:'bad\nreason',
+  }), fails('invalid'));
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'explorer' }], ['rfc.submit', submit],
+    ['session.bind', { role:'chief' }],
+    ['rfc.approve', { rfc_id:'RFC-1', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64) }],
+    ['rfc.inspect', { rfc_id:'RFC-1' }],
+    ['rfc.reject', { rfc_id:'RFC-1', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64), reason:'not needed' }],
+    ['rfc.supersede', { rfc_id:'RFC-1', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64), replacement_rfc_id:'RFC-2', reason:'replacement' }],
+    ['session.bind', { role:'builder' }],
+    ['rfc.smoke_start', { rfc_id:'RFC-2', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64) }],
+  ]);
+});
+
+
+test('task registration is Chief-only and never accepts repository or dispatch fields', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    assert.equal(methodsForRole(role).includes('taskRegister'), role === 'chief', role + '/taskRegister');
+    assert.equal(methodsForRole(role).includes('taskStatus'), ['chief','regional'].includes(role), role + '/taskStatus');
+  }
+  const task = { task_id:'T1', track:'infrastructure', module_path:'Demo.lean', target_decl:'demo', dependencies:[] };
+  await bridge.bind('chief').call('taskRegister', task);
+  await bridge.bind('chief').call('taskStatus', {});
+  for (const invalid of [
+    { ...task, repo:'/tmp/repo.git' }, { ...task, reviewed_commit:'a'.repeat(40) },
+    { ...task, dependencies:['T1'] }, { ...task, task_id:'x'.repeat(101) },
+  ]) await assert.rejects(bridge.bind('chief').call('taskRegister', invalid), fails('invalid'));
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'chief' }], ['task.register', task], ['task.status', {}],
+  ]);
+});
+
+
+test('worker tools are role-bound and reject cross-role suggestion shapes', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    for (const key of ['workerAcquire','workerSubmit','workerCancel','workerStatus']) {
+      assert.equal(methodsForRole(role).includes(key), ['prover','reviewer'].includes(role), role + '/' + key);
+    }
+  }
+  const acquire = { request_id:'REQ-1', wall_seconds:60 };
+  const submit = { attempt_id:'wa-1', suggestion:{kind:'proof_body',proof_body:'by rfl'} };
+  await bridge.bind('prover').call('workerAcquire', acquire);
+  await bridge.bind('prover').call('workerSubmit', submit);
+  await bridge.bind('prover').call('workerStatus', { attempt_id:'wa-1' });
+  await bridge.bind('reviewer').call('workerSubmit', { attempt_id:'wa-2', suggestion:{kind:'review',verdict:'needs_changes',rationale:'missing step'} });
+  await assert.rejects(bridge.bind('prover').call('workerSubmit', { attempt_id:'wa-1', suggestion:{kind:'review',verdict:'needs_changes',rationale:'x'} }), fails('invalid'));
+  await assert.rejects(bridge.bind('reviewer').call('workerSubmit', submit), fails('invalid'));
+  await assert.rejects(bridge.bind('prover').call('workerAcquire', { ...acquire, wall_seconds:5 }), fails('invalid'));
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'prover' }], ['worker.acquire', acquire], ['worker.submit', submit],
+    ['worker.status', { attempt_id:'wa-1' }], ['session.bind', { role:'reviewer' }],
+    ['worker.submit', { attempt_id:'wa-2', suggestion:{kind:'review',verdict:'needs_changes',rationale:'missing step'} }],
+  ]);
+});
+
+
+
+
+
+test('native RFC tools are Builder-only and accept no executable or repository fields', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    assert.equal(methodsForRole(role).includes('rfcFreeze'), role === 'builder', role + '/rfcFreeze');
+    assert.equal(methodsForRole(role).includes('rfcComplete'), role === 'builder', role + '/rfcComplete');
+  }
+  const freeze = { rfc_id:'RFC-1', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64), smoke_lemmas:['demo_eq'] };
+  const complete = { rfc_id:'RFC-1', reviewed_commit:'a'.repeat(40), draft_sha256:'b'.repeat(64) };
+  await bridge.bind('builder').call('rfcFreeze', freeze);
+  await bridge.bind('builder').call('rfcComplete', complete);
+  for (const invalid of [
+    { ...freeze, smoke_lemmas:[] },
+    { ...freeze, smoke_lemmas:Array.from({length:17}, (_, i) => 'L' + i) },
+    { ...freeze, executable:'/tmp/lean' },
+    { ...complete, repo:'/tmp/repo.git' },
+  ]) await assert.rejects(bridge.bind('builder').call(invalid.smoke_lemmas ? 'rfcFreeze' : 'rfcComplete', invalid), fails('invalid'));
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'builder' }], ['rfc.freeze', freeze], ['rfc.complete', complete],
+  ]);
+});
+
+test('typed Oracle trust tools are Chief-only and reject caller-selected levels', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    assert.equal(methodsForRole(role).includes('claimApplyOracle'), role === 'chief', role + '/claimApplyOracle');
+  }
+  const args = { claim_id:'C1', observation_id:'a'.repeat(64) };
+  await bridge.bind('chief').call('claimApplyOracle', args);
+  await assert.rejects(bridge.bind('chief').call('claimApplyOracle', { ...args, trust_level:'L5' }), fails('invalid'));
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'chief' }], ['claim.apply_oracle', args],
+  ]);
+});
+
+test('promotion tools are Chief-only redacted reads with no execution surface', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    assert.equal(methodsForRole(role).includes('promotionPreview'), role === 'chief', role + '/promotionPreview');
+    assert.equal(methodsForRole(role).includes('promotionStatus'), role === 'chief', role + '/promotionStatus');
+  }
+  await bridge.bind('chief').call('promotionPreview', { task_id:'T1' });
+  await bridge.bind('chief').call('promotionStatus', {});
+  await assert.rejects(bridge.bind('chief').call('promotionPreview', { task_id:'T1', proof_body:'secret' }), fails('invalid'));
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'chief' }], ['promotion.preview', { task_id:'T1' }], ['promotion.status', {}],
+  ]);
+});
+
+test('same-role Agent bindings use separate authenticated write connections', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  await bridge.bind('prover', { bindingId:'prover-a' }).call('workerAcquire', { request_id:'A', wall_seconds:60 });
+  await bridge.bind('prover', { bindingId:'prover-b' }).call('workerAcquire', { request_id:'B', wall_seconds:60 });
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'prover', binding_id:'prover-a' }],
+    ['worker.acquire', { request_id:'A', wall_seconds:60 }],
+    ['session.bind', { role:'prover', binding_id:'prover-b' }],
+    ['worker.acquire', { request_id:'B', wall_seconds:60 }],
+  ]);
+});
+
+test('first role writes share one bind and send immutable validated snapshots', async t => {
+  const calls = [];
+  let bindCount = 0;
+  let releaseBind;
+  let signalBind;
+  const bindSeen = new Promise(resolve => { signalBind = resolve; });
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    if (method === 'session.bind') {
+      bindCount++;
+      releaseBind = () => reply(socket, id, { principal:params.role });
+      signalBind();
+      return;
+    }
+    calls.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  const inbox = { inbox_id:'DEC-1', priority:'P1', category:'hard_bottleneck_escalation', summary:'Choose route',
+    options:[{label:'Continue',tradeoff:'More budget'},{label:'Pivot',tradeoff:'Archive route'}], details:{reason:'original'} };
+  const claim = { claim_id:'C1', title:'Claim', informal_statement:'Statement', module_path:'Demo.lean', target_decl:'demo' };
+  const first = bridge.bind('chief').call('inboxPush', inbox);
+  const second = bridge.bind('chief').call('claimCreate', claim);
+  await bindSeen;
+  inbox.details.reason = 'mutated';
+  inbox.options[0].label = 'mutated';
+  releaseBind();
+  await Promise.all([first, second]);
+  assert.equal(bindCount, 1);
+  const sentInbox = calls.find(([method]) => method === 'inbox.push')[1];
+  assert.equal(sentInbox.details.reason, 'original');
+  assert.equal(sentInbox.options[0].label, 'Continue');
 });
 
 test('in-flight proof traffic never head-of-line blocks owner RPCs', async (t) => {

@@ -25,6 +25,7 @@ mod graph_audit;
 mod graph_check;
 mod graph_replay;
 mod idle_queue;
+mod inbox;
 mod infra_rfc;
 mod ledger_replay;
 mod migrations;
@@ -32,6 +33,7 @@ mod oracle;
 mod pivot;
 mod plan_replay;
 mod probes;
+mod promotion;
 mod protocol;
 pub(crate) mod regression;
 mod reviewed_lean;
@@ -43,6 +45,7 @@ mod t3_baseline;
 mod t3_follow;
 mod tasks;
 mod trust_debt;
+mod trust_transition;
 pub use claim_replay::{ClaimReplay, ReplayedClaim};
 pub use compute_jobs::{ActiveComputeQuota, NewComputeJob, RetainedComputeJob};
 pub use epistemic_graph::{
@@ -56,6 +59,7 @@ pub use idle_queue::{
     IdleTicketSource, IdleTicketStatus, IdleUsageTotals, NewIdleVerificationTicket,
     RetainedIdleTicket,
 };
+pub use inbox::NewDecision;
 pub use infra_rfc::{INFRA_RFC_MAX_BYTES, InfraRfcRecord, InfraRfcStatus, parse_infra_rfc_draft};
 pub use oracle::{OracleApproval, RetainedOracleObservation};
 pub use pivot::{
@@ -65,6 +69,10 @@ pub use pivot::{
 };
 pub use plan_replay::{PlanReplay, ReplayedPlan, ReplayedPlanDependency};
 pub use probes::{BreakerProbeAttempt, BreakerProbeBatch, BreakerProbePlan, BreakerProbeScope};
+pub use promotion::{
+    PromotionClaimSummary, PromotionIntentSummary, PromotionPreview, PromotionRecoverySummary,
+    PromotionStatus, RecordedPromotionSummary,
+};
 pub use protocol::{RetainedPreRegistration, RetainedProtocolTrial};
 pub use reviewed_lean::{LeanSpecComparison, LeanSpecRecheck, ReviewedLeanSpec};
 pub use sediment_adaptation::{SedimentAdaptationApproval, SedimentAdaptationPlan};
@@ -73,6 +81,9 @@ pub use sediment_recheck::{RetainedSedimentReplay, SedimentReplayScope};
 pub use sweep::{T3SweepState, T3SweepStatus, T3SweepStep};
 pub use t3_baseline::T3DiscoveryBaseline;
 pub(crate) use tasks::scheduler_snapshot;
+pub use tasks::workers::{
+    WorkerAttempt, WorkerAttemptError, WorkerAttemptStatus, WorkerSuggestion,
+};
 pub use tasks::{
     ModelDispatchApproval, ModelDispatchState, NewModelDispatchApproval, NewTask, OracleTaskHold,
     TaskCandidate, TaskCandidateSource, TaskLease, TaskRunOutcome, TaskSchedulerStatus, TaskTrack,
@@ -81,6 +92,7 @@ pub use tasks::{
 pub use trust_debt::{
     TrustDebtCounts, TrustDebtFinding, TrustDebtKind, TrustDebtRole, TrustDebtScan,
 };
+pub use trust_transition::TrustTransitionError;
 
 const NOW: &str = "strftime('%Y-%m-%dT%H:%M:%fZ','now')";
 const DDL: &str = include_str!("../../../schemas/state-store.sql");
@@ -89,6 +101,16 @@ const T3_OPERATOR: &str = "operator:t3";
 pub struct StateStore {
     pub(crate) db: Connection,
 }
+
+#[derive(Debug)]
+pub struct IdempotencyConflict;
+
+impl std::fmt::Display for IdempotencyConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ID already identifies different content")
+    }
+}
+impl std::error::Error for IdempotencyConflict {}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Change<'a> {
@@ -499,6 +521,7 @@ impl StateStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let db = open_db(path.as_ref(), DDL)?;
         db.execute_batch(include_str!("../../../schemas/task-scheduler.sql"))?;
+        db.execute_batch(include_str!("../../../schemas/worker-attempts.sql"))?;
         // The schema defines the stream; prohibit mutation even through local SQL clients.
         db.execute_batch(
             "CREATE TRIGGER IF NOT EXISTS events_no_update BEFORE UPDATE ON events
@@ -910,11 +933,15 @@ impl StateStore {
 
     pub fn create_claim(&mut self, c: NewClaim<'_>, change: Change<'_>) -> Result<()> {
         self.write(|tx| {
+            let created = json!({"title": c.title, "engine": c.engine,"informal_statement":c.informal_statement,"formal_target":c.formal_target,"module_path":c.module_path,"critical":c.critical});
+            if creation_event_matches(tx, "CLAIM_CREATED", "claim", c.id, &created)? {
+                return Ok(());
+            }
             tx.execute(&format!("INSERT INTO claims (claim_id,title,informal_statement,engine,formal_target,
                 module_path,is_critical_path,local_trust_level,effective_trust_level,created_at,updated_at)
                 VALUES (?1,?2,?3,?4,?5,?6,?7,'L0','L0',{NOW},{NOW})"),
                 params![c.id,c.title,c.informal_statement,c.engine,c.formal_target,c.module_path,c.critical])?;
-            event(tx, change, "CLAIM_CREATED", "claim", c.id, json!({"title": c.title, "engine": c.engine,"informal_statement":c.informal_statement,"formal_target":c.formal_target,"module_path":c.module_path,"critical":c.critical}))?;
+            event(tx, change, "CLAIM_CREATED", "claim", c.id, created)?;
             Ok(())
         })
     }
@@ -925,13 +952,17 @@ impl StateStore {
             "new plan must be active or proved"
         );
         self.write(|tx| {
+            let created = json!({"target":p.target,"name":p.name,"track":p.track,"status":p.status.sql(),"dependencies":p.dependencies});
+            if creation_event_matches(tx, "PLAN_CREATED", "proof_plan", p.id, &created)? {
+                return Ok(());
+            }
             tx.execute(&format!("INSERT INTO proof_plans (plan_id,target_claim_id,name,track,status,effective_trust_level,created_at,updated_at)
                 VALUES (?1,?2,?3,?4,?5,'L0',{NOW},{NOW})"), params![p.id,p.target,p.name,p.track,p.status.sql()])?;
             for &(dep, kind) in p.dependencies {
                 tx.execute("INSERT INTO plan_dependencies (plan_id,dep_claim_id,dep_kind) VALUES (?1,?2,?3)", params![p.id,dep,kind])?;
             }
             graph_order(tx)?; // Reject cycles even in dormant plans.
-            event(tx, change, "PLAN_CREATED", "proof_plan", p.id, json!({"target":p.target,"name":p.name,"track":p.track,"status":p.status.sql(),"dependencies":p.dependencies}))?;
+            event(tx, change, "PLAN_CREATED", "proof_plan", p.id, created)?;
             invalidate_against_known_refutations(tx, p.id, change)?;
             recompute(tx, change)
         })
@@ -2207,6 +2238,32 @@ fn last_seq(db: &Connection) -> Result<i64> {
             r.get(0)
         })?,
     )
+}
+
+fn creation_event_matches(
+    tx: &Transaction<'_>,
+    kind: &str,
+    entity: &str,
+    id: &str,
+    expected: &Value,
+) -> Result<bool> {
+    let existing: Option<String> = tx
+        .query_row(
+            "SELECT payload_json FROM events WHERE event_type=?1 AND entity_type=?2 AND entity_id=?3 ORDER BY event_seq LIMIT 1",
+            [kind, entity, id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    match existing {
+        None => Ok(false),
+        Some(raw) => {
+            let payload: Value = serde_json::from_str(&raw)?;
+            if &payload != expected {
+                return Err(IdempotencyConflict.into());
+            }
+            Ok(true)
+        }
+    }
 }
 
 fn event(

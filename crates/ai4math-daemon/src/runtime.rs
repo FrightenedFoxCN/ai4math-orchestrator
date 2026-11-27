@@ -6,8 +6,17 @@ use crate::{
     t3_worker,
     transport::{self, Connection, Hub, RpcError},
 };
+use ai4math_core::{
+    Engine, InfraRFC, InfraStatus,
+    contracts::{DecisionCategory, DecisionOption, DecisionPriority},
+    validate_source_path,
+};
+use ai4math_git::ManagedGit;
 use ai4math_store::{
-    PivotLessonWarning, StateStore, Wiki, WikiManagedGeneration, WikiQuery, WikiStratum,
+    Change, IdempotencyConflict, NewClaim, NewDecision, NewPlan, NewTask, PivotLessonWarning,
+    PlanStatus, PromotionRecoverySummary, PromotionStatus, StateStore, TaskTrack,
+    TrustTransitionError, Wiki, WikiManagedGeneration, WikiQuery, WikiStratum, WorkerAttemptError,
+    WorkerSuggestion,
 };
 use anyhow::{Context, Result, ensure};
 use serde::Deserialize;
@@ -252,11 +261,274 @@ struct Proof {
     proof_body: String,
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimCreate {
+    claim_id: String,
+    title: String,
+    informal_statement: String,
+    module_path: String,
+    target_decl: String,
+    #[serde(default)]
+    critical: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimOracleTransition {
+    claim_id: String,
+    observation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaimRead {
+    claim_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanDependencyInput {
+    claim_id: String,
+    kind: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanCreate {
+    plan_id: String,
+    target_claim_id: String,
+    name: String,
+    track: String,
+    #[serde(default)]
+    dependencies: Vec<PlanDependencyInput>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanRead {
+    plan_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InboxPush {
+    inbox_id: String,
+    priority: String,
+    category: String,
+    summary: String,
+    #[serde(default)]
+    leverage_score: f64,
+    #[serde(default)]
+    related_claims: Vec<String>,
+    #[serde(default)]
+    evidence_refs: Vec<String>,
+    #[serde(default)]
+    options: Vec<DecisionOption>,
+    #[serde(default)]
+    details: Map<String, Value>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PromotionPreviewArgs {
+    task_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerAcquire {
+    request_id: String,
+    wall_seconds: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+enum WorkerSuggestionInput {
+    ProofBody { proof_body: String },
+    Review { verdict: String, rationale: String },
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerSubmit {
+    attempt_id: String,
+    suggestion: WorkerSuggestionInput,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerAttemptRef {
+    attempt_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskRegister {
+    task_id: String,
+    track: String,
+    module_path: String,
+    target_decl: String,
+    #[serde(default)]
+    dependencies: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RfcSubmit {
+    module_path: String,
+    reviewed_commit: String,
+    draft: InfraRFC,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RfcInspect {
+    rfc_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RfcFreeze {
+    rfc_id: String,
+    reviewed_commit: String,
+    draft_sha256: String,
+    smoke_lemmas: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RfcComplete {
+    rfc_id: String,
+    reviewed_commit: String,
+    draft_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RfcReject {
+    rfc_id: String,
+    reviewed_commit: String,
+    draft_sha256: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RfcSupersede {
+    rfc_id: String,
+    reviewed_commit: String,
+    draft_sha256: String,
+    replacement_rfc_id: String,
+    reason: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RfcApprove {
+    rfc_id: String,
+    reviewed_commit: String,
+    draft_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionBind {
+    role: String,
+    #[serde(default)]
+    binding_id: Option<String>,
+}
+
+const WRITE_ROLES: [&str; 8] = [
+    "owner",
+    "chief",
+    "regional",
+    "explorer",
+    "builder",
+    "prover",
+    "automation",
+    "reviewer",
+];
+
+fn require_write_role(role: &str, allowed: &[&str], method: &str) -> Result<(), RpcError> {
+    if !WRITE_ROLES.contains(&role) || !allowed.contains(&role) {
+        return Err(RpcError::new(
+            -32003,
+            format!("{method} is not allowed for this role"),
+        ));
+    }
+    Ok(())
+}
+
+fn actor(role: &str) -> String {
+    if role == "owner" {
+        "operator:rpc".into()
+    } else {
+        format!("agent:{role}")
+    }
+}
+
 fn parse<T: serde::de::DeserializeOwned>(
     map: Map<String, Value>,
 ) -> std::result::Result<T, RpcError> {
     serde_json::from_value(Value::Object(map)).map_err(|e| RpcError::new(-32602, e.to_string()))
 }
+fn rpc_id(field: &str, value: &str, max: usize) -> Result<(), RpcError> {
+    if value.is_empty()
+        || value.len() > max
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(RpcError::new(-32602, format!("invalid {field}")));
+    }
+    Ok(())
+}
+
+fn rpc_commit(value: &str) -> Result<(), RpcError> {
+    if !matches!(value.len(), 40 | 64)
+        || !value.bytes().any(|b| b != b'0')
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(RpcError::new(-32602, "invalid reviewed Git commit"));
+    }
+    Ok(())
+}
+
+fn rpc_sha256(value: &str) -> Result<(), RpcError> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(RpcError::new(-32602, "invalid draft SHA-256"));
+    }
+    Ok(())
+}
+
+fn rpc_reason(value: &str) -> Result<(), RpcError> {
+    if value.is_empty()
+        || value.len() > 512
+        || value.trim() != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(RpcError::new(-32602, "invalid RFC transition reason"));
+    }
+    Ok(())
+}
+
+fn rpc_text(field: &str, value: &str, max: usize) -> Result<(), RpcError> {
+    if value.trim().is_empty() || value.len() > max || value.contains('\0') {
+        return Err(RpcError::new(
+            -32602,
+            format!("{field} must be nonblank, at most {max} UTF-8 bytes, and without NUL"),
+        ));
+    }
+    Ok(())
+}
+
 fn cap(arg: Option<usize>, default: usize, max: usize) -> std::result::Result<usize, RpcError> {
     let n = arg.unwrap_or(default);
     if (1..=max).contains(&n) {
@@ -269,17 +541,106 @@ fn internal(error: anyhow::Error) -> RpcError {
     eprintln!("ai4mathd: {error:#}");
     RpcError::new(-32603, "local state operation failed")
 }
+
+fn native_rfc_error(error: anyhow::Error) -> RpcError {
+    eprintln!("ai4mathd native RFC: {error:#}");
+    RpcError::new(
+        -32006,
+        "native RFC verification failed or trusted tooling is unavailable",
+    )
+}
+
+fn classify_promotion_status(git: &ManagedGit, status: &mut PromotionStatus) {
+    if let Some(intent) = &status.pending_intent {
+        let kind = if status.current_head == intent.base_commit {
+            "prepared"
+        } else {
+            match git.is_ancestor(&intent.new_commit, &status.current_head) {
+                Ok(true) => "published_unrecorded",
+                Ok(false) => "main_diverged",
+                Err(_) => "git_unobserved",
+            }
+        };
+        status.recovery = PromotionRecoverySummary {
+            required: true,
+            kind,
+            operator_action: "recover-promotion",
+            automatic: false,
+        };
+    }
+    if let Some(recorded) = &mut status.latest_recorded {
+        recorded.on_main = git
+            .is_ancestor(&recorded.promoted_commit, &status.current_head)
+            .ok();
+    }
+}
+
+fn trust_error(error: anyhow::Error) -> RpcError {
+    if let Some(kind) = error.downcast_ref::<TrustTransitionError>() {
+        match kind {
+            TrustTransitionError::ObservationNotFound => {
+                RpcError::new(-32004, "retained Oracle observation not found")
+            }
+            TrustTransitionError::ContextMismatch => RpcError::new(
+                -32002,
+                "Oracle observation does not match the live Claim context",
+            ),
+            TrustTransitionError::UnsupportedOutcome => RpcError::new(
+                -32006,
+                "Oracle outcome does not authorize a trust transition",
+            ),
+        }
+    } else {
+        internal(error)
+    }
+}
+
+fn state_error(error: anyhow::Error) -> RpcError {
+    if error.downcast_ref::<IdempotencyConflict>().is_some() {
+        RpcError::new(-32005, "ID already identifies different content")
+    } else if let Some(kind) = error.downcast_ref::<WorkerAttemptError>() {
+        match kind {
+            WorkerAttemptError::NotFound => RpcError::new(-32004, "worker attempt not found"),
+            WorkerAttemptError::Forbidden => {
+                RpcError::new(-32003, "worker attempt belongs to another principal")
+            }
+            WorkerAttemptError::Terminal => RpcError::new(-32007, "worker attempt is not running"),
+        }
+    } else {
+        internal(error)
+    }
+}
+fn lock_managed_git(repo: &str) -> Result<ManagedGit, RpcError> {
+    ManagedGit::try_lock_existing(Path::new(repo)).map_err(|error| {
+        if error.to_string().contains("busy") {
+            RpcError::new(-32003, "managed Git coordination is busy")
+        } else {
+            RpcError::new(-32006, "trusted managed Git configuration is unavailable")
+        }
+    })
+}
+
+fn confirm_rfc_git(git: &ManagedGit, review: &str, module: &str) -> Result<()> {
+    ensure!(git.main_head()? == review, "reviewed Git head changed");
+    ensure!(
+        git.contains_tracked(review, module)?,
+        "InfraRFC target module is not tracked at the reviewed commit"
+    );
+    Ok(())
+}
 fn response<T: serde::Serialize>(v: T) -> std::result::Result<Value, RpcError> {
     serde_json::to_value(v).map_err(|e| internal(e.into()))
 }
 
 struct Project {
+    root: PathBuf,
     store: Mutex<StateStore>,
     wiki: Mutex<Wiki>,
     retained_dir: PathBuf,
     probes: Probes,
     t3_discovery: Option<Arc<Mutex<DiscoveryState>>>,
     t2_audit: Option<Arc<Mutex<AuditState>>>,
+    native_rfc: Option<crate::native_rfc::Config>,
 }
 
 impl Project {
@@ -352,6 +713,24 @@ impl Project {
         wiki_add_route_lessons(page, rows, limit, truncated)
     }
 
+    fn managed_repo_name(&self) -> Result<String, RpcError> {
+        self.store()
+            .map_err(internal)?
+            .managed_repo()
+            .map_err(internal)?
+            .ok_or_else(|| RpcError::new(-32006, "managed repository is not bound"))
+    }
+
+    fn module_engine(&self, module: &str) -> Result<&'static str> {
+        let configured = fs::read_to_string(self.root.join(".runtime/primary_engine"))?;
+        let engine = configured
+            .trim()
+            .parse::<Engine>()
+            .context("invalid project primary engine")?;
+        validate_source_path(engine, module).map_err(|e| anyhow::anyhow!(e.detail))?;
+        Ok(engine.as_str())
+    }
+
     fn status(&self) -> Result<Value> {
         let mut data = serde_json::to_value(self.store()?.live_telemetry()?)?;
         data["memory"] = memory_sample().unwrap_or(Value::Null);
@@ -379,6 +758,14 @@ impl Project {
         params: Map<String, Value>,
     ) -> std::result::Result<Value, RpcError> {
         match method {
+            "session.bind" => {
+                let args: SessionBind = parse(params)?;
+                if !WRITE_ROLES.contains(&args.role.as_str()) {
+                    return Err(RpcError::new(-32602, "invalid principal role"));
+                }
+                connection.bind_principal(&args.role, args.binding_id.as_deref())?;
+                Ok(json!({"principal":args.role}))
+            }
             "subscribe" | "unsubscribe" => {
                 let args: Topics = parse(params)?;
                 if args.topics.is_empty()
@@ -431,6 +818,760 @@ impl Project {
                     .map_err(internal)?
                     .ok_or_else(|| RpcError::new(-32004, "retained briefing not found"))?;
                 Ok(json!({"retained_id":args.id,"fact_pack":pack}))
+            }
+
+            "claim.create" => {
+                let args: ClaimCreate = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "claim.create")?;
+                rpc_id("claim_id", &args.claim_id, 128)?;
+                rpc_id("target_decl", &args.target_decl, 256)?;
+                rpc_text("title", &args.title, 512)?;
+                rpc_text("informal_statement", &args.informal_statement, 16 * 1024)?;
+                let engine = self
+                    .module_engine(&args.module_path)
+                    .map_err(|e| RpcError::new(-32602, e.to_string()))?;
+                let formal_target = format!("{}#{}", args.module_path, args.target_decl);
+                let actor = actor(&role);
+                let claim = {
+                    let mut store = self.store().map_err(internal)?;
+                    store
+                        .create_claim(
+                            NewClaim {
+                                id: &args.claim_id,
+                                title: &args.title,
+                                informal_statement: &args.informal_statement,
+                                engine,
+                                formal_target: Some(&formal_target),
+                                module_path: Some(&args.module_path),
+                                critical: args.critical,
+                            },
+                            Change {
+                                actor: &actor,
+                                git_commit: None,
+                            },
+                        )
+                        .map_err(state_error)?;
+                    store
+                        .claim(&args.claim_id)
+                        .map_err(internal)?
+                        .ok_or_else(|| RpcError::new(-32603, "created claim disappeared"))?
+                };
+                Ok(json!({"claim":claim}))
+            }
+
+            "claim.apply_oracle" => {
+                let args: ClaimOracleTransition = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "claim.apply_oracle")?;
+                rpc_id("claim_id", &args.claim_id, 128)?;
+                rpc_sha256(&args.observation_id)?;
+                let repo = self.managed_repo_name()?;
+                let git = lock_managed_git(&repo)?;
+                let head = git
+                    .main_head()
+                    .map_err(|e| RpcError::new(-32006, e.to_string()))?;
+                let actor = actor(&role);
+                let claim = self
+                    .store()
+                    .map_err(internal)?
+                    .apply_oracle_trust_transition(
+                        &args.claim_id,
+                        &args.observation_id,
+                        &head,
+                        Change {
+                            actor: &actor,
+                            git_commit: Some(&head),
+                        },
+                    )
+                    .map_err(trust_error)?;
+                Ok(json!({"claim":claim,"proof_verified":false}))
+            }
+            "claim.read" => {
+                let args: ClaimRead = parse(params)?;
+                rpc_id("claim_id", &args.claim_id, 128)?;
+                let claim = self
+                    .store()
+                    .map_err(internal)?
+                    .claim(&args.claim_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "claim not found"))?;
+                Ok(json!({"claim":claim}))
+            }
+
+            "plan.create" => {
+                let args: PlanCreate = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "plan.create")?;
+                rpc_id("plan_id", &args.plan_id, 128)?;
+                rpc_id("target_claim_id", &args.target_claim_id, 128)?;
+                rpc_text("name", &args.name, 512)?;
+                if !matches!(args.track.as_str(), "exploration" | "infrastructure") {
+                    return Err(RpcError::new(-32602, "invalid plan track"));
+                }
+                if args.dependencies.len() > 64 {
+                    return Err(RpcError::new(-32602, "at most 64 plan dependencies"));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for dep in &args.dependencies {
+                    rpc_id("dependency claim_id", &dep.claim_id, 128)?;
+                    if !matches!(
+                        dep.kind.as_str(),
+                        "lemma" | "definition" | "oracle_placeholder"
+                    ) {
+                        return Err(RpcError::new(-32602, "invalid dependency kind"));
+                    }
+                    if !seen.insert(dep.claim_id.as_str()) {
+                        return Err(RpcError::new(-32602, "duplicate plan dependency claim"));
+                    }
+                }
+                let actor = actor(&role);
+                let plan = {
+                    let mut store = self.store().map_err(internal)?;
+                    if store
+                        .claim(&args.target_claim_id)
+                        .map_err(internal)?
+                        .is_none()
+                    {
+                        return Err(RpcError::new(-32004, "target claim not found"));
+                    }
+                    for dep in &args.dependencies {
+                        if store.claim(&dep.claim_id).map_err(internal)?.is_none() {
+                            return Err(RpcError::new(-32004, "dependency claim not found"));
+                        }
+                    }
+                    let dependencies: Vec<(&str, &str)> = args
+                        .dependencies
+                        .iter()
+                        .map(|dep| (dep.claim_id.as_str(), dep.kind.as_str()))
+                        .collect();
+                    store
+                        .create_plan(
+                            NewPlan {
+                                id: &args.plan_id,
+                                target: &args.target_claim_id,
+                                name: &args.name,
+                                track: &args.track,
+                                status: PlanStatus::Active,
+                                dependencies: &dependencies,
+                            },
+                            Change {
+                                actor: &actor,
+                                git_commit: None,
+                            },
+                        )
+                        .map_err(state_error)?;
+                    store
+                        .plan_state(&args.plan_id)
+                        .map_err(internal)?
+                        .ok_or_else(|| RpcError::new(-32603, "created plan disappeared"))?
+                };
+                Ok(json!({
+                    "plan_id":args.plan_id,
+                    "target_claim_id":args.target_claim_id,
+                    "status":plan.0,
+                    "effective_trust_level":plan.1,
+                }))
+            }
+            "plan.read" => {
+                let args: PlanRead = parse(params)?;
+                rpc_id("plan_id", &args.plan_id, 128)?;
+                let plan = self
+                    .store()
+                    .map_err(internal)?
+                    .plan_state(&args.plan_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "plan not found"))?;
+                Ok(json!({"plan_id":args.plan_id,"status":plan.0,"effective_trust_level":plan.1}))
+            }
+
+            "inbox.push" => {
+                let args: InboxPush = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "inbox.push")?;
+                rpc_id("inbox_id", &args.inbox_id, 128)?;
+                rpc_text("summary", &args.summary, 4096)?;
+                let priority = args
+                    .priority
+                    .parse::<DecisionPriority>()
+                    .map_err(|_| RpcError::new(-32602, "invalid decision priority"))?;
+                let category = args
+                    .category
+                    .parse::<DecisionCategory>()
+                    .map_err(|_| RpcError::new(-32602, "invalid decision category"))?;
+                let related: Vec<&str> = args.related_claims.iter().map(String::as_str).collect();
+                let evidence: Vec<&str> = args.evidence_refs.iter().map(String::as_str).collect();
+                let actor = actor(&role);
+                let decision = self
+                    .store()
+                    .map_err(internal)?
+                    .push_decision(
+                        NewDecision {
+                            id: &args.inbox_id,
+                            priority,
+                            category,
+                            summary: &args.summary,
+                            leverage_score: args.leverage_score,
+                            related_claims: &related,
+                            evidence_refs: &evidence,
+                            options: &args.options,
+                            details: Value::Object(args.details),
+                        },
+                        Change {
+                            actor: &actor,
+                            git_commit: None,
+                        },
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"decision":decision}))
+            }
+
+            "promotion.preview" => {
+                let args: PromotionPreviewArgs = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "promotion.preview")?;
+                rpc_id("task_id", &args.task_id, 100)?;
+                let repo = self.managed_repo_name()?;
+                let git = lock_managed_git(&repo)?;
+                let head = git
+                    .main_head()
+                    .map_err(|e| RpcError::new(-32006, e.to_string()))?;
+                let preview = self
+                    .store()
+                    .map_err(internal)?
+                    .promotion_preview(&args.task_id, &head)
+                    .map_err(internal)?;
+                let head_after = git
+                    .main_head()
+                    .map_err(|e| RpcError::new(-32006, e.to_string()))?;
+                if head_after != head {
+                    return Err(RpcError::new(
+                        -32002,
+                        "managed Git HEAD changed during preview",
+                    ));
+                }
+                Ok(json!({"preview":preview}))
+            }
+            "promotion.status" => {
+                let _: Empty = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "promotion.status")?;
+                let repo = self.managed_repo_name()?;
+                let git = lock_managed_git(&repo)?;
+                let head = git
+                    .main_head()
+                    .map_err(|e| RpcError::new(-32006, e.to_string()))?;
+                let mut status = self
+                    .store()
+                    .map_err(internal)?
+                    .promotion_status(&head)
+                    .map_err(internal)?;
+                classify_promotion_status(&git, &mut status);
+                let head_after = git
+                    .main_head()
+                    .map_err(|e| RpcError::new(-32006, e.to_string()))?;
+                if head_after != head {
+                    return Err(RpcError::new(
+                        -32002,
+                        "managed Git HEAD changed during status read",
+                    ));
+                }
+                Ok(json!({"status":status}))
+            }
+            "worker.acquire" => {
+                let args: WorkerAcquire = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["prover", "reviewer"], "worker.acquire")?;
+                let principal = connection
+                    .principal_key()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                rpc_id("request_id", &args.request_id, 128)?;
+                if !(10..=600).contains(&args.wall_seconds) {
+                    return Err(RpcError::new(-32602, "wall_seconds must be in 10..=600"));
+                }
+                let repo = self.managed_repo_name()?;
+                let git = lock_managed_git(&repo)?;
+                let base = git
+                    .main_head()
+                    .map_err(|e| RpcError::new(-32006, e.to_string()))?;
+                let actor = actor(&role);
+                let attempt = self
+                    .store()
+                    .map_err(internal)?
+                    .acquire_worker_attempt(
+                        &args.request_id,
+                        &principal,
+                        &base,
+                        args.wall_seconds,
+                        Change {
+                            actor: &actor,
+                            git_commit: Some(&base),
+                        },
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"attempt":attempt}))
+            }
+            "worker.submit" => {
+                let args: WorkerSubmit = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["prover", "reviewer"], "worker.submit")?;
+                let principal = connection
+                    .principal_key()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                rpc_id("attempt_id", &args.attempt_id, 128)?;
+                let suggestion = match &args.suggestion {
+                    WorkerSuggestionInput::ProofBody { proof_body } => {
+                        WorkerSuggestion::ProofBody(proof_body)
+                    }
+                    WorkerSuggestionInput::Review { verdict, rationale } => {
+                        WorkerSuggestion::Review { verdict, rationale }
+                    }
+                };
+                let actor = actor(&role);
+                let attempt = self
+                    .store()
+                    .map_err(internal)?
+                    .submit_worker_attempt(
+                        &args.attempt_id,
+                        &principal,
+                        suggestion,
+                        Change {
+                            actor: &actor,
+                            git_commit: None,
+                        },
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"attempt":attempt}))
+            }
+            "worker.cancel" => {
+                let args: WorkerAttemptRef = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["prover", "reviewer"], "worker.cancel")?;
+                let principal = connection
+                    .principal_key()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                rpc_id("attempt_id", &args.attempt_id, 128)?;
+                let actor = actor(&role);
+                let attempt = self
+                    .store()
+                    .map_err(internal)?
+                    .cancel_worker_attempt(
+                        &args.attempt_id,
+                        &principal,
+                        Change {
+                            actor: &actor,
+                            git_commit: None,
+                        },
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"attempt":attempt}))
+            }
+            "worker.status" => {
+                let args: WorkerAttemptRef = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["prover", "reviewer"], "worker.status")?;
+                let principal = connection
+                    .principal_key()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                rpc_id("attempt_id", &args.attempt_id, 128)?;
+                let attempt = self
+                    .store()
+                    .map_err(internal)?
+                    .worker_attempt(&args.attempt_id, &principal)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "worker attempt not found"))?;
+                Ok(json!({"attempt":attempt}))
+            }
+            "task.register" => {
+                let args: TaskRegister = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "task.register")?;
+                rpc_id("task_id", &args.task_id, 100)?;
+                rpc_id("target_decl", &args.target_decl, 256)?;
+                let track = args
+                    .track
+                    .parse::<TaskTrack>()
+                    .map_err(|_| RpcError::new(-32602, "invalid task track"))?;
+                if args.dependencies.len() > 32 {
+                    return Err(RpcError::new(-32602, "at most 32 task dependencies"));
+                }
+                let mut seen = std::collections::BTreeSet::new();
+                for dependency in &args.dependencies {
+                    rpc_id("task dependency", dependency, 100)?;
+                    if dependency == &args.task_id || !seen.insert(dependency.as_str()) {
+                        return Err(RpcError::new(
+                            -32602,
+                            "invalid or duplicate task dependency",
+                        ));
+                    }
+                }
+                let engine = self
+                    .module_engine(&args.module_path)
+                    .map_err(|e| RpcError::new(-32602, e.to_string()))?;
+                let repo = self.managed_repo_name()?;
+                let git = lock_managed_git(&repo)?;
+                let review = git
+                    .main_head()
+                    .map_err(|e| RpcError::new(-32006, e.to_string()))?;
+                confirm_rfc_git(&git, &review, &args.module_path)
+                    .map_err(|e| RpcError::new(-32002, e.to_string()))?;
+                let actor = actor(&role);
+                let dependencies: Vec<&str> =
+                    args.dependencies.iter().map(String::as_str).collect();
+                self.store()
+                    .map_err(internal)?
+                    .register_task(
+                        NewTask {
+                            id: &args.task_id,
+                            track,
+                            engine,
+                            module_path: &args.module_path,
+                            target: &args.target_decl,
+                            dependencies: &dependencies,
+                        },
+                        Change {
+                            actor: &actor,
+                            git_commit: Some(&review),
+                        },
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"task_id":args.task_id,"track":track,"dispatched":false}))
+            }
+            "task.status" => {
+                let _: Empty = parse(params)?;
+                response(
+                    self.store()
+                        .map_err(internal)?
+                        .task_scheduler_status()
+                        .map_err(internal)?,
+                )
+            }
+            "rfc.submit" => {
+                let args: RfcSubmit = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["explorer"], "rfc.submit")?;
+                rpc_id("rfc_id", &args.draft.rfc_id, 100)?;
+                rpc_id("requested_by_claim", &args.draft.requested_by_claim, 256)?;
+                rpc_commit(&args.reviewed_commit)?;
+                if args.draft.status != InfraStatus::Draft {
+                    return Err(RpcError::new(-32602, "InfraRFC submission must be DRAFT"));
+                }
+                let engine = self
+                    .module_engine(&args.module_path)
+                    .map_err(|e| RpcError::new(-32602, e.to_string()))?;
+                if args.draft.engine.as_str() != engine {
+                    return Err(RpcError::new(
+                        -32602,
+                        "InfraRFC engine does not match the project",
+                    ));
+                }
+                let repo = self.managed_repo_name()?;
+                let git = lock_managed_git(&repo)?;
+                confirm_rfc_git(&git, &args.reviewed_commit, &args.module_path)
+                    .map_err(|e| RpcError::new(-32002, e.to_string()))?;
+                let actor = actor(&role);
+                let record = self
+                    .store()
+                    .map_err(internal)?
+                    .submit_infra_rfc_actor(
+                        &actor,
+                        &repo,
+                        &args.reviewed_commit,
+                        &args.module_path,
+                        &args.draft,
+                        || confirm_rfc_git(&git, &args.reviewed_commit, &args.module_path),
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"rfc":record}))
+            }
+            "rfc.approve" => {
+                let args: RfcApprove = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "rfc.approve")?;
+                rpc_id("rfc_id", &args.rfc_id, 100)?;
+                rpc_commit(&args.reviewed_commit)?;
+                rpc_sha256(&args.draft_sha256)?;
+                let repo = self.managed_repo_name()?;
+                let stored = self
+                    .store()
+                    .map_err(internal)?
+                    .infra_rfc(&repo, &args.rfc_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "InfraRFC not found"))?;
+                let git = lock_managed_git(&repo)?;
+                confirm_rfc_git(&git, &args.reviewed_commit, &stored.module_path)
+                    .map_err(|e| RpcError::new(-32002, e.to_string()))?;
+                let actor = actor(&role);
+                let record = self
+                    .store()
+                    .map_err(internal)?
+                    .approve_infra_rfc_actor(
+                        &actor,
+                        &repo,
+                        &args.reviewed_commit,
+                        &args.rfc_id,
+                        &args.draft_sha256,
+                        || confirm_rfc_git(&git, &args.reviewed_commit, &stored.module_path),
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"rfc":record}))
+            }
+
+            "rfc.smoke_start" => {
+                let args: RfcApprove = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["builder"], "rfc.smoke_start")?;
+                rpc_id("rfc_id", &args.rfc_id, 100)?;
+                rpc_commit(&args.reviewed_commit)?;
+                rpc_sha256(&args.draft_sha256)?;
+                let repo = self.managed_repo_name()?;
+                let stored = self
+                    .store()
+                    .map_err(internal)?
+                    .infra_rfc(&repo, &args.rfc_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "InfraRFC not found"))?;
+                let git = lock_managed_git(&repo)?;
+                confirm_rfc_git(&git, &args.reviewed_commit, &stored.module_path)
+                    .map_err(|e| RpcError::new(-32002, e.to_string()))?;
+                let actor = actor(&role);
+                let record = self
+                    .store()
+                    .map_err(internal)?
+                    .start_infra_rfc_smoke_actor(
+                        &actor,
+                        &repo,
+                        &args.reviewed_commit,
+                        &args.rfc_id,
+                        &args.draft_sha256,
+                        || confirm_rfc_git(&git, &args.reviewed_commit, &stored.module_path),
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"rfc":record}))
+            }
+
+            "rfc.freeze" => {
+                let args: RfcFreeze = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["builder"], "rfc.freeze")?;
+                rpc_id("rfc_id", &args.rfc_id, 100)?;
+                rpc_commit(&args.reviewed_commit)?;
+                rpc_sha256(&args.draft_sha256)?;
+                if args.smoke_lemmas.is_empty() || args.smoke_lemmas.len() > 16 {
+                    return Err(RpcError::new(
+                        -32602,
+                        "smoke_lemmas must contain 1..=16 names",
+                    ));
+                }
+                for lemma in &args.smoke_lemmas {
+                    rpc_text("smoke lemma", lemma, 512)?;
+                }
+                let config = self
+                    .native_rfc
+                    .as_ref()
+                    .ok_or_else(|| RpcError::new(-32006, "native RFC tooling is not configured"))?;
+                let repo = self.managed_repo_name()?;
+                let stored = self
+                    .store()
+                    .map_err(internal)?
+                    .infra_rfc(&repo, &args.rfc_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "InfraRFC not found"))?;
+                if stored.draft_sha256 != args.draft_sha256
+                    || stored.draft.engine != Engine::Lean4
+                    || !matches!(
+                        stored.status,
+                        ai4math_store::InfraRfcStatus::BuildingSmoke
+                            | ai4math_store::InfraRfcStatus::FrozenProving
+                    )
+                {
+                    return Err(RpcError::new(
+                        -32002,
+                        "InfraRFC is not ready for native freeze",
+                    ));
+                }
+                let git = lock_managed_git(&repo)?;
+                if git.main_head().map_err(native_rfc_error)? != args.reviewed_commit {
+                    return Err(RpcError::new(-32002, "reviewed Git head changed"));
+                }
+                drop(git);
+                let record = config
+                    .freeze(
+                        &self.root,
+                        Path::new(&repo),
+                        &args.rfc_id,
+                        &args.reviewed_commit,
+                        &args.draft_sha256,
+                        &args.smoke_lemmas,
+                    )
+                    .map_err(native_rfc_error)?;
+                Ok(json!({"rfc":record}))
+            }
+            "rfc.complete" => {
+                let args: RfcComplete = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["builder"], "rfc.complete")?;
+                rpc_id("rfc_id", &args.rfc_id, 100)?;
+                rpc_commit(&args.reviewed_commit)?;
+                rpc_sha256(&args.draft_sha256)?;
+                let config = self
+                    .native_rfc
+                    .as_ref()
+                    .ok_or_else(|| RpcError::new(-32006, "native RFC tooling is not configured"))?;
+                let repo = self.managed_repo_name()?;
+                let stored = self
+                    .store()
+                    .map_err(internal)?
+                    .infra_rfc(&repo, &args.rfc_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "InfraRFC not found"))?;
+                if stored.draft_sha256 != args.draft_sha256
+                    || stored.draft.engine != Engine::Lean4
+                    || stored.smoke_commit.as_deref() != Some(args.reviewed_commit.as_str())
+                    || !matches!(
+                        stored.status,
+                        ai4math_store::InfraRfcStatus::FrozenProving
+                            | ai4math_store::InfraRfcStatus::Completed
+                    )
+                {
+                    return Err(RpcError::new(
+                        -32002,
+                        "InfraRFC is not ready for native completion",
+                    ));
+                }
+                let git = lock_managed_git(&repo)?;
+                if git.main_head().map_err(native_rfc_error)? != args.reviewed_commit {
+                    return Err(RpcError::new(-32002, "reviewed Git head changed"));
+                }
+                drop(git);
+                let record = config
+                    .complete(
+                        &self.root,
+                        Path::new(&repo),
+                        &args.rfc_id,
+                        &args.reviewed_commit,
+                        &args.draft_sha256,
+                    )
+                    .map_err(native_rfc_error)?;
+                Ok(json!({"rfc":record}))
+            }
+            "rfc.reject" => {
+                let args: RfcReject = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "rfc.reject")?;
+                rpc_id("rfc_id", &args.rfc_id, 100)?;
+                rpc_commit(&args.reviewed_commit)?;
+                rpc_sha256(&args.draft_sha256)?;
+                rpc_reason(&args.reason)?;
+                let repo = self.managed_repo_name()?;
+                let stored = self
+                    .store()
+                    .map_err(internal)?
+                    .infra_rfc(&repo, &args.rfc_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "InfraRFC not found"))?;
+                let git = lock_managed_git(&repo)?;
+                confirm_rfc_git(&git, &args.reviewed_commit, &stored.module_path)
+                    .map_err(|e| RpcError::new(-32002, e.to_string()))?;
+                let actor = actor(&role);
+                let record = self
+                    .store()
+                    .map_err(internal)?
+                    .reject_infra_rfc_actor(
+                        &actor,
+                        &repo,
+                        &args.reviewed_commit,
+                        &args.rfc_id,
+                        &args.draft_sha256,
+                        &args.reason,
+                        || confirm_rfc_git(&git, &args.reviewed_commit, &stored.module_path),
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"rfc":record}))
+            }
+            "rfc.supersede" => {
+                let args: RfcSupersede = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["chief"], "rfc.supersede")?;
+                rpc_id("rfc_id", &args.rfc_id, 100)?;
+                rpc_id("replacement_rfc_id", &args.replacement_rfc_id, 100)?;
+                rpc_commit(&args.reviewed_commit)?;
+                rpc_sha256(&args.draft_sha256)?;
+                rpc_reason(&args.reason)?;
+                let repo = self.managed_repo_name()?;
+                let stored = self
+                    .store()
+                    .map_err(internal)?
+                    .infra_rfc(&repo, &args.rfc_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "InfraRFC not found"))?;
+                let git = lock_managed_git(&repo)?;
+                confirm_rfc_git(&git, &args.reviewed_commit, &stored.module_path)
+                    .map_err(|e| RpcError::new(-32002, e.to_string()))?;
+                let actor = actor(&role);
+                let record = self
+                    .store()
+                    .map_err(internal)?
+                    .supersede_infra_rfc_actor(
+                        &actor,
+                        &repo,
+                        &args.reviewed_commit,
+                        &args.rfc_id,
+                        &args.draft_sha256,
+                        &args.replacement_rfc_id,
+                        &args.reason,
+                        || confirm_rfc_git(&git, &args.reviewed_commit, &stored.module_path),
+                    )
+                    .map_err(state_error)?;
+                Ok(json!({"rfc":record}))
+            }
+            "rfc.inspect" => {
+                let args: RfcInspect = parse(params)?;
+                rpc_id("rfc_id", &args.rfc_id, 100)?;
+                let repo = self.managed_repo_name()?;
+                let record = self
+                    .store()
+                    .map_err(internal)?
+                    .infra_rfc(&repo, &args.rfc_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "InfraRFC not found"))?;
+                Ok(json!({"rfc":record}))
             }
             "frontier.list" => {
                 let args: List = parse(params)?;
@@ -684,6 +1825,7 @@ pub fn run(
     worker: Option<t3_worker::Config>,
     discovery: Option<t3_discovery::Config>,
     audit: Option<t2_audit::Config>,
+    native_rfc: Option<crate::native_rfc::Config>,
 ) -> Result<()> {
     let root = if worker.is_some() {
         t3_worker::verified_root(project)?
@@ -730,12 +1872,14 @@ pub fn run(
         .as_ref()
         .map(|_| Arc::new(Mutex::new(AuditState::starting())));
     let service = Arc::new(Project {
+        root: root.clone(),
         store: Mutex::new(store),
         wiki: Mutex::new(wiki_index),
         retained_dir,
         probes: Probes::open(&root, catalog)?,
         t3_discovery: discovery_state.clone(),
         t2_audit: audit_state.clone(),
+        native_rfc,
     });
     let hub = Hub::new();
     let ticker = hub.clone();

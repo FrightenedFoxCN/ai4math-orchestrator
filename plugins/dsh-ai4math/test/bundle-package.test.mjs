@@ -38,6 +38,20 @@ test('bundle manifest declares the exact DSH target and resolves its display res
   }
 });
 
+
+test('built-in Chief preset cannot write source or invoke a compiler shell', () => {
+  const patch = readFileSync(pathOf('cordis.patch.yml'), 'utf8');
+  assert.doesNotMatch(patch, /id: tool-bash\b/);
+  assert.doesNotMatch(patch, /id: tool-pwsh\b/);
+  const fs = patch.match(/- id: tool-fs\n[\s\S]*?(?=\n          - id:|\n    - id:)/)?.[0];
+  assert.ok(fs, 'tool-fs remains available for read-only inspection');
+  assert.match(fs, /read: true/);
+  assert.match(fs, /write: false/);
+  assert.match(fs, /edit: false/);
+  assert.match(fs, /applyPatch: false/);
+  assert.doesNotMatch(patch, /allowedAgentPresets:/, 'generic subagents inherit the same restricted Chief preset');
+});
+
 test('dry-run pack includes runtime and display files but excludes all test fixtures', (t) => {
   const npm = process.env.npm_execpath;
   const scratch = mkdtempSync(join(tmpdir(), 'ai4math-pack-'));

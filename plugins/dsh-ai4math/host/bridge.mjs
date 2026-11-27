@@ -6,15 +6,17 @@ export const AGENT_ROLES = Object.freeze(['chief', 'regional', 'explorer', 'buil
 // Global frontier / briefing / inbox may contain cross-task facts. No scoped view is available yet.
 // In particular the blind Reviewer cannot retrieve orchestration history through this bridge.
 const readWiki = Object.freeze(['status', 'wikiSearch']);
+const readGraph = Object.freeze(['claimRead', 'planRead']);
 const roleMethods = Object.freeze({
   owner: Object.freeze(Object.keys(REMOTE_METHODS).filter(key => !REMOTE_METHODS[key].agentOnly && !REMOTE_METHODS[key].hostOnly)),
-  chief: Object.freeze(['status', 'briefingPeek', 'frontierList', 'inboxList', 'wikiSearch', 'wikiCheckGraveyard', 'wikiProvenance']),
-  regional: Object.freeze([...readWiki, 'wikiCheckGraveyard']),
-  explorer: Object.freeze([...readWiki, 'wikiCheckGraveyard', 'wikiProvenance']),
-  builder: Object.freeze([...readWiki, 'wikiCheckGraveyard']),
-  prover: Object.freeze([...readWiki,'proofSubmit']),
+  chief: Object.freeze(['status', 'briefingPeek', 'frontierList', 'inboxList', 'wikiSearch', 'wikiCheckGraveyard', 'wikiProvenance',
+    ...readGraph, 'claimCreate', 'planCreate', 'claimApplyOracle', 'inboxPush', 'rfcApprove', 'rfcReject', 'rfcSupersede', 'rfcInspect', 'taskRegister', 'taskStatus', 'promotionPreview', 'promotionStatus']),
+  regional: Object.freeze([...readWiki, ...readGraph, 'wikiCheckGraveyard', 'rfcInspect', 'taskStatus']),
+  explorer: Object.freeze([...readWiki, ...readGraph, 'wikiCheckGraveyard', 'wikiProvenance', 'rfcSubmit', 'rfcInspect']),
+  builder: Object.freeze([...readWiki, ...readGraph, 'wikiCheckGraveyard', 'rfcInspect', 'rfcSmokeStart', 'rfcFreeze', 'rfcComplete']),
+  prover: Object.freeze([...readWiki,'proofSubmit','workerAcquire','workerSubmit','workerCancel','workerStatus']),
   automation: Object.freeze([...readWiki,'proofSubmit']),
-  reviewer: Object.freeze(['wikiSearch', 'wikiCheckGraveyard']),
+  reviewer: Object.freeze(['wikiSearch', 'wikiCheckGraveyard', ...readGraph, 'rfcInspect','workerAcquire','workerSubmit','workerCancel','workerStatus']),
 });
 const coreOnly = Object.freeze(['regional', 'builder', 'prover', 'automation']);
 export const methodsForRole = (role) => Object.hasOwn(roleMethods, role) ? roleMethods[role] : Object.freeze([]);
@@ -25,6 +27,67 @@ function validString(rule, value) {
   return !(wikiMax === undefined && rule.minLength && !value.trim()) &&
     !(rule.maxLength && Buffer.byteLength(value, 'utf8') > (wikiMax ?? rule.maxLength)) &&
     (!rule.pattern || new RegExp(rule.pattern, 'u').test(value));
+}
+
+
+function validJson(value, depth = 0) {
+  if (depth > 64 || (typeof value === 'number' && !Number.isFinite(value))) return false;
+  if (value === null || typeof value === 'string') return typeof value !== 'string' || !value.includes('\0');
+  if (typeof value === 'number' || typeof value === 'boolean') return true;
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i++) {
+      const item = Object.getOwnPropertyDescriptor(value, i);
+      if (!item || !Object.hasOwn(item, 'value') || !validJson(item.value, depth + 1)) return false;
+    }
+    return Object.keys(value).length === value.length;
+  }
+  if (!isObject(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) return false;
+  for (const key of Reflect.ownKeys(value)) {
+    if (typeof key !== 'string') return false;
+    const item = Object.getOwnPropertyDescriptor(value, key);
+    if (!item || !Object.hasOwn(item, 'value') || !validJson(item.value, depth + 1)) return false;
+  }
+  return true;
+}
+
+function validValue(rule, value, depth = 0) {
+  if (depth > 64) return false;
+  if (rule.type === 'string') return validString(rule, value);
+  if (rule.type === 'integer') return Number.isInteger(value) &&
+    (rule.minimum === undefined || value >= rule.minimum) &&
+    (rule.maximum === undefined || value <= rule.maximum);
+  if (rule.type === 'number') return typeof value === 'number' && Number.isFinite(value) &&
+    (rule.minimum === undefined || value >= rule.minimum) &&
+    (rule.maximum === undefined || value <= rule.maximum);
+  if (rule.type === 'boolean') return typeof value === 'boolean';
+  if (rule.type === 'array') {
+    if (!Array.isArray(value) || value.length < (rule.minItems ?? 0) || value.length > rule.maxItems) return false;
+    const items = [];
+    for (let i = 0; i < value.length; i++) {
+      const item = Object.getOwnPropertyDescriptor(value, i);
+      if (!item || !Object.hasOwn(item, 'value') || !validValue(rule.items, item.value, depth + 1)) return false;
+      items.push(item.value);
+    }
+    if (Object.keys(value).length !== value.length) return false;
+    return !rule.uniqueItems || new Set(items.map(item => JSON.stringify(item))).size === items.length;
+  }
+  if (rule.type === 'object') {
+    if (!isObject(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) return false;
+    const properties = rule.properties ?? {};
+    const required = rule.required ?? [];
+    const keys = Reflect.ownKeys(value);
+    if (keys.some(key => typeof key !== 'string') || required.some(name => !Object.hasOwn(value, name))) return false;
+    if (rule.additionalProperties === false && keys.some(name => !Object.hasOwn(properties, name))) return false;
+    for (const key of keys) {
+      const item = Object.getOwnPropertyDescriptor(value, key);
+      if (!item || !Object.hasOwn(item, 'value')) return false;
+      if (Object.hasOwn(properties, key)) {
+        if (!validValue(properties[key], item.value, depth + 1)) return false;
+      } else if (!validJson(item.value, depth + 1)) return false;
+    }
+    return true;
+  }
+  return false;
 }
 
 /** Revalidate/reconstruct inputs even outside Gateway (e.g. on model tool calls). */
@@ -41,25 +104,9 @@ export function parseParams(key, params) {
     if (!Object.hasOwn(prop, 'value')) throw new BridgeError('invalid');
     const rule = properties[key];
     const value = prop.value;
-    if (rule.type === 'integer') {
-      if (!Number.isInteger(value) || value < rule.minimum || value > rule.maximum) throw new BridgeError('invalid');
-    } else if (rule.type === 'string') {
-      if (!validString(rule, value)) throw new BridgeError('invalid');
-    } else if (rule.type === 'boolean') {
-      if (typeof value !== 'boolean') throw new BridgeError('invalid');
-    } else if (rule.type === 'array') {
-      if (!Array.isArray(value) || value.length < (rule.minItems ?? 0) || value.length > rule.maxItems) throw new BridgeError('invalid');
-      const items = [];
-      for (let index = 0; index < value.length; index++) {
-        const item = Object.getOwnPropertyDescriptor(value, index);
-        if (!item || !Object.hasOwn(item, 'value') || !validString(rule.items, item.value)) throw new BridgeError('invalid');
-        items.push(item.value);
-      }
-      if (rule.uniqueItems && new Set(items).size !== items.length) throw new BridgeError('invalid');
-      result[key] = items;
-      continue;
-    } else throw new BridgeError('invalid');
-    result[key] = value;
+    if (!validValue(rule, value)) throw new BridgeError('invalid');
+    try { result[key] = structuredClone(value); }
+    catch { throw new BridgeError('invalid'); }
   }
   return result;
 }
@@ -117,6 +164,7 @@ export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reco
   const connections = new Set();
   const sleepers = new Set();
   let unary;
+  const writeConnections = new Map();
   let streams = 0;
   let proofCalls = 0;
 
@@ -127,6 +175,30 @@ export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reco
     return conn;
   }
 
+  async function boundWrite(key, role, bindingId, method, params, signal) {
+    let entry = writeConnections.get(key);
+    if (!entry) {
+      entry = { conn:undefined, bound:false, binding:undefined };
+      writeConnections.set(key, entry);
+      entry.conn = open({
+        onDisconnect:() => { if (writeConnections.get(key) === entry) writeConnections.delete(key); },
+      });
+    }
+    if (!entry.bound) {
+      const bindParams = bindingId === undefined ? { role } : { role, binding_id:bindingId };
+      entry.binding ??= entry.conn.request('session.bind', bindParams, lifetime.signal)
+        .then(() => { entry.bound = true; })
+        .catch(error => {
+          entry.conn.close(error);
+          if (writeConnections.get(key) === entry) writeConnections.delete(key);
+          throw error;
+        })
+        .finally(() => { entry.binding = undefined; });
+      await entry.binding;
+    }
+    return entry.conn.request(method, params, signal);
+  }
+
   function wakeSleepers() {
     for (const sleeper of [...sleepers]) sleeper.abort();
     sleepers.clear();
@@ -134,6 +206,7 @@ export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reco
 
   function disconnect() {
     unary = undefined;
+    writeConnections.clear();
     const error = new BridgeError('disconnected');
     for (const conn of [...connections]) conn.close(error);
     connections.clear();
@@ -228,13 +301,36 @@ export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reco
     retarget,
     disconnect,
     wake: wakeSleepers,
-    bind(role, { proofSlots = [] } = {}) {
+    bind(role, { proofSlots = [], bindingId } = {}) {
+      if (bindingId !== undefined &&
+          (typeof bindingId !== 'string' || !bindingId || bindingId.length > 128 ||
+           !/^[A-Za-z0-9_.:-]+$/.test(bindingId))) throw new BridgeError('invalid');
+      const writeKey = bindingId ?? role;
       const allowed = methodsForRole(role);
       const assigned = new Set(proofSlots);
       const check = (key, params) => {
         if (!allowed.includes(key)) throw new BridgeError('denied');
         const parsed = parseParams(key, params);
         if (key === 'proofSubmit' && !assigned.has(parsed.target_id)) throw new BridgeError('denied');
+        if (key === 'planCreate') {
+          const claims = (parsed.dependencies ?? []).map(dep => dep.claim_id);
+          if (new Set(claims).size !== claims.length) throw new BridgeError('invalid');
+        }
+        if (key === 'taskRegister' && (parsed.dependencies ?? []).includes(parsed.task_id)) {
+          throw new BridgeError('invalid');
+        }
+        if ((key === 'rfcReject' || key === 'rfcSupersede') &&
+            (parsed.reason.trim() !== parsed.reason || /[\u0000-\u001f\u007f]/.test(parsed.reason))) {
+          throw new BridgeError('invalid');
+        }
+        if (key === 'workerSubmit') {
+          const suggestion = parsed.suggestion;
+          const keys = Object.keys(suggestion).sort().join(',');
+          const valid = role === 'prover'
+            ? suggestion.kind === 'proof_body' && keys === 'kind,proof_body'
+            : role === 'reviewer' && suggestion.kind === 'review' && keys === 'kind,rationale,verdict';
+          if (!valid) throw new BridgeError('invalid');
+        }
         if (key === 'wikiSearch' && coreOnly.includes(role) && parsed.scope !== undefined && parsed.scope !== 'core') {
           throw new BridgeError('denied');
         }
@@ -247,7 +343,9 @@ export function createBridge({ socketPath, timeoutMs, reconnectMinMs = 250, reco
           const operationSignal = withLifetime(lifetime.signal, signal);
           if (operationSignal.aborted) throw new BridgeError('cancelled');
           let result;
-          if (key === 'proofSubmit') {
+          if (REMOTE_METHODS[key].agentWrite) {
+            result = await boundWrite(writeKey, role, bindingId, REMOTE_METHODS[key].method, args, operationSignal);
+          } else if (key === 'proofSubmit') {
             if (proofCalls >= 4) throw new BridgeError('busy');
             proofCalls++;
             let isolated;
