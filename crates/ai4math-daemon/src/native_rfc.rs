@@ -80,6 +80,10 @@ impl Config {
             .args(lemmas)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
+            .env(
+                "AI4MATH_BROKER_TIMEOUT_SECS",
+                self.timeout.as_secs().to_string(),
+            )
             .current_dir("/")
             .process_group(0)
             .stdin(Stdio::piped())
@@ -148,6 +152,10 @@ impl Config {
             .arg(probe_observation_id)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
+            .env(
+                "AI4MATH_BROKER_TIMEOUT_SECS",
+                self.timeout.as_secs().to_string(),
+            )
             .current_dir("/")
             .process_group(0)
             .stdin(Stdio::piped())
@@ -173,6 +181,10 @@ impl Config {
             .arg(probe_observation_id)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
+            .env(
+                "AI4MATH_BROKER_TIMEOUT_SECS",
+                self.timeout.as_secs().to_string(),
+            )
             .current_dir("/")
             .process_group(0)
             .stdin(Stdio::piped())
@@ -191,6 +203,10 @@ impl Config {
             .arg(&self.lean)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
+            .env(
+                "AI4MATH_BROKER_TIMEOUT_SECS",
+                self.timeout.as_secs().to_string(),
+            )
             .current_dir("/")
             .process_group(0)
             .stdin(Stdio::piped())
@@ -208,6 +224,10 @@ impl Config {
             .arg(&self.lean)
             .env_clear()
             .env("PATH", "/usr/bin:/bin")
+            .env(
+                "AI4MATH_BROKER_TIMEOUT_SECS",
+                self.timeout.as_secs().to_string(),
+            )
             .current_dir("/")
             .process_group(0)
             .stdin(Stdio::piped())
