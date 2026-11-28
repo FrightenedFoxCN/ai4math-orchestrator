@@ -185,24 +185,37 @@ fn boot_with_native_timeout(
     lean: &Path,
     timeout_secs: &str,
 ) -> Result<Server> {
-    Ok(Server(
-        Command::new(env!("CARGO_BIN_EXE_ai4mathd"))
+    let project = project.to_str().context("UTF8 fixture")?;
+    let cli = cli.to_str().context("UTF8 CLI")?;
+    let lean = lean.to_str().context("UTF8 Lean")?;
+    let mut last = None;
+    for _ in 0..20 {
+        let spawned = Command::new(env!("CARGO_BIN_EXE_ai4mathd"))
             .args([
                 "--project",
-                project.to_str().context("UTF8 fixture")?,
+                project,
                 "--tick-ms",
                 "150",
                 "--rfc-cli",
-                cli.to_str().context("UTF8 CLI")?,
+                cli,
                 "--rfc-lean",
-                lean.to_str().context("UTF8 Lean")?,
+                lean,
                 "--rfc-timeout-secs",
                 timeout_secs,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .spawn()?,
-    ))
+            .spawn();
+        match spawned {
+            Ok(child) => return Ok(Server(child)),
+            Err(error) if error.raw_os_error() == Some(35) => {
+                last = Some(error);
+                thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => return Err(error).context("spawn native ai4mathd"),
+        }
+    }
+    Err(last.unwrap()).context("spawn native ai4mathd after resource backoff")
 }
 
 fn boot_with_native(project: &Path, cli: &Path, lean: &Path) -> Result<Server> {
@@ -316,7 +329,8 @@ fn native_rfc_freeze_and_complete_with_real_lean() -> Result<()> {
     )?;
     drop(store);
 
-    let mut child = boot_with_native_timeout(project, &cli, &lean, "600")?;
+    let mut child =
+        boot_with_native_timeout(project, &cli, &lean, "600").context("boot native rfc daemon")?;
     let socket = runtime.join("ai4mathd.sock");
     let mut chief = connect(project, &mut child)?;
     chief.bind("chief")?;
@@ -479,7 +493,8 @@ fn native_owner_promotion_execute_with_real_lean() -> Result<()> {
         fs::Permissions::from_mode(0o600),
     )?;
 
-    let mut child = boot_with_native_timeout(project, &cli, &lean, "600")?;
+    let mut child =
+        boot_with_native_timeout(project, &cli, &lean, "600").context("boot native rfc daemon")?;
     let mut owner = connect(project, &mut child)?;
     owner.set_timeout(Duration::from_secs(620))?;
     owner.bind("owner")?;
@@ -646,7 +661,8 @@ fn native_formal_sketch_applies_l3_without_publishing() -> Result<()> {
     )?;
     drop(store);
 
-    let mut child = boot_with_native_timeout(project, &cli, &lean, "600")?;
+    let mut child =
+        boot_with_native_timeout(project, &cli, &lean, "600").context("boot native rfc daemon")?;
     let mut builder = connect(project, &mut child)?;
     builder.bind("builder")?;
     builder.set_timeout(Duration::from_secs(620))?;
@@ -789,7 +805,8 @@ fn native_oracle_backed_applies_l4a_debt_without_publishing() -> Result<()> {
     )?;
     drop(store);
 
-    let mut child = boot_with_native_timeout(project, &cli, &lean, "600")?;
+    let mut child =
+        boot_with_native_timeout(project, &cli, &lean, "600").context("boot native rfc daemon")?;
     let mut builder = connect(project, &mut child)?;
     builder.bind("builder")?;
     builder.set_timeout(Duration::from_secs(620))?;
