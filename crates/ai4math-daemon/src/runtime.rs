@@ -772,7 +772,10 @@ impl Project {
     }
 
     fn status(&self) -> Result<Value> {
+        let managed_repo = self.store()?.managed_repo()?;
         let mut data = serde_json::to_value(self.store()?.live_telemetry()?)?;
+        data["managed_repo_bound"] = json!(managed_repo.is_some());
+        data["managed_repo"] = json!(managed_repo);
         data["memory"] = memory_sample().unwrap_or(Value::Null);
         // These counters cover the daemon broker, not independent CLI processes.
         data["broker"] = serde_json::to_value(self.probes.load()?)?;

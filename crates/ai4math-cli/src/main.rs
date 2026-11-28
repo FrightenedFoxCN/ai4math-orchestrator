@@ -36,7 +36,7 @@ use promotion::{PendingRef, Promotion, PromotionRepo};
 use std::{env, fs, io::Read, path::Path};
 use worker_dispatch::{Suggestion, decode_result};
 
-const HELP: &str = "ai4math init ROOT [lean4|agda|rocq]\nai4math status ROOT\nai4math claim-replay ROOT CLAIM [THROUGH_EVENT_SEQ]\nai4math plan-replay ROOT PLAN [THROUGH_EVENT_SEQ]\nai4math graph-replay ROOT [THROUGH_EVENT_SEQ]\nai4math graph-audit ROOT\nai4math graph-check ROOT\nai4math wiki-rebuild ROOT\nai4math wiki-core-rebuild ROOT BARE_REPO REVIEWED_MAIN\nai4math wiki-core-search ROOT BARE_REPO REVIEWED_MAIN TEXT\nai4math wiki-core-provenance ROOT BARE_REPO REVIEWED_MAIN ENTRY_ID\nai4math wiki-sediment-preview ROOT BARE_REPO CLAIM REVIEWED_MAIN\nai4math wiki-sediment-archive ROOT BARE_REPO CLAIM REVIEWED_MAIN APPROVAL_SHA256\nai4math wiki-sediment-wake-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN\nai4math wiki-sediment-wake-recheck ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-retain ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-result ROOT OBSERVATION_SHA256\nai4math wiki-sediment-adapt-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM\nai4math wiki-sediment-adapt-approve ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM APPROVAL_SHA256\nai4math wiki-sediment-adapt-result ROOT APPROVAL_SHA256\nai4math wiki-sediment-adapt-run ROOT BARE_REPO APPROVAL_SHA256 WORKER_EXE WORKER_SHA256 WALL_SECONDS\nai4math wiki-sediment-adapt-lineage-retain ROOT BARE_REPO APPROVAL_SHA256 PROMOTED_HEAD\nai4math wiki-sediment-adapt-lineage-result ROOT APPROVAL_SHA256\nai4math self-test\nai4math hammer-reconstruct ROOT BARE_REPO CLAIM REVIEWED_COMMIT PREMISES_JSON NATIVE_LEAN\nai4math oracle-probe QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-preview ROOT BARE_REPO CLAIM QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-retain ROOT BARE_REPO CLAIM APPROVAL_SHA256 QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-result ROOT RECORD_SHA256\nai4math oracle-hold ROOT BARE_REPO TASK RECORD_SHA256 SECONDS\nai4math oracle-release ROOT TASK HOLD_SHA256\nai4math oracle-hold-status ROOT TASK\nai4math promote BARE_REPO MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math declare-claim ROOT CLAIM MODULE TARGET TITLE STATEMENT [--critical]\nai4math bind-lean-spec ROOT BARE_REPO CLAIM SPEC_MODULE SPEC_DECL APPROVED_COMMIT\nai4math lean-spec-comparison ROOT PROMOTED_COMMIT\nai4math lean-spec-recheck ROOT CLAIM PLAN_SHA256\nai4math bind-witness-spec ROOT BARE_REPO CLAIM MODULE PROPOSITION APPROVED_COMMIT\nai4math refute-managed ROOT BARE_REPO CLAIM MODULE PROPOSITION NATIVE_LEAN PROOF_BODY_FILE\nai4math promote-reviewed-body ROOT BARE_REPO CLAIM MODULE TARGET REVIEWED_COMMIT NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math promote-managed ROOT BARE_REPO CLAIM MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math recover-promotion ROOT BARE_REPO NATIVE_ENGINE [ENGINE_DATA]\nai4math t2-build ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN\nai4math t2-heartbeats ROOT BARE_REPO TARGET_MODULE REVIEWED_MAIN NATIVE_LEAN COMPILER_SHA256\nai4math t2-audit ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN\nai4math t2-compare BASELINE_JSON CANDIDATE_JSON MIN_DELTA_MS MIN_INCREASE_PERCENT\nai4math t2-compare-heartbeats BASELINE_JSON CANDIDATE_JSON MIN_DELTA_HEARTBEATS_RAW MIN_INCREASE_PERCENT\nai4math t2-compare-managed-heartbeats ROOT BARE_REPO TARGET_MODULE BASELINE_COMMIT REVIEWED_MAIN NATIVE_LEAN COMPILER_SHA256 MIN_DELTA_HEARTBEATS_RAW MIN_INCREASE_PERCENT\nai4math t2-compare-release-heartbeats ROOT BARE_REPO TARGET_MODULE BASELINE_LABEL BASELINE_TAG_OID REVIEWED_MAIN NATIVE_LEAN COMPILER_SHA256 MIN_DELTA_HEARTBEATS_RAW MIN_INCREASE_PERCENT\nai4math t2-trust-debt ROOT\nai4math t2-check-export EXPORT_NDJSON EXPORT_SHA256 NATIVE_NANODA CHECKER_SHA256\nai4math t2-check-managed ROOT BARE_REPO TARGET_MODULE DECLARATION REVIEWED_MAIN NATIVE_LEAN EXPORTER_SHA256 CHECKER_SHA256\nai4math t2-check-batch ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN EXPORTER_SHA256 CHECKER_SHA256 TARGETS_JSON\nai4math t2-release-check ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN POLICY_SHA256 COMPILER_SHA256 EXPORTER_SHA256 CHECKER_SHA256\nai4math t2-release-tag ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN POLICY_SHA256 COMPILER_SHA256 EXPORTER_SHA256 CHECKER_SHA256 LABEL\nai4math t2-release-inspect ROOT BARE_REPO LABEL [EXPECTED_TAG_OID]\nai4math t3-discover ROOT BARE_REPO ANCHOR_MODULE BASELINE_COMMIT\nai4math t3-discover-claim ROOT BARE_REPO CLAIM_ID\nai4math t3-preview ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT\nai4math t3-apply ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT PLAN_SHA256\nai4math t3-recheck ROOT BARE_REPO PLAN_SHA256 NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-worklist ROOT BARE_REPO PLAN_SHA256 LIMIT [AFTER_CLAIM]\nai4math t3-recheck-one ROOT BARE_REPO PLAN_SHA256 CLAIM NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-recheck-batch ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--after CLAIM EVENT_SEQ]\nai4math t3-sweep-status ROOT BARE_REPO PLAN_SHA256\nai4math t3-sweep-step ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--restart]\nai4math trip-breaker ROOT BARE_REPO BREAKER MODULE DEFINITION REASON [--critical]
+const HELP: &str = "ai4math init ROOT [lean4|agda|rocq]\nai4math init-managed ROOT [lean4|agda|rocq]\nai4math status ROOT\nai4math claim-replay ROOT CLAIM [THROUGH_EVENT_SEQ]\nai4math plan-replay ROOT PLAN [THROUGH_EVENT_SEQ]\nai4math graph-replay ROOT [THROUGH_EVENT_SEQ]\nai4math graph-audit ROOT\nai4math graph-check ROOT\nai4math wiki-rebuild ROOT\nai4math wiki-core-rebuild ROOT BARE_REPO REVIEWED_MAIN\nai4math wiki-core-search ROOT BARE_REPO REVIEWED_MAIN TEXT\nai4math wiki-core-provenance ROOT BARE_REPO REVIEWED_MAIN ENTRY_ID\nai4math wiki-sediment-preview ROOT BARE_REPO CLAIM REVIEWED_MAIN\nai4math wiki-sediment-archive ROOT BARE_REPO CLAIM REVIEWED_MAIN APPROVAL_SHA256\nai4math wiki-sediment-wake-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN\nai4math wiki-sediment-wake-recheck ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-retain ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-result ROOT OBSERVATION_SHA256\nai4math wiki-sediment-adapt-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM\nai4math wiki-sediment-adapt-approve ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM APPROVAL_SHA256\nai4math wiki-sediment-adapt-result ROOT APPROVAL_SHA256\nai4math wiki-sediment-adapt-run ROOT BARE_REPO APPROVAL_SHA256 WORKER_EXE WORKER_SHA256 WALL_SECONDS\nai4math wiki-sediment-adapt-lineage-retain ROOT BARE_REPO APPROVAL_SHA256 PROMOTED_HEAD\nai4math wiki-sediment-adapt-lineage-result ROOT APPROVAL_SHA256\nai4math self-test\nai4math hammer-reconstruct ROOT BARE_REPO CLAIM REVIEWED_COMMIT PREMISES_JSON NATIVE_LEAN\nai4math oracle-probe QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-preview ROOT BARE_REPO CLAIM QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-retain ROOT BARE_REPO CLAIM APPROVAL_SHA256 QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-result ROOT RECORD_SHA256\nai4math oracle-hold ROOT BARE_REPO TASK RECORD_SHA256 SECONDS\nai4math oracle-release ROOT TASK HOLD_SHA256\nai4math oracle-hold-status ROOT TASK\nai4math promote BARE_REPO MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math declare-claim ROOT CLAIM MODULE TARGET TITLE STATEMENT [--critical]\nai4math bind-lean-spec ROOT BARE_REPO CLAIM SPEC_MODULE SPEC_DECL APPROVED_COMMIT\nai4math lean-spec-comparison ROOT PROMOTED_COMMIT\nai4math lean-spec-recheck ROOT CLAIM PLAN_SHA256\nai4math bind-witness-spec ROOT BARE_REPO CLAIM MODULE PROPOSITION APPROVED_COMMIT\nai4math refute-managed ROOT BARE_REPO CLAIM MODULE PROPOSITION NATIVE_LEAN PROOF_BODY_FILE\nai4math promote-reviewed-body ROOT BARE_REPO CLAIM MODULE TARGET REVIEWED_COMMIT NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math promote-managed ROOT BARE_REPO CLAIM MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math recover-promotion ROOT BARE_REPO NATIVE_ENGINE [ENGINE_DATA]\nai4math t2-build ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN\nai4math t2-heartbeats ROOT BARE_REPO TARGET_MODULE REVIEWED_MAIN NATIVE_LEAN COMPILER_SHA256\nai4math t2-audit ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN\nai4math t2-compare BASELINE_JSON CANDIDATE_JSON MIN_DELTA_MS MIN_INCREASE_PERCENT\nai4math t2-compare-heartbeats BASELINE_JSON CANDIDATE_JSON MIN_DELTA_HEARTBEATS_RAW MIN_INCREASE_PERCENT\nai4math t2-compare-managed-heartbeats ROOT BARE_REPO TARGET_MODULE BASELINE_COMMIT REVIEWED_MAIN NATIVE_LEAN COMPILER_SHA256 MIN_DELTA_HEARTBEATS_RAW MIN_INCREASE_PERCENT\nai4math t2-compare-release-heartbeats ROOT BARE_REPO TARGET_MODULE BASELINE_LABEL BASELINE_TAG_OID REVIEWED_MAIN NATIVE_LEAN COMPILER_SHA256 MIN_DELTA_HEARTBEATS_RAW MIN_INCREASE_PERCENT\nai4math t2-trust-debt ROOT\nai4math t2-check-export EXPORT_NDJSON EXPORT_SHA256 NATIVE_NANODA CHECKER_SHA256\nai4math t2-check-managed ROOT BARE_REPO TARGET_MODULE DECLARATION REVIEWED_MAIN NATIVE_LEAN EXPORTER_SHA256 CHECKER_SHA256\nai4math t2-check-batch ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN EXPORTER_SHA256 CHECKER_SHA256 TARGETS_JSON\nai4math t2-release-check ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN POLICY_SHA256 COMPILER_SHA256 EXPORTER_SHA256 CHECKER_SHA256\nai4math t2-release-tag ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN POLICY_SHA256 COMPILER_SHA256 EXPORTER_SHA256 CHECKER_SHA256 LABEL\nai4math t2-release-inspect ROOT BARE_REPO LABEL [EXPECTED_TAG_OID]\nai4math t3-discover ROOT BARE_REPO ANCHOR_MODULE BASELINE_COMMIT\nai4math t3-discover-claim ROOT BARE_REPO CLAIM_ID\nai4math t3-preview ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT\nai4math t3-apply ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT PLAN_SHA256\nai4math t3-recheck ROOT BARE_REPO PLAN_SHA256 NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-worklist ROOT BARE_REPO PLAN_SHA256 LIMIT [AFTER_CLAIM]\nai4math t3-recheck-one ROOT BARE_REPO PLAN_SHA256 CLAIM NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-recheck-batch ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--after CLAIM EVENT_SEQ]\nai4math t3-sweep-status ROOT BARE_REPO PLAN_SHA256\nai4math t3-sweep-step ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--restart]\nai4math trip-breaker ROOT BARE_REPO BREAKER MODULE DEFINITION REASON [--critical]
 ai4math linux-cgroup-preflight ABSOLUTE_LEAF
 ai4math rocq-t2-check ROOT BARE_REPO MODULE THEOREM REVIEWED_MAIN NATIVE_ROCQ ROCQ_DATA COMPILER_SHA256 COQCHK CHECKER_SHA256
 ai4math pivot-preview ROOT BARE_REPO FACT_SHA256 BREAKER REASON
@@ -125,6 +125,193 @@ fn replay_audit(command: &str, root: &Path, id: &str, cursor: Option<&str>) -> R
 /// The guard is kept across the subprocess, postchecks, and associated commit.
 fn managed_native(root: &Path) -> Result<ai4math_broker::ProjectNativeLease> {
     ManagedProject::new(root)?.try_native_heavy()
+}
+
+fn git_output(root: &Path, args: &[&str]) -> Result<std::process::Output> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .context("run Git")?;
+    ensure!(
+        output.status.success(),
+        "Git failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(output)
+}
+
+fn git_text(root: &Path, args: &[&str]) -> Result<String> {
+    Ok(String::from_utf8_lossy(&git_output(root, args)?.stdout)
+        .trim()
+        .to_owned())
+}
+
+fn git_try_text(root: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .context("run Git")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+    Ok(Some(
+        String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+    ))
+}
+
+fn init_managed(root: &Path, engine: Engine) -> Result<()> {
+    use std::io::Write;
+
+    if root.join(".runtime/state.sqlite").exists() && root.join(".runtime/primary_engine").exists()
+    {
+        let configured = fs::read_to_string(root.join(".runtime/primary_engine"))
+            .context("read configured project engine")?;
+        ensure!(
+            configured.trim() == engine.as_str(),
+            "primary engine is already configured differently"
+        );
+    } else {
+        init(root, engine)?;
+    }
+    let root = root.canonicalize().context("canonicalize project root")?;
+    let runtime = root.join(".runtime");
+    let bare = runtime.join("managed.git");
+    let anchor = match engine {
+        Engine::Lean4 => "Main.lean",
+        Engine::Agda => "Main.agda",
+        Engine::Rocq => "Main.v",
+    };
+    let scaffold = match engine {
+        Engine::Lean4 => {
+            "-- Managed by AI4Math Workbench.\ntheorem goal : True := by trivial\ndef helper : Nat := 0\n"
+        }
+        Engine::Agda => "-- Managed by AI4Math Workbench.\n",
+        Engine::Rocq => "(* Managed by AI4Math Workbench. *)\n",
+    };
+    let ignore = root.join(".gitignore");
+    if !ignore.exists() {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&ignore)?;
+        writeln!(file, ".runtime/")?;
+        writeln!(file, ".mathwiki/")?;
+    }
+    let anchor_path = root.join(anchor);
+    if !anchor_path.exists() {
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&anchor_path)?;
+        write!(file, "{scaffold}")?;
+    }
+
+    if !root.join(".git").exists() {
+        git_output(&root, &["init", "--quiet", "--initial-branch=main"])?;
+    }
+    let branch = git_text(&root, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    ensure!(
+        branch == "main",
+        "managed initialization requires the main branch to be checked out"
+    );
+    if git_try_text(&root, &["rev-parse", "--verify", "HEAD"])?.is_none() {
+        git_output(&root, &["add", "--", anchor])?;
+        git_output(
+            &root,
+            &[
+                "-c",
+                "user.name=AI4Math",
+                "-c",
+                "user.email=ai4math@localhost",
+                "-c",
+                "commit.gpgSign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+                "commit",
+                "--quiet",
+                "--only",
+                "-m",
+                "AI4Math: initialize managed project",
+                "--",
+                anchor,
+            ],
+        )?;
+    } else {
+        let tracked =
+            git_try_text(&root, &["cat-file", "-e", &format!("main:{anchor}")])?.is_some();
+        if !tracked {
+            git_output(&root, &["add", "--", anchor])?;
+            git_output(
+                &root,
+                &[
+                    "-c",
+                    "user.name=AI4Math",
+                    "-c",
+                    "user.email=ai4math@localhost",
+                    "-c",
+                    "commit.gpgSign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                    "commit",
+                    "--quiet",
+                    "--only",
+                    "-m",
+                    "AI4Math: add managed anchor module",
+                    "--",
+                    anchor,
+                ],
+            )?;
+        }
+    }
+    let head = git_text(&root, &["rev-parse", "HEAD"])?;
+    if bare.exists() {
+        git_output(
+            &root,
+            &[
+                "--git-dir",
+                bare.to_str()
+                    .context("managed repository path is not UTF-8")?,
+                "fetch",
+                "--quiet",
+                ".",
+                "main:main",
+            ],
+        )?;
+    } else {
+        git_output(
+            &root,
+            &[
+                "clone",
+                "--quiet",
+                "--bare",
+                ".",
+                bare.to_str()
+                    .context("managed repository path is not UTF-8")?,
+            ],
+        )?;
+    }
+    let bare = bare
+        .canonicalize()
+        .context("canonicalize managed repository")?;
+    worker_dispatch::bind(&root, &bare, anchor, &head)?;
+    let marker = serde_json::json!({
+        "version": 1,
+        "repo": bare.to_str().context("managed repository path is not UTF-8")?,
+        "anchor_module": anchor,
+        "base_commit": head,
+    });
+    let marker_path = runtime.join("managed-git.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&marker_path)?;
+    writeln!(file, "{marker}")?;
+    Ok(())
 }
 
 fn init(root: &Path, engine: Engine) -> Result<()> {
@@ -929,12 +1116,24 @@ fn run() -> Result<()> {
             Path::new(root),
             engine.parse().map_err(|e| anyhow::anyhow!("{e}"))?,
         ),
+        ["init-managed", root, engine] => init_managed(
+            Path::new(root),
+            engine.parse().map_err(|e| anyhow::anyhow!("{e}"))?,
+        ),
+        ["init-managed", root] => init_managed(Path::new(root), Engine::Lean4),
         ["status", root] => {
             let root = Path::new(root);
             let primary_engine = fs::read_to_string(root.join(".runtime/primary_engine"))
                 .context("initialize the project first")?;
-            let state = open_managed_state(root, true)?.status()?;
-            print_json(serde_json::json!({"primary_engine": primary_engine.trim(), "state": state}))
+            let store = open_managed_state(root, true)?;
+            let managed_repo = store.managed_repo()?;
+            let state = store.status()?;
+            print_json(serde_json::json!({
+                "primary_engine": primary_engine.trim(),
+                "managed_repo_bound": managed_repo.is_some(),
+                "managed_repo": managed_repo,
+                "state": state,
+            }))
         }
         [command @ ("claim-replay" | "plan-replay"), root, id] => {
             replay_audit(command, Path::new(root), id, None)

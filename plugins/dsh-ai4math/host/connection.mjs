@@ -19,7 +19,10 @@ const messages = {
 
 export class BridgeError extends Error {
   constructor(code, rpcCode) {
-    super(messages[code]);
+    const detail = code === 'daemon' && rpcCode === -32006
+      ? ' Initialize the managed Git repository in the Workbench before registering tasks.'
+      : '';
+    super(messages[code] + detail);
     this.name = 'Ai4mathBridgeError';
     this.code = code;
     if (rpcCode !== undefined) this.rpcCode = rpcCode;

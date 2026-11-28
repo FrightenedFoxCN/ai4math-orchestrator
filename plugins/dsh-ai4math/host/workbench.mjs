@@ -71,6 +71,25 @@ function isInitializedProject(root) {
   return existsSync(join(root, '.runtime', 'state.sqlite'));
 }
 
+function normalizeManagedGit(raw) {
+  if (!raw || typeof raw !== 'object' || raw.bound !== true || typeof raw.repo !== 'string' || !isAbsolute(raw.repo)) return null;
+  return {
+    bound: true,
+    repo: raw.repo,
+    anchor_module: typeof raw.anchor_module === 'string' ? raw.anchor_module : null,
+    base_commit: typeof raw.base_commit === 'string' ? raw.base_commit : null,
+  };
+}
+
+function readManagedGit(root) {
+  try {
+    const raw = JSON.parse(readFileSync(join(root, '.runtime', 'managed-git.json'), 'utf8'));
+    return normalizeManagedGit({ ...raw, bound: true });
+  } catch {
+    return null;
+  }
+}
+
 function socketPathFor(root) {
   return join(root, '.runtime', 'ai4mathd.sock');
 }
@@ -137,6 +156,7 @@ function normalizeProjectRecord(raw) {
     socket_path: socketPathFor(raw.root),
     created_at: typeof raw.created_at === 'string' ? raw.created_at : new Date().toISOString(),
     updated_at: typeof raw.updated_at === 'string' ? raw.updated_at : new Date().toISOString(),
+    managed_git: normalizeManagedGit(raw.managed_git),
   };
 }
 
@@ -376,6 +396,7 @@ export function createWorkbench({
         socket_limit: length.limit,
         exists,
         initialized,
+        managed_git: project.managed_git ?? readManagedGit(project.root),
         daemon_status,
         active: activeSocket === project.socket_path,
         updated_at: project.updated_at,
@@ -393,6 +414,7 @@ export function createWorkbench({
         root: inferredRoot,
         socket_path: activeSocket,
         engine: inferredRoot ? readEngineMarker(inferredRoot) : null,
+        managed_git: inferredRoot ? readManagedGit(inferredRoot) : null,
         daemon_status: probe === 'live' ? 'external' : probe,
       };
     }
@@ -435,7 +457,7 @@ export function createWorkbench({
       return buildState();
     },
 
-    async projectInit({ root, engine = 'lean4', name, auto_start = true } = {}) {
+    async projectInit({ root, engine = 'lean4', name, auto_start = true, setupManagedGit = true } = {}) {
       return serialized(async () => {
         if (typeof root !== 'string' || !isAbsolute(root) || root.includes('\0') || /[\u0000-\u001f\u007f]/.test(root)) {
           throw new BridgeError('invalid');
@@ -474,14 +496,14 @@ export function createWorkbench({
             };
           }
           try {
-            await execFileAsync(cli.path, ['init', canonical, engine], {
-              timeout: 15_000,
+            await execFileAsync(cli.path, [setupManagedGit ? 'init-managed' : 'init', canonical, engine], {
+              timeout: 30_000,
               maxBuffer: 256 * 1024,
             });
             initializedNow = true;
           } catch (error) {
             const detail = sanitizeLine(error?.stderr || error?.message || 'ai4math init failed');
-            return { ok: false, code: 'init_failed', message: detail || 'ai4math init failed.', state: await buildState() };
+            return { ok: false, code: setupManagedGit ? 'managed_git_failed' : 'init_failed', message: detail || 'ai4math init failed.', state: await buildState() };
           }
         }
 
@@ -498,6 +520,7 @@ export function createWorkbench({
           socket_path: lengthCheck.socketPath,
           created_at: existingIndex >= 0 ? registry.projects[existingIndex].created_at : now,
           updated_at: now,
+          managed_git: readManagedGit(canonical),
         };
         if (existingIndex >= 0) {
           registry.projects[existingIndex] = record;
@@ -509,6 +532,28 @@ export function createWorkbench({
         }
         registry.active_project_id = record.id;
         saveRegistry(storePath, registry);
+
+        if (setupManagedGit && !record.managed_git && cli.ready) {
+          try {
+            const observed = JSON.parse((await execFileAsync(cli.path, ['status', canonical], {
+              timeout: 10_000, maxBuffer: 256 * 1024,
+            })).stdout);
+            if (observed.managed_repo_bound !== true) {
+              await execFileAsync(cli.path, ['init-managed', canonical, resolvedEngine], {
+                timeout: 30_000, maxBuffer: 256 * 1024,
+              });
+            }
+            record.managed_git = observed.managed_repo_bound === true
+              ? normalizeManagedGit({ bound: true, repo: observed.managed_repo })
+              : readManagedGit(canonical);
+            const existing = registry.projects.find((p) => p.root === canonical);
+            if (existing) existing.managed_git = record.managed_git;
+            saveRegistry(storePath, registry);
+          } catch (error) {
+            const detail = sanitizeLine(error?.stderr || error?.message || 'managed Git setup failed');
+            return { ok: false, code: 'managed_git_failed', message: detail || 'managed Git setup failed.', state: await buildState() };
+          }
+        }
 
         let daemonResult = null;
         if (auto_start) {
@@ -522,6 +567,7 @@ export function createWorkbench({
           code: daemonResult && !daemonResult.ok ? daemonResult.code : undefined,
           message: daemonResult && !daemonResult.ok ? daemonResult.message : undefined,
           initialized: initializedNow,
+          managed_git: readManagedGit(canonical),
           project: record,
           state: await buildState(),
         };

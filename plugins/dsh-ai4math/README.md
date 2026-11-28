@@ -6,7 +6,7 @@ This local bundle targets **DeepSeek Harness 0.2.2-rc.5** on the Desktop/Web sur
 
 - **Install & enable**: Run `pnpm install` once inside this directory before adding it via **Plugins → Add plugin** (the four Host packages `@deepseek-ai/dsh-scope`, `@deepseek-ai/dsh-typert-protocol`, `@deepseek-ai/schemastery`, and `zod` are declared in `dependencies`; packed tarballs carry the same declaration). Adding the bundle registers the `preset-ai4math-chief` preset row and inserts `dsh-ai4math` **disabled by default** with `rolePresets: { chief: 'ai4math-chief' }` and empty `proofSlots`.
 - **One-click Workbench (`AI4Math` in left navigation)**: After enabling `dsh-ai4math`, open **AI4Math** from the left sidebar (or click `AI4Math` in the bottom HUD). From the Workbench you can:
-  - Pick or create a local math project folder (`lean4` / `agda` / `rocq`), with live Unix socket byte-length checks (`≤ 103` bytes on macOS/BSD, `≤ 107` on Linux) and automatic `ai4math init` or adoption of existing projects.
+  - Pick or create a local math project folder (`lean4` / `agda` / `rocq`), with live Unix socket byte-length checks (`≤ 103` bytes on macOS/BSD, `≤ 107` on Linux) and automatic `ai4math init-managed` or adoption of existing projects. Managed initialization creates the root `main` branch, a minimal engine-specific anchor module, a bare repository under `.runtime/managed.git`, and the reviewed `task-bind`; it is idempotent and never commits unrelated user files.
   - Manage multiple projects (`~/.dsh/ai4math/workbench.json`), hot-switch active projects without restarting DSH, and either supervise a Host-managed `ai4mathd` or attach read-only to an externally started `ai4mathd` (external daemons are never killed by DSH).
   - Launch a new conversation pre-bound to the project directory and the `ai4math-chief` preset in one click (**New Chief Session**), or jump back to linked conversations.
 - **In-conversation companion & language**: The bottom Live HUD and right-sidebar **Briefing**, **Frontier**, **Inbox**, and **Wiki** tabs follow DSH's active language (`en` / `zh`) reactively. When the active conversation directory matches another registered AI4Math project, a compact switch chip appears in the session header and HUD.
@@ -25,7 +25,7 @@ ELECTRON_RUN_AS_NODE=1 "$DSH_NODE_EXECUTABLE" test/installed-bundle-metadata.mjs
 
 - **安装与启用**：按目录安装前，请先在本目录执行一次 `pnpm install`（Host 依赖 `@deepseek-ai/dsh-scope`、`@deepseek-ai/dsh-typert-protocol`、`@deepseek-ai/schemastery`、`zod` 均声明在 `dependencies` 中；打包 tarball 带有相同声明），然后在 DSH **插件 → 添加插件** 中选择此目录或 tarball。添加后会自动注册 `preset-ai4math-chief` 预设，并插入**默认禁用**的 `dsh-ai4math` 插件行（默认配置 `rolePresets: { chief: 'ai4math-chief' }`、`proofSlots: {}`）。
 - **一键工作台（左侧导航栏 `AI4Math`）**：启用 `dsh-ai4math` 后，从左侧栏点击 **AI4Math**（或点击底部 HUD 左侧的 `AI4Math`）即可打开全屏工作台：
-  - 通过原生文件夹选择器新建或接管本地数学项目（支持 `Lean 4` / `Agda` / `Rocq`），实时校验 Unix socket 路径字节上限（macOS/BSD ≤ 103 字节，Linux ≤ 107 字节），空目录自动执行 `ai4math init`，已有目录直接接管。
+  - 通过原生文件夹选择器新建或接管本地数学项目（支持 `Lean 4` / `Agda` / `Rocq`），实时校验 Unix socket 路径字节上限（macOS/BSD ≤ 103 字节，Linux ≤ 107 字节），空目录自动执行 `ai4math init-managed`，已有目录直接接管。托管初始化会创建根级 `main` 分支、最小引擎锚点模块、`.runtime/managed.git` 裸仓库和已审阅的 `task-bind`；该流程幂等，且不会提交无关用户文件。
   - 多项目持久化在 `~/.dsh/ai4math/workbench.json`，支持热切换活跃项目（无需重启 DSH），既可由 Host 托管启停 `ai4mathd`，也可自动识别并只读挂载外部终端启动的 `ai4mathd`（DSH 绝不终止外部进程）。
   - 点击 **新建 Chief 主编排会话**，一键创建并进入已绑定项目目录与 `ai4math-chief` 预设的新对话，或在工作台总览中直达该项目的关联历史会话。
 - **对话内伴随视图与多语言**：底部 Live HUD 与右侧栏 **简报 / 前沿 / 收件箱 / Wiki** 实时跟随 DSH 语言设置（中文 / 英文）无刷新切换。当当前会话目录命中另一个已注册的数学项目时，会话顶栏与 HUD 会自动提示一键切换。

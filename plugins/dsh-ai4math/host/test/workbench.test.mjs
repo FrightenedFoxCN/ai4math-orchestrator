@@ -28,13 +28,15 @@ test('workbench initializes, persists, hot-switches projects, and supervises man
 
   // Fake ai4math CLI: creates .runtime/state.sqlite and .runtime/primary_engine
   const fakeCli = writeExecutable(join(scratch, 'fake-cli.mjs'), `#!/usr/bin/env node
-import { mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 const [cmd, root, engine] = process.argv.slice(2);
-if (cmd !== 'init') process.exit(2);
+if (cmd === 'status') { const bound = existsSync(join(root, '.runtime', 'managed-git.json')); console.log(JSON.stringify({managed_repo_bound:bound,managed_repo:bound?join(root,'.runtime','managed.git'):null})); process.exit(0); }
+if (cmd !== 'init' && cmd !== 'init-managed') process.exit(2);
 mkdirSync(join(root, '.runtime'), { recursive: true, mode: 0o700 });
 writeFileSync(join(root, '.runtime', 'state.sqlite'), 'stub');
 writeFileSync(join(root, '.runtime', 'primary_engine'), engine + '\\n');
+if (cmd === 'init-managed') { const ext = engine === 'lean4' ? 'lean' : engine === 'agda' ? 'agda' : 'v'; writeFileSync(join(root, '.runtime', 'managed-git.json'), JSON.stringify({version:1,repo:join(root,'.runtime','managed.git'),anchor_module:'Main.' + ext,base_commit:'a'.repeat(40)})); }
 `);
 
   // Fake ai4mathd daemon: serves NDJSON status on <root>/.runtime/ai4mathd.sock
@@ -80,6 +82,8 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
   assert.equal(initA.ok, true);
   assert.equal(initA.initialized, true);
   assert.equal(initA.project.engine, 'lean4');
+  assert.equal(initA.managed_git.bound, true);
+  assert.equal(initA.state.projects[0].managed_git.bound, true);
   assert.equal(initA.state.active_project_id, initA.project.id);
   assert.equal(initA.state.chief_preset, 'ai4math-chief');
   assert.equal(initA.state.chief_bound, true);
@@ -119,6 +123,33 @@ process.on('SIGTERM', () => server.close(() => process.exit(0)));
   assert.equal(existsSync(join(projA, '.runtime', 'state.sqlite')), true, 'never deletes project data on disk');
 });
 
+
+
+test('workbench upgrades an initialized but unbound project to managed Git', async (t) => {
+  const scratch = makeTempDir(t, 'a4u-');
+  const proj = join(scratch, 'legacy');
+  mkdirSync(join(proj, '.runtime'), { recursive: true });
+  writeFileSync(join(proj, '.runtime', 'state.sqlite'), 'stub');
+  writeFileSync(join(proj, '.runtime', 'primary_engine'), 'lean4\n');
+  const fakeCli = writeExecutable(join(scratch, 'fake-cli.mjs'), `#!/usr/bin/env node
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+const [cmd, root] = process.argv.slice(2);
+if (cmd === 'status') { console.log(JSON.stringify({managed_repo_bound:existsSync(join(root,'.runtime','managed-git.json')),managed_repo:null})); process.exit(0); }
+if (cmd !== 'init-managed') process.exit(2);
+mkdirSync(join(root, '.runtime'), { recursive: true });
+writeFileSync(join(root, '.runtime', 'managed-git.json'), JSON.stringify({version:1,repo:join(root,'.runtime','managed.git'),anchor_module:'Main.lean',base_commit:'a'.repeat(40)}));
+`);
+  const bridge = createBridge({ timeoutMs: 2000 });
+  const wb = createWorkbench({ bridge, cliPath: fakeCli, daemonPath: join(scratch, 'missing-daemon'), registryPath: join(scratch, 'wb.json') });
+  t.after(async () => { await wb.close(); bridge.close(); });
+  const upgraded = await wb.projectInit({ root: proj, engine: 'lean4', auto_start: false });
+  assert.equal(upgraded.ok, true);
+  assert.equal(upgraded.initialized, false);
+  assert.equal(upgraded.managed_git.bound, true);
+  assert.equal(upgraded.state.projects[0].managed_git.bound, true);
+});
+
 test('workbench detects external daemons, never kills them, and rejects overlong socket paths', async (t) => {
   const scratch = makeTempDir(t, 'a4e-');
   const proj = join(scratch, 'ext');
@@ -145,7 +176,7 @@ test('workbench detects external daemons, never kills them, and rejects overlong
   const wb = createWorkbench({ bridge, registryPath: join(scratch, 'wb.json') });
   t.after(async () => { await wb.close(); bridge.close(); });
 
-  const adopted = await wb.projectInit({ root: proj, engine: 'lean4', auto_start: true });
+  const adopted = await wb.projectInit({ root: proj, engine: 'lean4', auto_start: true, setupManagedGit: false });
   assert.equal(adopted.ok, true);
   assert.equal(adopted.state.projects[0].daemon_status, 'external');
   assert.equal(adopted.state.managed_daemon, null);

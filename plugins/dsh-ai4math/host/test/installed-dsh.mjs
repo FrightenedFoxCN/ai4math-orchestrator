@@ -5,7 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { join } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { execFileSync, spawn } from 'node:child_process';
-import { lstat, mkdir, mkdtemp, rm, unlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, rm, unlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 
 const [dshRoot, daemon, cli] = process.argv.slice(2);
@@ -51,6 +51,8 @@ async function stopDaemon(run) {
   daemons.delete(run);
   if (result.error) throw result.error;
 }
+let managedInit = null;
+if (cli) managedInit = JSON.parse(execFileSync(cli, ['init-managed', dir, 'lean4'], { encoding:'utf8', timeout:10000 }));
 const initialDaemon = startDaemon();
 let fiber;
 try {
@@ -74,7 +76,8 @@ try {
       await delay(50);
     }
   }
-  assert.equal(result.event_seq,0);
+  const initialSeq = managedInit ? 1 : 0;
+  assert.equal(result.event_seq,initialSeq);
   assert.equal(result.archived_breakers,0);
   assert.equal(ctx.typert.local.get('ai4math/pivotArchivePreview'),undefined);
   assert.equal(ctx.typert.local.get('ai4math/pivotArchiveApply'),undefined);
@@ -82,7 +85,7 @@ try {
   await assert.rejects(gateway.invoke(request('status',{}, {kind:'guest'})), {code:'ai4math/denied'});
   const wire = await gateway.dispatchRpc('ai4math/status', { args: { params: {} } }, signal, {principal:{kind:'owner'},signal});
   assert.equal(wire.ok,true);
-  assert.equal(wire.value.event_seq,0);
+  assert.equal(wire.value.event_seq,initialSeq);
   assert.equal(ctx.typert.local.get('ai4math/proofSubmit'),undefined);
   for (const [method, params, expected] of [
     ['wikiProvenance', {id:'COR-A'}, {edges:[], truncated:false, managed_core:false}],
@@ -100,37 +103,22 @@ try {
   assert.equal(connected.value.data.state,'connected');
   const first=await iterator.next();
   assert.equal(first.value.topic,'vital_signs.tick');
-  assert.equal(first.value.data.event_seq,0);
+  assert.equal(first.value.data.event_seq,initialSeq);
   await iterator.return();
   console.log('Installed Cordis + Typert Gateway + Rust UDS: owner, deny and stream passed');
   if (cli) {
-    const fixture = join(dir, 'fixture');
-    const repo = join(dir, 'repo.git');
-    const run = (file,args,cwd=dir) => execFileSync(file,args,{ cwd, encoding:'utf8', timeout:5000 }).trim();
-    const git = (...args) => run('/usr/bin/git', [
-      '-c','user.name=Fixture','-c','user.email=fixture@localhost',
-      '-c','commit.gpgSign=false','-c','core.hooksPath=/dev/null',...args,
-    ], fixture);
-    await mkdir(fixture);
-    git('init','--quiet','--initial-branch=main');
-    await writeFile(join(fixture,'Proof.lean'), 'theorem goal : True := by trivial\n');
-    await writeFile(join(fixture,'Support.lean'), 'def helper : Nat := 0\n');
-    await writeFile(join(fixture,'ai4math-modules.txt'), 'Proof.lean\nSupport.lean\n');
-    git('add','.');
-    git('commit','--quiet','-m','scheduler fixture');
-    const head=git('rev-parse','HEAD');
-    git('clone','--quiet','--bare',fixture,repo);
+    const repo = join(dir, '.runtime', 'managed.git');
+    const run = (file,args,cwd=dir) => execFileSync(file,args,{ cwd, encoding:'utf8', timeout:10000 }).trim();
+    const head = managedInit.base_commit;
     const deadline=AbortSignal.timeout(10_000);
     const req=request('subscribe',{topics:['alert.p0']});
     const events=await gateway.stream({...req,signal:deadline,peer:{...req.peer,signal:deadline}});
     const alerts=events[Symbol.asyncIterator]();
     try {
       assert.equal((await alerts.next()).value.topic,'ai4math.connection');
-      run(cli,['init',dir,'lean4']);
-      run(cli,['task-bind',dir,repo,'Proof.lean',head]);
-      run(cli,['task-register',dir,repo,'explore','exploration','Proof.lean','goal']);
-      run(cli,['task-register',dir,repo,'infra','infrastructure','Support.lean','helper','explore']);
-      run(cli,['trip-breaker',dir,repo,'fixture-breaker','Proof.lean','goal','deliberately blocked fixture']);
+      run(cli,['task-register',dir,repo,'explore','exploration','Main.lean','goal']);
+      run(cli,['task-register',dir,repo,'infra','infrastructure','Main.lean','helper','explore']);
+      run(cli,['trip-breaker',dir,repo,'fixture-breaker','Main.lean','goal','deliberately blocked fixture']);
       const next=await alerts.next();
       assert.equal(next.value?.topic,'alert.p0');
       const alert=next.value.data;
@@ -149,7 +137,7 @@ try {
     const plan=JSON.parse(run(cli,['pivot-archive-preview',...args]));
     assert.equal(plan.action,'ARCHIVE_BREAKER');
     assert.equal(plan.to_state,'ARCHIVED');
-    assert.equal(git('--git-dir='+repo,'rev-parse','refs/heads/main'),head);
+    assert.equal(run('/usr/bin/git',['--git-dir='+repo,'rev-parse','refs/heads/main']),head);
     const reqArchive=request('subscribe',{topics:['breaker.state_changed','vital_signs.tick']});
     const deadlineArchive=AbortSignal.timeout(10_000);
     const archiveStream=await gateway.stream({...reqArchive,signal:deadlineArchive,

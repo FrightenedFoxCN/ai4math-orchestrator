@@ -12,6 +12,12 @@ const topics = [event];
 const abort = () => new AbortController();
 const fails = (code) => (error) => error instanceof BridgeError && error.code === code;
 
+test('unbound managed Git errors remain safe and actionable', () => {
+  const error = new BridgeError('daemon', -32006);
+  assert.match(error.message, /Initialize the managed Git repository in the Workbench/);
+  assert.equal(error.rpcCode, -32006);
+});
+
 test('tool schemas avoid Unicode property regex unsupported by upstream validators', () => {
   const serialized = JSON.stringify(REMOTE_METHODS);
   assert.equal(serialized.includes('\\p{'), false);
