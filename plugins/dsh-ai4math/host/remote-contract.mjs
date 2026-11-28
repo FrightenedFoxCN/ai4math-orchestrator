@@ -31,6 +31,11 @@ const agentEndpoint = (method, description, params) => Object.freeze({ ...endpoi
 const principalEndpoint = (method, description, params) => Object.freeze({ ...endpoint(method, description, params), principalBound: true });
 const writeEndpoint = (method, description, params) => Object.freeze({ ...agentEndpoint(method, description, params), agentWrite: true });
 const id = (maximum = 128) => Object.freeze({ type:'string', minLength:1, maxLength:maximum, pattern:'^[A-Za-z0-9_.:-]+$' });
+const sourcePath = Object.freeze({
+  type:'string', minLength:3, maxLength:256,
+  description:'Workspace-relative source file path including the engine extension, e.g. Collatz/Conjecture.lean; not a dotted module identifier.',
+  pattern:'^[A-Za-z_][A-Za-z0-9_-]*(?:/[A-Za-z_][A-Za-z0-9_-]*)*\\.(?:lean|agda|v)$',
+});
 const roleText = (maximum) => Object.freeze({ type:'string', minLength:1, maxLength:maximum, 'x-ai4math-maxUtf8Bytes':maximum, pattern:nonBlankTextPattern });
 const strings = (item, maximum) => Object.freeze({ type:'array', items:item, maxItems:maximum, uniqueItems:true });
 const commit = Object.freeze({type:'string',minLength:40,maxLength:64,pattern:'^[0-9a-f]{40}([0-9a-f]{24})?$'});
@@ -68,11 +73,11 @@ export const REMOTE_METHODS = Object.freeze({
   workerStatus: agentEndpoint('worker.status', 'Read one attempt owned by the bound role; candidate content and fences are never returned.', object({attempt_id:id(128)}, ['attempt_id'])),
   taskRegister: writeEndpoint('task.register', 'Register scheduler metadata against the bound managed Git HEAD; never dispatches work.', object({
     task_id:id(100), track:Object.freeze({type:'string',enum:Object.freeze(['exploration','infrastructure'])}),
-    module_path:id(256), target_decl:id(256), dependencies:strings(id(100),32),
+    module_path:sourcePath, target_decl:id(256), dependencies:strings(id(100),32),
   }, ['task_id','track','module_path','target_decl'])),
   taskStatus: agentEndpoint('task.status', 'Read the current scheduler snapshot; this is not a reservation or worker count.', empty),
   rfcSubmit: writeEndpoint('rfc.submit', 'Submit an immutable DRAFT InfraRFC against the bound managed Git HEAD.', object({
-    module_path:id(256), reviewed_commit:commit, draft:infraDraft,
+    module_path:sourcePath, reviewed_commit:commit, draft:infraDraft,
   }, ['module_path','reviewed_commit','draft'])),
   rfcApprove: writeEndpoint('rfc.approve', 'Approve the exact reviewed InfraRFC draft without admitting work or trust.', object({
     rfc_id:id(100), reviewed_commit:commit, draft_sha256:sha256,
@@ -95,7 +100,7 @@ export const REMOTE_METHODS = Object.freeze({
   }, ['rfc_id','reviewed_commit','draft_sha256','replacement_rfc_id','reason'])),
   rfcInspect: agentEndpoint('rfc.inspect', 'Read one InfraRFC lifecycle record from the bound managed repository.', object({rfc_id:id(100)}, ['rfc_id'])),
   claimCreate: writeEndpoint('claim.create', 'Create a new L0 mathematical claim in the managed project ledger.', object({
-    claim_id:id(), title:roleText(512), informal_statement:roleText(16384), module_path:id(256), target_decl:id(256), critical:Object.freeze({type:'boolean'}),
+    claim_id:id(), title:roleText(512), informal_statement:roleText(16384), module_path:sourcePath, target_decl:id(256), critical:Object.freeze({type:'boolean'}),
   }, ['claim_id','title','informal_statement','module_path','target_decl'])),
   claimApplyOracleBacked: writeEndpoint('claim.apply_oracle_backed', 'Run trusted compiler-Oracle assessment and reviewed-spec comparison, then apply L4a with explicit oracle debt.', object({
     task_id:id(100), observation_id:sha256,

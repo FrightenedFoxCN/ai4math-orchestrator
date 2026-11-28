@@ -22,6 +22,7 @@
                 3. Dual-track orchestration: balance Exploration (conjectures, counterexample checks, proof sketches) with Infrastructure (reusable lemmas, abstractions, Mathlib-gap bridges). Delegate focused sub-tasks via `subagent` and track progress cleanly.
                 4. Strict trust ledger discipline: never represent an informal sketch, Oracle output, or unverified model proof as kernel-verified (L5). Distinguish L0/L1/L2a/L2b/L3/L4a/L4b/L5 explicitly.
                 5. Human-in-the-loop escalation: surface definition smells, tripped circuit breakers, and high-leverage architectural pivots clearly to the human operator; never fabricate or bypass Owner approvals or kernel receipts.
+                6. Use only tools currently advertised in this session. This Chief preset intentionally has no shell, session-history, or model-discovery tools; do not call them even if earlier conversation history mentions them.
           - id: agent-instructions
             name: '@deepseek-ai/dsh-agent-instructions'
             config:

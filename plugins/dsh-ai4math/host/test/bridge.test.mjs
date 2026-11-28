@@ -146,8 +146,9 @@ test('role graph and inbox tools are host-bound, schema-checked, and audited', a
       ['claimRead', readRoles], ['planRead', readRoles],
     ]) assert.equal(methodsForRole(role).includes(key), roles.includes(role), role + '/' + key);
   }
-  const claim = { claim_id:'C1', title:'Claim', informal_statement:'Statement', module_path:'Demo.lean', target_decl:'demo' };
+  const claim = { claim_id:'C1', title:'Claim', informal_statement:'Statement', module_path:'Demo/Goal.lean', target_decl:'demo' };
   await assert.rejects(bridge.bind('explorer').call('claimCreate', claim), fails('denied'));
+  await assert.rejects(bridge.bind('chief').call('claimCreate', { ...claim, module_path:'Demo.Goal' }), fails('invalid'));
   await assert.rejects(bridge.bind('chief').call('claimCreate', { ...claim, role:'owner' }), fails('invalid'));
   await bridge.bind('chief').call('claimCreate', claim);
   const plan = { plan_id:'P1', target_claim_id:'C1', name:'Induction', track:'infrastructure',
