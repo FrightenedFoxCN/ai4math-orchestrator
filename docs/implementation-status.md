@@ -264,10 +264,18 @@
 - Store 要求 OracleBacked candidate、sealed spec comparison、retained `NoCounterexampleWithinBounds` probe 与 live Claim/repo/HEAD 全部匹配，原子写入 evidence、receipt、L4a 和 `oracle_debt=true`；`proof_verified:false`，不授予 L5。
 - Store、假 CLI/UDS 与真实 Lean 4.35.0 `native_decide` 端到端验收已通过，验证不发布 Git commit；测试加入 `.github/native-lean.sh`。L4b 保持默认 `FORBIDDEN`，没有伪造 ADR 解锁或跨 ITP 桥接。
 
+## Rocq / Agda 原生验收（2026-11-28）
+
+- 本机 macOS arm64：原生 Agda 2.8.0.2、Rocq 9.3.0、同安装 `coqchk` 9.3.0；所有验证均由 Broker 自行施加 Seatbelt，外层会话不套沙箱。
+- Agda 原生 promotion 正反例通过；Homebrew `bin/agda` 是 wrapper，验收使用其 `libexec` 下 Mach-O 二进制，并只授予 GHC/Agda 运行库、GMP 与 ICU 目录/文件。
+- Rocq Broker 3 项、CLI 3 项（含无效证明拒绝、T1 合入/Golden、精确恢复）、T2 `coqchk` 1 项、daemon frozen-slot 1 项全部通过。
+- 修复 `coqchk` 初始化失败：显式在私有可写 scratch 作为 cwd，并仅 literal 授予所属安装根目录与 `bin` 目录项及只读 `vfs.disk-space`；没有递归开放安装目录、源码、插件或 ambient load path。
+- 复现入口：[`.github/native-rocq-agda.sh`](.github/native-rocq-agda.sh)。T2 仍是只读咨询观察，不签发 receipt、不写信任、不发布 Golden，也不是发布门禁。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。
 - 常驻模型循环未配置生产凭据或部署为自动启动的服务。
 - DSH 工作台仍待补齐 Guest / 登出态浏览器实测、非 `chief` 多角色独立生产 Preset 生命周期验收，以及托管 daemon 启用 `--proof-targets` 时与 macOS Seatbelt 嵌套的专项核对；Owner 仍仅保留本地签名归档闭环，无远程写入口。
 - Linux 仍无可用验证后端；需实现并验收 launcher、cgroup 实际入组与回收、全主机配额。
-- Agda 独立 T2 尚未实现；Rocq `coqchk` 原生端到端尚未通过。Lean 全仓覆盖与强制发布门禁尚未验收。
+- Agda 独立 T2 尚未实现；Agda 原生 promotion 与 Rocq T1/T2/daemon 原生验收已于 2026-11-28 通过。Lean 全仓覆盖与强制发布门禁尚未验收。

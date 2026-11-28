@@ -94,6 +94,7 @@ fn profile(
 (deny network*)
 (deny process-fork)
 (allow sysctl-read)
+(allow system-info (literal "vfs.disk-space"))
 ; dyld ignition opens the root directory; literal does not grant child paths.
 (allow file-read* (literal "/"))
 (allow file-read* file-map-executable (subpath "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld"))
@@ -170,6 +171,31 @@ pub(crate) fn run_grouped(
     run_grouped_until(spec, data_reads, literal_data_reads, group, None)
 }
 
+/// Run with an explicitly selected current directory inside the granted room.
+/// This is needed by standalone checkers that initialize state in getcwd();
+/// the selected directory must be the private writable scratch, never a data root.
+pub(crate) fn run_grouped_until_in_dir(
+    spec: Invocation<'_>,
+    data_reads: &[PathBuf],
+    literal_data_reads: &[PathBuf],
+    group: ProcessGroup,
+    deadline: Option<Instant>,
+    cwd: &Path,
+) -> Result<String> {
+    let bytes = run_inner(
+        spec,
+        data_reads,
+        literal_data_reads,
+        group,
+        None,
+        deadline,
+        cwd,
+    )?;
+    let log = String::from_utf8_lossy(&bytes).into_owned();
+    deadline_remaining(deadline)?;
+    Ok(log)
+}
+
 /// Apply an absolute wall-clock bound in addition to the invocation timeout.
 pub(crate) fn run_grouped_until(
     spec: Invocation<'_>,
@@ -178,7 +204,16 @@ pub(crate) fn run_grouped_until(
     group: ProcessGroup,
     deadline: Option<Instant>,
 ) -> Result<String> {
-    let bytes = run_inner(spec, data_reads, literal_data_reads, group, None, deadline)?;
+    let cwd = spec.room;
+    let bytes = run_inner(
+        spec,
+        data_reads,
+        literal_data_reads,
+        group,
+        None,
+        deadline,
+        cwd,
+    )?;
     let log = String::from_utf8_lossy(&bytes).into_owned();
     deadline_remaining(deadline)?;
     Ok(log)
@@ -211,6 +246,7 @@ pub(crate) fn run_capture_bytes(
         max_stdout <= MAX_CAPTURE_STDOUT,
         "sandbox stdout capture limit exceeds 16 MiB"
     );
+    let cwd = spec.room;
     run_inner(
         spec,
         data_reads,
@@ -218,6 +254,7 @@ pub(crate) fn run_capture_bytes(
         group,
         Some(max_stdout),
         None,
+        cwd,
     )
 }
 
@@ -247,6 +284,7 @@ fn run_inner(
     group: ProcessGroup,
     max_stdout: Option<usize>,
     deadline: Option<Instant>,
+    cwd: &Path,
 ) -> Result<Vec<u8>> {
     use std::{fs, process::Command};
 
@@ -255,10 +293,12 @@ fn run_inner(
     let executable = fs::canonicalize(spec.executable)?;
     let room = fs::canonicalize(spec.room)?;
     let writable = fs::canonicalize(spec.writable)?;
+    let cwd = fs::canonicalize(cwd)?;
     ensure!(
         writable.starts_with(&room) && writable != room,
         "write grant outside room"
     );
+    ensure!(cwd.starts_with(&room), "current directory outside room");
     let mut reads = Vec::new();
     for requested in spec.reads {
         let real = fs::canonicalize(requested)?;
@@ -302,7 +342,7 @@ fn run_inner(
         .env("TMPDIR", &writable)
         .env("LANG", "en_US.UTF-8")
         .envs(spec.env.iter().copied())
-        .current_dir(&room);
+        .current_dir(&cwd);
     supervise(
         command,
         spec.timeout,
@@ -478,6 +518,7 @@ fn run_inner(
     _group: ProcessGroup,
     _max_stdout: Option<usize>,
     _deadline: Option<Instant>,
+    _cwd: &Path,
 ) -> Result<Vec<u8>> {
     let Invocation {
         executable,

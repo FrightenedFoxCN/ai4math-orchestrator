@@ -198,7 +198,7 @@ pub(crate) fn recheck_generated_objects(
     let scratch = tempfile::tempdir_in(checker_room.path())?;
     let checker = resolve_checker(install, checker_path)?;
     let checker_sha256 = pin_checker(&checker, expected_checker_sha)?;
-    sandbox::run_grouped_until(
+    sandbox::run_grouped_until_in_dir(
         sandbox::Invocation {
             executable: &checker,
             args: &args,
@@ -209,9 +209,13 @@ pub(crate) fn recheck_generated_objects(
             timeout: TIMEOUT,
         },
         &data,
-        &[],
+        // OCaml/Rocq initialization lists its own install root and bin
+        // directory. Literal grants permit those directory entries without
+        // recursively exposing unrelated installation files.
+        &[install.prefix.clone(), install.prefix.join("bin")],
         tool.sandbox_group,
         deadline,
+        scratch.path(),
     )
     .context("run standalone Rocq object checker")?;
     Ok(ObjectRecheck { checker_sha256 })
