@@ -10,9 +10,15 @@ printf '%s\n' "$version"
 export AI4MATH_TEST_LEAN
 export AI4MATH_BROKER_TIMEOUT_SECS=120
 
+cleanup_native_processes() {
+    pkill -x lean 2>/dev/null || true
+    pkill -x ai4mathd 2>/dev/null || true
+    sleep 5
+}
+
 run_one() {
     local name=$1 output
-    sleep 5
+    cleanup_native_processes
     shift
     output=$(cargo test --locked "$@" -- "$name" --ignored --exact) || {
         printf '%s\n' "$output"
