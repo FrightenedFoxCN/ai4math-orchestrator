@@ -86,6 +86,16 @@ use std::{
 };
 
 const TIMEOUT: Duration = Duration::from_secs(30);
+
+fn broker_timeout() -> Duration {
+    std::env::var("AI4MATH_BROKER_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| (1..=300).contains(seconds))
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| Duration::from_secs(30))
+}
+
 const LEAN_ADVISORY_TIMEOUT: Duration = Duration::from_secs(15);
 const SOURCE_CAP: usize = 2 * 1024 * 1024;
 const MAX_MODULES: usize = 128;
@@ -660,7 +670,7 @@ impl<'a> ModuleBuild<'a> {
                         CheckMode::IsolatedLean {
                             predecessors,
                             save_object,
-                            timeout: TIMEOUT,
+                            timeout: broker_timeout(),
                             deadline: None,
                             diagnostic_output,
                             pin_audit_options: false,
@@ -822,7 +832,7 @@ impl Broker {
                     (
                         save_object,
                         DiagnosticOutput::Text,
-                        TIMEOUT,
+                        broker_timeout(),
                         &[][..],
                         None,
                         false,

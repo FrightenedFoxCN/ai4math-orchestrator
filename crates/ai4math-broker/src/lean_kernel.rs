@@ -1,6 +1,6 @@
 //! Shared admission and independent kernel-replay policy for native Lean.
 use super::{
-    AXIOMS, TIMEOUT, Toolchain, digest, path_for, sandbox, stage_source, validate_modules,
+    AXIOMS, Toolchain, broker_timeout, digest, path_for, sandbox, stage_source, validate_modules,
 };
 use anyhow::{Context, Result, ensure};
 use std::{fs, path::Path};
@@ -193,7 +193,7 @@ fn run_checker(
             writable: &writable,
             reads: &tool.reads,
             env: &[],
-            timeout: TIMEOUT,
+            timeout: broker_timeout(),
         },
         std::slice::from_ref(&objects),
         &[],

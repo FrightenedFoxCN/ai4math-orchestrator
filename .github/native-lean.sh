@@ -8,6 +8,7 @@ version=$("$AI4MATH_TEST_LEAN" --version)
 printf '%s\n' "$version"
 [[ $version == *'version 4.35.0,'* && $version == *'commit eb6cafb7290e8bd5f2937522d8d804f58f02bafc,'* ]]
 export AI4MATH_TEST_LEAN
+export AI4MATH_BROKER_TIMEOUT_SECS=120
 
 run_one() {
     local name=$1 output
