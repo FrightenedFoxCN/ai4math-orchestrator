@@ -1,6 +1,6 @@
 //! Native Lean regression checks for operator-approved, committed probes.
 use super::{
-    Broker, Engine, Lane, Pressure, TIMEOUT, Toolchain, dependencies_digest, digest,
+    Broker, Engine, Lane, Pressure, Toolchain, broker_timeout, dependencies_digest, digest,
     lean_objects::LeanObjects, path_for, sandbox, stage_source, validate_modules,
 };
 use ai4math_evidence::BreakerProbeEvidence;
@@ -160,7 +160,7 @@ pub(super) fn command_timeout(deadline: Instant) -> Result<Duration> {
         !remaining.is_zero(),
         "isolated Lean audit wall-clock budget exhausted"
     );
-    Ok(TIMEOUT.min(remaining))
+    Ok(broker_timeout().min(remaining))
 }
 
 /// Run each source with only its own source and read-only predecessor objects.
@@ -300,7 +300,10 @@ mod tests {
 
     #[test]
     fn deadline_budget_fails_closed() -> Result<()> {
-        assert_eq!(command_timeout(Instant::now() + TOTAL_TIMEOUT)?, TIMEOUT);
+        assert_eq!(
+            command_timeout(Instant::now() + TOTAL_TIMEOUT)?,
+            broker_timeout()
+        );
         assert!(command_timeout(Instant::now()).is_err());
         Ok(())
     }
