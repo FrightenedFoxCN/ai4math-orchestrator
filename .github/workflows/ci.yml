@@ -23,6 +23,10 @@ jobs:
   native-lean:
     runs-on: macos-15
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        group: [kernel, rfc]
     permissions:
       contents: read
     steps:
@@ -42,8 +46,8 @@ jobs:
           mkdir "$prefix"
           tar --strip-components 1 -xf "$archive" -C "$prefix"
           printf 'AI4MATH_TEST_LEAN=%s/bin/lean\n' "$prefix" >> "$GITHUB_ENV"
-      - name: Run native Lean and recovery gates
-        run: bash .github/native-lean.sh
+      - name: Run native Lean ${{ matrix.group }} gates
+        run: bash .github/native-lean${{ matrix.group == 'rfc' && '-rfc' || '' }}.sh
 
   plugin:
     runs-on: ubuntu-latest

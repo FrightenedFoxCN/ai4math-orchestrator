@@ -365,6 +365,7 @@ fn native_rfc_freeze_and_complete_with_real_lean() -> Result<()> {
     explorer.bind("explorer")?;
     let mut builder = Rpc::new(UnixStream::connect(&socket)?)?;
     builder.bind("builder")?;
+    builder.set_timeout(Duration::from_secs(600))?;
 
     let draft = json!({
         "rfc_id":"RFC-NATIVE","requested_by_claim":"C1","engine":"lean4",
@@ -718,6 +719,7 @@ fn native_formal_sketch_applies_l3_without_publishing() -> Result<()> {
         boot_with_native_timeout(project, &cli, &lean, "600").context("boot native rfc daemon")?;
     let mut builder = connect(project, &mut child)?;
     builder.bind("builder")?;
+    builder.set_timeout(Duration::from_secs(600))?;
     builder.set_timeout(Duration::from_secs(620))?;
     let result = builder.result(
         "claim.apply_formal_sketch",
@@ -875,6 +877,7 @@ fn native_oracle_backed_applies_l4a_debt_without_publishing() -> Result<()> {
         boot_with_native_timeout(project, &cli, &lean, "600").context("boot native rfc daemon")?;
     let mut builder = connect(project, &mut child)?;
     builder.bind("builder")?;
+    builder.set_timeout(Duration::from_secs(600))?;
     builder.set_timeout(Duration::from_secs(620))?;
     let result = builder.result(
         "claim.apply_oracle_backed",
@@ -1001,6 +1004,7 @@ fn rfc_submit_and_approval_use_bound_git_and_principal_actors() -> Result<()> {
     );
     let mut builder = Rpc::new(UnixStream::connect(&socket)?)?;
     builder.bind("builder")?;
+    builder.set_timeout(Duration::from_secs(600))?;
     let mut owner = Rpc::new(UnixStream::connect(&socket)?)?;
     owner.bind("owner")?;
     assert_eq!(chief.call("rfc.submit", json!({"module_path":"Demo.lean","reviewed_commit":head,"draft":{
