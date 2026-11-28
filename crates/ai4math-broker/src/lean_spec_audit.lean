@@ -54,14 +54,18 @@ private partial def replayClosure (trusted env : Environment) (todo : List Name)
         | _ => [])
       replayClosure trusted env (deps ++ rest) (acc.insert name info)
 
-private def auditAxioms (env : Environment) (name : Name) : IO Unit := do
+private def auditAxioms (env : Environment) (name : Name) (allowSorry : Bool) : IO Unit := do
   let check : CoreM (Array Name) := Lean.collectAxioms name
   let (axioms, _) ← check.toIO { fileName := "<reviewed spec comparison>", fileMap := default } { env }
   for ax in axioms do
-    unless ax == `propext || ax == `Classical.choice || ax == `Quot.sound do
+    unless ax == `propext || ax == `Classical.choice || ax == `Quot.sound || (allowSorry && ax == `sorryAx) do
       throw <| IO.userError s!"'{name}' depends on non-kernel axiom '{ax}'"
 
 def main (args : List String) : IO Unit := do
+  let mode :: args := args | throw <| IO.userError "missing spec audit mode"
+  let allowSorry := mode == "sketch"
+  unless mode == "strict" || allowSorry do
+    throw <| IO.userError "invalid spec audit mode"
   let [prefixPath, fullPath, specModule, specText, candidateModule, candidateText] := args
     | throw <| IO.userError "invalid spec audit arguments"
   let smod := Name.mkSimple specModule
@@ -94,8 +98,8 @@ def main (args : List String) : IO Unit := do
       throw <| IO.userError s!"candidate environment changes the reviewed spec dependency '{name}'"
   let closure ← replayClosure trusted full [candidate] specClosure
   let checked ← trusted.toKernelEnv.replay closure
-  for name in [spec, candidate] do
-    auditAxioms (.ofKernelEnv checked) name
+  auditAxioms (.ofKernelEnv checked) spec false
+  auditAxioms (.ofKernelEnv checked) candidate allowSorry
 
   -- The value is the bare theorem constant (with its original universe params),
   -- not an elaborated term. The trusted native kernel accepts this declaration

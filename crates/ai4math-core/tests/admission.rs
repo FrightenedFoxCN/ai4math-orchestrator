@@ -1,6 +1,6 @@
 use ai4math_core::{
     Engine, FrozenTarget, PreFlightScanResult, ProofBodyError, ProofBodySubmission,
-    render_proof_body, scan_source, validate_source_path,
+    render_proof_body, render_proof_body_allow_sorry, scan_source, validate_source_path,
 };
 
 fn lean_target() -> FrozenTarget {
@@ -310,6 +310,33 @@ fn rejects_unsupported_or_missing_proof_syntax() {
         submit(&target, &" ".repeat(256 * 1024 + 1)),
         Err(ProofBodyError::InvalidBody { .. })
     ));
+}
+
+#[test]
+fn formal_sketch_render_admits_only_explicit_sorry_holes() {
+    let target = lean_target();
+    let submission = ProofBodySubmission {
+        target_id: "target".into(),
+        proof_body: "by sorry".into(),
+    };
+    assert!(render_proof_body_allow_sorry(&target, &submission).is_ok());
+    assert!(matches!(
+        render_proof_body(&target, &submission),
+        Err(ProofBodyError::PreFlight(_))
+    ));
+    for body in ["axiom bypass : True", "by native_decide", "by run_tac"] {
+        let submission = ProofBodySubmission {
+            target_id: "target".into(),
+            proof_body: body.into(),
+        };
+        assert!(
+            matches!(
+                render_proof_body_allow_sorry(&target, &submission),
+                Err(ProofBodyError::PreFlight(_))
+            ),
+            "{body}"
+        );
+    }
 }
 
 fn rocq_target() -> FrozenTarget {

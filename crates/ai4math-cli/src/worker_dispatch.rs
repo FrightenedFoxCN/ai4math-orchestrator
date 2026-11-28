@@ -63,7 +63,7 @@ enum Input<'a> {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-enum Suggestion {
+pub(super) enum Suggestion {
     Findings {
         summary: String,
     },
@@ -78,7 +78,7 @@ enum Suggestion {
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
-enum ReviewVerdict {
+pub(crate) enum ReviewVerdict {
     LooksConsistent,
     NeedsChanges,
     InsufficientContext,
@@ -253,7 +253,7 @@ fn safe_text(s: &str) -> bool {
             .any(|c| c.is_control() && !matches!(c, '\n' | '\t'))
 }
 
-fn decode_result(raw: &[u8]) -> Result<Suggestion> {
+pub(super) fn decode_result(raw: &[u8]) -> Result<Suggestion> {
     ensure!(
         !raw.is_empty() && raw.len() <= RESULT_CAP,
         "worker result is empty or exceeds the 32 KiB protocol bound"

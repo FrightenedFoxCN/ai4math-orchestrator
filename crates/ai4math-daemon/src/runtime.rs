@@ -275,6 +275,13 @@ struct ClaimCreate {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct FormalSketchArgs {
+    task_id: String,
+    observation_id: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ClaimOracleTransition {
     claim_id: String,
     observation_id: String,
@@ -891,6 +898,43 @@ impl Project {
                 Ok(json!({"claim":claim}))
             }
 
+            "claim.apply_formal_sketch" => {
+                let args: FormalSketchArgs = parse(params)?;
+                let role = connection
+                    .principal()
+                    .ok_or_else(|| RpcError::new(-32003, "connection principal is not bound"))?;
+                require_write_role(&role, &["builder"], "claim.apply_formal_sketch")?;
+                rpc_id("task_id", &args.task_id, 100)?;
+                rpc_sha256(&args.observation_id)?;
+                let config = self.native_rfc.as_ref().ok_or_else(|| {
+                    RpcError::new(-32006, "trusted formal sketch tooling is not configured")
+                })?;
+                let repo = self.managed_repo_name()?;
+                let git = lock_managed_git(&repo)?;
+                let head = git.main_head().map_err(native_rfc_error)?;
+                let candidate = self
+                    .store()
+                    .map_err(internal)?
+                    .task_candidate(&args.task_id)
+                    .map_err(internal)?
+                    .ok_or_else(|| RpcError::new(-32004, "retained task candidate not found"))?;
+                if candidate.role != "prover_worker" || candidate.base_commit != head {
+                    return Err(RpcError::new(
+                        -32002,
+                        "formal sketch candidate is not current prover evidence",
+                    ));
+                }
+                drop(git);
+                let record = config
+                    .formal_sketch_task(
+                        &self.root,
+                        Path::new(&repo),
+                        &args.task_id,
+                        &args.observation_id,
+                    )
+                    .map_err(native_rfc_error)?;
+                Ok(record)
+            }
             "claim.apply_oracle" => {
                 let args: ClaimOracleTransition = parse(params)?;
                 let role = connection

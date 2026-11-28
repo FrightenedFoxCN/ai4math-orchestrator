@@ -36,7 +36,10 @@ pub use pack_itp::ItpDomainPack;
 pub use preflight::{
     PreFlightScanResult, PreFlightSeverity, PreFlightViolation, scan_source, validate_source_path,
 };
-pub use proof::{FrozenTarget, ProofBodyError, ProofBodySubmission, render_proof_body};
+pub use proof::{
+    FrozenTarget, ProofBodyError, ProofBodySubmission, render_proof_body,
+    render_proof_body_allow_sorry,
+};
 pub use trust::{Trust, aggregate_plan, best_proof_plan};
 
 /// Error returned when a string is not an enum's wire spelling.

@@ -13,7 +13,7 @@ const roleMethods = Object.freeze({
     ...readGraph, 'claimCreate', 'planCreate', 'claimApplyOracle', 'inboxPush', 'rfcApprove', 'rfcReject', 'rfcSupersede', 'rfcInspect', 'taskRegister', 'taskStatus', 'promotionPreview', 'promotionStatus']),
   regional: Object.freeze([...readWiki, ...readGraph, 'wikiCheckGraveyard', 'rfcInspect', 'taskStatus']),
   explorer: Object.freeze([...readWiki, ...readGraph, 'wikiCheckGraveyard', 'wikiProvenance', 'rfcSubmit', 'rfcInspect']),
-  builder: Object.freeze([...readWiki, ...readGraph, 'wikiCheckGraveyard', 'rfcInspect', 'rfcSmokeStart', 'rfcFreeze', 'rfcComplete']),
+  builder: Object.freeze([...readWiki, ...readGraph, 'wikiCheckGraveyard', 'rfcInspect', 'rfcSmokeStart', 'rfcFreeze', 'rfcComplete', 'claimApplyFormalSketch']),
   prover: Object.freeze([...readWiki,'proofSubmit','workerAcquire','workerSubmit','workerCancel','workerStatus']),
   automation: Object.freeze([...readWiki,'proofSubmit']),
   reviewer: Object.freeze(['wikiSearch', 'wikiCheckGraveyard', ...readGraph, 'rfcInspect','workerAcquire','workerSubmit','workerCancel','workerStatus']),

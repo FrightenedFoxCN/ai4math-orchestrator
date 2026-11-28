@@ -506,6 +506,23 @@ pub fn render_proof_body(
     target: &FrozenTarget,
     submission: &ProofBodySubmission,
 ) -> Result<String, ProofBodyError> {
+    render_proof_body_with_policy(target, submission, false)
+}
+
+/// Formal-sketch rendering admits only the explicit `sorry`/`admit` proof-hole
+/// constructs. Every other static deny rule remains in force.
+pub fn render_proof_body_allow_sorry(
+    target: &FrozenTarget,
+    submission: &ProofBodySubmission,
+) -> Result<String, ProofBodyError> {
+    render_proof_body_with_policy(target, submission, true)
+}
+
+fn render_proof_body_with_policy(
+    target: &FrozenTarget,
+    submission: &ProofBodySubmission,
+    allow_sorry: bool,
+) -> Result<String, ProofBodyError> {
     if target.target_id != submission.target_id {
         return Err(ProofBodyError::TargetMismatch);
     }
@@ -543,7 +560,7 @@ pub fn render_proof_body(
         // The trusted spans own the parentheses. Separating their tokens from
         // the body also prevents a body edge from forming a comment opener.
         let source = format!("{}\n{body}\n{}", target.prefix, target.suffix);
-        return checked_source(target, source);
+        return checked_source_policy(target, source, allow_sorry);
     }
     let (lead, gap) = template_slot(target, module)?;
     body_subset(target.engine, body)?;
@@ -587,16 +604,22 @@ pub fn render_proof_body(
     source.push_str(&padding);
     source.push(')');
     source.push_str(&target.suffix);
-    checked_source(target, source)
+    checked_source_policy(target, source, allow_sorry)
 }
 
-fn checked_source(target: &FrozenTarget, source: String) -> Result<String, ProofBodyError> {
+fn checked_source_policy(
+    target: &FrozenTarget,
+    source: String,
+    allow_sorry: bool,
+) -> Result<String, ProofBodyError> {
     let report = scan_source(target.engine, &target.file_path, &source);
-    if let Some(violation) = report
-        .violations
-        .into_iter()
-        .find(|v| v.severity == crate::PreFlightSeverity::Deny)
-    {
+    if let Some(violation) = report.violations.into_iter().find(|v| {
+        v.severity == crate::PreFlightSeverity::Deny
+            && !(allow_sorry
+                && target.engine == Engine::Lean4
+                && v.rule_id == "LEAN_TRUST"
+                && matches!(v.matched_construct.as_deref(), Some("sorry" | "admit")))
+    }) {
         return Err(ProofBodyError::PreFlight(violation));
     }
     Ok(source)

@@ -10,7 +10,7 @@ const CHECKER: &str = include_str!("lean_kernel_audit.lean");
 const SEAL: &str = "ai4math:sealed-lean-kernel-audit:v1 ";
 const CHECKER_HASH_DOMAIN: &str = "ai4math:lean-kernel-policy:checker-source:v1";
 // Update this pinned source identity and its unit golden together with CHECKER.
-const CHECKER_SHA256: &str = "890637e92eeb329fa34ed1aa60b6e515ceb3f48c9f32678368c63465c72978b3";
+const CHECKER_SHA256: &str = "19f920ebd59debd1012ab9c1e02347a4a1340f9a3efc550637ec3b0f217e6bde";
 
 /// Common policy for every broker entrypoint that admits Lean source modules or
 /// authorizes a candidate after native verification.
@@ -44,6 +44,25 @@ impl LeanKernelPolicy {
         module: &str,
         target: &str,
     ) -> Result<Vec<String>> {
+        Self::replay_with_policy(tool, objects, module, target, false)
+    }
+
+    pub(super) fn replay_formal_sketch(
+        tool: &Toolchain,
+        objects: &Path,
+        module: &str,
+        target: &str,
+    ) -> Result<Vec<String>> {
+        Self::replay_with_policy(tool, objects, module, target, true)
+    }
+
+    fn replay_with_policy(
+        tool: &Toolchain,
+        objects: &Path,
+        module: &str,
+        target: &str,
+        allow_sorry: bool,
+    ) -> Result<Vec<String>> {
         ensure!(
             objects.join(format!("{module}.olean")).is_file(),
             "missing Lean replay object for target module {module:?}"
@@ -60,11 +79,17 @@ impl LeanKernelPolicy {
             vec![
                 "--run".into(),
                 CHECKER_FILE.into(),
-                "target".into(),
+                if allow_sorry {
+                    "sketch-target"
+                } else {
+                    "target"
+                }
+                .into(),
                 objects_text.into(),
                 module.into(),
                 target.into(),
             ],
+            allow_sorry,
         )
     }
 
@@ -98,7 +123,7 @@ impl LeanKernelPolicy {
             modules.len().to_string(),
         ];
         args.extend(modules.iter().map(|module| (*module).to_owned()));
-        run_checker(tool, &objects, args)
+        run_checker(tool, &objects, args, false)
     }
 
     /// Require the independent replay to agree with the ordinary compiler's
@@ -109,8 +134,13 @@ impl LeanKernelPolicy {
         module: &str,
         target: &str,
         reported: &[String],
+        allow_sorry: bool,
     ) -> Result<()> {
-        let replayed = Self::replay(tool, objects, module, target)?;
+        let replayed = if allow_sorry {
+            Self::replay_formal_sketch(tool, objects, module, target)?
+        } else {
+            Self::replay(tool, objects, module, target)?
+        };
         let mut expected = reported.to_vec();
         expected.sort_unstable();
         expected.dedup();
@@ -123,7 +153,12 @@ impl LeanKernelPolicy {
     }
 }
 
-fn run_checker(tool: &Toolchain, objects: &Path, args: Vec<String>) -> Result<Vec<String>> {
+fn run_checker(
+    tool: &Toolchain,
+    objects: &Path,
+    args: Vec<String>,
+    allow_sorry: bool,
+) -> Result<Vec<String>> {
     ensure!(
         tool.engine == super::Engine::Lean4,
         "Lean replay requires native Lean"
@@ -164,7 +199,7 @@ fn run_checker(tool: &Toolchain, objects: &Path, args: Vec<String>) -> Result<Ve
         &[],
     )
     .context("independent Lean kernel replay failed")?;
-    audit_report(&log)
+    audit_report_with_policy(&log, allow_sorry)
 }
 
 pub(super) fn checker_source_sha256() -> String {
@@ -174,7 +209,12 @@ pub(super) fn checker_source_sha256() -> String {
     )
 }
 
+#[cfg(test)]
 fn audit_report(log: &str) -> Result<Vec<String>> {
+    audit_report_with_policy(log, false)
+}
+
+fn audit_report_with_policy(log: &str, allow_sorry: bool) -> Result<Vec<String>> {
     let json = log
         .strip_prefix(SEAL)
         .and_then(|line| line.strip_suffix('\n'))
@@ -183,7 +223,9 @@ fn audit_report(log: &str) -> Result<Vec<String>> {
     let axioms: Vec<String> =
         serde_json::from_str(json).context("invalid sealed Lean kernel axiom list")?;
     ensure!(
-        axioms.iter().all(|a| AXIOMS.contains(&a.as_str()))
+        axioms
+            .iter()
+            .all(|a| AXIOMS.contains(&a.as_str()) || (allow_sorry && a == "sorryAx"))
             && axioms.windows(2).all(|pair| pair[0] < pair[1]),
         "non-L5 or ambiguous independently replayed Lean axioms: {axioms:?}"
     );

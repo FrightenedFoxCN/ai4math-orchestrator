@@ -252,7 +252,9 @@
 - L3 只接受三类同时匹配 live Claim/repo/HEAD 的证据：assessed T3 candidate（axioms 含 `sorryAx`）、sealed reviewed-spec comparison、retained `NoCounterexampleWithinBounds` Oracle probe。
 - 任一证据缺失、spec 不匹配、非 T3、HEAD/Claim 上下文变化或 Claim 已 stale/refuted/higher-trust 都会拒绝；proof body 不进入证据表或响应，只保留 source/receipt/probe 哈希。
 - receipt、evidence、trust change 与 graph recompute 在同一事务完成，按 sketch ID 精确幂等；`proof_verified:false`，不授予 L4a/L4b/L5。
-- Store 正反例覆盖三证据齐全、重放、缺失 probe、spec 不匹配与非 T3 receipt。当前尚未暴露 Agent RPC，需下一轮受信 CLI/Broker 入口。
+- Builder-only `claim.apply_formal_sketch {task_id, observation_id}` 通过受信 CLI/Lean 适配器执行；CLI 从 retained candidate 读取 proof body，Agent 不能提交 proof body、repo、executable 或目标 trust level。
+- Broker 新增显式 `FormalSketch` 模式：静态准入仅放行 `sorry`/`admit`，axiom 报告与独立 kernel replay 仅额外接受 `sorryAx`；spec comparator 只对 candidate 放行 `sorryAx`，reviewed spec 仍保持严格。
+- Store 正反例覆盖三证据齐全、重放、缺失 probe、spec 不匹配与非 T3 receipt；真实 Lean 4.35.0 端到端验收已验证 L3 写入且不发布 Git commit，并加入 `.github/native-lean.sh`。
 
 ## 尚未完成
 

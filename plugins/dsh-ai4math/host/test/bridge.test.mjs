@@ -303,6 +303,28 @@ test('native RFC tools are Builder-only and accept no executable or repository f
   ]);
 });
 
+
+test('formal sketch tools are Builder-only and accept no proof body or trust level', async t => {
+  const seen = [];
+  const socketPath = await fixture(t, ({ id, method, params }, socket) => {
+    seen.push([method, params]);
+    reply(socket, id, {});
+  });
+  const bridge = createBridge({ socketPath });
+  t.after(() => bridge.close());
+  for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
+    assert.equal(methodsForRole(role).includes('claimApplyFormalSketch'), role === 'builder', role + '/claimApplyFormalSketch');
+  }
+  const args = { task_id:'T1', observation_id:'a'.repeat(64) };
+  await bridge.bind('builder').call('claimApplyFormalSketch', args);
+  for (const invalid of [{ ...args, proof_body:'sorry' }, { ...args, trust_level:'L3' }, { ...args, executable:'/tmp/lean' }]) {
+    await assert.rejects(bridge.bind('builder').call('claimApplyFormalSketch', invalid), fails('invalid'));
+  }
+  assert.deepEqual(seen, [
+    ['session.bind', { role:'builder' }], ['claim.apply_formal_sketch', args],
+  ]);
+});
+
 test('typed Oracle trust tools are Chief-only and reject caller-selected levels', async t => {
   const seen = [];
   const socketPath = await fixture(t, ({ id, method, params }, socket) => {

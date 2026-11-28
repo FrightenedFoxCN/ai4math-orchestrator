@@ -444,7 +444,10 @@ pub struct VerifiedCandidate {
 impl VerifiedCandidate {
     /// Distinguish typed native T3 assessment from a caller-selected legacy tier.
     pub fn is_assessed_t3(&self) -> bool {
-        matches!(self.mode, VerificationMode::AssessT3)
+        matches!(
+            self.mode,
+            VerificationMode::AssessT3 | VerificationMode::FormalSketch
+        )
     }
 
     pub fn source(&self) -> &str {
@@ -517,6 +520,7 @@ enum CheckMode<'a> {
 enum VerificationMode {
     Legacy(ReceiptTier),
     AssessT3,
+    FormalSketch,
 }
 
 #[derive(Default)]
@@ -740,6 +744,17 @@ fn lean_axioms(output: &str, target: &str) -> Result<Vec<String>> {
     ensure!(
         axioms.iter().all(|a| AXIOMS.contains(&a.as_str())),
         "non-L5 Lean axioms: {axioms:?}"
+    );
+    Ok(axioms)
+}
+
+fn lean_axioms_allow_sorry(output: &str, target: &str) -> Result<Vec<String>> {
+    let axioms = lean_axiom_report(output, target)?;
+    ensure!(
+        axioms
+            .iter()
+            .all(|a| AXIOMS.contains(&a.as_str()) || a == "sorryAx"),
+        "unsupported formal sketch Lean axioms: {axioms:?}"
     );
     Ok(axioms)
 }
@@ -1066,6 +1081,27 @@ impl Broker {
         }
     }
 
+    /// Compile a formal sketch that may contain explicit sorry/admit holes.
+    /// The resulting T3 candidate is still subject to axiom replay and is never
+    /// promotion authority by itself.
+    pub fn assess_formal_sketch_with_dependencies(
+        &self,
+        tool: &Toolchain,
+        target: &FrozenTarget,
+        submission: &ProofBodySubmission,
+        base_commit: &str,
+        dependencies: &[(&str, &str)],
+    ) -> Result<VerifiedCandidate> {
+        self.verify_at_tier(
+            tool,
+            target,
+            submission,
+            base_commit,
+            dependencies,
+            VerificationMode::FormalSketch,
+        )
+    }
+
     fn verify_at_tier(
         &self,
         tool: &Toolchain,
@@ -1077,10 +1113,14 @@ impl Broker {
     ) -> Result<VerifiedCandidate> {
         let tier = match mode {
             VerificationMode::Legacy(tier) => tier,
-            VerificationMode::AssessT3 => ReceiptTier::T3TaintRebuild,
+            VerificationMode::AssessT3 | VerificationMode::FormalSketch => {
+                ReceiptTier::T3TaintRebuild
+            }
         };
-        let classify_lean =
-            matches!(mode, VerificationMode::AssessT3) && tool.engine == Engine::Lean4;
+        let classify_lean = matches!(
+            mode,
+            VerificationMode::AssessT3 | VerificationMode::FormalSketch
+        ) && tool.engine == Engine::Lean4;
         ensure!(
             matches!(base_commit.len(), 40 | 64)
                 && base_commit.bytes().all(|c| c.is_ascii_hexdigit()),
@@ -1091,14 +1131,21 @@ impl Broker {
             "compiler/target engine mismatch"
         );
         validate_modules_for_tool(tool, dependencies, Some(&target.file_path))?;
-        let source = render_proof_body(target, submission)?;
+        let source = if matches!(mode, VerificationMode::FormalSketch) {
+            ai4math_core::render_proof_body_allow_sorry(target, submission)?
+        } else {
+            render_proof_body(target, submission)?
+        };
         ensure!(source.len() <= SOURCE_CAP, "module source exceeds limit");
         let _lease = self.resources.acquire(Lane::Heavy, Pressure::Red)?;
         let room = tempfile::tempdir()?;
         let mut build = ModuleBuild::new(tool, room.path())?;
         let start = Instant::now();
         let dependency_build = build.compile_all(self, dependencies);
-        if matches!(mode, VerificationMode::AssessT3) {
+        if matches!(
+            mode,
+            VerificationMode::AssessT3 | VerificationMode::FormalSketch
+        ) {
             dependency_build.context("build verification dependencies")?;
         } else {
             dependency_build?;
@@ -1138,6 +1185,9 @@ impl Broker {
         };
         let output = &build.output;
         let observed_axioms = match tool.engine {
+            Engine::Lean4 if matches!(mode, VerificationMode::FormalSketch) => {
+                lean_axioms_allow_sorry(&log, &target.target_id)?
+            }
             Engine::Lean4 => lean_axioms(&log, &target.target_id)?,
             Engine::Agda => vec![],
             Engine::Rocq => {
@@ -1152,6 +1202,7 @@ impl Broker {
                 path_for(Engine::Lean4, &target.file_path)?,
                 &target.target_id,
                 &observed_axioms,
+                matches!(mode, VerificationMode::FormalSketch),
             )?;
         }
         let mut receipt = VerificationReceipt {
@@ -1293,6 +1344,7 @@ impl Broker {
                 path_for(Engine::Lean4, candidate.receipt.file_path())?,
                 candidate.receipt.target_id(),
                 candidate.receipt.observed_axioms(),
+                false,
             )?;
             if !downstream_modules.is_empty() {
                 LeanKernelPolicy::replay_modules(tool, output, &downstream_modules)?;

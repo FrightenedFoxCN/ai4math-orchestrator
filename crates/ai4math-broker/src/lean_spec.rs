@@ -14,6 +14,9 @@ use std::{fs, time::Instant};
 
 const CHECKER_FILE: &str = "Ai4mathSealedLeanComparison.lean";
 const CHECKER: &str = include_str!("lean_spec_audit.lean");
+// Existing T1/T3 comparison identities remain anchored to the pre-sketch checker.
+const LEGACY_CHECKER_SHA256: &str =
+    "7fa3d500c0f97bf99a72d02ca9f483816a31bda1014ab2a573295db03295c667";
 const SEAL: &str = "ai4math:sealed-lean-spec-comparison:v1
 ";
 
@@ -129,6 +132,28 @@ fn comparison_digest(
         spec_decl,
         spec_prefix_sha256,
         CHECKER_FILE,
+        LEGACY_CHECKER_SHA256,
+    ))?))
+}
+
+fn formal_sketch_comparison_digest(
+    candidate: &VerificationReceipt,
+    spec_file: &str,
+    spec_decl: &str,
+    spec_prefix_sha256: &str,
+) -> Result<String> {
+    Ok(digest(&serde_json::to_vec(&(
+        "ai4math:lean-spec-comparison:formal-sketch:v1",
+        candidate.base_commit(),
+        candidate.file_path(),
+        candidate.target_id(),
+        candidate.patch_sha256(),
+        candidate.dependencies_sha256(),
+        &candidate.compiler_sha256,
+        spec_file,
+        spec_decl,
+        spec_prefix_sha256,
+        CHECKER_FILE,
         digest(CHECKER.as_bytes()),
     ))?))
 }
@@ -142,6 +167,7 @@ fn check_candidate_binding(candidate: &VerifiedCandidate) -> Result<()> {
                 ReceiptTier::T1Promotion,
                 VerificationMode::Legacy(ReceiptTier::T1Promotion)
             ) | (ReceiptTier::T3TaintRebuild, VerificationMode::AssessT3)
+                | (ReceiptTier::T3TaintRebuild, VerificationMode::FormalSketch)
         ),
         "reviewed Lean comparison requires a T1 promotion or an assessed T3 recheck"
     );
@@ -174,6 +200,43 @@ impl Broker {
         spec_file: &str,
         spec_decl: &str,
         dependencies: &[(&str, &str)],
+    ) -> Result<VerifiedLeanComparison> {
+        self.compare_lean_spec_with_policy(
+            tool,
+            candidate,
+            spec_file,
+            spec_decl,
+            dependencies,
+            false,
+        )
+    }
+
+    pub fn compare_formal_sketch_spec(
+        &self,
+        tool: &Toolchain,
+        candidate: &VerifiedCandidate,
+        spec_file: &str,
+        spec_decl: &str,
+        dependencies: &[(&str, &str)],
+    ) -> Result<VerifiedLeanComparison> {
+        self.compare_lean_spec_with_policy(
+            tool,
+            candidate,
+            spec_file,
+            spec_decl,
+            dependencies,
+            true,
+        )
+    }
+
+    fn compare_lean_spec_with_policy(
+        &self,
+        tool: &Toolchain,
+        candidate: &VerifiedCandidate,
+        spec_file: &str,
+        spec_decl: &str,
+        dependencies: &[(&str, &str)],
+        allow_sorry: bool,
     ) -> Result<VerifiedLeanComparison> {
         let receipt = candidate.receipt();
         ensure!(
@@ -245,6 +308,7 @@ impl Broker {
                 args: &[
                     "--run".into(),
                     CHECKER_FILE.into(),
+                    if allow_sorry { "sketch" } else { "strict" }.into(),
                     prefix_objects
                         .to_str()
                         .context("non-UTF-8 spec object path")?
@@ -272,7 +336,11 @@ impl Broker {
         command_timeout(deadline)?;
         require_seal(&log)?;
 
-        let receipt_sha256 = comparison_digest(receipt, spec_file, spec_decl, &spec_prefix_sha256)?;
+        let receipt_sha256 = if allow_sorry {
+            formal_sketch_comparison_digest(receipt, spec_file, spec_decl, &spec_prefix_sha256)?
+        } else {
+            comparison_digest(receipt, spec_file, spec_decl, &spec_prefix_sha256)?
+        };
         Ok(VerifiedLeanComparison {
             spec_file: spec_file.into(),
             spec_decl: spec_decl.into(),

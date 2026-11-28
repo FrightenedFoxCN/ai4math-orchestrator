@@ -54,26 +54,26 @@ private partial def replayClosure (stock imported : Environment) (todo : List Na
         | _ => [])
       replayClosure stock imported (deps ++ rest) (acc.insert name info)
 
-private def auditAxioms (env : Environment) (roots : List Name) : IO (Array String) := do
+private def auditAxioms (env : Environment) (roots : List Name) (allowSorry : Bool) : IO (Array String) := do
   let mut observed : Std.HashSet Name := {}
   for name in roots do
     let collect : CoreM (Array Name) := Lean.collectAxioms name
     let (axioms, _) ← collect.toIO
       { fileName := "<independent Lean kernel replay>", fileMap := default } { env }
     for ax in axioms do
-      unless ax == `propext || ax == `Classical.choice || ax == `Quot.sound do
+      unless ax == `propext || ax == `Classical.choice || ax == `Quot.sound || (allowSorry && ax == `sorryAx) do
         throw <| IO.userError s!"'{name}' depends on non-kernel axiom '{ax}'"
       observed := observed.insert ax
   return (observed.toArray.map Name.toString).qsort (· < ·)
 
-private def replayAndSeal (stock imported : Environment) (roots : List Name) : IO Unit := do
+private def replayAndSeal (stock imported : Environment) (roots : List Name) (allowSorry : Bool) : IO Unit := do
   let closure ← replayClosure stock imported roots
   let checked ← stock.toKernelEnv.replay closure
-  let axioms ← auditAxioms (.ofKernelEnv checked) roots
+  let axioms ← auditAxioms (.ofKernelEnv checked) roots allowSorry
   IO.println ("ai4math:sealed-lean-kernel-audit:v1 " ++
     (Lean.toJson axioms).compress)
 
-private def runTarget (args : List String) : IO Unit := do
+private def runTarget (args : List String) (allowSorry : Bool) : IO Unit := do
   let [objectsText, moduleText, targetText] := args
     | throw <| IO.userError "invalid Lean kernel target replay arguments"
   let objects := System.FilePath.mk objectsText
@@ -88,7 +88,7 @@ private def runTarget (args : List String) : IO Unit := do
   Lean.searchPathRef.set (builtinPath ++ [objects])
   let imported ← Lean.importModules (builtins.push { module := mod }) {} (loadExts := false)
   ownTheorem objects imported mod target
-  replayAndSeal stock imported [target]
+  replayAndSeal stock imported [target] allowSorry
 
 private def publicRoots (objects : System.FilePath) (imported : Environment)
     (mods : List Name) : IO (List Name) := do
@@ -123,10 +123,11 @@ private def runModules (args : List String) : IO Unit := do
   let imports := builtins ++ (mods.toArray.map fun mod => { module := mod })
   let imported ← Lean.importModules imports {} (loadExts := false)
   let roots ← publicRoots objects imported mods
-  replayAndSeal stock imported roots
+  replayAndSeal stock imported roots false
 
 def main (args : List String) : IO Unit := do
   match args with
-  | "target" :: rest => runTarget rest
+  | "target" :: rest => runTarget rest false
+  | "sketch-target" :: rest => runTarget rest true
   | "modules" :: rest => runModules rest
   | _ => throw <| IO.userError "invalid Lean kernel replay mode"

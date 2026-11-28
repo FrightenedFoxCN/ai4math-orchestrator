@@ -34,6 +34,7 @@ use ai4math_store::{
 use anyhow::{Context, Result, bail, ensure};
 use promotion::{PendingRef, Promotion, PromotionRepo};
 use std::{env, fs, io::Read, path::Path};
+use worker_dispatch::{Suggestion, decode_result};
 
 const HELP: &str = "ai4math init ROOT [lean4|agda|rocq]\nai4math status ROOT\nai4math claim-replay ROOT CLAIM [THROUGH_EVENT_SEQ]\nai4math plan-replay ROOT PLAN [THROUGH_EVENT_SEQ]\nai4math graph-replay ROOT [THROUGH_EVENT_SEQ]\nai4math graph-audit ROOT\nai4math graph-check ROOT\nai4math wiki-rebuild ROOT\nai4math wiki-core-rebuild ROOT BARE_REPO REVIEWED_MAIN\nai4math wiki-core-search ROOT BARE_REPO REVIEWED_MAIN TEXT\nai4math wiki-core-provenance ROOT BARE_REPO REVIEWED_MAIN ENTRY_ID\nai4math wiki-sediment-preview ROOT BARE_REPO CLAIM REVIEWED_MAIN\nai4math wiki-sediment-archive ROOT BARE_REPO CLAIM REVIEWED_MAIN APPROVAL_SHA256\nai4math wiki-sediment-wake-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN\nai4math wiki-sediment-wake-recheck ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-retain ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN NATIVE_LEAN\nai4math wiki-sediment-wake-result ROOT OBSERVATION_SHA256\nai4math wiki-sediment-adapt-preview ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM\nai4math wiki-sediment-adapt-approve ROOT BARE_REPO ARCHIVE_ID REVIEWED_MAIN TARGET_CLAIM APPROVAL_SHA256\nai4math wiki-sediment-adapt-result ROOT APPROVAL_SHA256\nai4math wiki-sediment-adapt-run ROOT BARE_REPO APPROVAL_SHA256 WORKER_EXE WORKER_SHA256 WALL_SECONDS\nai4math wiki-sediment-adapt-lineage-retain ROOT BARE_REPO APPROVAL_SHA256 PROMOTED_HEAD\nai4math wiki-sediment-adapt-lineage-result ROOT APPROVAL_SHA256\nai4math self-test\nai4math hammer-reconstruct ROOT BARE_REPO CLAIM REVIEWED_COMMIT PREMISES_JSON NATIVE_LEAN\nai4math oracle-probe QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-preview ROOT BARE_REPO CLAIM QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-retain ROOT BARE_REPO CLAIM APPROVAL_SHA256 QUERY_JSON NATIVE_Z3 NATIVE_CVC5\nai4math oracle-result ROOT RECORD_SHA256\nai4math oracle-hold ROOT BARE_REPO TASK RECORD_SHA256 SECONDS\nai4math oracle-release ROOT TASK HOLD_SHA256\nai4math oracle-hold-status ROOT TASK\nai4math promote BARE_REPO MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math declare-claim ROOT CLAIM MODULE TARGET TITLE STATEMENT [--critical]\nai4math bind-lean-spec ROOT BARE_REPO CLAIM SPEC_MODULE SPEC_DECL APPROVED_COMMIT\nai4math lean-spec-comparison ROOT PROMOTED_COMMIT\nai4math lean-spec-recheck ROOT CLAIM PLAN_SHA256\nai4math bind-witness-spec ROOT BARE_REPO CLAIM MODULE PROPOSITION APPROVED_COMMIT\nai4math refute-managed ROOT BARE_REPO CLAIM MODULE PROPOSITION NATIVE_LEAN PROOF_BODY_FILE\nai4math promote-reviewed-body ROOT BARE_REPO CLAIM MODULE TARGET REVIEWED_COMMIT NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math promote-managed ROOT BARE_REPO CLAIM MODULE TARGET NATIVE_ENGINE PROOF_BODY_FILE [ENGINE_DATA]\nai4math recover-promotion ROOT BARE_REPO NATIVE_ENGINE [ENGINE_DATA]\nai4math t2-build ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN\nai4math t2-heartbeats ROOT BARE_REPO TARGET_MODULE REVIEWED_MAIN NATIVE_LEAN COMPILER_SHA256\nai4math t2-audit ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN\nai4math t2-compare BASELINE_JSON CANDIDATE_JSON MIN_DELTA_MS MIN_INCREASE_PERCENT\nai4math t2-compare-heartbeats BASELINE_JSON CANDIDATE_JSON MIN_DELTA_HEARTBEATS_RAW MIN_INCREASE_PERCENT\nai4math t2-compare-managed-heartbeats ROOT BARE_REPO TARGET_MODULE BASELINE_COMMIT REVIEWED_MAIN NATIVE_LEAN COMPILER_SHA256 MIN_DELTA_HEARTBEATS_RAW MIN_INCREASE_PERCENT\nai4math t2-compare-release-heartbeats ROOT BARE_REPO TARGET_MODULE BASELINE_LABEL BASELINE_TAG_OID REVIEWED_MAIN NATIVE_LEAN COMPILER_SHA256 MIN_DELTA_HEARTBEATS_RAW MIN_INCREASE_PERCENT\nai4math t2-trust-debt ROOT\nai4math t2-check-export EXPORT_NDJSON EXPORT_SHA256 NATIVE_NANODA CHECKER_SHA256\nai4math t2-check-managed ROOT BARE_REPO TARGET_MODULE DECLARATION REVIEWED_MAIN NATIVE_LEAN EXPORTER_SHA256 CHECKER_SHA256\nai4math t2-check-batch ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN EXPORTER_SHA256 CHECKER_SHA256 TARGETS_JSON\nai4math t2-release-check ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN POLICY_SHA256 COMPILER_SHA256 EXPORTER_SHA256 CHECKER_SHA256\nai4math t2-release-tag ROOT BARE_REPO ANCHOR_MODULE REVIEWED_MAIN NATIVE_LEAN POLICY_SHA256 COMPILER_SHA256 EXPORTER_SHA256 CHECKER_SHA256 LABEL\nai4math t2-release-inspect ROOT BARE_REPO LABEL [EXPECTED_TAG_OID]\nai4math t3-discover ROOT BARE_REPO ANCHOR_MODULE BASELINE_COMMIT\nai4math t3-discover-claim ROOT BARE_REPO CLAIM_ID\nai4math t3-preview ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT\nai4math t3-apply ROOT BARE_REPO ANCHOR_MODULE OLD_COMMIT REVIEW_COMMIT PLAN_SHA256\nai4math t3-recheck ROOT BARE_REPO PLAN_SHA256 NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-worklist ROOT BARE_REPO PLAN_SHA256 LIMIT [AFTER_CLAIM]\nai4math t3-recheck-one ROOT BARE_REPO PLAN_SHA256 CLAIM NATIVE_ENGINE [ENGINE_DATA]\nai4math t3-recheck-batch ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--after CLAIM EVENT_SEQ]\nai4math t3-sweep-status ROOT BARE_REPO PLAN_SHA256\nai4math t3-sweep-step ROOT BARE_REPO PLAN_SHA256 LIMIT NATIVE_ENGINE [ENGINE_DATA] [--restart]\nai4math trip-breaker ROOT BARE_REPO BREAKER MODULE DEFINITION REASON [--critical]
 ai4math linux-cgroup-preflight ABSOLUTE_LEAF
@@ -81,6 +82,7 @@ ai4math task-result ROOT ID
 ai4math refute-managed ROOT BARE_REPO ID MODULE PROPOSITION NATIVE_LEAN PROOF_BODY
 ai4math refute-pending ROOT
 ai4math refute-reconcile ROOT [CLAIM]
+ai4math formal-sketch-task ROOT BARE_REPO ID NATIVE_LEAN PROBE_OBSERVATION_ID
 ai4math promote-task-result ROOT BARE_REPO ID NATIVE_ENGINE [ENGINE_DATA]
 ai4math cache-clone BARE_REPO COMMIT NEW_DIR";
 const HOLE: &str = "{{PROOF_BODY}}";
@@ -429,6 +431,130 @@ enum ManagedProofInput<'a> {
         body: String,
         reviewed_base: &'a str,
     },
+}
+
+fn formal_sketch_task(
+    root: &Path,
+    repo: &Path,
+    task_id: &str,
+    executable: &Path,
+    probe_observation_id: &str,
+) -> Result<()> {
+    let project = ManagedProject::new(root)?;
+    let _native = project.try_native_heavy()?;
+    let locked = PromotionRepo::try_lock_existing(repo)?;
+    let mut store = project.open_state()?;
+    let row = store
+        .task_candidate(task_id)?
+        .context("no retained task candidate")?;
+    ensure!(
+        row.role == "prover_worker",
+        "formal sketch requires a prover candidate"
+    );
+    let Suggestion::ProofBody { proof_body } = decode_result(row.result_json.as_bytes())? else {
+        bail!("formal sketch candidate is not a proof body");
+    };
+    ensure!(
+        locked.main_head()? == row.base_commit,
+        "formal sketch candidate belongs to an older Git snapshot"
+    );
+    ensure!(
+        store.managed_repo()?.as_deref() == locked.path().to_str(),
+        "formal sketch candidate is bound to a different repository"
+    );
+    ensure!(
+        !store.module_breaker_gated("lean4", &row.module_path)?,
+        "breaker still gates the formal sketch module"
+    );
+    ensure!(
+        store.pivot_intent()?.is_none() && store.promotion_intent()?.is_none(),
+        "recover pending Git transaction before formal sketch retention"
+    );
+    let claim = store
+        .claim(&row.claim_id)?
+        .context("formal sketch claim not found")?;
+    ensure!(
+        claim.engine == "lean4"
+            && claim.formal_target.as_deref()
+                == Some(format!("{}#{}", row.module_path, row.target).as_str()),
+        "formal sketch claim target mismatch"
+    );
+    let spec = store
+        .lean_spec(&row.claim_id)?
+        .context("formal sketch requires a reviewed Lean spec")?;
+    let tx = locked.snapshot(&row.module_path, Some(&row.base_commit))?;
+    reviewed_spec::check_snapshot(&locked, &tx, &spec)?;
+    let files = tx.project()?;
+    let index = files
+        .iter()
+        .position(|(path, _)| *path == row.module_path)
+        .context("formal sketch module missing")?;
+    let source = &files[index].1;
+    let (prefix, suffix) = source
+        .split_once(HOLE)
+        .context("formal sketch module must contain one proof slot")?;
+    ensure!(
+        !suffix.contains(HOLE),
+        "formal sketch module has multiple proof slots"
+    );
+    let target = FrozenTarget {
+        engine: Engine::Lean4,
+        target_id: row.target.clone(),
+        file_path: row.module_path.clone(),
+        prefix: prefix.to_owned(),
+        suffix: suffix.to_owned(),
+    };
+    let submission = ProofBodySubmission {
+        target_id: row.target.clone(),
+        proof_body,
+    };
+    let deps: Vec<(&str, &str)> = files[..index]
+        .iter()
+        .map(|(p, s)| (*p, s.as_str()))
+        .collect();
+    reviewed_spec::check_prefix(&deps, &spec)?;
+    let toolchain = trusted_toolchain(Engine::Lean4, executable, None)?;
+    let broker = Broker::new();
+    let candidate = broker
+        .assess_formal_sketch_with_dependencies(
+            &toolchain,
+            &target,
+            &submission,
+            &row.base_commit,
+            &deps,
+        )
+        .context("formal sketch did not pass assessed T3 compilation")?;
+    ensure!(
+        locked.main_head()? == row.base_commit,
+        "main changed during formal sketch verification"
+    );
+    let comparison = broker
+        .compare_formal_sketch_spec(
+            &toolchain,
+            &candidate,
+            &spec.spec_file,
+            &spec.spec_decl,
+            &deps,
+        )
+        .context("formal sketch spec comparison failed")?;
+    ensure!(
+        locked.main_head()? == row.base_commit,
+        "main changed during formal sketch comparison"
+    );
+    let claim = store.apply_formal_sketch_evidence(
+        &row.claim_id,
+        &row.base_commit,
+        &candidate,
+        &comparison,
+        probe_observation_id,
+        Change {
+            actor: "broker:formal-sketch",
+            git_commit: Some(&row.base_commit),
+        },
+    )?;
+    print_json(
+        serde_json::json!({"claim":claim,"proof_verified":false,"candidate_receipt_sha256":candidate.receipt().receipt_sha256(),"comparison_receipt_sha256":comparison.receipt_sha256()}),
+    )
 }
 
 fn promote_managed_body(
@@ -1480,6 +1606,9 @@ fn run() -> Result<()> {
             },
         ),
         ["task-result", root, id] => worker_dispatch::result(Path::new(root), id),
+        ["formal-sketch-task", root, repo, id, exe, probe] => {
+            formal_sketch_task(Path::new(root), Path::new(repo), id, Path::new(exe), probe)
+        }
         ["promote-task-result", root, repo, id, exe] => {
             worker_dispatch::promote(Path::new(root), Path::new(repo), id, Path::new(exe), None)
         }
