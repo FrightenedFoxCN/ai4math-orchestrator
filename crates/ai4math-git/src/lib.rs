@@ -208,12 +208,35 @@ mod tests {
         git_ok(dir.path(), &["init", "--bare", "--initial-branch=main"])?;
         let empty = git(dir.path(), &["hash-object", "-w", "-t", "tree", "--stdin"])?;
         let tree = String::from_utf8(empty)?.trim().to_owned();
-        let commit = git(dir.path(), &["commit-tree", &tree, "-m", "initial"])?;
+        let commit = git(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=AI4Math Test",
+                "-c",
+                "user.email=ai4math@localhost",
+                "commit-tree",
+                &tree,
+                "-m",
+                "initial",
+            ],
+        )?;
         let commit = String::from_utf8(commit)?.trim().to_owned();
         git_ok(dir.path(), &["update-ref", MAIN, &commit])?;
         let next = git(
             dir.path(),
-            &["commit-tree", &tree, "-p", &commit, "-m", "next"],
+            &[
+                "-c",
+                "user.name=AI4Math Test",
+                "-c",
+                "user.email=ai4math@localhost",
+                "commit-tree",
+                &tree,
+                "-p",
+                &commit,
+                "-m",
+                "next",
+            ],
         )?;
         let next = String::from_utf8(next)?.trim().to_owned();
         git_ok(dir.path(), &["update-ref", MAIN, &next])?;

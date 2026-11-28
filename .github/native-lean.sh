@@ -22,7 +22,7 @@ run_one() {
 }
 
 cargo build --locked -p ai4math-cli -p ai4math-daemon
-cargo test --locked -p ai4math-broker --test lean_kernel_policy --test t3 -- --ignored
+cargo test --locked -p ai4math-broker --test lean_kernel_policy --test t3 -- --ignored --test-threads=1
 run_one native_lean_witness_checks_exact_proposition_and_ordered_sources -p ai4math-broker --test witness
 run_one native_rfc_freeze_and_complete_with_real_lean -p ai4math-daemon --test role_rfc
 run_one native_owner_promotion_execute_with_real_lean -p ai4math-daemon --test role_rfc
