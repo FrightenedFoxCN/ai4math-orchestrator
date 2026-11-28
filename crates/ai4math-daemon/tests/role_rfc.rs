@@ -108,24 +108,38 @@ impl Rpc {
 }
 
 fn git(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
-    let mut child = Command::new("/usr/bin/git")
-        .arg("--git-dir")
-        .arg(repo)
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@localhost")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@localhost")
-        .args(args)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = None;
+    for _ in 0..20 {
+        let spawned = Command::new("/usr/bin/git")
+            .arg("--git-dir")
+            .arg(repo)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "Test")
+            .env("GIT_AUTHOR_EMAIL", "test@localhost")
+            .env("GIT_COMMITTER_NAME", "Test")
+            .env("GIT_COMMITTER_EMAIL", "test@localhost")
+            .args(args)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn();
+        match spawned {
+            Ok(started) => {
+                child = Some(started);
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(35) => {
+                thread::sleep(Duration::from_millis(250));
+            }
+            Err(error) => return Err(error).context("spawn Git fixture command"),
+        }
+    }
+    let mut child = child.context("spawn Git fixture command after resource backoff")?;
     if let Some(bytes) = input {
         child
             .stdin
