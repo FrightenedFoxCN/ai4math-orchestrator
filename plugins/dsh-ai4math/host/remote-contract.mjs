@@ -8,9 +8,13 @@ const object = (properties = {}, required = []) => Object.freeze({
   type: 'object', properties: Object.freeze(properties), required: Object.freeze(required), additionalProperties: false,
 });
 const limit = (maximum) => Object.freeze({ type: 'integer', minimum: 1, maximum });
+// OpenCode Go's tool-schema validator uses RE2, which does not support
+// Unicode property escapes such as \p{White_Space}. Keep the wire pattern
+// portable; Host-side safeText still enforces UTF-8 and control-character rules.
+const nonBlankTextPattern = '^[^\\u0000\\uD800-\\uDFFF]*[^\\s\\u0085\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$';
 const wikiText = (max) => Object.freeze({
   type: 'string', minLength: 1, maxLength: max, 'x-ai4math-maxUtf8Bytes': max,
-  pattern: '^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$',
+  pattern: nonBlankTextPattern,
 });
 const wikiSymbol = wikiText(128);
 const wikiSymbols = Object.freeze({ type: 'array', items: wikiSymbol, maxItems: 8, uniqueItems: true });
@@ -27,7 +31,7 @@ const agentEndpoint = (method, description, params) => Object.freeze({ ...endpoi
 const principalEndpoint = (method, description, params) => Object.freeze({ ...endpoint(method, description, params), principalBound: true });
 const writeEndpoint = (method, description, params) => Object.freeze({ ...agentEndpoint(method, description, params), agentWrite: true });
 const id = (maximum = 128) => Object.freeze({ type:'string', minLength:1, maxLength:maximum, pattern:'^[A-Za-z0-9_.:-]+$' });
-const roleText = (maximum) => Object.freeze({ type:'string', minLength:1, maxLength:maximum, 'x-ai4math-maxUtf8Bytes':maximum, pattern:'^[^\\u0000\\uD800-\\uDFFF]*[^\\p{White_Space}\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$' });
+const roleText = (maximum) => Object.freeze({ type:'string', minLength:1, maxLength:maximum, 'x-ai4math-maxUtf8Bytes':maximum, pattern:nonBlankTextPattern });
 const strings = (item, maximum) => Object.freeze({ type:'array', items:item, maxItems:maximum, uniqueItems:true });
 const commit = Object.freeze({type:'string',minLength:40,maxLength:64,pattern:'^[0-9a-f]{40}([0-9a-f]{24})?$'});
 const sha256 = Object.freeze({type:'string',minLength:64,maxLength:64,pattern:'^[0-9a-f]{64}$'});

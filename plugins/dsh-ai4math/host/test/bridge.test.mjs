@@ -12,6 +12,13 @@ const topics = [event];
 const abort = () => new AbortController();
 const fails = (code) => (error) => error instanceof BridgeError && error.code === code;
 
+test('tool schemas avoid Unicode property regex unsupported by upstream validators', () => {
+  const serialized = JSON.stringify(REMOTE_METHODS);
+  assert.equal(serialized.includes('\\p{'), false);
+  const pattern = REMOTE_METHODS.claimCreate.params.properties.title.pattern;
+  assert.equal(pattern, '^[^\\u0000\\uD800-\\uDFFF]*[^\\s\\u0085\\u0000\\uD800-\\uDFFF][^\\u0000\\uD800-\\uDFFF]*$');
+});
+
 test('reassembles split UTF-8 + CRLF and matches out-of-order replies', async (t) => {
   let first;
   const socketPath = await fixture(t, (request, socket) => {
