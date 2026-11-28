@@ -1,6 +1,7 @@
 use ai4math_core::{
     Engine, FrozenTarget, PreFlightScanResult, ProofBodyError, ProofBodySubmission,
-    render_proof_body, render_proof_body_allow_sorry, scan_source, validate_source_path,
+    render_proof_body, render_proof_body_allow_oracle, render_proof_body_allow_sorry, scan_source,
+    validate_source_path,
 };
 
 fn lean_target() -> FrozenTarget {
@@ -332,6 +333,33 @@ fn formal_sketch_render_admits_only_explicit_sorry_holes() {
         assert!(
             matches!(
                 render_proof_body_allow_sorry(&target, &submission),
+                Err(ProofBodyError::PreFlight(_))
+            ),
+            "{body}"
+        );
+    }
+}
+
+#[test]
+fn oracle_backed_render_admits_only_compiler_trust_constructs() {
+    let target = lean_target();
+    let oracle = ProofBodySubmission {
+        target_id: "target".into(),
+        proof_body: "by native_decide".into(),
+    };
+    assert!(render_proof_body_allow_oracle(&target, &oracle).is_ok());
+    assert!(matches!(
+        render_proof_body(&target, &oracle),
+        Err(ProofBodyError::PreFlight(_))
+    ));
+    for body in ["by sorry", "axiom bypass : True", "by run_tac"] {
+        let submission = ProofBodySubmission {
+            target_id: "target".into(),
+            proof_body: body.into(),
+        };
+        assert!(
+            matches!(
+                render_proof_body_allow_oracle(&target, &submission),
                 Err(ProofBodyError::PreFlight(_))
             ),
             "{body}"

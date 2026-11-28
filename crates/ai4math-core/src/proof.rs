@@ -506,7 +506,7 @@ pub fn render_proof_body(
     target: &FrozenTarget,
     submission: &ProofBodySubmission,
 ) -> Result<String, ProofBodyError> {
-    render_proof_body_with_policy(target, submission, false)
+    render_proof_body_with_policy(target, submission, false, false)
 }
 
 /// Formal-sketch rendering admits only the explicit `sorry`/`admit` proof-hole
@@ -515,13 +515,23 @@ pub fn render_proof_body_allow_sorry(
     target: &FrozenTarget,
     submission: &ProofBodySubmission,
 ) -> Result<String, ProofBodyError> {
-    render_proof_body_with_policy(target, submission, true)
+    render_proof_body_with_policy(target, submission, true, false)
+}
+
+/// Oracle-backed rendering admits only the documented compiler-trust constructs.
+/// It never admits proof holes or arbitrary axioms and does not confer kernel trust.
+pub fn render_proof_body_allow_oracle(
+    target: &FrozenTarget,
+    submission: &ProofBodySubmission,
+) -> Result<String, ProofBodyError> {
+    render_proof_body_with_policy(target, submission, false, true)
 }
 
 fn render_proof_body_with_policy(
     target: &FrozenTarget,
     submission: &ProofBodySubmission,
     allow_sorry: bool,
+    allow_oracle: bool,
 ) -> Result<String, ProofBodyError> {
     if target.target_id != submission.target_id {
         return Err(ProofBodyError::TargetMismatch);
@@ -560,7 +570,7 @@ fn render_proof_body_with_policy(
         // The trusted spans own the parentheses. Separating their tokens from
         // the body also prevents a body edge from forming a comment opener.
         let source = format!("{}\n{body}\n{}", target.prefix, target.suffix);
-        return checked_source_policy(target, source, allow_sorry);
+        return checked_source_policy(target, source, allow_sorry, allow_oracle);
     }
     let (lead, gap) = template_slot(target, module)?;
     body_subset(target.engine, body)?;
@@ -604,21 +614,27 @@ fn render_proof_body_with_policy(
     source.push_str(&padding);
     source.push(')');
     source.push_str(&target.suffix);
-    checked_source_policy(target, source, allow_sorry)
+    checked_source_policy(target, source, allow_sorry, allow_oracle)
 }
 
 fn checked_source_policy(
     target: &FrozenTarget,
     source: String,
     allow_sorry: bool,
+    allow_oracle: bool,
 ) -> Result<String, ProofBodyError> {
     let report = scan_source(target.engine, &target.file_path, &source);
     if let Some(violation) = report.violations.into_iter().find(|v| {
         v.severity == crate::PreFlightSeverity::Deny
-            && !(allow_sorry
-                && target.engine == Engine::Lean4
+            && !(target.engine == Engine::Lean4
                 && v.rule_id == "LEAN_TRUST"
-                && matches!(v.matched_construct.as_deref(), Some("sorry" | "admit")))
+                && ((allow_sorry
+                    && matches!(v.matched_construct.as_deref(), Some("sorry" | "admit")))
+                    || (allow_oracle
+                        && matches!(
+                            v.matched_construct.as_deref(),
+                            Some("native_decide" | "ofReduceBool" | "trustCompiler")
+                        ))))
     }) {
         return Err(ProofBodyError::PreFlight(violation));
     }

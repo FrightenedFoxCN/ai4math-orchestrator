@@ -158,6 +158,28 @@ fn formal_sketch_comparison_digest(
     ))?))
 }
 
+fn oracle_backed_comparison_digest(
+    candidate: &VerificationReceipt,
+    spec_file: &str,
+    spec_decl: &str,
+    spec_prefix_sha256: &str,
+) -> Result<String> {
+    Ok(digest(&serde_json::to_vec(&(
+        "ai4math:lean-spec-comparison:oracle-backed:v1",
+        candidate.base_commit(),
+        candidate.file_path(),
+        candidate.target_id(),
+        candidate.patch_sha256(),
+        candidate.dependencies_sha256(),
+        &candidate.compiler_sha256,
+        spec_file,
+        spec_decl,
+        spec_prefix_sha256,
+        CHECKER_FILE,
+        digest(CHECKER.as_bytes()),
+    ))?))
+}
+
 fn check_candidate_binding(candidate: &VerifiedCandidate) -> Result<()> {
     let receipt = candidate.receipt();
     ensure!(
@@ -168,6 +190,7 @@ fn check_candidate_binding(candidate: &VerifiedCandidate) -> Result<()> {
                 VerificationMode::Legacy(ReceiptTier::T1Promotion)
             ) | (ReceiptTier::T3TaintRebuild, VerificationMode::AssessT3)
                 | (ReceiptTier::T3TaintRebuild, VerificationMode::FormalSketch)
+                | (ReceiptTier::T3TaintRebuild, VerificationMode::OracleBacked)
         ),
         "reviewed Lean comparison requires a T1 promotion or an assessed T3 recheck"
     );
@@ -184,6 +207,13 @@ fn require_seal(log: &str) -> Result<()> {
         "missing or inexact sealed Lean spec audit: {log:?}"
     );
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ComparisonPolicy {
+    Strict,
+    Sketch,
+    Oracle,
 }
 
 impl Broker {
@@ -207,7 +237,7 @@ impl Broker {
             spec_file,
             spec_decl,
             dependencies,
-            false,
+            ComparisonPolicy::Strict,
         )
     }
 
@@ -225,7 +255,25 @@ impl Broker {
             spec_file,
             spec_decl,
             dependencies,
-            true,
+            ComparisonPolicy::Sketch,
+        )
+    }
+
+    pub fn compare_oracle_backed_spec(
+        &self,
+        tool: &Toolchain,
+        candidate: &VerifiedCandidate,
+        spec_file: &str,
+        spec_decl: &str,
+        dependencies: &[(&str, &str)],
+    ) -> Result<VerifiedLeanComparison> {
+        self.compare_lean_spec_with_policy(
+            tool,
+            candidate,
+            spec_file,
+            spec_decl,
+            dependencies,
+            ComparisonPolicy::Oracle,
         )
     }
 
@@ -236,7 +284,7 @@ impl Broker {
         spec_file: &str,
         spec_decl: &str,
         dependencies: &[(&str, &str)],
-        allow_sorry: bool,
+        policy: ComparisonPolicy,
     ) -> Result<VerifiedLeanComparison> {
         let receipt = candidate.receipt();
         ensure!(
@@ -308,7 +356,12 @@ impl Broker {
                 args: &[
                     "--run".into(),
                     CHECKER_FILE.into(),
-                    if allow_sorry { "sketch" } else { "strict" }.into(),
+                    match policy {
+                        ComparisonPolicy::Oracle => "oracle",
+                        ComparisonPolicy::Sketch => "sketch",
+                        ComparisonPolicy::Strict => "strict",
+                    }
+                    .into(),
                     prefix_objects
                         .to_str()
                         .context("non-UTF-8 spec object path")?
@@ -336,10 +389,16 @@ impl Broker {
         command_timeout(deadline)?;
         require_seal(&log)?;
 
-        let receipt_sha256 = if allow_sorry {
-            formal_sketch_comparison_digest(receipt, spec_file, spec_decl, &spec_prefix_sha256)?
-        } else {
-            comparison_digest(receipt, spec_file, spec_decl, &spec_prefix_sha256)?
+        let receipt_sha256 = match policy {
+            ComparisonPolicy::Oracle => {
+                oracle_backed_comparison_digest(receipt, spec_file, spec_decl, &spec_prefix_sha256)?
+            }
+            ComparisonPolicy::Sketch => {
+                formal_sketch_comparison_digest(receipt, spec_file, spec_decl, &spec_prefix_sha256)?
+            }
+            ComparisonPolicy::Strict => {
+                comparison_digest(receipt, spec_file, spec_decl, &spec_prefix_sha256)?
+            }
         };
         Ok(VerifiedLeanComparison {
             spec_file: spec_file.into(),

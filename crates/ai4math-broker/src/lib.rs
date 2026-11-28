@@ -450,6 +450,10 @@ impl VerifiedCandidate {
         )
     }
 
+    pub fn is_oracle_backed(&self) -> bool {
+        matches!(self.mode, VerificationMode::OracleBacked)
+    }
+
     pub fn source(&self) -> &str {
         &self.source
     }
@@ -471,6 +475,10 @@ unsafe impl ai4math_evidence::CandidateEvidence for VerifiedCandidate {
 
     fn is_assessed_t3(&self) -> bool {
         self.is_assessed_t3()
+    }
+
+    fn is_oracle_backed(&self) -> bool {
+        self.is_oracle_backed()
     }
 }
 
@@ -521,6 +529,7 @@ enum VerificationMode {
     Legacy(ReceiptTier),
     AssessT3,
     FormalSketch,
+    OracleBacked,
 }
 
 #[derive(Default)]
@@ -755,6 +764,20 @@ fn lean_axioms_allow_sorry(output: &str, target: &str) -> Result<Vec<String>> {
             .iter()
             .all(|a| AXIOMS.contains(&a.as_str()) || a == "sorryAx"),
         "unsupported formal sketch Lean axioms: {axioms:?}"
+    );
+    Ok(axioms)
+}
+
+fn lean_axioms_allow_oracle(output: &str, target: &str) -> Result<Vec<String>> {
+    let axioms = lean_axiom_report(output, target)?;
+    let native_prefix = format!("{target}._native.native_decide.ax_");
+    ensure!(
+        axioms.iter().all(|a| AXIOMS.contains(&a.as_str())
+            || a == "Lean.ofReduceBool"
+            || a == "Lean.trustCompiler"
+            || a.starts_with(&native_prefix))
+            && !axioms.iter().any(|a| a == "sorryAx"),
+        "unsupported Oracle-backed Lean axioms: {axioms:?}"
     );
     Ok(axioms)
 }
@@ -1102,6 +1125,26 @@ impl Broker {
         )
     }
 
+    /// Compile an explicit compiler-Oracle candidate such as native_decide.
+    /// This path never performs kernel replay and never authorizes L5 promotion.
+    pub fn assess_oracle_backed_with_dependencies(
+        &self,
+        tool: &Toolchain,
+        target: &FrozenTarget,
+        submission: &ProofBodySubmission,
+        base_commit: &str,
+        dependencies: &[(&str, &str)],
+    ) -> Result<VerifiedCandidate> {
+        self.verify_at_tier(
+            tool,
+            target,
+            submission,
+            base_commit,
+            dependencies,
+            VerificationMode::OracleBacked,
+        )
+    }
+
     fn verify_at_tier(
         &self,
         tool: &Toolchain,
@@ -1113,13 +1156,15 @@ impl Broker {
     ) -> Result<VerifiedCandidate> {
         let tier = match mode {
             VerificationMode::Legacy(tier) => tier,
-            VerificationMode::AssessT3 | VerificationMode::FormalSketch => {
-                ReceiptTier::T3TaintRebuild
-            }
+            VerificationMode::AssessT3
+            | VerificationMode::FormalSketch
+            | VerificationMode::OracleBacked => ReceiptTier::T3TaintRebuild,
         };
         let classify_lean = matches!(
             mode,
-            VerificationMode::AssessT3 | VerificationMode::FormalSketch
+            VerificationMode::AssessT3
+                | VerificationMode::FormalSketch
+                | VerificationMode::OracleBacked
         ) && tool.engine == Engine::Lean4;
         ensure!(
             matches!(base_commit.len(), 40 | 64)
@@ -1133,6 +1178,8 @@ impl Broker {
         validate_modules_for_tool(tool, dependencies, Some(&target.file_path))?;
         let source = if matches!(mode, VerificationMode::FormalSketch) {
             ai4math_core::render_proof_body_allow_sorry(target, submission)?
+        } else if matches!(mode, VerificationMode::OracleBacked) {
+            ai4math_core::render_proof_body_allow_oracle(target, submission)?
         } else {
             render_proof_body(target, submission)?
         };
@@ -1144,7 +1191,9 @@ impl Broker {
         let dependency_build = build.compile_all(self, dependencies);
         if matches!(
             mode,
-            VerificationMode::AssessT3 | VerificationMode::FormalSketch
+            VerificationMode::AssessT3
+                | VerificationMode::FormalSketch
+                | VerificationMode::OracleBacked
         ) {
             dependency_build.context("build verification dependencies")?;
         } else {
@@ -1188,6 +1237,9 @@ impl Broker {
             Engine::Lean4 if matches!(mode, VerificationMode::FormalSketch) => {
                 lean_axioms_allow_sorry(&log, &target.target_id)?
             }
+            Engine::Lean4 if matches!(mode, VerificationMode::OracleBacked) => {
+                lean_axioms_allow_oracle(&log, &target.target_id)?
+            }
             Engine::Lean4 => lean_axioms(&log, &target.target_id)?,
             Engine::Agda => vec![],
             Engine::Rocq => {
@@ -1195,7 +1247,7 @@ impl Broker {
                 vec![]
             }
         };
-        if tool.engine == Engine::Lean4 {
+        if tool.engine == Engine::Lean4 && !matches!(mode, VerificationMode::OracleBacked) {
             LeanKernelPolicy::replay_matching_report(
                 tool,
                 output,

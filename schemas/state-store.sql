@@ -323,6 +323,23 @@ CREATE TRIGGER IF NOT EXISTS formal_sketch_evidence_no_update BEFORE UPDATE ON f
 BEGIN SELECT RAISE(ABORT, 'formal sketch evidence is immutable'); END;
 CREATE TRIGGER IF NOT EXISTS formal_sketch_evidence_no_delete BEFORE DELETE ON formal_sketch_evidence
 BEGIN SELECT RAISE(ABORT, 'formal sketch evidence is immutable'); END;
+CREATE TABLE IF NOT EXISTS oracle_backed_evidence (
+  evidence_id TEXT PRIMARY KEY CHECK(length(evidence_id)=64 AND evidence_id NOT GLOB '*[^0-9a-f]*'),
+  claim_id TEXT NOT NULL REFERENCES claims(claim_id),
+  git_commit TEXT NOT NULL,
+  module_path TEXT NOT NULL,
+  target_decl TEXT NOT NULL,
+  candidate_receipt_sha256 TEXT NOT NULL REFERENCES verification_receipts(receipt_sha256),
+  comparison_receipt_sha256 TEXT NOT NULL CHECK(length(comparison_receipt_sha256)=64),
+  probe_observation_id TEXT NOT NULL REFERENCES oracle_observations(id),
+  proof_body_sha256 TEXT NOT NULL CHECK(length(proof_body_sha256)=64),
+  oracle_axioms_json TEXT NOT NULL,
+  event_seq INTEGER NOT NULL UNIQUE REFERENCES events(event_seq)
+) STRICT;
+CREATE TRIGGER IF NOT EXISTS oracle_backed_evidence_no_update BEFORE UPDATE ON oracle_backed_evidence
+BEGIN SELECT RAISE(ABORT, 'Oracle-backed evidence is immutable'); END;
+CREATE TRIGGER IF NOT EXISTS oracle_backed_evidence_no_delete BEFORE DELETE ON oracle_backed_evidence
+BEGIN SELECT RAISE(ABORT, 'Oracle-backed evidence is immutable'); END;
 CREATE TABLE IF NOT EXISTS promotion_approval_requests (
   request_id TEXT PRIMARY KEY CHECK(length(request_id) BETWEEN 1 AND 128),
   message_sha256 TEXT NOT NULL CHECK(length(message_sha256)=64 AND message_sha256 NOT GLOB '*[^0-9a-f]*'),

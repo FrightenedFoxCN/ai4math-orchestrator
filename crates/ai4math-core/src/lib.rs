@@ -38,7 +38,7 @@ pub use preflight::{
 };
 pub use proof::{
     FrozenTarget, ProofBodyError, ProofBodySubmission, render_proof_body,
-    render_proof_body_allow_sorry,
+    render_proof_body_allow_oracle, render_proof_body_allow_sorry,
 };
 pub use trust::{Trust, aggregate_plan, best_proof_plan};
 

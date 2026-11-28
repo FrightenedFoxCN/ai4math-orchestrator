@@ -117,6 +117,31 @@ impl Config {
         ))
     }
 
+    pub fn oracle_backed_task(
+        &self,
+        root: &Path,
+        repo: &Path,
+        task_id: &str,
+        probe_observation_id: &str,
+    ) -> Result<Value> {
+        let mut command = Command::new(&self.cli);
+        command
+            .arg("oracle-backed-task")
+            .arg(root)
+            .arg(repo)
+            .arg(task_id)
+            .arg(&self.lean)
+            .arg(probe_observation_id)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .current_dir("/")
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        self.run(command)
+    }
+
     pub fn formal_sketch_task(
         &self,
         root: &Path,

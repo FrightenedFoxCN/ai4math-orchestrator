@@ -22,6 +22,7 @@ pub enum TrustTransitionError {
     ContextMismatch,
     UnsupportedOutcome,
     SketchEvidenceMismatch,
+    OracleEvidenceMismatch,
 }
 
 impl std::fmt::Display for TrustTransitionError {
@@ -32,6 +33,9 @@ impl std::fmt::Display for TrustTransitionError {
             Self::UnsupportedOutcome => "Oracle outcome does not authorize a trust transition",
             Self::SketchEvidenceMismatch => {
                 "formal sketch evidence does not match the live Claim context"
+            }
+            Self::OracleEvidenceMismatch => {
+                "Oracle-backed evidence does not match the live Claim context"
             }
         })
     }
@@ -49,6 +53,21 @@ pub struct FormalSketchEvidence {
     pub comparison_receipt_sha256: String,
     pub probe_observation_id: String,
     pub proof_body_sha256: String,
+    pub event_seq: i64,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OracleBackedEvidence {
+    pub evidence_id: String,
+    pub claim_id: String,
+    pub git_commit: String,
+    pub module_path: String,
+    pub target_decl: String,
+    pub candidate_receipt_sha256: String,
+    pub comparison_receipt_sha256: String,
+    pub probe_observation_id: String,
+    pub proof_body_sha256: String,
+    pub oracle_axioms: Vec<String>,
     pub event_seq: i64,
 }
 
@@ -307,6 +326,189 @@ impl StateStore {
             require_claim(tx, claim_id)
         })
     }
+
+    /// Apply L4a only for an explicit compiler-Oracle candidate, a sealed spec
+    /// comparison and a retained no-counterexample probe. This always records
+    /// oracle debt and never claims kernel verification.
+    pub fn apply_oracle_backed_evidence(
+        &mut self,
+        claim_id: &str,
+        current_head: &str,
+        candidate: &dyn CandidateEvidence,
+        comparison: &dyn LeanComparisonEvidence,
+        probe_observation_id: &str,
+        change: Change<'_>,
+    ) -> Result<ClaimState> {
+        ensure!(
+            candidate.is_oracle_backed(),
+            "L4a requires an explicit Oracle-backed candidate"
+        );
+        let receipt = VerifiedReceipt::from_candidate(candidate)?;
+        let compared = ComparedSpec {
+            spec_file: comparison.spec_file().into(),
+            spec_decl: comparison.spec_decl().into(),
+            spec_prefix_sha256: comparison.spec_prefix_sha256().into(),
+            candidate_receipt_sha256: comparison.candidate_receipt_sha256().into(),
+            receipt_sha256: comparison.receipt_sha256().into(),
+        };
+        self.apply_oracle_backed_receipt(
+            claim_id,
+            current_head,
+            &receipt,
+            &compared,
+            probe_observation_id,
+            change,
+        )
+    }
+
+    pub(super) fn apply_oracle_backed_receipt(
+        &mut self,
+        claim_id: &str,
+        current_head: &str,
+        receipt: &VerifiedReceipt,
+        comparison: &ComparedSpec,
+        probe_observation_id: &str,
+        change: Change<'_>,
+    ) -> Result<ClaimState> {
+        let retained = self
+            .oracle_observation(probe_observation_id)?
+            .ok_or(TrustTransitionError::ObservationNotFound)?;
+        if retained.observation.get("outcome").and_then(Value::as_str)
+            != Some("no_counterexample_within_bounds")
+        {
+            return Err(TrustTransitionError::UnsupportedOutcome.into());
+        }
+        let spec = self
+            .lean_spec(claim_id)?
+            .ok_or(TrustTransitionError::OracleEvidenceMismatch)?;
+        let native_prefix = format!("{}._native.native_decide.ax_", receipt.target_decl);
+        let oracle_axioms: Vec<String> = receipt
+            .axioms_used
+            .iter()
+            .filter(|a| {
+                *a == "Lean.ofReduceBool"
+                    || *a == "Lean.trustCompiler"
+                    || a.starts_with(&native_prefix)
+            })
+            .cloned()
+            .collect();
+        if oracle_axioms.is_empty() || receipt.axioms_used.iter().any(|a| a == "sorryAx") {
+            return Err(TrustTransitionError::OracleEvidenceMismatch.into());
+        }
+        let evidence_id = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&(
+                "ai4math:oracle-backed:v1",
+                claim_id,
+                current_head,
+                &receipt.receipt_sha256,
+                &comparison.receipt_sha256,
+                probe_observation_id,
+            ))?)
+        );
+        self.write(|tx| {
+            let claim = require_claim(tx, claim_id)?;
+            if claim.stale || !matches!(claim.local_trust, Trust::L0 | Trust::L1 | Trust::L3 | Trust::L4a) {
+                return Err(TrustTransitionError::OracleEvidenceMismatch.into());
+            }
+            super::validate_target(&claim, receipt)?;
+            if receipt.tier != "T3_TAINT_REBUILD"
+                || receipt.broker_assessed_t3
+                || receipt.base_commit != current_head
+                || comparison.candidate_receipt_sha256 != receipt.receipt_sha256
+                || comparison.spec_file != spec.spec_file
+                || comparison.spec_decl != spec.spec_decl
+                || comparison.spec_prefix_sha256 != spec.spec_prefix_sha256
+            {
+                return Err(TrustTransitionError::OracleEvidenceMismatch.into());
+            }
+            let (engine, formal_target, informal_statement): (String, Option<String>, String) = tx.query_row(
+                "SELECT engine,formal_target,informal_statement FROM claims WHERE claim_id=?1",
+                [claim_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            let repo: Option<String> = tx.query_row("SELECT repo FROM managed_repo WHERE singleton=1", [], |r| r.get(0)).optional()?;
+            let approval = &retained.approval;
+            if engine != "lean4"
+                || approval.claim_id != claim_id
+                || approval.commit != current_head
+                || approval.repo != repo.unwrap_or_default()
+                || approval.engine != engine
+                || approval.formal_target != formal_target.unwrap_or_default()
+                || approval.informal_statement != informal_statement
+                || spec.repo != approval.repo
+            {
+                return Err(TrustTransitionError::OracleEvidenceMismatch.into());
+            }
+            let replayed: Option<i64> = tx.query_row(
+                "SELECT event_seq FROM oracle_backed_evidence WHERE evidence_id=?1",
+                [&evidence_id],
+                |r| r.get(0),
+            ).optional()?;
+            if replayed.is_some() {
+                return Ok(claim);
+            }
+            let receipt_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM verification_receipts WHERE receipt_sha256=?1)",
+                [&receipt.receipt_sha256],
+                |r| r.get(0),
+            )?;
+            if !receipt_exists {
+                persist_receipt(tx, &claim, receipt, change)?;
+            }
+            let seq = event(
+                tx,
+                change,
+                "ORACLE_BACKED_EVIDENCE_RECORDED",
+                "oracle_backed",
+                &evidence_id,
+                json!({
+                    "claim_id":claim_id,
+                    "candidate_receipt_sha256":receipt.receipt_sha256,
+                    "comparison_receipt_sha256":comparison.receipt_sha256,
+                    "probe_observation_id":probe_observation_id,
+                    "oracle_axioms":oracle_axioms,
+                }),
+            )?;
+            tx.execute(
+                "INSERT INTO oracle_backed_evidence(evidence_id,claim_id,git_commit,module_path,target_decl,
+                    candidate_receipt_sha256,comparison_receipt_sha256,probe_observation_id,proof_body_sha256,oracle_axioms_json,event_seq)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                rusqlite::params![
+                    evidence_id, claim_id, current_head, receipt.file_path, receipt.target_decl,
+                    receipt.receipt_sha256, comparison.receipt_sha256, probe_observation_id,
+                    receipt.patch_sha256, serde_json::to_string(&oracle_axioms)?, seq,
+                ],
+            )?;
+            update_trust(
+                tx,
+                &claim,
+                Trust::L4a,
+                None,
+                change,
+                json!({
+                    "transition":"oracle_backed_evidence",
+                    "evidence_id":evidence_id,
+                    "candidate_receipt_sha256":receipt.receipt_sha256,
+                    "comparison_receipt_sha256":comparison.receipt_sha256,
+                    "probe_observation_id":probe_observation_id,
+                    "oracle_axioms":oracle_axioms,
+                    "proof_verified":false,
+                    "oracle_debt":true,
+                }),
+            )?;
+            event(
+                tx,
+                change,
+                "CLAIM_ORACLE_BACKED_TRUST_APPLIED",
+                "claim",
+                claim_id,
+                json!({"evidence_id":evidence_id,"target":"L4a","proof_verified":false,"oracle_debt":true}),
+            )?;
+            recompute(tx, change)?;
+            require_claim(tx, claim_id)
+        })
+    }
 }
 
 #[cfg(test)]
@@ -526,6 +728,57 @@ mod tests {
         assert!(
             store
                 .apply_formal_sketch_receipt(
+                    "C1",
+                    HEAD,
+                    &receipt,
+                    &comparison,
+                    &observation_id,
+                    change,
+                )
+                .is_err()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oracle_backed_requires_oracle_axioms_probe_and_records_debt() -> Result<()> {
+        let (mut store, observation_id, mut receipt, comparison) = sketch_fixture()?;
+        receipt.axioms_used = vec!["Lean.ofReduceBool".into(), "Lean.trustCompiler".into()];
+        receipt.broker_assessed_t3 = false;
+        let change = Change {
+            actor: "agent:builder",
+            git_commit: Some(HEAD),
+        };
+        let claim = store.apply_oracle_backed_receipt(
+            "C1",
+            HEAD,
+            &receipt,
+            &comparison,
+            &observation_id,
+            change,
+        )?;
+        assert_eq!(claim.local_trust, Trust::L4a);
+        let debt: bool = store.db.query_row(
+            "SELECT oracle_debt FROM claims WHERE claim_id='C1'",
+            [],
+            |r| r.get(0),
+        )?;
+        assert!(debt);
+        let before = store.status()?.last_event_seq;
+        let replay = store.apply_oracle_backed_receipt(
+            "C1",
+            HEAD,
+            &receipt,
+            &comparison,
+            &observation_id,
+            change,
+        )?;
+        assert_eq!(replay.local_trust, Trust::L4a);
+        assert_eq!(store.status()?.last_event_seq, before);
+        receipt.axioms_used = vec!["sorryAx".into()];
+        assert!(
+            store
+                .apply_oracle_backed_receipt(
                     "C1",
                     HEAD,
                     &receipt,

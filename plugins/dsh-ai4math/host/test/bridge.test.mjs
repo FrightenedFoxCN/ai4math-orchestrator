@@ -314,14 +314,16 @@ test('formal sketch tools are Builder-only and accept no proof body or trust lev
   t.after(() => bridge.close());
   for (const role of ['owner', ...AGENT_ROLES, 'unmapped']) {
     assert.equal(methodsForRole(role).includes('claimApplyFormalSketch'), role === 'builder', role + '/claimApplyFormalSketch');
+    assert.equal(methodsForRole(role).includes('claimApplyOracleBacked'), role === 'builder', role + '/claimApplyOracleBacked');
   }
   const args = { task_id:'T1', observation_id:'a'.repeat(64) };
   await bridge.bind('builder').call('claimApplyFormalSketch', args);
+  await bridge.bind('builder').call('claimApplyOracleBacked', args);
   for (const invalid of [{ ...args, proof_body:'sorry' }, { ...args, trust_level:'L3' }, { ...args, executable:'/tmp/lean' }]) {
     await assert.rejects(bridge.bind('builder').call('claimApplyFormalSketch', invalid), fails('invalid'));
   }
   assert.deepEqual(seen, [
-    ['session.bind', { role:'builder' }], ['claim.apply_formal_sketch', args],
+    ['session.bind', { role:'builder' }], ['claim.apply_formal_sketch', args], ['claim.apply_oracle_backed', args],
   ]);
 });
 

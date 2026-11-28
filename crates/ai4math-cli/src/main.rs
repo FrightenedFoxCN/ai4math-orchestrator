@@ -83,6 +83,7 @@ ai4math refute-managed ROOT BARE_REPO ID MODULE PROPOSITION NATIVE_LEAN PROOF_BO
 ai4math refute-pending ROOT
 ai4math refute-reconcile ROOT [CLAIM]
 ai4math formal-sketch-task ROOT BARE_REPO ID NATIVE_LEAN PROBE_OBSERVATION_ID
+ai4math oracle-backed-task ROOT BARE_REPO ID NATIVE_LEAN PROBE_OBSERVATION_ID
 ai4math promote-task-result ROOT BARE_REPO ID NATIVE_ENGINE [ENGINE_DATA]
 ai4math cache-clone BARE_REPO COMMIT NEW_DIR";
 const HOLE: &str = "{{PROOF_BODY}}";
@@ -555,6 +556,132 @@ fn formal_sketch_task(
     print_json(
         serde_json::json!({"claim":claim,"proof_verified":false,"candidate_receipt_sha256":candidate.receipt().receipt_sha256(),"comparison_receipt_sha256":comparison.receipt_sha256()}),
     )
+}
+
+fn oracle_backed_task(
+    root: &Path,
+    repo: &Path,
+    task_id: &str,
+    executable: &Path,
+    probe_observation_id: &str,
+) -> Result<()> {
+    let project = ManagedProject::new(root)?;
+    let _native = project.try_native_heavy()?;
+    let locked = PromotionRepo::try_lock_existing(repo)?;
+    let mut store = project.open_state()?;
+    let row = store
+        .task_candidate(task_id)?
+        .context("no retained task candidate")?;
+    ensure!(
+        row.role == "prover_worker",
+        "Oracle-backed trust requires a prover candidate"
+    );
+    let Suggestion::ProofBody { proof_body } = decode_result(row.result_json.as_bytes())? else {
+        bail!("Oracle-backed candidate is not a proof body");
+    };
+    ensure!(
+        locked.main_head()? == row.base_commit,
+        "Oracle-backed candidate belongs to an older Git snapshot"
+    );
+    ensure!(
+        store.managed_repo()?.as_deref() == locked.path().to_str(),
+        "Oracle-backed candidate is bound to a different repository"
+    );
+    ensure!(
+        !store.module_breaker_gated("lean4", &row.module_path)?,
+        "breaker still gates the Oracle-backed module"
+    );
+    ensure!(
+        store.pivot_intent()?.is_none() && store.promotion_intent()?.is_none(),
+        "recover pending Git transaction before Oracle-backed retention"
+    );
+    let claim = store
+        .claim(&row.claim_id)?
+        .context("Oracle-backed claim not found")?;
+    ensure!(
+        claim.engine == "lean4"
+            && claim.formal_target.as_deref()
+                == Some(format!("{}#{}", row.module_path, row.target).as_str()),
+        "Oracle-backed claim target mismatch"
+    );
+    let spec = store
+        .lean_spec(&row.claim_id)?
+        .context("Oracle-backed trust requires a reviewed Lean spec")?;
+    let tx = locked.snapshot(&row.module_path, Some(&row.base_commit))?;
+    reviewed_spec::check_snapshot(&locked, &tx, &spec)?;
+    let files = tx.project()?;
+    let index = files
+        .iter()
+        .position(|(path, _)| *path == row.module_path)
+        .context("Oracle-backed module missing")?;
+    let source = &files[index].1;
+    let (prefix, suffix) = source
+        .split_once(HOLE)
+        .context("Oracle-backed module must contain one proof slot")?;
+    ensure!(
+        !suffix.contains(HOLE),
+        "Oracle-backed module has multiple proof slots"
+    );
+    let target = FrozenTarget {
+        engine: Engine::Lean4,
+        target_id: row.target.clone(),
+        file_path: row.module_path.clone(),
+        prefix: prefix.to_owned(),
+        suffix: suffix.to_owned(),
+    };
+    let submission = ProofBodySubmission {
+        target_id: row.target.clone(),
+        proof_body,
+    };
+    let deps: Vec<(&str, &str)> = files[..index]
+        .iter()
+        .map(|(p, s)| (*p, s.as_str()))
+        .collect();
+    reviewed_spec::check_prefix(&deps, &spec)?;
+    let toolchain = trusted_toolchain(Engine::Lean4, executable, None)?;
+    let broker = Broker::new();
+    let candidate = broker
+        .assess_oracle_backed_with_dependencies(
+            &toolchain,
+            &target,
+            &submission,
+            &row.base_commit,
+            &deps,
+        )
+        .context("Oracle-backed candidate did not pass compiler assessment")?;
+    ensure!(
+        locked.main_head()? == row.base_commit,
+        "main changed during Oracle-backed verification"
+    );
+    let comparison = broker
+        .compare_oracle_backed_spec(
+            &toolchain,
+            &candidate,
+            &spec.spec_file,
+            &spec.spec_decl,
+            &deps,
+        )
+        .context("Oracle-backed spec comparison failed")?;
+    ensure!(
+        locked.main_head()? == row.base_commit,
+        "main changed during Oracle-backed comparison"
+    );
+    let claim = store.apply_oracle_backed_evidence(
+        &row.claim_id,
+        &row.base_commit,
+        &candidate,
+        &comparison,
+        probe_observation_id,
+        Change {
+            actor: "broker:oracle-backed",
+            git_commit: Some(&row.base_commit),
+        },
+    )?;
+    print_json(serde_json::json!({
+        "claim":claim,"proof_verified":false,"oracle_debt":true,
+        "candidate_receipt_sha256":candidate.receipt().receipt_sha256(),
+        "comparison_receipt_sha256":comparison.receipt_sha256(),
+    }))
 }
 
 fn promote_managed_body(
@@ -1608,6 +1735,9 @@ fn run() -> Result<()> {
         ["task-result", root, id] => worker_dispatch::result(Path::new(root), id),
         ["formal-sketch-task", root, repo, id, exe, probe] => {
             formal_sketch_task(Path::new(root), Path::new(repo), id, Path::new(exe), probe)
+        }
+        ["oracle-backed-task", root, repo, id, exe, probe] => {
+            oracle_backed_task(Path::new(root), Path::new(repo), id, Path::new(exe), probe)
         }
         ["promote-task-result", root, repo, id, exe] => {
             worker_dispatch::promote(Path::new(root), Path::new(repo), id, Path::new(exe), None)

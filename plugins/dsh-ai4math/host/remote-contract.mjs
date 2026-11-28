@@ -93,6 +93,9 @@ export const REMOTE_METHODS = Object.freeze({
   claimCreate: writeEndpoint('claim.create', 'Create a new L0 mathematical claim in the managed project ledger.', object({
     claim_id:id(), title:roleText(512), informal_statement:roleText(16384), module_path:id(256), target_decl:id(256), critical:Object.freeze({type:'boolean'}),
   }, ['claim_id','title','informal_statement','module_path','target_decl'])),
+  claimApplyOracleBacked: writeEndpoint('claim.apply_oracle_backed', 'Run trusted compiler-Oracle assessment and reviewed-spec comparison, then apply L4a with explicit oracle debt.', object({
+    task_id:id(100), observation_id:sha256,
+  }, ['task_id','observation_id'])),
   claimApplyFormalSketch: writeEndpoint('claim.apply_formal_sketch', 'Run trusted T3 compilation and reviewed-spec comparison for a retained candidate, then apply the L3 evidence gate.', object({
     task_id:id(100), observation_id:sha256,
   }, ['task_id','observation_id'])),

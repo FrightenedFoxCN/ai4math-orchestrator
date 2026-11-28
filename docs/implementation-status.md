@@ -256,6 +256,14 @@
 - Broker 新增显式 `FormalSketch` 模式：静态准入仅放行 `sorry`/`admit`，axiom 报告与独立 kernel replay 仅额外接受 `sorryAx`；spec comparator 只对 candidate 放行 `sorryAx`，reviewed spec 仍保持严格。
 - Store 正反例覆盖三证据齐全、重放、缺失 probe、spec 不匹配与非 T3 receipt；真实 Lean 4.35.0 端到端验收已验证 L3 写入且不发布 Git commit，并加入 `.github/native-lean.sh`。
 
+## L4a Oracle-backed typed transition（2026-11-28）
+
+- 新增 Builder-only `claim.apply_oracle_backed {task_id, observation_id}` 与受信 CLI `oracle-backed-task`；Agent 不能提交 proof body、repo、executable 或目标 trust level。
+- Broker 新增显式 `OracleBacked` 模式：静态准入只放行 `native_decide` / `ofReduceBool` / `trustCompiler`，axiom 报告只接受标准白名单、Lean compiler-trust axiom 或目标限定的 `._native.native_decide.ax_` 生成 axiom；拒绝 `sorryAx` 与任意用户 axiom，且不运行独立 kernel replay。
+- spec comparator 的 `oracle` 模式只对 candidate 放行上述 compiler-Oracle axiom，reviewed spec 仍严格；comparison 使用独立身份域，既有 T1/T3 身份保持兼容。
+- Store 要求 OracleBacked candidate、sealed spec comparison、retained `NoCounterexampleWithinBounds` probe 与 live Claim/repo/HEAD 全部匹配，原子写入 evidence、receipt、L4a 和 `oracle_debt=true`；`proof_verified:false`，不授予 L5。
+- Store、假 CLI/UDS 与真实 Lean 4.35.0 `native_decide` 端到端验收已通过，验证不发布 Git commit；测试加入 `.github/native-lean.sh`。L4b 保持默认 `FORBIDDEN`，没有伪造 ADR 解锁或跨 ITP 桥接。
+
 ## 尚未完成
 
 - Wiki 索引文件自身的完整路径/ACL 防护仍需独立核对，不等于 Markdown 输入已受保护。后续验收见[交付清单](delivery-roadmap.md)。

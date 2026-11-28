@@ -89,6 +89,10 @@ pub unsafe trait CandidateEvidence {
     fn source(&self) -> &str;
     fn receipt(&self) -> &dyn ReceiptEvidence;
     fn is_assessed_t3(&self) -> bool;
+    /// Explicit non-kernel compiler-Oracle path; never promotion authority.
+    fn is_oracle_backed(&self) -> bool {
+        false
+    }
 }
 
 /// Confirms that a fresh native regression checked the exact candidate.

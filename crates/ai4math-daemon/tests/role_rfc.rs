@@ -664,6 +664,157 @@ fn native_formal_sketch_applies_l3_without_publishing() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires native macOS Seatbelt, real Lean 4.35.0 and a built ai4math CLI"]
+fn native_oracle_backed_applies_l4a_debt_without_publishing() -> Result<()> {
+    let lean = PathBuf::from(
+        std::env::var_os("AI4MATH_TEST_LEAN")
+            .context("set AI4MATH_TEST_LEAN to the real Lean binary")?,
+    );
+    let version = Command::new(&lean).arg("--version").output()?;
+    ensure!(version.status.success(), "Lean version query failed");
+    ensure!(
+        String::from_utf8_lossy(&version.stdout).contains("version 4.35.0,"),
+        "Oracle-backed acceptance requires Lean 4.35.0"
+    );
+    let cli = PathBuf::from(env!("CARGO_BIN_EXE_ai4mathd"))
+        .parent()
+        .context("daemon parent")?
+        .join("ai4math");
+    ensure!(
+        cli.is_file(),
+        "build ai4math before running Oracle-backed acceptance"
+    );
+
+    let dir = tempfile::Builder::new()
+        .prefix("a4oracle-native")
+        .rand_bytes(4)
+        .tempdir()?;
+    let project = dir.path();
+    let runtime = project.join(".runtime");
+    fs::create_dir_all(&runtime)?;
+    fs::write(runtime.join("primary_engine"), "lean4\n")?;
+    let repo_path = project.join("repo.git");
+    let head = bare_with_files(
+        &repo_path,
+        &[
+            ("ASpec.lean", b"def spec : Prop := (2 : Nat) = 2\n"),
+            (
+                "ZTarget.lean",
+                b"theorem demo : (2 : Nat) = 2 := {{PROOF_BODY}}\n",
+            ),
+            ("ai4math-modules.txt", b"ASpec.lean\nZTarget.lean\n"),
+        ],
+    )?;
+    fs::write(repo_path.join("ai4math-promotion.lock"), "")?;
+    fs::set_permissions(
+        repo_path.join("ai4math-promotion.lock"),
+        fs::Permissions::from_mode(0o600),
+    )?;
+    let repo = repo_path.canonicalize()?;
+    let mut store = StateStore::open(runtime.join("state.sqlite"))?;
+    store.bind_task_repository(repo.to_str().context("repo path")?, &head)?;
+    store.create_claim(
+        NewClaim {
+            id: "C1",
+            title: "Claim",
+            informal_statement: "2 = 2",
+            engine: "lean4",
+            formal_target: Some("ZTarget.lean#demo"),
+            module_path: Some("ZTarget.lean"),
+            critical: false,
+        },
+        Change {
+            actor: "test",
+            git_commit: None,
+        },
+    )?;
+    let spec_prefix = ai4math_broker::lean_breaker_sources_sha256(&[(
+        "ASpec.lean",
+        "def spec : Prop := (2 : Nat) = 2\n",
+    )]);
+    store.bind_lean_spec(&ai4math_store::ReviewedLeanSpec {
+        repo: repo.to_str().context("repo path")?.into(),
+        claim_id: "C1".into(),
+        approved_git_commit: head.clone(),
+        spec_file: "ASpec.lean".into(),
+        spec_decl: "spec".into(),
+        spec_prefix_sha256: spec_prefix,
+    })?;
+    let approval = store.oracle_approval(
+        repo.to_str().context("repo path")?,
+        "C1",
+        &head,
+        QUERY,
+        [Z3, CVC5],
+    )?;
+    let observation_id = store
+        .record_oracle_observation(&approval, &OracleEvidence::new()?)?
+        .id;
+    store.register_task(
+        NewTask {
+            id: "T1",
+            track: TaskTrack::Infrastructure,
+            engine: "lean4",
+            module_path: "ZTarget.lean",
+            target: "demo",
+            dependencies: &[],
+        },
+        Change {
+            actor: "test",
+            git_commit: None,
+        },
+    )?;
+    let lease = store
+        .claim_task(
+            Some(TaskTrack::Infrastructure),
+            Duration::from_secs(60),
+            Change {
+                actor: "test",
+                git_commit: None,
+            },
+        )?
+        .context("lease")?;
+    store.finish_task_run(
+        &lease,
+        TaskRunOutcome::ModelCandidate {
+            base_commit: &head,
+            claim_id: "C1",
+            role: "prover_worker",
+            result_json: r#"{"kind":"proof_body","proof_body":"by\n  native_decide"}"#,
+        },
+        Change {
+            actor: "test",
+            git_commit: None,
+        },
+    )?;
+    drop(store);
+
+    let mut child = boot_with_native_timeout(project, &cli, &lean, "600")?;
+    let mut builder = connect(project, &mut child)?;
+    builder.bind("builder")?;
+    builder.set_timeout(Duration::from_secs(620))?;
+    let result = builder.result(
+        "claim.apply_oracle_backed",
+        json!({"task_id":"T1","observation_id":observation_id}),
+    )?;
+    assert_eq!(result["claim"]["local_trust"], "L4a");
+    assert_eq!(result["proof_verified"], false);
+    assert_eq!(result["oracle_debt"], true);
+    let db = rusqlite::Connection::open(runtime.join("state.sqlite"))?;
+    let debt: bool = db.query_row(
+        "SELECT oracle_debt FROM claims WHERE claim_id='C1'",
+        [],
+        |r| r.get(0),
+    )?;
+    assert!(debt);
+    assert_eq!(
+        String::from_utf8(git(&repo_path, &["rev-parse", "refs/heads/main"], None)?)?.trim(),
+        head
+    );
+    Ok(())
+}
+
+#[test]
 fn rfc_submit_and_approval_use_bound_git_and_principal_actors() -> Result<()> {
     let dir = tempfile::Builder::new()
         .prefix("a4rfc")
@@ -945,6 +1096,31 @@ fn rfc_submit_and_approval_use_bound_git_and_principal_actors() -> Result<()> {
         sketch_argv.lines().collect::<Vec<_>>(),
         [
             "formal-sketch-task",
+            project.canonicalize()?.to_str().context("project path")?,
+            repo.to_str().context("repo path")?,
+            "T1",
+            fake_lean.to_str().context("lean path")?,
+            oracle_id.as_str(),
+        ]
+    );
+
+    assert_eq!(
+        chief.call(
+            "claim.apply_oracle_backed",
+            json!({"task_id":"T1","observation_id":oracle_id})
+        )?["error"]["code"],
+        -32003
+    );
+    let oracle_backed = builder.result(
+        "claim.apply_oracle_backed",
+        json!({"task_id":"T1","observation_id":oracle_id}),
+    )?;
+    assert_eq!(oracle_backed["fixture"], true);
+    let oracle_argv = fs::read_to_string(&argv_log)?;
+    assert_eq!(
+        oracle_argv.lines().collect::<Vec<_>>(),
+        [
+            "oracle-backed-task",
             project.canonicalize()?.to_str().context("project path")?,
             repo.to_str().context("repo path")?,
             "T1",
