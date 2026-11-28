@@ -441,14 +441,31 @@ fn supervise(
     // An absolute deadline includes policy and command setup, unlike the legacy timeout.
     deadline_remaining(deadline)?;
     let start = Instant::now();
-    let mut running = Running(
-        Some(
-            command
-                .spawn()
-                .map_err(|source| LauncherStartError { launcher, source })?,
-        ),
-        own_session,
-    );
+    let mut child = None;
+    let mut last_start_error = None;
+    for _ in 0..20 {
+        match command.spawn() {
+            Ok(started) => {
+                child = Some(started);
+                break;
+            }
+            Err(source) if source.raw_os_error() == Some(35) => {
+                last_start_error = Some(source);
+                ensure!(
+                    start.elapsed() < timeout,
+                    "sandbox timeout after {:?}",
+                    timeout
+                );
+                thread::sleep(Duration::from_secs(1));
+            }
+            Err(source) => return Err(LauncherStartError { launcher, source }.into()),
+        }
+    }
+    let child = child.ok_or_else(|| LauncherStartError {
+        launcher,
+        source: last_start_error.unwrap(),
+    })?;
+    let mut running = Running(Some(child), own_session);
     let status = loop {
         if let Some(status) = running.0.as_mut().unwrap().try_wait()? {
             break status;

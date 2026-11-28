@@ -12,6 +12,7 @@ export AI4MATH_BROKER_TIMEOUT_SECS=120
 
 run_one() {
     local name=$1 output
+    sleep 5
     shift
     output=$(cargo test --locked "$@" -- "$name" --ignored --exact) || {
         printf '%s\n' "$output"

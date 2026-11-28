@@ -10,6 +10,7 @@ use std::{
     fs::{File, OpenOptions},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
+    thread,
 };
 
 const MAIN: &str = "refs/heads/main";
@@ -167,7 +168,19 @@ fn command(repo: &Path, args: &[&str]) -> Command {
 }
 
 fn run_git(repo: &Path, args: &[&str]) -> Result<Output> {
-    command(repo, args).output().context("start Git")
+    let mut command = command(repo, args);
+    let mut last = None;
+    for _ in 0..20 {
+        match command.output() {
+            Ok(output) => return Ok(output),
+            Err(error) if error.raw_os_error() == Some(35) => {
+                last = Some(error);
+                thread::sleep(std::time::Duration::from_secs(1));
+            }
+            Err(error) => return Err(error).context("start Git"),
+        }
+    }
+    Err(last.unwrap()).context("start Git after resource backoff")
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {

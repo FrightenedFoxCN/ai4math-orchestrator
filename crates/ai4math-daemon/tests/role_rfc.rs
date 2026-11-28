@@ -134,7 +134,7 @@ fn git(repo: &Path, args: &[&str], input: Option<&[u8]>) -> Result<Vec<u8>> {
                 break;
             }
             Err(error) if error.raw_os_error() == Some(35) => {
-                thread::sleep(Duration::from_millis(250));
+                thread::sleep(Duration::from_secs(1));
             }
             Err(error) => return Err(error).context("spawn Git fixture command"),
         }
@@ -224,7 +224,7 @@ fn boot_with_native_timeout(
             Ok(child) => return Ok(Server(child)),
             Err(error) if error.raw_os_error() == Some(35) => {
                 last = Some(error);
-                thread::sleep(Duration::from_millis(250));
+                thread::sleep(Duration::from_secs(1));
             }
             Err(error) => return Err(error).context("spawn native ai4mathd"),
         }
@@ -290,7 +290,20 @@ fn native_rfc_freeze_and_complete_with_real_lean() -> Result<()> {
         std::env::var_os("AI4MATH_TEST_LEAN")
             .context("set AI4MATH_TEST_LEAN to the real Lean binary")?,
     );
-    let version = Command::new(&lean).arg("--version").output()?;
+    let mut version = None;
+    for _ in 0..20 {
+        match Command::new(&lean).arg("--version").output() {
+            Ok(output) => {
+                version = Some(output);
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(35) => {
+                thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => return Err(error).context("query native Lean version"),
+        }
+    }
+    let version = version.context("query native Lean version after resource backoff")?;
     ensure!(version.status.success(), "Lean version query failed");
     ensure!(
         String::from_utf8_lossy(&version.stdout).contains("version 4.35.0,"),
@@ -393,7 +406,20 @@ fn native_owner_promotion_execute_with_real_lean() -> Result<()> {
         std::env::var_os("AI4MATH_TEST_LEAN")
             .context("set AI4MATH_TEST_LEAN to the real Lean binary")?,
     );
-    let version = Command::new(&lean).arg("--version").output()?;
+    let mut version = None;
+    for _ in 0..20 {
+        match Command::new(&lean).arg("--version").output() {
+            Ok(output) => {
+                version = Some(output);
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(35) => {
+                thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => return Err(error).context("query native Lean version"),
+        }
+    }
+    let version = version.context("query native Lean version after resource backoff")?;
     ensure!(version.status.success(), "Lean version query failed");
     ensure!(
         String::from_utf8_lossy(&version.stdout).contains("version 4.35.0,"),
@@ -561,7 +587,20 @@ fn native_formal_sketch_applies_l3_without_publishing() -> Result<()> {
         std::env::var_os("AI4MATH_TEST_LEAN")
             .context("set AI4MATH_TEST_LEAN to the real Lean binary")?,
     );
-    let version = Command::new(&lean).arg("--version").output()?;
+    let mut version = None;
+    for _ in 0..20 {
+        match Command::new(&lean).arg("--version").output() {
+            Ok(output) => {
+                version = Some(output);
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(35) => {
+                thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => return Err(error).context("query native Lean version"),
+        }
+    }
+    let version = version.context("query native Lean version after resource backoff")?;
     ensure!(version.status.success(), "Lean version query failed");
     ensure!(
         String::from_utf8_lossy(&version.stdout).contains("version 4.35.0,"),
@@ -700,7 +739,20 @@ fn native_oracle_backed_applies_l4a_debt_without_publishing() -> Result<()> {
         std::env::var_os("AI4MATH_TEST_LEAN")
             .context("set AI4MATH_TEST_LEAN to the real Lean binary")?,
     );
-    let version = Command::new(&lean).arg("--version").output()?;
+    let mut version = None;
+    for _ in 0..20 {
+        match Command::new(&lean).arg("--version").output() {
+            Ok(output) => {
+                version = Some(output);
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(35) => {
+                thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => return Err(error).context("query native Lean version"),
+        }
+    }
+    let version = version.context("query native Lean version after resource backoff")?;
     ensure!(version.status.success(), "Lean version query failed");
     ensure!(
         String::from_utf8_lossy(&version.stdout).contains("version 4.35.0,"),

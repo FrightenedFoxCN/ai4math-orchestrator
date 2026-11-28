@@ -92,9 +92,25 @@ fn run_git(
     index: Option<&Path>,
     input: Option<&[u8]>,
 ) -> Result<Output> {
-    let mut child = git_command(repo, args, index, input.is_some())
-        .spawn()
-        .context("start Git")?;
+    let mut child = None;
+    let mut last = None;
+    for _ in 0..20 {
+        match git_command(repo, args, index, input.is_some()).spawn() {
+            Ok(started) => {
+                child = Some(started);
+                break;
+            }
+            Err(error) if error.raw_os_error() == Some(35) => {
+                last = Some(error);
+                thread::sleep(Duration::from_secs(1));
+            }
+            Err(error) => return Err(error).context("start Git"),
+        }
+    }
+    let mut child = match child {
+        Some(child) => child,
+        None => return Err(last.unwrap()).context("start Git after resource backoff"),
+    };
     let write = input.map(|data| child.stdin.take().expect("piped stdin").write_all(data));
     let out = child.wait_with_output()?;
     if let Some(result) = write.filter(|_| out.status.success()) {

@@ -13,6 +13,7 @@ use std::{
     os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -89,7 +90,20 @@ impl Config {
 
     fn run(&self, mut command: Command) -> Result<Value> {
         let started = Instant::now();
-        let mut child = command.spawn().context("start native RFC CLI")?;
+        let mut child = None;
+        for _ in 0..20 {
+            match command.spawn() {
+                Ok(started_child) => {
+                    child = Some(started_child);
+                    break;
+                }
+                Err(error) if error.raw_os_error() == Some(35) => {
+                    thread::sleep(Duration::from_secs(1));
+                }
+                Err(error) => return Err(error).context("start native RFC CLI"),
+            }
+        }
+        let mut child = child.context("start native RFC CLI after resource backoff")?;
         let output = capture_stdout_limited(&mut child, started, self.timeout, MAX_OUTPUT)?;
         let value: Value =
             serde_json::from_slice(&output).context("decode native RFC CLI output")?;
